@@ -5,6 +5,10 @@ const crypto = require("node:crypto");
 const batch = require("../public/client/rootark-zk1-protected-text-batch");
 const index = require("../public/client/rootark-zk1-protected-revision-index");
 const content = require("../public/client/rootark-zk1-file-content");
+const productionFloor = require("../public/client/rootark-zk1-normal-browser-trust-floor");
+const ownerCheckpoints = require("../public/client/rootark-zk1-owner-signed-checkpoint");
+const recoveryV2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
+const recoveryV2Fixtures = require("./support/issue-65-recovery-v2-fixtures");
 
 const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
 const sha = (bytes) => b64(crypto.createHash("sha256").update(bytes).digest());
@@ -15,10 +19,11 @@ const id = () => b64(crypto.randomBytes(16));
 function memoryDB() {
   const rows = new Map();
   let ready = false, readonlySnapshot = null, beforeWriteGet = null;
-  let afterQueuedPut = null;
+  let afterQueuedPut = null, beforeReadonlyGet = null;
   return { rows, forceStaleReadonlySnapshot(record) {
     readonlySnapshot = record === null ? null : structuredClone(record);
   }, beforeWriteReadOnce(callback) { beforeWriteGet = callback; },
+    beforeReadonlyGetOnce(callback) { beforeReadonlyGet = callback; },
     afterQueuedPutOnce(callback) { afterQueuedPut = callback; }, open(_name, version) {
     assert.equal(version, 1);
     const request = {};
@@ -53,6 +58,11 @@ function memoryDB() {
               return req;
             }
             return { get(key) { return action(() => {
+              if (mode === "readonly" && beforeReadonlyGet) {
+                const callback = beforeReadonlyGet;
+                beforeReadonlyGet = null;
+                callback();
+              }
               if (mode === "readwrite" && beforeWriteGet) {
                 const callback = beforeWriteGet;
                 beforeWriteGet = null;
@@ -95,12 +105,12 @@ function memoryDB() {
   } };
 }
 
-async function fixture(count = 2) {
-  const scope = { account_id: id(), compartment_id: id(), keyring_id: id() };
+async function fixture(count = 2, suppliedScope = null, suppliedEpoch = 3) {
+  const scope = suppliedScope || { account_id: id(), compartment_id: id(), keyring_id: id() };
   const ownerDigest = b64(crypto.randomBytes(32));
-  const grant = { ...scope, device_id: id(), current_epoch: 3,
+  const grant = { ...scope, device_id: id(), current_epoch: suppliedEpoch,
     manifest_revision: 11, manifest_digest: ownerDigest, revoked_at_epoch: null };
-  const ownerHead = { revision: 11, epoch: 3, digest: ownerDigest };
+  const ownerHead = { revision: 11, epoch: suppliedEpoch, digest: ownerDigest };
   const baseline = { head: { sequence: 19, digest: b64(crypto.randomBytes(32)) }, entries: [] };
   const objectId = id();
   const selected = [], checked = new Map(), keys = new Map();
@@ -110,14 +120,14 @@ async function fixture(count = 2) {
         : "Histórico revisão " + (i + 1) + ": orçamento reservado"]);
   for (const [revision, text] of versions) {
     const metadata = { ...scope, object_id: objectId, version_id: id(),
-      parent_version_id: null, epoch: 3, kind: "file" };
+      parent_version_id: null, epoch: suppliedEpoch, kind: "file" };
     const rawCek = crypto.randomBytes(32);
     const ciphertext = await content.encryptFile({
       cek: await content.importFileCek(rawCek), metadata,
       name: "relatorio-confidencial.txt", mediaType: "text/plain",
       data: new TextEncoder().encode(text),
     });
-    const entry = { objectId, revision, epoch: 3, ciphertextDigestBase64: sha(ciphertext) };
+    const entry = { objectId, revision, epoch: suppliedEpoch, ciphertextDigestBase64: sha(ciphertext) };
     baseline.entries.push(entry);
     checked.set(objectId + ":" + revision, { ...entry, verifiedCiphertext: true,
       plaintextAvailable: false, authorizesMutation: false,
@@ -263,7 +273,626 @@ test("P2 RED: index append cannot persist signed plaintext after an awaited logo
   assert.equal(f.database.rows.size, 0, "denied append cannot write a local index");
 });
 
+test("P2 RED: index search must reuse genuine signed owner reader after async grant revocation", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const input = { ...f.core(), query: "histórico" };
+  const signedReader = input.verifyOwnerGrant;
+  let authenticReads = 0;
+  input.verifyOwnerGrant = async () => {
+    const signed = await signedReader();
+    if (++authenticReads === 1) {
+      // The owner signs revocation while the initial genuine reader is awaited.
+      f.updateOwnerGrant({ ...f.core().grant, revoked_at_epoch: 3 });
+      // A caller-controlled callback slot now impersonates the stale grant.
+      input.verifyOwnerGrant = async () => ({ verifiedCurrent: true,
+        grant: structuredClone(input.grant), ownerHead: structuredClone(input.ownerHead) });
+    }
+    return signed;
+  };
+  await assert.rejects(index.search(input), /ZK_REVISION_INDEX_DENIED/,
+    "a replaced callback cannot release cached plaintext after signed revocation");
+  assert.equal(authenticReads, 2,
+    "the same originally captured signed reader must recheck the revoked grant");
+});
+
+test("P2 RED: index append must not persist after a signed owner reader swap", async () => {
+  const f = await fixture();
+  const selected = f.selected[0].selected;
+  const input = { ...f.core(), entries: [{ ...selected, name: "private.txt",
+    mediaType: "text/plain", text: "authenticated confidential content" }] };
+  const signedReader = input.verifyOwnerGrant;
+  let authenticReads = 0;
+  input.verifyOwnerGrant = async () => {
+    const signed = await signedReader();
+    if (++authenticReads === 1) {
+      f.updateOwnerGrant({ ...f.core().grant, revoked_at_epoch: 3 });
+      input.verifyOwnerGrant = async () => ({ verifiedCurrent: true,
+        grant: structuredClone(input.grant), ownerHead: structuredClone(input.ownerHead) });
+    }
+    return signed;
+  };
+  await assert.rejects(index.append(input), /ZK_REVISION_INDEX_DENIED/,
+    "a replaced callback cannot bless an encrypted index after signed revocation");
+  assert.equal(authenticReads, 2,
+    "append must recheck the revocation with the original signed reader");
+  assert.equal(f.database.rows.size, 0, "revoked append cannot commit plaintext-derived bytes");
+});
+
+test("P2 RED: index search must reuse genuine signed catalog reader after async revocation", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const input = { ...f.core(), query: "histórico", assertLive() { return true; } };
+  const signedReader = input.client.verifyPrivateListingHead.bind(input.client);
+  let authenticAttempts = 0;
+  input.client = { async verifyPrivateListingHead(...args) {
+    authenticAttempts++;
+    const signed = await signedReader(...args);
+    if (authenticAttempts === 1) {
+      // The signed listing is revoked after the initial genuine verification.
+      f.revoke();
+      input.client.verifyPrivateListingHead = async () => signed;
+    }
+    return signed;
+  } };
+  await assert.rejects(index.search(input), /ZK_REVISION_INDEX_DENIED/,
+    "a swapped stale catalog reader must never release private index excerpts");
+  assert.equal(authenticAttempts, 2,
+    "the original signed verifier must attempt the final revocation check");
+});
+
+// Revoke with the fixture's genuine Ed25519 owner key, without changing the
+// independently signed listing CAS or the live local-session callback.
+function revokeSignedOwner(f) {
+  const grant = f.core().grant;
+  f.updateOwnerGrant({ ...grant, revoked_at_epoch: grant.current_epoch });
+}
+
+test("P2 RED: search FIRST page leaks when owner grant revokes during LAST genuine catalog await", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const input = { ...f.core(), query: "histórico" };
+  const realCatalog = input.client.verifyPrivateListingHead.bind(input.client);
+  let catalogReads = 0;
+  input.client = { async verifyPrivateListingHead(...args) {
+    const signed = await realCatalog(...args);
+    if (++catalogReads === 2) revokeSignedOwner(f);
+    return signed;
+  } };
+  await assert.rejects(index.search(input), /ZK_REVISION_INDEX_DENIED/,
+    "grant revoked after final genuine owner check cannot release private excerpts");
+  assert.equal(catalogReads, 2, "both genuine catalog verifications must run");
+  assert.equal((await f.core().verifyOwnerGrant()).grant.revoked_at_epoch, 3,
+    "revocation is genuinely owner-signed, not a forged verifier result");
+});
+
+test("P2 RED: readPage leaks when owner grant revokes during LAST genuine catalog await", async () => {
+  const f = await fixture(51);
+  await f.scan(f.selected);
+  const input = { ...f.core(), query: "histórico" };
+  const realCatalog = input.client.verifyPrivateListingHead.bind(input.client);
+  let catalogReads = 0, navigating = false, pageCatalogReads = 0;
+  input.client = { async verifyPrivateListingHead(...args) {
+    const signed = await realCatalog(...args);
+    catalogReads++;
+    if (navigating && ++pageCatalogReads === 1) revokeSignedOwner(f);
+    return signed;
+  } };
+  const first = await index.search(input);
+  assert.equal(first.entries.length, 50);
+  navigating = true;
+  await assert.rejects(first.readPage(50), /ZK_REVISION_INDEX_DENIED/,
+    "revocation after readPage's signed owner check cannot release page 2 excerpts");
+  assert.equal(pageCatalogReads, 1, "the genuine catalog must be read during page navigation");
+  assert.ok(catalogReads >= 3, "initial search and next page must both verify signed catalog");
+  assert.equal((await f.core().verifyOwnerGrant()).grant.revoked_at_epoch, 3);
+});
+
+test("P2 RED: append persists after owner grant revokes during LAST genuine catalog await", async () => {
+  const f = await fixture();
+  const input = { ...f.core(), entries: [{ ...f.selected[0].selected,
+    name: "revoke-before-commit.txt", mediaType: "text/plain",
+    text: "OWNER_REVOKED_BEFORE_COMMIT" }] };
+  const realCatalog = input.client.verifyPrivateListingHead.bind(input.client);
+  let catalogReads = 0;
+  input.client = { async verifyPrivateListingHead(...args) {
+    const signed = await realCatalog(...args);
+    if (++catalogReads === 2) revokeSignedOwner(f);
+    return signed;
+  } };
+  await assert.rejects(index.append(input), /ZK_REVISION_INDEX_DENIED/,
+    "post-check owner revocation must block encrypted local index persistence");
+  assert.equal(catalogReads, 2);
+  assert.equal((await f.core().verifyOwnerGrant()).grant.revoked_at_epoch, 3);
+  assert.equal(f.database.rows.size, 0, "no encrypted index may commit after revocation");
+});
+
+test("P2 RED: search FIRST page leaks after signed grant revokes in final queued IDB read", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const input = { ...f.core(), query: "histórico" };
+  const realCatalog = input.client.verifyPrivateListingHead.bind(input.client);
+  let catalogReads = 0, reachedFinalIdb = false;
+  input.client = { async verifyPrivateListingHead(...args) {
+    const signed = await realCatalog(...args);
+    if (++catalogReads === 2) f.database.beforeReadonlyGetOnce(() => {
+      reachedFinalIdb = true;
+      revokeSignedOwner(f);
+    });
+    return signed;
+  } };
+  await assert.rejects(index.search(input), /ZK_REVISION_INDEX_DENIED/,
+    "IDB await can outlive the final owner check; no post-revocation plaintext release");
+  assert.equal(reachedFinalIdb, true, "revocation occurred at final readonly IDB request");
+  assert.equal(catalogReads, 3, "the post-IDB independent catalog recheck must execute before denial");
+  assert.equal((await f.core().verifyOwnerGrant()).grant.revoked_at_epoch, 3);
+});
+
+test("P2 RED: readPage leaks after signed grant revokes in queued IDB read", async () => {
+  const f = await fixture(51);
+  await f.scan(f.selected);
+  const first = await index.search({ ...f.core(), query: "histórico" });
+  assert.equal(first.entries.length, 50);
+  let reachedIdb = false;
+  f.database.beforeReadonlyGetOnce(() => {
+    reachedIdb = true;
+    revokeSignedOwner(f);
+  });
+  await assert.rejects(first.readPage(50), /ZK_REVISION_INDEX_DENIED/,
+    "readPage cannot release cached excerpts after revocation in final IDB await");
+  assert.equal(reachedIdb, true, "revocation happened at real queued readonly get");
+  assert.equal((await f.core().verifyOwnerGrant()).grant.revoked_at_epoch, 3);
+});
+
+test("P2 RED: append commits after signed grant revokes during queued IDB write admission", async () => {
+  const f = await fixture();
+  const input = { ...f.core(), entries: [{ ...f.selected[0].selected,
+    name: "revoke-in-idb.txt", mediaType: "text/plain",
+    text: "OWNER_REVOKED_DURING_IDB_WRITE" }] };
+  let reachedWrite = false;
+  f.database.beforeWriteReadOnce(() => {
+    reachedWrite = true;
+    revokeSignedOwner(f);
+  });
+  await assert.rejects(index.append(input), /ZK_REVISION_INDEX_DENIED/,
+    "last owner check before async IDB get cannot report successful post-revocation append");
+  assert.equal(reachedWrite, true, "revocation occurred during actual IDB readwrite get");
+  assert.equal((await f.core().verifyOwnerGrant()).grant.revoked_at_epoch, 3);
+  // A remote owner-signed revocation cannot atomically roll back an IndexedDB
+  // transaction already committed in another asynchronous authority domain.
+  // The corrected contract can deny success and retain only AEAD ciphertext;
+  // it must NOT claim zero durable bytes after a post-admission revoke.
+  assert.doesNotMatch(JSON.stringify([...f.database.rows.values()]),
+    /OWNER_REVOKED_DURING_IDB_WRITE|revoke-in-idb\.txt/,
+    "any post-revocation IndexedDB residue must remain encrypted");
+});
+
+// Models the essential browser Web Locks contract: an exclusive lock is held
+// until its async callback settles; a second same-name request must queue.
+// Expose that queue edge and permit explicit test-only cancellation so a RED
+// test can prove a cycle without sleeping or leaving a pending process alive.
+function observableExclusiveWebLocks() {
+  const held = new Set(), queued = [];
+  let queuedCount = 0;
+  let reportQueue;
+  const firstQueued = new Promise((resolve) => { reportQueue = resolve; });
+  const advance = (name) => {
+    held.delete(name);
+    const at = queued.findIndex((entry) => entry.name === name);
+    if (at !== -1) start(queued.splice(at, 1)[0]);
+  };
+  const start = (entry) => {
+    held.add(entry.name);
+    Promise.resolve().then(() => entry.work({ name: entry.name, mode: "exclusive" }))
+      .then((value) => { advance(entry.name); entry.resolve(value); },
+        (error) => { advance(entry.name); entry.reject(error); });
+  };
+  return {
+    locks: { request(name, options, work) {
+      assert.equal(options?.mode, "exclusive");
+      assert.equal(typeof work, "function");
+      return new Promise((resolve, reject) => {
+        const entry = { name, work, resolve, reject };
+        if (held.has(name)) { queuedCount++; queued.push(entry); reportQueue(name); }
+        else start(entry);
+      });
+    } },
+    get queuedCount() { return queuedCount; },
+    firstQueued,
+    cancelQueued(name) {
+      const at = queued.findIndex((entry) => entry.name === name);
+      assert.notEqual(at, -1, "the same-key waiter must actually be queued");
+      queued.splice(at, 1)[0].reject(Error("TEST_CANCEL_REENTRANT_LOCK_WAIT"));
+    },
+  };
+}
+
+test("P2 RED: browser-like exclusive Web Lock cannot wait for signed verifier that awaits same-scope clear", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const input = { ...f.core(), query: "histórico" };
+  const genuineCatalogReader = input.client.verifyPrivateListingHead.bind(input.client);
+  const manager = observableExclusiveWebLocks();
+  const sharedStore = new Map();
+  const originalGlobals = new Map(["document", "navigator", "localStorage"].map(
+    (name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  let catalogReads = 0, settledNestedClear;
+  const nestedClearSettled = new Promise((resolve) => { settledNestedClear = resolve; });
+  const key = JSON.stringify([input.grant.account_id, input.grant.compartment_id,
+    input.grant.keyring_id]);
+  const lockName = "rootark-zk1-protected-revision-index-v1/" + key;
+  const clearNonceKey = "rootark-zk1-protected-revision-index-v1/clear/" + key;
+  input.client = { async verifyPrivateListingHead(...args) {
+    const authentic = await genuineCatalogReader(...args);
+    if (++catalogReads === 3) {
+      // This is a possible FUTURE revocation callback, not a behavior of the
+      // current production reader: the actual signed reader ran successfully,
+      // then an owner-signed revocation provokes awaited local invalidation.
+      revokeSignedOwner(f);
+      try {
+        await index.clear({ grant: input.grant, indexedDBImpl: input.indexedDBImpl,
+          assertLive: input.assertLive });
+        settledNestedClear("cleared");
+      } catch (error) { settledNestedClear("clear-rejected"); throw error; }
+    }
+    return authentic;
+  } };
+  try {
+    for (const [name, value] of [
+      ["document", {}], ["navigator", { locks: manager.locks }],
+      ["localStorage", { getItem: (key) => sharedStore.get(key) ?? null,
+        setItem: (key, value) => { sharedStore.set(key, String(value)); } }],
+    ]) Object.defineProperty(globalThis, name,
+      { configurable: true, writable: true, value });
+    const pending = index.search(input);
+    // A queued same-name request while the original verifier waits for it is
+    // a deterministically observable dependency cycle. No timeout is needed.
+    const observed = await Promise.race([
+      manager.firstQueued.then((name) => ({ state: "blocked", name })),
+      nestedClearSettled.then((state) => ({ state })),
+      pending.then(() => ({ state: "search-resolved" }),
+        () => ({ state: "search-rejected-early" })),
+    ]);
+    if (observed.state === "blocked") {
+      manager.cancelQueued(observed.name); // Always break the RED cycle first.
+      assert.equal(observed.name, lockName, "the pending clear requests the HELD scope lock");
+    }
+    await assert.rejects(pending, /ZK_REVISION_INDEX_DENIED/,
+      "a revoked owner must never receive the private index search page");
+    assert.equal(catalogReads, 3,
+      "the actual third signed catalog verifier must be reached");
+    assert.equal((await f.core().verifyOwnerGrant()).grant.revoked_at_epoch, 3,
+      "owner grant revocation is verified with the real Ed25519 fixture key");
+    assert.notEqual(observed.state, "blocked",
+      "genuine signed verifier waiting for same-scope clear cannot hold that exclusive Web Lock");
+    assert.equal(observed.state, "cleared",
+      "the nested clear must complete durably without requiring queue cancellation");
+    assert.match(sharedStore.get(clearNonceKey), /^[A-Za-z0-9_-]{22}$/,
+      "the clear publishes an opaque cross-tab invalidation nonce");
+    assert.equal([...f.database.rows.values()][0]?.format,
+      "rootark-zk1-protected-revision-index-clear/v1",
+      "the completed nested clear must persist a durable IDB tombstone");
+  } finally {
+    for (const [name, previous] of originalGlobals) {
+      if (previous) Object.defineProperty(globalThis, name, previous);
+      else delete globalThis[name];
+    }
+  }
+});
+
+test("browser-like Web Locks: signed revocation rejects first, then same-scope clear completes outside verifier", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const input = { ...f.core(), query: "histórico" };
+  const authenticReader = input.client.verifyPrivateListingHead.bind(input.client);
+  const manager = observableExclusiveWebLocks(), sharedStore = new Map();
+  const originalGlobals = new Map(["document", "navigator", "localStorage"].map(
+    (name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const key = JSON.stringify([input.grant.account_id, input.grant.compartment_id,
+    input.grant.keyring_id]);
+  let genuineCatalogReads = 0;
+  input.client = { async verifyPrivateListingHead(...args) {
+    const signed = await authenticReader(...args);
+    if (++genuineCatalogReads === 3) {
+      revokeSignedOwner(f);
+      // Legitimate integration: do NOT await index.clear here while a Web Lock
+      // might be held; reject immediately, let the owner caller clear below.
+      throw Error("GENUINE_SIGNED_OWNER_REVOKED");
+    }
+    return signed;
+  } };
+  try {
+    for (const [name, value] of [
+      ["document", {}], ["navigator", { locks: manager.locks }],
+      ["localStorage", { getItem: (key) => sharedStore.get(key) ?? null,
+        setItem: (key, value) => { sharedStore.set(key, String(value)); } }],
+    ]) Object.defineProperty(globalThis, name,
+      { configurable: true, writable: true, value });
+    await assert.rejects(index.search(input), /ZK_REVISION_INDEX_DENIED/,
+      "signed owner revocation must fail closed before releasing indexed plaintext");
+    assert.equal(genuineCatalogReads, 3);
+    assert.equal((await f.core().verifyOwnerGrant()).grant.revoked_at_epoch, 3);
+    await index.clear({ grant: input.grant, indexedDBImpl: input.indexedDBImpl,
+      assertLive: input.assertLive });
+    assert.equal(manager.queuedCount, 0,
+      "no callback awaited a second exclusive lock while the first was held");
+    assert.match(sharedStore.get("rootark-zk1-protected-revision-index-v1/clear/" + key),
+      /^[A-Za-z0-9_-]{22}$/);
+    assert.equal([...f.database.rows.values()][0]?.format,
+      "rootark-zk1-protected-revision-index-clear/v1",
+      "a post-unwind clear must durably replace the index with its tombstone");
+  } finally {
+    for (const [name, previous] of originalGlobals) {
+      if (previous) Object.defineProperty(globalThis, name, previous);
+      else delete globalThis[name];
+    }
+  }
+});
+
+test("P2 RED: signed owner-selected replacement during final readPage check cannot release stale excerpt", async () => {
+  const f = await fixture(2);
+  await f.scan([f.selected[0]]);
+  const input = { ...f.core(), query: "histórico" };
+  const realCatalog = input.client.verifyPrivateListingHead.bind(input.client);
+  let navigating = false, pageCatalogReads = 0, replaced = false;
+  input.client = { async verifyPrivateListingHead(...args) {
+    const signed = await realCatalog(...args);
+    if (navigating && ++pageCatalogReads === 2) {
+      replaced = true;
+      await index.append({ ...f.core(), replaceExisting: true,
+        entries: [{ ...f.selected[1].selected, name: "new-private.txt",
+          mediaType: "text/plain", text: "fresh replacement confidential text" }] });
+    }
+    return signed;
+  } };
+  const previous = await index.search(input);
+  assert.equal(previous.entries[0].revision, 1,
+    "positive signed/AEAD index contains the original revision");
+  navigating = true;
+  await assert.rejects(previous.readPage(0), /ZK_REVISION_INDEX_DENIED/,
+    "page captured before a newly committed selected index cannot release obsolete excerpts");
+  assert.equal(pageCatalogReads, 2, "the replacement raced the real final signed catalog read");
+  assert.equal(replaced, true);
+  const fresh = await index.search({ ...f.core(), query: "fresh replacement" });
+  assert.equal(fresh.entries[0].revision, 2, "new signed selection remains accessible");
+});
+
+test("P2 RED: initial private page cannot outlive index replacement during final signed read", async () => {
+  const f = await fixture(2);
+  await f.scan([f.selected[0]]);
+  const input = { ...f.core(), query: "histórico" };
+  const realCatalog = input.client.verifyPrivateListingHead.bind(input.client);
+  let catalogReads = 0, replaced = false;
+  input.client = { async verifyPrivateListingHead(...args) {
+    const signed = await realCatalog(...args);
+    if (++catalogReads === 3) {
+      replaced = true;
+      await index.append({ ...f.core(), replaceExisting: true,
+        entries: [{ ...f.selected[1].selected, name: "fresh-private.txt",
+          mediaType: "text/plain", text: "second selected private revision" }] });
+    }
+    return signed;
+  } };
+  await assert.rejects(index.search(input), /ZK_REVISION_INDEX_DENIED/,
+    "the first result cannot release an older owner selection after concurrent signed replacement");
+  assert.ok(catalogReads >= 3, "real signed catalog reads were performed");
+  assert.equal(replaced, true);
+  const current = await index.search({ ...f.core(), query: "second selected" });
+  assert.equal(current.entries[0].revision, 2);
+});
+
+test("P2 RED: caller-mutated grant G1 cannot revive G0 signed private index excerpts", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const input = { ...f.core(), query: "histórico" };
+  const first = await index.search(input);
+  assert.equal(first.entries[0].revision, 1,
+    "positive control decrypts the authentic AES-GCM index using original signed G0");
+  const newSignedGrant = { ...structuredClone(input.grant),
+    permissions: ["metadata-only-after-owner-rotation"] };
+  // The genuine owner signs G1 at the same manifest/head. Only its contents
+  // change; a stale G0 cached page is no longer justified by the new grant.
+  f.updateOwnerGrant(newSignedGrant);
+  const proof = await f.core().verifyOwnerGrant();
+  assert.deepEqual(proof.grant, newSignedGrant, "fresh G1 is truly Ed25519-signed");
+  input.grant = newSignedGrant; // attacker replaces the caller-owned reference
+  await assert.rejects(first.readPage(0), /ZK_REVISION_INDEX_DENIED/,
+    "a mutable input grant cannot overwrite the originally sealed G0 digest");
+});
+
+// Only IndexedDB storage is mocked. Owner signatures, WIRE admission, the
+// offline trust floor, owner checkpoint, and V2 authorized roster are real.
+function disposableOwnerFloorIDB() {
+  const databases = new Map();
+  return { open(name, version) {
+    assert.equal(version, 1);
+    const request = {};
+    queueMicrotask(() => {
+      const fresh = !databases.has(name);
+      if (fresh) databases.set(name, new Map());
+      const tables = databases.get(name);
+      const db = {
+        objectStoreNames: { contains: (table) => tables.has(table) },
+        createObjectStore(table) { assert.equal(tables.has(table), false);
+          tables.set(table, new Map()); },
+        transaction(table, mode) {
+          assert.ok(tables.has(table));
+          let aborted = false;
+          const tx = { abort() { aborted = true; queueMicrotask(() => tx.onabort?.()); },
+            objectStore() { return {
+              get(key) {
+                const req = {};
+                queueMicrotask(() => {
+                  if (aborted) return;
+                  req.result = tables.get(table).get(key);
+                  req.onsuccess?.();
+                  queueMicrotask(() => { if (!aborted) tx.oncomplete?.(); });
+                });
+                return req;
+              },
+              put(value, key) {
+                assert.equal(mode, "readwrite");
+                tables.get(table).set(key, structuredClone(value));
+              },
+            }; } };
+          return tx;
+        },
+        close() {},
+      };
+      request.result = db;
+      if (fresh) request.onupgradeneeded?.();
+      queueMicrotask(() => request.onsuccess?.());
+    });
+    return request;
+  } };
+}
+
+test("P2 RED: real WIRE/trust-floor G0 to roster-authorized G1 never releases stale signed AES-GCM excerpts", async (t) => {
+  // The G0 and G1 devices were both ACTUALLY enrolled in the same verified V2
+  // manifest, not invented by switching an illegal `permissions` field.
+  const state = await recoveryV2Fixtures.createInitialState(2);
+  const manifest = state.headManifest;
+  const roster = manifest.devices.filter((device) => device.revoked_at_epoch === null);
+  assert.equal(roster.length, 2, "two authentic enrolled, non-revoked devices");
+  const manifestDigest = await recoveryV2.recoveryManifestDigestV2(manifest);
+  const scope = Object.fromEntries(Object.entries(state.scope).map(
+    ([field, bytes]) => [field, b64(bytes)]));
+  const head = { revision: manifest.revision, epoch: manifest.current_epoch,
+    digest: b64(manifestDigest) };
+  const owner = crypto.generateKeyPairSync("ed25519");
+  const ownerSpki = owner.publicKey.export({ format: "der", type: "spki" });
+  const ownerPublicKey = await crypto.webcrypto.subtle.importKey("spki", ownerSpki,
+    "Ed25519", true, ["verify"]);
+  const ownerSigningKey = await crypto.webcrypto.subtle.importKey("pkcs8",
+    owner.privateKey.export({ format: "der", type: "pkcs8" }),
+    "Ed25519", false, ["sign"]);
+  const signerKeyId = crypto.randomBytes(16);
+  const ownerHistoryCheckpoint = await ownerCheckpoints.signOwnerCheckpoint({
+    scope, signerKey: ownerSigningKey, signerPublicKey: ownerPublicKey,
+    signerKeyId, deviceId: "offline-owner", revision: manifest.revision,
+    manifestDigest, issuedAt: 1600, previous: null,
+  });
+  const grantFields = ["schema", "account_id", "compartment_id", "keyring_id",
+    "device_id", "authorization_key_id", "authorization_public_key",
+    "manifest_revision", "manifest_digest", "current_epoch", "enrolled_epoch",
+    "revoked_at_epoch"];
+  const domain = Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0");
+  const signGrant = (device) => {
+    const body = { schema: "rootark-zk1-browser-owner-device-grant/v1", ...scope,
+      device_id: device.device_id,
+      authorization_key_id: b64(device.authorization_key_id),
+      authorization_public_key: b64(device.authorization_public_key),
+      manifest_revision: manifest.revision, manifest_digest: b64(manifestDigest),
+      current_epoch: manifest.current_epoch, enrolled_epoch: device.enrolled_epoch,
+      revoked_at_epoch: null };
+    const wire = Object.fromEntries(grantFields.map((field) => [field, body[field]]));
+    const signature = crypto.sign(null, Buffer.concat([domain,
+      Buffer.from(JSON.stringify(wire))]), owner.privateKey);
+    return { ...wire, signature: b64(signature) };
+  };
+  const G0 = signGrant(roster[0]), G1 = signGrant(roster[1]);
+  assert.notEqual(G0.device_id, G1.device_id);
+  assert.notEqual(G0.authorization_public_key, G1.authorization_public_key);
+  const trust = { ownerPublicKey,
+    independentOwnerSpkiSha256: crypto.createHash("sha256").update(ownerSpki).digest(),
+    pinnedCurrentHead: { revision: head.revision, epoch: head.epoch,
+      digest: Buffer.from(manifestDigest) },
+    ownerHistoryCheckpoint, previousOwnerHistoryProof: null };
+  const previousIDB = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true,
+    writable: true, value: disposableOwnerFloorIDB() });
+  t.after(() => {
+    if (previousIDB) Object.defineProperty(globalThis, "indexedDB", previousIDB);
+    else delete globalThis.indexedDB;
+  });
+  // Real production trust floor verifies exact WIRE, domain-separated Ed25519
+  // signatures, owner-signed checkpoint, independently pinned SPKI, and the
+  // durable monotonic owner head. No fabricated `verifiedCurrent` is admitted.
+  await productionFloor.provisionOffline({ ...trust, signedDeviceGrant: G0 });
+  const proof0 = await productionFloor.assertCurrent({ ...trust, signedDeviceGrant: G0 });
+  const proof1 = await productionFloor.assertCurrent({ ...trust, signedDeviceGrant: G1 });
+  assert.equal(proof0.signedOwnerGrantVerified, true);
+  assert.equal(proof1.signedOwnerGrantVerified, true);
+  assert.equal(proof1.localMonotonicFloorChecked, true);
+
+  const f = await fixture(2, scope, head.epoch); // AES-GCM scope AND epoch match the V2 manifest.
+  let selectedGrant = G0;
+  let currentG1Reads = 0;
+  const verifyOwnerGrant = async () => {
+    const signedGrant = selectedGrant;
+    const proof = await productionFloor.assertCurrent({
+      ...trust, signedDeviceGrant: signedGrant });
+    assert.equal(proof.signedOwnerGrantVerified, true);
+    if (signedGrant === G1) currentG1Reads++;
+    return { verifiedCurrent: true, grant: structuredClone(signedGrant),
+      ownerHead: structuredClone(head) };
+  };
+  const input = { ...f.core(), grant: G0, ownerHead: head,
+    verifyOwnerGrant, query: "histórico" };
+  await f.scan([f.selected[0]], { grant: G0, ownerHead: head, verifyOwnerGrant,
+    onVerifiedBatch: (entries) => index.append({ ...input, entries }) });
+  const first = await index.search(input);
+  assert.equal(first.entries[0].revision, 1,
+    "positive: the real G0 trust-floor authority opens the AES-GCM index");
+  const positivePage = await first.readPage(0);
+  assert.equal(positivePage.entries[0].revision, 1,
+    "positive: readPage really releases the authentic G0 excerpt before signed grant change");
+
+  selectedGrant = G1;
+  input.grant = G1; // Only the caller's reference changes; G0 index stays sealed.
+  const legalG1 = await productionFloor.assertCurrent({ ...trust, signedDeviceGrant: G1 });
+  assert.equal(legalG1.signedOwnerGrantVerified, true,
+    "G1 is a REAL enrolled owner's signed device grant at unchanged owner head");
+  await assert.rejects(first.readPage(0), /ZK_REVISION_INDEX_DENIED/,
+    "a previously cached G0 page cannot be released under another legal grant G1");
+  assert.ok(currentG1Reads > 0,
+    "the denied page must actually invoke the current G1 production-floor-backed owner verifier");
+});
+
+test("P2 RED: a tab cannot adopt another tab's write marker before append capture", async () => {
+  const f = await fixture(2);
+  await f.scan([f.selected[0]]);
+  const original = structuredClone([...f.database.rows.values()][0]);
+  const manager = observableExclusiveWebLocks();
+  const sharedStore = new Map();
+  const descriptors = new Map(["document", "navigator", "localStorage"].map(
+    (name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  let superseded = false;
+  try {
+    for (const [name, value] of [
+      ["document", {}], ["navigator", { locks: manager.locks }],
+      ["localStorage", {
+        getItem: (key) => sharedStore.get(key) ?? null,
+        setItem: (key, value) => {
+          sharedStore.set(key, String(value));
+          if (!superseded && key.includes("/write/")) {
+            // A second tab's synchronous mutation wins before tab A captures.
+            superseded = true;
+            sharedStore.set(key, String(value)[0] === "A"
+              ? "B".repeat(22) : "A".repeat(22));
+          }
+        },
+      }],
+    ]) Object.defineProperty(globalThis, name,
+      { configurable: true, writable: true, value });
+    await assert.rejects(index.append({ ...f.core(), replaceExisting: true,
+      entries: [{ ...f.selected[1].selected, name: "new-signed-owner.txt",
+        mediaType: "text/plain", text: "second owner-approved text" }] }),
+    /ZK_REVISION_INDEX_DENIED/,
+    "tab A must not adopt tab B's newer marker as authority to write after B");
+    assert.equal(superseded, true, "actual shared storage overwrite must occur");
+    assert.equal([...f.database.rows.values()][0]?.nonce, original.nonce,
+      "a superseded append may not replace the original encrypted index");
+  } finally {
+    for (const [name, descriptor] of descriptors) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete globalThis[name];
+    }
+  }
+});
+
 test("one explicitly owner-selected 128-revision batch verifies all 16 windows before one encrypted commit", async () => {
+
   const f = await fixture(128);
   let saves = 0;
   const progress = [];

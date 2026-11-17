@@ -19,7 +19,12 @@
   // Synchronous same-realm fence: invocation of clear invalidates ALL older
   // local async operations, including those waiting before the first IDB read.
   const clearGenerations = new Map();
+  // A new signed owner-selected batch can replace an existing index without
+  // changing the owner/catalog CAS. A page created from the older snapshot
+  // must not outlive such a write across tabs or asynchronous signed readers.
+  const writeGenerations = new Map();
   function generation(key) { return clearGenerations.get(key) || 0; }
+  function writeGeneration(key) { return writeGenerations.get(key) || 0; }
   function browserRealm() {
     return typeof document === "object" || typeof WorkerGlobalScope !== "undefined";
   }
@@ -34,12 +39,39 @@
     if (value !== null && !opaque.test(value)) deny();
     return value;
   }
+  function sharedWriteGeneration(key) {
+    if (!browserRealm()) return null;
+    if (typeof localStorage === "undefined"
+      || typeof localStorage.getItem !== "function") deny();
+    const value = localStorage.getItem(DB + "/write/" + key);
+    if (value !== null && !opaque.test(value)) deny();
+    return value;
+  }
+  function advanceWriteGeneration(key) {
+    let shared = null;
+    if (browserRealm()) {
+      if (typeof localStorage === "undefined"
+        || typeof localStorage.setItem !== "function") deny();
+      shared = to64(webCrypto.getRandomValues(new Uint8Array(16)));
+      localStorage.setItem(DB + "/write/" + key, shared);
+    }
+    const local = writeGeneration(key) + 1;
+    writeGenerations.set(key, local);
+    return { local, shared };
+  }
   function captureGeneration(key) {
-    return { local: generation(key), shared: sharedGeneration(key) };
+    return { local: generation(key), shared: sharedGeneration(key),
+      writeLocal: writeGeneration(key), writeShared: sharedWriteGeneration(key) };
   }
   function checkGeneration(key, expected) {
     if (generation(key) !== expected.local
-      || sharedGeneration(key) !== expected.shared) deny();
+      || sharedGeneration(key) !== expected.shared
+      || writeGeneration(key) !== expected.writeLocal
+      || sharedWriteGeneration(key) !== expected.writeShared) deny();
+  }
+  function updateOwnWriteGeneration(expected, marker) {
+    expected.writeLocal = marker.local;
+    expected.writeShared = marker.shared;
   }
   function checkRecordGeneration(record, expected) {
     if (!browserRealm()) return;
@@ -220,27 +252,32 @@
       info: encoder.encode("Root.ark/zk-1/protected-revision-text-index/aes-gcm/v1") },
     root, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
   }
-  async function verifiedHead(input, pinned, assertLive) {
+  async function verifiedHead(input, pinned, assertLive, verifySignedHead) {
     live(assertLive);
-    if (typeof input.client?.verifyPrivateListingHead !== "function") deny();
-    const result = await input.client.verifyPrivateListingHead(input.baseline);
+    const result = await verifySignedHead(input.baseline);
     live(assertLive);
     if (result?.head?.sequence !== pinned.catalogHead.sequence
       || result.head.digest !== pinned.catalogHead.digest
       || !["account_id", "compartment_id", "keyring_id"]
         .every((name) => result.scope?.[name] === pinned.scope[name])) deny();
   }
-  async function verifiedOwnerGrant(input, pinned, assertLive) {
+  async function verifiedOwnerGrant(input, pinned, assertLive, verifySignedOwnerGrant) {
     // The caller independently re-imports and validates the current signed
     // owner/grant evidence against its monotonic trust floor. Catalog CAS alone
     // cannot detect a revoked device if its snapshot head has not changed.
     live(assertLive);
-    if (typeof input.verifyOwnerGrant !== "function") deny();
-    const current = await input.verifyOwnerGrant();
+    const current = await verifySignedOwnerGrant();
     live(assertLive);
     if (current?.verifiedCurrent !== true
-      || !current.grant || current.grant.revoked_at_epoch !== null
-      || JSON.stringify(current.grant) !== JSON.stringify(input.grant)
+      || !current.grant || current.grant.revoked_at_epoch !== null) deny();
+    // `input.grant` is caller-owned and can be replaced during an await. The
+    // encrypted index was sealed under the ORIGINAL complete grant digest;
+    // only a fresh genuinely verified grant with that same digest may release
+    // private excerpts, even if the signer has issued G1 at the same head.
+    const currentGrantDigest = to64(new Uint8Array(await webCrypto.subtle.digest(
+      "SHA-256", encoder.encode(JSON.stringify(current.grant)))));
+    live(assertLive);
+    if (currentGrantDigest !== pinned.grantDigest
       || current.ownerHead?.revision !== pinned.ownerHead.revision
       || current.ownerHead?.epoch !== pinned.ownerHead.epoch
       || current.ownerHead?.digest !== pinned.ownerHead.digest) deny();
@@ -289,11 +326,25 @@
       // A signed verifier may await and later mutate the caller-owned input.
       // Never let it replace the session guard already trusted at invocation.
       const assertLive = input.assertLive.bind(input);
+      // Both independent signed readers must be the ORIGINAL callbacks for
+      // initial and final checks, not replacements supplied during an await.
+      if (typeof input.verifyOwnerGrant !== "function"
+        || typeof input.client?.verifyPrivateListingHead !== "function") deny();
+      const verifySignedOwnerGrant = input.verifyOwnerGrant.bind(input);
+      const verifySignedHead = input.client.verifyPrivateListingHead.bind(input.client);
       if (input.replaceExisting !== undefined
         && typeof input.replaceExisting !== "boolean") deny();
       const replaceExisting = input.replaceExisting === true;
       const key = cacheKey(scopeOf(input.grant));
+      // Rotate synchronously at invocation, before the first awaited IDB read,
+      // so existing page closures deny even if this append later fails.
+      const ownInvocationMarker = advanceWriteGeneration(key);
       const initialGeneration = captureGeneration(key);
+      // Separate browser tabs can interleave synchronous localStorage calls.
+      // Never accidentally adopt a newer tab's write marker as our own after
+      // our invocation marker was superseded before captureGeneration().
+      if (initialGeneration.writeLocal !== ownInvocationMarker.local
+        || initialGeneration.writeShared !== ownInvocationMarker.shared) deny();
       const assertCurrent = () => {
         live(assertLive);
         checkGeneration(key, initialGeneration);
@@ -314,8 +365,8 @@
         || (tombstone && Object.keys(record).sort().join(",") !== "format,nonce")
         || (!tombstone && record.format !== FORMAT))) deny();
       if (record) checkRecordGeneration(record, initialGeneration);
-      await verifiedOwnerGrant(input, pinned, assertLive);
-      await verifiedHead(input, pinned, assertLive);
+      await verifiedHead(input, pinned, assertLive, verifySignedHead);
+      await verifiedOwnerGrant(input, pinned, assertLive, verifySignedOwnerGrant);
       assertCurrent();
       const secret = await keyFor(input.metadataRaw, pinned.scope);
       assertCurrent();
@@ -373,14 +424,33 @@
         secret, plain);
       } finally { plain.fill(0); }
       assertCurrent();
-      await verifiedOwnerGrant(input, pinned, assertLive);
-      await verifiedHead(input, pinned, assertLive);
+      // A revocation may be signed while the independent catalog verifier
+      // awaits. The owner grant must be read AFTER that final catalog await.
+      await verifiedHead(input, pinned, assertLive, verifySignedHead);
+      await verifiedOwnerGrant(input, pinned, assertLive, verifySignedOwnerGrant);
       assertCurrent();
-      await db.save(key, { format: FORMAT, context: JSON.stringify(pinned),
-        nonce: to64(webCrypto.getRandomValues(new Uint8Array(16))),
-        clearNonce: initialGeneration.shared,
-        iv: to64(iv), ciphertext: to64(new Uint8Array(sealed)) },
-      record?.nonce ?? null, assertCurrent);
+      await scopeGate(key, async () => {
+        assertCurrent();
+        // A reader can begin after this append was invoked but before its
+        // write commits. Rotate again under the short scope lock.
+        updateOwnWriteGeneration(initialGeneration, advanceWriteGeneration(key));
+        await db.save(key, { format: FORMAT, context: JSON.stringify(pinned),
+          nonce: to64(webCrypto.getRandomValues(new Uint8Array(16))),
+          clearNonce: initialGeneration.shared,
+          iv: to64(iv), ciphertext: to64(new Uint8Array(sealed)) },
+        record?.nonce ?? null, assertCurrent);
+        assertCurrent();
+        // Publication of the new snapshot invalidates readers that started
+        // while this transaction was in flight.
+        updateOwnWriteGeneration(initialGeneration, advanceWriteGeneration(key));
+      });
+      assertCurrent();
+      // Never call external async signed readers while holding a Web Lock:
+      // a verifier that awaits a same-scope clear would deadlock the lock.
+      // A revocation while IndexedDB commits denies reported success, but
+      // cannot roll back a previously committed AEAD ciphertext atomically.
+      await verifiedHead(input, pinned, assertLive, verifySignedHead);
+      await verifiedOwnerGrant(input, pinned, assertLive, verifySignedOwnerGrant);
       assertCurrent();
       return Object.freeze({ indexedCount: rows.length, persistedIndex: true,
         discardedCount, replacedIncompatibleIndex, replacedSelectedIndex,
@@ -421,6 +491,10 @@
     try {
       live(input?.assertLive);
       const assertLive = input.assertLive.bind(input);
+      if (typeof input.verifyOwnerGrant !== "function"
+        || typeof input.client?.verifyPrivateListingHead !== "function") deny();
+      const verifySignedOwnerGrant = input.verifyOwnerGrant.bind(input);
+      const verifySignedHead = input.client.verifyPrivateListingHead.bind(input.client);
       const key = cacheKey(scopeOf(input.grant));
       const initialGeneration = captureGeneration(key);
       const assertCurrent = () => {
@@ -431,8 +505,8 @@
       const pinned = await context(input);
       assertCurrent();
       if (cacheKey(pinned.scope) !== key) deny();
-      await verifiedOwnerGrant(input, pinned, assertLive);
-      await verifiedHead(input, pinned, assertLive);
+      await verifiedHead(input, pinned, assertLive, verifySignedHead);
+      await verifiedOwnerGrant(input, pinned, assertLive, verifySignedOwnerGrant);
       const db = store(input.indexedDBImpl);
       const record = await db.read(key);
       assertCurrent();
@@ -442,8 +516,8 @@
       assertCurrent();
       let rows = await openRows(record, pinned, secret, input.baseline);
       assertCurrent();
-      await verifiedOwnerGrant(input, pinned, assertLive);
-      await verifiedHead(input, pinned, assertLive);
+      await verifiedHead(input, pinned, assertLive, verifySignedHead);
+      await verifiedOwnerGrant(input, pinned, assertLive, verifySignedOwnerGrant);
       const matches = [];
       for (const row of rows) {
         const normalized = row.text.normalize("NFC");
@@ -475,38 +549,44 @@
       const readPage = async (offset) => {
         try {
           assertCurrent();
-          await verifiedOwnerGrant(input, pinned, assertLive);
-          await verifiedHead(input, pinned, assertLive);
+          await verifiedHead(input, pinned, assertLive, verifySignedHead);
+          await verifiedOwnerGrant(input, pinned, assertLive, verifySignedOwnerGrant);
           // A previously loaded result may outlive a scoped clear or a new
           // encrypted snapshot with the same signed catalog head. Never emit
           // another page from an index that was deleted/replaced meanwhile.
-          const page = await scopeGate(key, async () => {
+          await scopeGate(key, async () => {
             const currentRecord = await db.read(key);
             assertCurrent();
             if (!currentRecord || currentRecord.format !== FORMAT
               || currentRecord.context !== record.context
               || currentRecord.nonce !== record.nonce) deny();
             checkRecordGeneration(currentRecord, initialGeneration);
-            return paged(offset);
           });
           assertCurrent();
-          return page;
+          // Final independent signed authority check comes AFTER the async
+          // IndexedDB read, outside its non-reentrant exclusive Web Lock.
+          await verifiedHead(input, pinned, assertLive, verifySignedHead);
+          await verifiedOwnerGrant(input, pinned, assertLive, verifySignedOwnerGrant);
+          assertCurrent();
+          return paged(offset);
         } catch (_) { deny(); }
       };
       // The FIRST page needs the same scoped current-record check as later
       // navigation, after the last asynchronous signed owner/catalog check.
       // Keep final check + page construction ordered against cross-tab clear.
-      const firstPage = await scopeGate(key, async () => {
+      await scopeGate(key, async () => {
         const currentRecord = await db.read(key);
         assertCurrent();
         if (!currentRecord || currentRecord.format !== FORMAT
           || currentRecord.context !== record.context
           || currentRecord.nonce !== record.nonce) deny();
         checkRecordGeneration(currentRecord, initialGeneration);
-        return paged(input.offset === undefined ? 0 : input.offset);
       });
       assertCurrent();
-      return firstPage;
+      await verifiedHead(input, pinned, assertLive, verifySignedHead);
+      await verifiedOwnerGrant(input, pinned, assertLive, verifySignedOwnerGrant);
+      assertCurrent();
+      return paged(input.offset === undefined ? 0 : input.offset);
     } catch (_) { deny(); }
   }
   async function clear(input) {
