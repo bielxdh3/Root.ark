@@ -779,7 +779,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       issued_at: now + 9, expires_at: now + 39, ciphertext_digest: digest };
     const grantInput = { authorization: shareAuthorization, grantId: b64(crypto.randomBytes(32)),
       recipientUsername: "recipient", recipientDeviceId: fresh.request.device_id,
-      expiresAt: now + 129 };
+      expiresAt: now + 420 };
     const message = await shareGrantMessageV1(grantInput);
     const shareSignatureBase64 = b64(crypto.sign(null, message, originalActor));
     const shareAuthorizationWire = Object.fromEntries(
@@ -1192,6 +1192,27 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     "issuer revoked during HPKE/file AEAD awaits cannot yield plaintext");
     assert.equal(authorityReads, 3,
       "additional current authority check must occur after owner CEK and file AEAD");
+    // The authenticated share grant remains live after the shorter, genuinely
+    // owner-signed HPKE CEK envelope. Advance the wall clock only during the
+    // third independent authority read, after the real HTTP, HPKE and AEAD work.
+    assert.ok(grant.expiresAt > envelope.core.expires_at + 1,
+      "fixture requires the owner HPKE envelope to expire before the signed grant");
+    const recipientExpiryClock = Date.now;
+    let recipientExpiryReads = 0;
+    try {
+      await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++recipientExpiryReads === 3) {
+            Date.now = () => (envelope.core.expires_at + 1) * 1000;
+          }
+          return current;
+        } },
+      }), /ZK_SHARE_FILE_OPEN_DENIED/,
+      "the final authority await cannot release plaintext after signed HPKE expiry");
+    } finally { Date.now = recipientExpiryClock; }
+    assert.equal(recipientExpiryReads, 3,
+      "expiry race must reach the final independent read after real HPKE and AEAD");
     // This proof covers the three explicitly owner-selected versions, never
     // unknown historical versions or externally held backup copies.
     assert.equal(typeof cekBatch.sealOwnerAuthorizedVersionedCeks, "function",

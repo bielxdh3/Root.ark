@@ -366,7 +366,11 @@ async function openProtectedRecipientShareFile(input) {
     // again immediately before releasing the decrypted file to this process.
     currentAuthority(await redeemInput.readIndependentAuthority(),
       statement, shareSignature, statementBytes);
-    if (Math.floor(Date.now() / 1000) >= statement.expires_at
+    // The signed HPKE envelope can expire before the owner-signed share grant.
+    // Both authorizations must still be live after the final authority await.
+    const releaseSeconds = Math.floor(Date.now() / 1000);
+    if (releaseSeconds >= core.expires_at || nowSeconds >= core.expires_at
+      || releaseSeconds >= statement.expires_at
       || nowSeconds >= statement.expires_at) deny();
     const result = Object.freeze({
       schema: "rootark-zk1-recipient-share-file-dev/v1",
