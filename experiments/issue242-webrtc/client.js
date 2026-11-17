@@ -19,11 +19,13 @@
   const MAX_FILE = 1024 * 1024;
   const MAX_FILE_CHUNKS = MAX_FILE / (8 * 1024); // Honest sender emits at most 64.
   let ws, roomId, hostKey, selfId, role;
+  let roomGeneration = 0;
   const peers = new Map(), invites = new Map();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
 
   function connect(credentials) {
+    roomGeneration++;
     const oldSocket = ws;
     ws = null; // old callbacks must not retain authority over the new room.
     if (oldSocket && oldSocket.readyState < 2) oldSocket.close();
@@ -274,30 +276,45 @@
   }
   async function sendFile(file) {
     if (!file || file.size === 0 || file.size > MAX_FILE) return log('Arquivo fora do limite de 1 MiB');
+    const generation = roomGeneration;
+    const targets = [...peers.values()].filter(p => p.dc?.readyState === 'open' && !p.outgoing)
+      .map(p => ({ peer: p, channel: p.dc }));
     const bytes = await file.arrayBuffer();
+    if (generation !== roomGeneration) return;
     const digest = await sha(bytes);
-    const receivers = [...peers.values()].filter(p => p.dc && p.dc.readyState === 'open' && !p.outgoing);
-    for (const p of receivers) {
+    if (generation !== roomGeneration) return;
+    let count = 0;
+    for (const { peer: p, channel } of targets) {
+      if (peers.get(p.id) !== p || p.dc !== channel || channel.readyState !== 'open' || p.outgoing) continue;
       const id = crypto.randomUUID();
       p.outgoing = { id, name: file.name.slice(0, 100), bytes, digest };
-      p.dc.send(JSON.stringify({ type: 'offer-file', id, name: file.name.slice(0, 100), size: bytes.byteLength, digest }));
+      channel.send(JSON.stringify({ type: 'offer-file', id, name: file.name.slice(0, 100), size: bytes.byteLength, digest }));
+      count++;
     }
-    log('Arquivo oferecido a ' + receivers.length + ' destinatário(s)');
+    log('Arquivo oferecido a ' + count + ' destinatário(s)');
   }
   async function sendText(value) {
     if (!value || value.length > 1000) return;
+    const generation = roomGeneration;
+    const targets = [...peers.values()].filter(p => p.dc?.readyState === 'open')
+      .map(p => ({ peer: p, channel: p.dc }));
     const digest = await sha(new TextEncoder().encode(value));
+    if (generation !== roomGeneration) return;
     let count = 0;
-    for (const p of peers.values()) if (p.dc?.readyState === 'open') {
-      p.dc.send(JSON.stringify({ type: 'text', text: value, digest }));
+    for (const { peer: p, channel } of targets) {
+      if (peers.get(p.id) !== p || p.dc !== channel || channel.readyState !== 'open') continue;
+      channel.send(JSON.stringify({ type: 'text', text: value, digest }));
       count++;
     }
     log('Texto enviado a ' + count + ' destinatário(s)');
   }
   async function createRoom() {
+    const generation = ++roomGeneration;
     const response = await fetch('/rooms', { method: 'POST' });
+    if (generation !== roomGeneration) return;
     if (!response.ok) throw new Error('room creation failed');
     const result = await response.json();
+    if (generation !== roomGeneration) return;
     ({ roomId, hostKey } = result);
     $('room').textContent = roomId;
     connect({ hostKey });
