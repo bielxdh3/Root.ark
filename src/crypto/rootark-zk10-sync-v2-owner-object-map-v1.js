@@ -40,6 +40,9 @@ const {
   pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
 } = require("./rootark-zk10-native-intrinsics-v1");
 const protocol = require("../../sync-client/rootark-sync-protocol");
+// This CommonJS export is mutable. Pin the real operation validator before a
+// caller-owned native KeyObject getter can replace it during provisioning.
+const PINNED_VALIDATE_STORED_OPERATION = protocol.validateStoredOperation;
 const { verifyHistoricalAuthorizationProof } =
   require("../../sync-client/rootark-sync-authorization");
 const { verifyPinnedAtomicOwnerProvision } =
@@ -486,7 +489,7 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
 
         const operation = copyJson(r.sourceOperation);
         if (NATIVE_BUFFER_BYTE_LENGTH(NATIVE_JSON_STRINGIFY(operation), "utf8") > 9 * 1024 * 1024) deny();
-        const normalized = protocol.validateStoredOperation(operation);
+        const normalized = PINNED_VALIDATE_STORED_OPERATION(operation);
         if (!normalized.authorization || normalized.operation === "delete"
           || normalized.tombstone || normalized.revision.counter < 1
           || normalized.revision.deviceId !== normalized.deviceId

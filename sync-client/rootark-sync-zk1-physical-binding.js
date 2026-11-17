@@ -115,6 +115,7 @@ function snapshotLocalDevicePolicy(input) {
     || NATIVE_ARRAY_IS_ARRAY(raw.trustedDevicePublicKeys)
     || (pinsPrototype !== Object.prototype && pinsPrototype !== null)
     || !NATIVE_ARRAY_IS_ARRAY(raw.revokedDeviceIds)
+    || isProxy(raw.revokedDeviceIds)
     || raw.revokedDeviceIds.length > 10000) deny();
   const pins = NATIVE_OBJECT_CREATE(null);
   const pinKeys = NATIVE_OWN_KEYS(raw.trustedDevicePublicKeys);

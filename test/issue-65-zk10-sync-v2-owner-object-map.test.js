@@ -8,6 +8,8 @@ const protocol = require("../sync-client/rootark-sync-protocol");
 const { DOMAIN: SOURCE_DOMAIN, verifyPinnedAtomicOwnerProvision } =
   require("../sync-client/rootark-sync-atomic-owner-provision");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { snapshotLocalDevicePolicy } =
+  require("../sync-client/rootark-sync-zk1-physical-binding");
 const { signOwnerCutover, digestOwnerCutover, signOwnerRotation, spkiHash,
   verifyOwnerRotationKeys } =
   require("../src/crypto/rootark-zk10-account-cutover-v1");
@@ -167,6 +169,62 @@ async function fixture(overrides = {}, { coveredCompartments = [id(9)] } = {}) {
     input: { sourceOperation: source, zkObject: target,
       zkMembershipProof: proof.siblings, ownerMapping: mapping } };
 }
+
+test("P2: proxy-backed revocation policy cannot hide a real revoked source device", () => {
+  const revoked = new Proxy(["source-device-4"], {
+    get(target, property, receiver) {
+      if (property === "length") return 0;
+      return Reflect.get(target, property, receiver);
+    },
+    ownKeys() { return ["length"]; },
+  });
+  assert.equal(Array.isArray(revoked), true,
+    "real Proxy-wrapped Array must reach the vulnerable array type check");
+  const policy = { username: identity.username,
+    trustedDevicePublicKeys: { "source-device-4": b64(keys.device) },
+    revokedDeviceIds: revoked };
+  assert.throws(() => snapshotLocalDevicePolicy(policy), /SYNC_ZK1_PHYSICAL_BINDING_DENIED/,
+    "an adversarial revocation-list Proxy must never be snapshotted as an empty list");
+  const ordinary = snapshotLocalDevicePolicy({ ...policy, revokedDeviceIds: ["source-device-4"] });
+  assert.deepEqual(ordinary.revokedDeviceIds, ["source-device-4"],
+    "a real ordinary revocation list must retain its entries");
+});
+
+test("P2: source KeyObject getter cannot replace the operation validator after construction", async () => {
+  const f = await fixture();
+  const handle = Object.getOwnPropertySymbols(keys.source.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handle, "real Ed25519 native handle is required for the adversarial callback");
+  const originalValidator = protocol.validateStoredOperation;
+  const hostileKey = Object.create(keys.source.publicKey);
+  let invoked = 0;
+  Object.defineProperty(hostileKey, handle, { get() {
+    invoked++;
+    // A malicious callback attempts to substitute signed B for input A.
+    protocol.validateStoredOperation = () => f.source;
+    return keys.source.publicKey[handle];
+  } });
+  try {
+    const verify = createOwnerObjectMapVerifier({
+      sourceAuthority: { ...f.sourceAuthority, provisionerPublicKey: hostileKey },
+      zkAuthority: f.zkAuthority, mappingAuthority: f.authority,
+    });
+    assert.ok(invoked > 0, "genuine provisioning must invoke the hostile native getter");
+    await assert.rejects(verify({ ...f.input,
+      sourceOperation: { forged: "not an authenticated SyncV2 envelope" } }), deny,
+    "input A cannot receive verification evidence for callback-substituted signed B");
+  } finally {
+    protocol.validateStoredOperation = originalValidator;
+  }
+  const positive = await fixture();
+  const verify = createOwnerObjectMapVerifier({
+    sourceAuthority: positive.sourceAuthority,
+    zkAuthority: positive.zkAuthority,
+    mappingAuthority: positive.authority,
+  });
+  assert.equal((await verify(positive.input)).authorizesIo, false,
+    "valid signed sources remain verifiable without granting I/O authority");
+});
 
 test("P2: reentrant source KeyObjects cannot change any pinned role after provisioning verification", async () => {
   const f = await fixture();
