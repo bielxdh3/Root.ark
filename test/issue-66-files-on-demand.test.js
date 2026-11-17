@@ -118,8 +118,9 @@ test("issue 66 P2: first FOD CREATE cleanup failure cannot mint an untracked loc
   assert.equal(await fsp.readFile(target, "utf8"), "authenticated remote bytes");
   assert.equal((await fsp.lstat(target)).nlink, 2,
     "failed post-link cleanup must leave a physical hardlink guard, not an ordinary nlink=1 file");
-  assert.equal(consumer.snapshot.files["docs/first.txt"], undefined,
-    "failed publication cannot mark a fresh signed cache as admitted");
+  assert.equal(consumer.snapshot.files["docs/first.txt"]?.hash,
+    crypto.createHash("sha256").update("authenticated remote bytes").digest("hex"),
+    "the signed identity must be durably recorded before cleanup is attempted");
   assert.equal((await fsp.readdir(path.join(root, "docs")))
     .some((name) => name.includes(".tmp-")), false);
   assert.equal((await fsp.readdir(path.join(root, ".rootark-trash")))
@@ -129,6 +130,115 @@ test("issue 66 P2: first FOD CREATE cleanup failure cannot mint an untracked loc
   await assert.rejects(consumer.reconcileLocal(), (error) => error.code === "unsafe_path");
   assert.deepEqual(await consumer.journal.recover(), [], "no synthesized local CREATE outbox");
   assert.equal(state.pushes, 0, "no local upload may escape after cleanup failure");
+  const restarted = await open();
+  assert.equal(restarted.snapshot.files["docs/first.txt"]?.objectId,
+    consumer.snapshot.files["docs/first.txt"].objectId,
+    "cleanup failure after durable snapshot must keep its signed identity across restart");
+  await assert.rejects(restarted.reconcileLocal(), { code: "unsafe_path" });
+  assert.deepEqual(await restarted.journal.recover(), []);
+});
+
+test("issue 66 P2 RED: crash after FOD CREATE publication cannot enqueue local CREATE on restart", async (t) => {
+  const body = "remote-authenticated-only; never a local user CREATE";
+  const relative = "docs/postlink-crash.txt";
+  const { root, open, state } = await setup(t, { [relative]: body });
+  const consumer = await open();
+  const target = path.join(root, "docs", "postlink-crash.txt");
+  const originalPersist = consumer.persistSnapshot.bind(consumer);
+  let injectedAfterPhysicalPublication = 0;
+
+  // Simulate power loss at the REAL snapshot durability boundary, after the
+  // signed remote ciphertext has materialized as a visible file. Do not fake
+  // a local file or manufacture a journal entry: exercise the actual hardlink,
+  // cleanup, restart and reconcile code paths.
+  consumer.persistSnapshot = async (...args) => {
+    if (!(await exists(target))) return originalPersist(...args);
+    assert.equal(await fsp.readFile(target, "utf8"), body,
+      "injection must follow real authenticated physical publication");
+    injectedAfterPhysicalPublication++;
+    throw Object.assign(new Error("injected crash before FOD snapshot fsync"), { code: "EIO" });
+  };
+  try {
+    await assert.rejects(consumer.materializeRemote(relative),
+      (error) => error.code === "EIO" && /before FOD snapshot fsync/.test(error.message));
+  } finally {
+    consumer.persistSnapshot = originalPersist;
+  }
+  assert.equal(injectedAfterPhysicalPublication, 1,
+    "test must cross exactly one physical-publication-before-snapshot window");
+  assert.equal(await fsp.readFile(target, "utf8"), body,
+    "a crash may not destroy the signed remote content");
+
+  // Reopening discards the prior instance's in-memory rememberOperation().
+  // The pre-fix baseline removes the private link before durable snapshot,
+  // leaving a nlink=1 target that turns into an unsolicited CREATE. The fix
+  // must retain nlink=2 until the snapshot is safely written.
+  const restarted = await open();
+  assert.equal(restarted.snapshot.files[relative], undefined,
+    "failed snapshot fsync must not create a durable signed cache entry");
+  let scanErrorCode = null;
+  try { await restarted.scanFiles(); }
+  catch (error) { scanErrorCode = error.code; if (error.code !== "unsafe_path") throw error; }
+  let reconcileErrorCode = null;
+  try { await restarted.reconcileLocal(); }
+  catch (error) { reconcileErrorCode = error.code; if (error.code !== "unsafe_path") throw error; }
+  const pending = await restarted.journal.recover();
+  const synthesizedCreates = pending.filter((item) => item.operation === "create"
+    && item.metadata?.path === relative);
+  // On the pre-fix HEAD, the calls above really enqueue the unsolicited
+  // CREATE; assert that fact FIRST so the RED demonstrates the bad effect,
+  // rather than short-circuiting on a missing nlink=2 guard assertion.
+  assert.deepEqual(synthesizedCreates, [],
+    "RED on ccbc028b: restart reconciliation must NOT enqueue a user CREATE for remotely hydrated bytes");
+  assert.equal((await fsp.lstat(target)).nlink, 2,
+    "a crash after publication must leave a private hardlink guard");
+  assert.equal(scanErrorCode, "unsafe_path",
+    "a remote orphan with retained private alias must be refused by the sync scanner");
+  assert.equal(reconcileErrorCode, "unsafe_path",
+    "restart reconciliation must fail closed before creating any local operation");
+  assert.equal(state.pushes, 0, "no remote upload may occur after interrupted hydration");
+});
+
+test("issue 66 P2: CREATE and UPDATE retain private hardlink until signed snapshot is durable", async (t) => {
+  const relative = "docs/durable.txt";
+  const { root, source, writer, open, state } = await setup(t,
+    { [relative]: "version 1 signed by remote" });
+  const consumer = await open();
+  const target = path.join(root, "docs", "durable.txt");
+  const trashDir = path.join(root, ".rootark-trash");
+  const originalPersist = consumer.persistSnapshot.bind(consumer);
+  let verifiedAtPersist = 0;
+  consumer.persistSnapshot = async (...args) => {
+    if (await exists(target)) {
+      const aliases = (await fsp.readdir(trashDir)).filter((name) =>
+        /^hydrate-[a-f0-9-]{36}\.tmp$/.test(name));
+      assert.equal(aliases.length, 1,
+        "a real private hydration alias must remain through snapshot persistence");
+      assert.equal((await fsp.lstat(target)).nlink, 2,
+        "published bytes must remain unscannable until signed identity is durable");
+      verifiedAtPersist++;
+    }
+    return originalPersist(...args);
+  };
+  assert.equal(await consumer.materializeRemote(relative), true);
+  const first = structuredClone(consumer.snapshot.files[relative]);
+  assert.equal(verifiedAtPersist, 1);
+  assert.equal((await fsp.lstat(target)).nlink, 1,
+    "successful snapshot persist must be followed by private-alias removal");
+  assert.deepEqual((await fsp.readdir(trashDir)).filter((name) => name.startsWith("hydrate-")), []);
+  await fsp.writeFile(path.join(source, relative), "version 2 signed by remote");
+  await writer.syncOnce();
+  state.pushes = 0;
+  assert.equal(await consumer.materializeRemote(relative), true);
+  assert.equal(verifiedAtPersist, 2, "UPDATE must obey the same durable-publication ordering");
+  assert.notEqual(consumer.snapshot.files[relative].versionId, first.versionId);
+  assert.equal(await fsp.readFile(target, "utf8"), "version 2 signed by remote");
+  assert.equal((await fsp.lstat(target)).nlink, 1);
+  assert.deepEqual((await fsp.readdir(trashDir)).filter((name) => name.startsWith("hydrate-")), []);
+  const restarted = await open();
+  await restarted.reconcileLocal();
+  assert.deepEqual(await restarted.journal.recover(), []);
+  assert.equal(state.pushes, 0);
 });
 
 test("issue 66 P2: hydration cleanup EPERM cannot return success or leak syncable CREATE", async (t) => {
@@ -155,8 +265,11 @@ test("issue 66 P2: hydration cleanup EPERM cannot return success or leak syncabl
       "failing finally/unlink must propagate without falsely reporting hydration success");
   } finally { fsp.rm = originalRm; }
   assert.equal(intercepted, 1, "the real private cleanup call must have been reached");
-  assert.deepEqual(consumer.snapshot.files["docs/cleanup.txt"], previousSnapshot,
-    "cleanup failure cannot mark the newer remote content as durably hydrated");
+  assert.notEqual(consumer.snapshot.files["docs/cleanup.txt"]?.versionId, previousSnapshot.versionId,
+    "signed UPDATE snapshot must be durable before attempting private alias cleanup");
+  const restarted = await open();
+  assert.deepEqual(restarted.snapshot.files["docs/cleanup.txt"],
+    consumer.snapshot.files["docs/cleanup.txt"], "restart must retain the signed UPDATE identity");
   assert.equal(state.pushes, 0);
   assert.deepEqual((await fsp.readdir(path.join(root, "docs"))).filter((name) => name.includes(".tmp-")), []);
   const trashDir = path.join(root, ".rootark-trash");
@@ -171,6 +284,8 @@ test("issue 66 P2: hydration cleanup EPERM cannot return success or leak syncabl
     "new signed remote content", "new materialization is not destroyed on cleanup failure");
   await assert.rejects(consumer.scanFiles(), (error) => error.code === "unsafe_path",
     "hardlinked target with an unresolved private alias must fail closed");
+  await assert.rejects(restarted.reconcileLocal(), { code: "unsafe_path" });
+  assert.deepEqual(await restarted.journal.recover(), []);
 });
 
 test("issue 66 P2: interrupted FOD temp write is never scanned as ordinary CREATE", async (t) => {
@@ -895,7 +1010,7 @@ test("issue 66 P2 signed MOVE: " + (explicitlyEvicted ? "explicit eviction can m
 }
 
 test("issue 66: a clean cached source can be hydrated through a verified remote MOVE", async (t) => {
-  const { root, open, store, key } = await setup(t, { "docs/original.txt": "signed move bytes" });
+  const { root, open, store, key, state } = await setup(t, { "docs/original.txt": "signed move bytes" });
   const client = await open();
   await client.materializeRemote("docs/original.txt");
   const before = store.list("alice")[0];
@@ -907,9 +1022,69 @@ test("issue 66: a clean cached source can be hydrated through a verified remote 
     metadata: { path: "docs/renamed.txt", sourcePath: "docs/original.txt" },
     plaintext: protocol.encodeMovePayload(Buffer.from("signed move bytes"), key), fileKey: key,
   }))).kind, "stored");
+  const target = path.join(root, "docs", "renamed.txt");
+  const originalPersist = client.persistSnapshot.bind(client);
+  let persistedWithGuard = 0;
+  client.persistSnapshot = async (...args) => {
+    if (await exists(target)) {
+      const aliases = (await fsp.readdir(path.join(root, ".rootark-trash")))
+        .filter((name) => name.startsWith(".rootark-move-"));
+      assert.equal(aliases.length, 1, "MOVE must retain its actual private publication alias");
+      assert.equal((await fsp.lstat(target)).nlink, 2,
+        "MOVE must be unscannable until its signed snapshot is durable");
+      persistedWithGuard++;
+    }
+    return originalPersist(...args);
+  };
   assert.equal(await client.materializeRemote("docs/renamed.txt"), true);
+  assert.equal(persistedWithGuard, 1);
   assert.equal(await fsp.readFile(path.join(root, "docs", "renamed.txt"), "utf8"), "signed move bytes");
   assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
+  assert.equal((await fsp.lstat(target)).nlink, 1);
+  assert.deepEqual((await fsp.readdir(path.join(root, ".rootark-trash")))
+    .filter((name) => name.startsWith(".rootark-move-")), []);
+  const restarted = await open();
+  await restarted.reconcileLocal();
+  assert.deepEqual(await restarted.journal.recover(), []);
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: crash after signed FOD MOVE publication remains guarded across restart", async (t) => {
+  const { root, open, store, key, state } = await setup(t,
+    { "docs/original.txt": "old signed bytes" });
+  const client = await open();
+  assert.equal(await client.materializeRemote("docs/original.txt"), true);
+  const before = store.list("alice")[0];
+  const moved = protocol.createOperation({
+    operation: "move", objectId: before.objectId, fileId: before.fileId,
+    versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    baseRevision: before.revision,
+    revision: { counter: before.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/renamed.txt", sourcePath: "docs/original.txt" },
+    plaintext: protocol.encodeMovePayload(Buffer.from("new signed move bytes"), key), fileKey: key,
+  });
+  assert.equal((await store.put("alice", moved)).kind, "stored");
+  const target = path.join(root, "docs", "renamed.txt");
+  let injected = 0;
+  client.persistSnapshot = async () => {
+    assert.equal(await fsp.readFile(target, "utf8"), "new signed move bytes");
+    injected++;
+    throw Object.assign(new Error("injected FOD MOVE post-link crash"), { code: "EIO" });
+  };
+  await assert.rejects(client.materializeRemote("docs/renamed.txt"), { code: "EIO" });
+  assert.equal(injected, 1, "must reach snapshot boundary after real MOVE publication");
+  assert.equal((await fsp.lstat(target)).nlink, 2);
+  const oldCopies = await Promise.all((await fsp.readdir(path.join(root, ".rootark-trash")))
+    .filter((name) => !name.startsWith(".rootark-move-"))
+    .map((name) => fsp.readFile(path.join(root, ".rootark-trash", name), "utf8")));
+  assert.ok(oldCopies.includes("old signed bytes"), "staged source remains recoverable after crash");
+  const restarted = await open();
+  assert.equal(restarted.snapshot.files["docs/renamed.txt"], undefined);
+  await assert.rejects(restarted.scanFiles(), { code: "unsafe_path" });
+  await assert.rejects(restarted.reconcileLocal(), { code: "unsafe_path" });
+  assert.deepEqual(await restarted.journal.recover(), []);
+  assert.equal(state.pushes, 0);
 });
 
 test("issue 66 P2: verified FOD MOVE cleanup failure cannot claim hydration success", async (t) => {
@@ -944,18 +1119,29 @@ test("issue 66 P2: verified FOD MOVE cleanup failure cannot claim hydration succ
   } finally { fsp.rm = originalRm; }
   assert.equal(intercepted, 1);
   assert.equal(state.pushes, 0);
-  assert.equal(await fsp.readFile(path.join(root, "docs", "original.txt"), "utf8"),
-    "signed move bytes", "old cached user bytes must be restored on failed move cleanup");
+  assert.equal(await exists(path.join(root, "docs", "original.txt")), false,
+    "signed MOVE source is staged until the new signed snapshot is durable");
   assert.equal(await fsp.readFile(path.join(root, "docs", "renamed.txt"), "utf8"),
     "signed move bytes", "newly linked bytes must not be silently destroyed");
-  assert.equal(client.snapshot.files["docs/renamed.txt"], undefined,
-    "no successful hydrated cache revision may be recorded");
+  assert.equal(client.snapshot.files["docs/renamed.txt"]?.versionId, moved.versionId,
+    "MOVE identity must be durably recorded before final alias cleanup");
+  assert.equal((await fsp.lstat(path.join(root, "docs", "renamed.txt"))).nlink, 2,
+    "failed cleanup must leave the MOVE destination unscannable");
   assert.equal((await fsp.readdir(path.join(root, "docs")))
     .filter((name) => name.startsWith(".rootark-move-")).length, 0,
     "verified MOVE may not leak plaintext staging into the syncable path");
-  assert.equal((await fsp.readdir(path.join(root, ".rootark-trash")))
-    .filter((name) => name.startsWith(".rootark-move-")).length, 1,
+  const trashNames = await fsp.readdir(path.join(root, ".rootark-trash"));
+  assert.equal(trashNames.filter((name) => name.startsWith(".rootark-move-")).length, 1,
     "unremoved private temp must remain outside inventory");
+  const olderCopies = await Promise.all(trashNames.filter((name) =>
+    !name.startsWith(".rootark-move-")).map((name) =>
+    fsp.readFile(path.join(root, ".rootark-trash", name), "utf8")));
+  assert.ok(olderCopies.includes("signed move bytes"),
+    "old cached source must stay recoverable in private trash after cleanup failure");
+  const restarted = await open();
+  assert.equal(restarted.snapshot.files["docs/renamed.txt"]?.versionId, moved.versionId);
+  await assert.rejects(restarted.reconcileLocal(), { code: "unsafe_path" });
+  assert.deepEqual(await restarted.journal.recover(), []);
 });
 
 test("issue 66 P2: interrupted FOD MOVE plaintext write stays outside sync inventory", async (t) => {

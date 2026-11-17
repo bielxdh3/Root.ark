@@ -1855,6 +1855,11 @@ class SyncEngine {
     // must not leave an applied object with no restart-safe observation.
     if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
     let cleanupPath = null;
+    // FOD publishes with an exclusive hardlink. Keep the private alias (nlink=2)
+    // until the signed remote identity is durably in the snapshot: after a
+    // crash, readContainedFile then fails closed instead of treating a nlink=1
+    // orphan as a new local CREATE.
+    let privatePublishedTemp = null;
     if (operation.operation === "delete" || operation.tombstone) {
       const priorAtTarget = this.snapshot.files[metadata.path];
       const targetMatchesIdentity = priorAtTarget && !priorAtTarget.deleted
@@ -1925,15 +1930,18 @@ class SyncEngine {
             await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
             // Hard-link publication is exclusive (no replace), unlike rename
             // on platforms where an intervening local file could be clobbered.
-            try { await fsp.link(temporary, target); }
+            try {
+              await fsp.link(temporary, target);
+              privatePublishedTemp = temporary;
+            }
             catch (error) {
               if (await exists(target)) fail("Local destination appeared before MOVE publication", "local_changes_pending");
               throw error;
             }
           } finally {
-            // A failed unlink after no-replace publication leaves nlink=2.
-            // The move must not be reported as hydrated in that state.
-            await fsp.rm(temporary, { force: true });
+            // Do not drop the last extra link before persistSnapshot().
+            // Failures before link still remove their uncommitted private temp.
+            if (privatePublishedTemp !== temporary) await fsp.rm(temporary, { force: true });
           }
         } catch (error) {
           await this.restoreStagedTrackedFile(sourcePath, stagedSource);
@@ -1979,7 +1987,10 @@ class SyncEngine {
           try {
             await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
             if (beforeHydrationWrite) {
-              try { await fsp.link(temporary, target); }
+              try {
+                await fsp.link(temporary, target);
+                privatePublishedTemp = temporary;
+              }
               catch (error) {
                 if (await exists(target)) fail("Local destination appeared before MOVE publication", "local_changes_pending");
                 throw error;
@@ -1988,8 +1999,11 @@ class SyncEngine {
               await fsp.rename(temporary, target);
             }
           } finally {
-            if (beforeHydrationWrite) await fsp.rm(temporary, { force: true });
-            else await fsp.rm(temporary, { force: true }).catch(() => {});
+            if (beforeHydrationWrite) {
+              if (privatePublishedTemp !== temporary) await fsp.rm(temporary, { force: true });
+            } else {
+              await fsp.rm(temporary, { force: true }).catch(() => {});
+            }
           }
         } catch (error) {
           if (stagedTarget) await this.restoreStagedTrackedFile(metadata.path, stagedTarget);
@@ -2099,10 +2113,11 @@ class SyncEngine {
           }
           if (beforeHydrationWrite) {
             // For both CREATE and UPDATE, publish by exclusive hardlink and
-            // unlink only after success. Rename would consume the temp and
-            // make a later unlink failure leave an untracked nlink=1 file.
+            // unlink only after a durable snapshot. Rename would consume the
+            // temp and make a crash leave an untracked nlink=1 file.
             try {
               await fsp.link(temporary, target);
+              privatePublishedTemp = temporary;
             } catch (error) {
               if (await exists(target)) fail("Local destination was recreated before publication", "local_changes_pending");
               throw error;
@@ -2124,10 +2139,13 @@ class SyncEngine {
           }
           throw error;
         } finally {
-          // A surviving private hardlink may keep the newly materialized file
-          // at nlink=2. Do not report hydration success if cleanup failed.
-          if (hydrationTempDir) await fsp.rm(temporary, { force: true });
-          else await fsp.rm(temporary, { force: true }).catch(() => {});
+          // Until persistSnapshot() succeeds, retaining nlink=2 is the only
+          // durable guard against restart reconciliation minting a local CREATE.
+          if (hydrationTempDir && privatePublishedTemp !== temporary) {
+            await fsp.rm(temporary, { force: true });
+          } else if (!hydrationTempDir) {
+            await fsp.rm(temporary, { force: true }).catch(() => {});
+          }
         }
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"),
@@ -2139,6 +2157,11 @@ class SyncEngine {
       await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath || metadata.path, true)));
     }
     await this.persistSnapshot();
+    // The durable snapshot now binds the visible bytes to their remote
+    // identity. Only now may the private hardlink alias be removed. If
+    // persistence or cleanup fails, do not claim hydration success; leaving
+    // the alias prevents the scanner from queuing an unauthorized CREATE.
+    if (privatePublishedTemp) await fsp.rm(privatePublishedTemp, { force: true });
     if (summary) summary.applied = (summary.applied || 0) + 1;
     return verifiedFreshDigest;
   }
