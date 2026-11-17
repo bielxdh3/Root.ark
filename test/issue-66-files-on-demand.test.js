@@ -13,6 +13,11 @@ const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { SyncObjectStore } = require("../src/routes/sync");
 
+// Preserve the original physical fault oracles for when a real native provider
+// exists. They must never count as passing native I/O tests while RootSession
+// deliberately denies publication before the tested rename/fsync boundary.
+const NATIVE_PUBLISH_PENDING = "Native RootSession publication is disabled; physical fault oracle pending";
+
 async function setup(t, files) {
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-on-demand-"));
   t.after(() => fsp.rm(directory, { recursive: true, force: true }));
@@ -56,47 +61,73 @@ async function setup(t, files) {
   state.inventoryReads = 0;
   state.pushes = 0;
   const root = path.join(directory, "consumer");
-  const open = (selectedPaths = ["docs"]) => new SyncEngine({
+  const open = (selectedPaths = ["docs"], filesOnDemand = true) => new SyncEngine({
     rootDir: root, adapter, deviceId: "device-b", keyEpoch: "epoch-1",
     compartmentId: "private", fileKeyResolver: () => key, selectedPaths,
-    filesOnDemand: true,
+    filesOnDemand,
   }).open();
-  return { root, source, writer, open, adapter, state, store, key };
+  const openCached = (...relativePaths) =>
+    openPreexistingCachedFodFixture({ root, source, writer, open, store }, relativePaths);
+  return { root, source, writer, open, openCached, adapter, state, store, key };
 }
 
 async function exists(filePath) {
   return fsp.stat(filePath).then(() => true, () => false);
 }
 
-// Construct a disposable *preexisting* cache, rather than asking the current
-// FOD engine to publish bytes without the required native RootSession. The
-// writer has already created the remote operation and its local tracked
-// identity in setup(); this fixture only copies those known bytes and fields
-// into the consumer's isolated temp root. It is not a production hydration.
-async function seedLegacyCachedFodFixture({ root, source, writer, open }, relativePaths) {
-  const initial = await open();
+// Hydrate through a real legacy sync before the FOD mode marker exists. This
+// exercises the signed envelope/AEAD and on-disk snapshot service boundary;
+// current FOD publication must remain denied after the marker is created.
+async function openPreexistingCachedFodFixture({ root, source, writer, open, store }, relativePaths) {
+  const legacy = await open(["docs"], false);
+  assert.equal(legacy.filesOnDemand, false);
+  await legacy.syncOnce();
   for (const relative of relativePaths) {
     const tracked = writer.snapshot.files[relative];
     assert.ok(tracked && !tracked.deleted, `writer must track ${relative}`);
-    const target = path.join(root, relative);
-    await fsp.mkdir(path.dirname(target), { recursive: true });
-    await fsp.copyFile(path.join(source, relative), target);
-    initial.snapshot.files[relative] = structuredClone(tracked);
+    const received = legacy.snapshot.files[relative];
+    assert.ok(received && !received.deleted, `real pre-FOD sync must hydrate ${relative}`);
+    for (const field of ["objectId", "fileId", "versionId", "hash"]) {
+      assert.equal(received[field], tracked[field], `pre-FOD ${field} must match the signed source`);
+    }
+    assert.ok(store.list("alice").some((record) => record.objectId === received.objectId
+      && record.fileId === received.fileId && record.versionId === received.versionId),
+    `the hydrated cache must match an actual remote record for ${relative}`);
+    const bytes = await fsp.readFile(path.join(root, relative));
+    assert.deepEqual(bytes, await fsp.readFile(path.join(source, relative)));
+    assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"), received.hash);
   }
-  // This is deliberately a direct disk fixture write, not persistSnapshot():
-  // that production API must continue to require native mutation authority.
-  await fsp.writeFile(path.join(root, ".rootark-sync-index.json"),
-    JSON.stringify(initial.snapshot));
   const reopened = await open();
   for (const relative of relativePaths) {
-    assert.deepEqual(reopened.snapshot.files[relative], writer.snapshot.files[relative],
-      "disposable legacy cache must retain exact tracked object, version and hash");
+    assert.deepEqual(reopened.snapshot.files[relative], legacy.snapshot.files[relative],
+      "reopened FOD cache must retain the actual legacy-synced record");
     assert.deepEqual(await fsp.readFile(path.join(root, relative)),
       await fsp.readFile(path.join(source, relative)),
-      "disposable legacy cache must retain exact source bytes");
+      "reopened FOD cache must retain the verified source bytes");
   }
   return reopened;
 }
+
+test("issue 66: preexisting FOD cache fixture refuses unauthenticated remote bytes", async (t) => {
+  const { root, adapter, openCached, store } = await setup(t,
+    { "docs/protected.txt": "authenticated cache content" });
+  const originalRecords = JSON.stringify(store.list("alice"));
+  const originalList = adapter.list;
+  adapter.list = async (objectId) => (await originalList(objectId)).map((record) => {
+    if (record.metadata?.path !== "docs/protected.txt") return record;
+    const first = record.ciphertext[0] === "A" ? "B" : "A";
+    return { ...record, ciphertext: first + record.ciphertext.slice(1) };
+  });
+  await assert.rejects(openCached("docs/protected.txt"), (error) => {
+    assert.notEqual(error.code, "root_session_native_unavailable",
+      "real legacy sync must reject altered ciphertext before native FOD is enabled");
+    return true;
+  });
+  assert.equal(await exists(path.join(root, "docs", "protected.txt")), false);
+  assert.equal(await exists(path.join(root, ".rootark-sync-ever-fod")), false);
+  assert.equal(JSON.stringify(store.list("alice")), originalRecords,
+    "the remote source record must remain unchanged by a failed fixture");
+});
 
 async function seedRemote(store, key, relative, objectId = `external-${crypto.randomUUID()}`) {
   const operation = protocol.createOperation({
@@ -209,7 +240,7 @@ test("issue 66 P2: unrelated local CREATE still publishes after a clean metadata
     ["docs/existing.txt", "docs/new.txt"]);
 });
 
-test("issue 66: lazy sync pages metadata and hydrates only the selected signed object", async (t) => {
+test("issue 66: lazy sync pages metadata and denies publication without native custody", async (t) => {
   const { root, open, state, store } = await setup(t, {
     "docs/a.txt": "first payload", "docs/b.txt": "second payload", "private/secret.txt": "private",
   });
@@ -227,8 +258,9 @@ test("issue 66: lazy sync pages metadata and hydrates only the selected signed o
     record.selectedOnDevice === record.metadata.path.startsWith("docs/")), true);
   assert.equal(Object.keys(client.snapshot.remoteOnly).length, 0, "unsigned inventory cannot create durable pins");
 
-  assert.equal(await client.materializeRemote("docs/b.txt"), true);
-  assert.equal(await fsp.readFile(path.join(root, "docs", "b.txt"), "utf8"), "second payload");
+  await assert.rejects(client.materializeRemote("docs/b.txt"),
+    { code: "root_session_native_unavailable" });
+  assert.equal(await exists(path.join(root, "docs", "b.txt")), false);
   const objectId = store.list("alice").find((item) => item.metadata.path === "docs/b.txt").objectId;
   assert.deepEqual(state.fullReads, [objectId]);
   assert.equal(await exists(path.join(root, "docs", "a.txt")), false);
@@ -236,7 +268,9 @@ test("issue 66: lazy sync pages metadata and hydrates only the selected signed o
 
   state.offline = true;
   assert.equal((await client.syncOnce()).offline, true);
-  assert.equal(await fsp.readFile(path.join(root, "docs", "b.txt"), "utf8"), "second payload");
+  assert.equal(await exists(path.join(root, "docs", "b.txt")), false);
+  assert.equal(Object.keys(client.snapshot.files).length, 0);
+  assert.deepEqual(await client.journal.recover(), []);
   assert.equal(store.list("alice").every((item) => item.tombstone === false), true);
 });
 
@@ -287,7 +321,7 @@ test("issue 66: duplicate inventory paths refuse ambiguous hydration", async (t)
   assert.equal(await exists(path.join(root, "docs", "a.txt")), false);
 });
 
-test("issue 66: hydration finds a file on later inventory pages without downloading siblings", async (t) => {
+test("issue 66: pagination finds later inventory entries but native-required publish stays blocked", async (t) => {
   const { root, open, adapter, state } = await setup(t, {
     "docs/a.txt": "one", "docs/b.txt": "two", "docs/c.txt": "three",
   });
@@ -295,15 +329,16 @@ test("issue 66: hydration finds a file on later inventory pages without download
   adapter.listInventory = (request) => listInventory({ ...request, limit: 1 });
   const client = await open();
   assert.equal((await client.syncOnce()).available, 3);
-  assert.equal(await client.materializeRemote("docs/c.txt"), true);
-  assert.equal(await fsp.readFile(path.join(root, "docs", "c.txt"), "utf8"), "three");
+  await assert.rejects(client.materializeRemote("docs/c.txt"),
+    { code: "root_session_native_unavailable" });
+  assert.equal(await exists(path.join(root, "docs", "c.txt")), false);
   assert.equal(state.fullReads.length, 1);
   assert.equal(await exists(path.join(root, "docs", "a.txt")), false);
 });
 
 test("issue 66: Files On-Demand refuses destructive cache eviction without native root custody", async (t) => {
-  const { root, source, writer, open, store, state } = await setup(t, { "docs/cache.txt": "cache me" });
-  const client = await seedLegacyCachedFodFixture({ root, source, writer, open }, ["docs/cache.txt"]);
+  const { root, open, openCached, store, state } = await setup(t, { "docs/cache.txt": "cache me" });
+  const client = await openCached("docs/cache.txt");
   const before = store.list("alice")[0];
   const beforeSnapshot = JSON.stringify(client.snapshot);
   const beforeFullReads = state.fullReads.length;
@@ -332,9 +367,9 @@ test("issue 66: Files On-Demand refuses destructive cache eviction without nativ
 });
 
 test("issue 66: automatic excluded cache migration refuses legacy eviction before snapshot mutation", async (t) => {
-  const { root, source, writer, open, adapter, store, state, key } = await setup(t,
+  const { root, openCached, adapter, store, state, key } = await setup(t,
     { "docs/cache.txt": "retain exact Unicode café-中-😀 bytes" });
-  await seedLegacyCachedFodFixture({ root, source, writer, open }, ["docs/cache.txt"]);
+  await openCached("docs/cache.txt");
   const snapshotPath = path.join(root, ".rootark-sync-index.json");
   const oldSnapshot = await fsp.readFile(snapshotPath);
   const oldFile = await fsp.readFile(path.join(root, "docs", "cache.txt"));
@@ -360,9 +395,8 @@ test("issue 66: automatic excluded cache migration refuses legacy eviction befor
 });
 
 test("issue 66: Files On-Demand cannot sign remote DELETE merely because a cached pathname vanishes", async (t) => {
-  const { root, open, store, state } = await setup(t, { "docs/café-中-😀.txt": "trusted cached bytes" });
-  const client = await open();
-  await client.materializeRemote("docs/café-中-😀.txt");
+  const { root, openCached, store, state } = await setup(t, { "docs/café-中-😀.txt": "trusted cached bytes" });
+  const client = await openCached("docs/café-中-😀.txt");
   const original = await fsp.readFile(path.join(root, "docs", "café-中-😀.txt"));
   const originalSnapshot = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
   const originalRemote = JSON.stringify(store.list("alice"));
@@ -379,9 +413,8 @@ test("issue 66: Files On-Demand cannot sign remote DELETE merely because a cache
 });
 
 test("issue 66: Files On-Demand WebDAV translation never signs pathname-derived DELETE", async (t) => {
-  const { root, open, store, state } = await setup(t, { "docs/item.txt": "trusted cached bytes" });
-  const client = await open();
-  await client.materializeRemote("docs/item.txt");
+  const { root, openCached, store, state } = await setup(t, { "docs/item.txt": "trusted cached bytes" });
+  const client = await openCached("docs/item.txt");
   const originalSnapshot = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
   const originalRemote = JSON.stringify(store.list("alice"));
   await fsp.unlink(path.join(root, "docs", "item.txt"));
@@ -439,11 +472,10 @@ test("issue 66: unsupported pin and signed batch preflight cannot leave a false 
 });
 
 test("issue 66: rejected native-required excluded-cache migration never leaves a spurious physical lock", async (t) => {
-  const { root, open, state } = await setup(t, {
+  const { root, open, openCached, state } = await setup(t, {
     "docs/cache.txt": "verified cached bytes",
   });
-  const client = await open();
-  await client.materializeRemote("docs/cache.txt");
+  const client = await openCached("docs/cache.txt");
   const snapshot = path.join(root, ".rootark-sync-index.json");
   const before = await fsp.readFile(snapshot);
   client.excludedPaths = ["docs"];
@@ -519,9 +551,8 @@ test("issue 66: FOD public staging denies before probing an outside-root path", 
 });
 
 test("issue 66: public staging cannot relocate an in-root cached FOD file without native custody", async (t) => {
-  const { root, open, store } = await setup(t, { "docs/retained.txt": "protected FOD cache" });
-  const client = await open();
-  await client.materializeRemote("docs/retained.txt");
+  const { root, openCached, store } = await setup(t, { "docs/retained.txt": "protected FOD cache" });
+  const client = await openCached("docs/retained.txt");
   const target = path.join(root, "docs", "retained.txt");
   const bytesBefore = await fsp.readFile(target);
   const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
@@ -534,10 +565,9 @@ test("issue 66: public staging cannot relocate an in-root cached FOD file withou
 });
 
 test("issue 66: direct incoming DELETE must not stage materialized FOD bytes without native custody", async (t) => {
-  const { root, open, store, key } = await setup(t,
+  const { root, openCached, store, key } = await setup(t,
     { "docs/retained.txt": "verified cached owner bytes" });
-  const client = await open();
-  await client.materializeRemote("docs/retained.txt");
+  const client = await openCached("docs/retained.txt");
   const original = store.list("alice")[0];
   const originalBytes = await fsp.readFile(path.join(root, "docs", "retained.txt"));
   const originalSnapshot = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
@@ -558,9 +588,8 @@ test("issue 66: direct incoming DELETE must not stage materialized FOD bytes wit
 });
 
 test("issue 66: Files On-Demand WebDAV MOVE translation denies before any local scan", async (t) => {
-  const { root, open, store, state } = await setup(t, { "docs/a.txt": "retained signed bytes" });
-  const client = await open();
-  await client.materializeRemote("docs/a.txt");
+  const { root, openCached, store, state } = await setup(t, { "docs/a.txt": "retained signed bytes" });
+  const client = await openCached("docs/a.txt");
   const originalBytes = await fsp.readFile(path.join(root, "docs", "a.txt"));
   const originalSnapshot = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
   const remoteBefore = JSON.stringify(store.list("alice"));
@@ -578,10 +607,9 @@ test("issue 66: Files On-Demand WebDAV MOVE translation denies before any local 
 });
 
 test("issue 66: out-of-scope remote DELETE cannot stage an in-scope FOD cache origin", async (t) => {
-  const { root, open, store, key } = await setup(t,
+  const { root, openCached, store, key } = await setup(t,
     { "docs/retained.txt": "same cache origin must remain" });
-  const client = await open();
-  await client.materializeRemote("docs/retained.txt");
+  const client = await openCached("docs/retained.txt");
   const original = store.list("alice")[0];
   const bytesBefore = await fsp.readFile(path.join(root, "docs", "retained.txt"));
   const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
@@ -603,10 +631,9 @@ test("issue 66: out-of-scope remote DELETE cannot stage an in-scope FOD cache or
 });
 
 test("issue 66: out-of-scope remote MOVE cannot rename a tracked FOD origin without native custody", async (t) => {
-  const { root, open, store, key } = await setup(t,
+  const { root, openCached, store, key } = await setup(t,
     { "docs/café-中-😀.txt": "origin must survive MOVE outside selected scope" });
-  const client = await open();
-  await client.materializeRemote("docs/café-中-😀.txt");
+  const client = await openCached("docs/café-中-😀.txt");
   const original = store.list("alice")[0];
   const filePath = path.join(root, "docs", "café-中-😀.txt");
   const bytesBefore = await fsp.readFile(filePath);
@@ -631,10 +658,9 @@ test("issue 66: out-of-scope remote MOVE cannot rename a tracked FOD origin with
 });
 
 test("issue 66: replacing public preflight cannot bypass direct out-of-scope FOD DELETE denial", async (t) => {
-  const { root, open, store, key } = await setup(t,
+  const { root, openCached, store, key } = await setup(t,
     { "docs/retained.txt": "must never be staged by a shadowed method" });
-  const client = await open();
-  await client.materializeRemote("docs/retained.txt");
+  const client = await openCached("docs/retained.txt");
   const remote = store.list("alice")[0];
   const cachePath = path.join(root, "docs", "retained.txt");
   const originalBytes = await fsp.readFile(cachePath);
@@ -663,10 +689,9 @@ test("issue 66: replacing public preflight cannot bypass direct out-of-scope FOD
 });
 
 test("issue 66: Proxy preflight interception cannot bypass FOD remote pull denial", async (t) => {
-  const { root, open, store, key } = await setup(t,
+  const { root, openCached, store, key } = await setup(t,
     { "docs/café-中-😀.txt": "proxy must not stage owner bytes" });
-  const client = await open();
-  await client.materializeRemote("docs/café-中-😀.txt");
+  const client = await openCached("docs/café-中-😀.txt");
   const remote = store.list("alice")[0];
   const cachePath = path.join(root, "docs", "café-中-😀.txt");
   const originalBytes = await fsp.readFile(cachePath);
@@ -704,10 +729,9 @@ test("issue 66: Proxy preflight interception cannot bypass FOD remote pull denia
 });
 
 test("issue 66: a FOD root retains its mode across non-FOD restart and custom snapshot paths", async (t) => {
-  const { root, open, adapter, store, key, state } = await setup(t,
+  const { root, open, openCached, adapter, store, key, state } = await setup(t,
     { "docs/cache.txt": "mode must remain bound to this physical root" });
-  const client = await open();
-  await client.materializeRemote("docs/cache.txt");
+  const client = await openCached("docs/cache.txt");
   const cachedPath = path.join(root, "docs", "cache.txt");
   const original = await fsp.readFile(cachedPath);
   const originalStore = JSON.stringify(store.list("alice"));
@@ -777,8 +801,11 @@ test("issue 66: an already-open non-FOD engine cannot evict after another instan
   }).open();
   assert.equal(await exists(path.join(root, ".rootark-sync-ever-fod")), false,
     "ordinary non-FOD operations must not set the marker");
+  await legacy.syncOnce();
+  assert.equal(await fsp.readFile(path.join(root, "docs", "retained.txt"), "utf8"),
+    "bytes of owner must never be evicted");
   const fod = await open();
-  await fod.materializeRemote("docs/retained.txt");
+  assert.equal(fod.filesOnDemand, true);
   const cachedPath = path.join(root, "docs", "retained.txt");
   const original = await fsp.readFile(cachedPath);
   const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
@@ -807,8 +834,11 @@ test("issue 66: direct recoverConflict cannot write after another engine marks F
     deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
     fileKeyResolver: () => key,
   }).open();
+  await legacy.syncOnce();
+  assert.equal(await fsp.readFile(path.join(root, "docs", "retained.txt"), "utf8"),
+    "protected content");
   const fod = await open();
-  await fod.materializeRemote("docs/retained.txt");
+  assert.equal(fod.filesOnDemand, true);
   const original = store.list("alice")[0];
   const cachedPath = path.join(root, "docs", "retained.txt");
   const snapshotPath = path.join(root, ".rootark-sync-index.json");
@@ -1210,7 +1240,7 @@ test("issue 66: a physically rebound FOD marker never authorizes a foreign inode
   assert.equal(state.pushes, pushesBefore, "a failed root-mode admission must not push a signed operation");
 });
 
-test("issue 66: ambiguous FOD publish retains foreign temporary and quarantines the root", async (t) => {
+test("issue 66: ambiguous FOD publish retains foreign temporary and quarantines the root", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const { root, open, store, state } = await setup(t, {
     "docs/restore.txt": "authenticated recovery payload",
   });
@@ -1283,7 +1313,7 @@ test("issue 66: ambiguous FOD publish retains foreign temporary and quarantines 
   assert.equal(state.pushes, pushesBefore, "blocked cold retry may not sign a foreign temp or delete");
 });
 
-test("issue 66: new FOD parent remains locked when inbound payload rename fails", async (t) => {
+test("issue 66: new FOD parent remains locked when inbound payload rename fails", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const { root, open, store, state } = await setup(t, {
     "docs/restore.txt": "inbound payload denied before final rename",
   });
@@ -1323,7 +1353,7 @@ test("issue 66: new FOD parent remains locked when inbound payload rename fails"
   assert.equal(JSON.stringify(store.list("alice")), beforeStore);
 });
 
-test("issue 66: recursive FOD parent mkdir partial EIO cannot free cold lock", async (t) => {
+test("issue 66: recursive FOD parent mkdir partial EIO cannot free cold lock", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const { root, open, store, state } = await setup(t, {
     "docs/sub/restore.txt": "remote bytes after a partial ancestor mkdir",
   });
@@ -1369,7 +1399,7 @@ test("issue 66: recursive FOD parent mkdir partial EIO cannot free cold lock", a
   assert.equal(JSON.stringify(store.list("alice")), oldStore);
 });
 
-test("issue 66: physical post-publish FOD crash retains lock and stops cold outbound reconcile", async (t) => {
+test("issue 66: physical post-publish FOD crash retains lock and stops cold outbound reconcile", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const { root, open, store, state, key } = await setup(t, {
     "docs/restore.txt": "remote fixture bytes after abrupt exit",
   });
@@ -1451,7 +1481,7 @@ test("issue 66: physical post-publish FOD crash retains lock and stops cold outb
   assert.equal(JSON.stringify(store.list("alice")), beforeStore);
 });
 
-test("issue 66: FOD post-publish snapshot EIO retains root lock before any outbound reconcile", async (t) => {
+test("issue 66: FOD post-publish snapshot EIO retains root lock before any outbound reconcile", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const { root, open, store, state, adapter } = await setup(t, {
     "docs/recover.txt": "remote file published before a failed checkpoint",
   });
@@ -1524,7 +1554,7 @@ test("issue 66: FOD post-publish snapshot EIO retains root lock before any outbo
   assert.equal(JSON.stringify(store.list("alice")), beforeStore);
 });
 
-test("issue 66: inbound FOD rename completion followed by EIO retains lock before cold reconcile", async (t) => {
+test("issue 66: inbound FOD rename completion followed by EIO retains lock before cold reconcile", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const { root, open, store, state } = await setup(t, {
     "docs/restore.txt": "remote authenticated content after a late native error",
   });
@@ -1848,7 +1878,7 @@ test("issue 66: native-required retry cannot dispatch a freshly signed DELETE sw
   assert.equal(await exists(path.join(root, ".rootark-sync.lock")), false);
 });
 
-test("issue 66: a started but unawaited native-required _apply keeps the physical lock through all awaited I/O", async (t) => {
+test("issue 66: a started but unawaited native-required _apply keeps the physical lock through all awaited I/O", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const { root, open, store, state } = await setup(t, {
     "docs/restore.txt": "remote content behind deferred key resolver",
   });
@@ -1977,7 +2007,7 @@ test("issue 66: direct cold private _materializeRemote cannot create a root mark
   assert.equal(state.inventoryReads, 0, "deny before contacting remote inventory");
 });
 
-test("issue 66: an unawaited inbound publish that physically renames then fails cannot make its lock owner succeed", async (t) => {
+test("issue 66: an unawaited inbound publish that physically renames then fails cannot make its lock owner succeed", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const payload = "published physical bytes before injected EIO";
   const { root, open, store, state } = await setup(t, { "docs/restore.txt": payload });
   const client = await open();
@@ -2265,7 +2295,7 @@ test("issue 66: cold FOD mode marker fsync followed by EIO cannot release the ph
   await assert.rejects(open(), { code: "sync_root_busy" });
 });
 
-test("issue 66: durable signed inbound seen write followed by EIO keeps the physical root lock", async (t) => {
+test("issue 66: durable signed inbound seen write followed by EIO keeps the physical root lock", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const { root, open, state } = await setup(t, {
     "docs/restore.txt": "original authenticated remote payload",
   });
@@ -2382,7 +2412,7 @@ test("issue 66: native-required private pull, push, enqueue and prune deny befor
   assert.deepEqual(await fsp.readFile(snapshot), snapshotBefore);
 });
 
-test("issue 66: equal-byte foreign inbound stage cannot authorize a successful FOD publish", async (t) => {
+test("issue 66: equal-byte foreign inbound stage cannot authorize a successful FOD publish", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const payload = "remote source payload with identical foreign bytes";
   const { root, open, store, state } = await setup(t, { "docs/restore.txt": payload });
   const client = await open();
@@ -2488,7 +2518,7 @@ test("issue 66: equal-byte foreign inbound stage cannot authorize a successful F
   }
 });
 
-test("issue 66: signed FOD directory CREATE followed by snapshot EIO keeps cold root locked", async (t) => {
+test("issue 66: signed FOD directory CREATE followed by snapshot EIO keeps cold root locked", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const { root, adapter, store, state, key } = await setup(t, {});
   const signer = crypto.generateKeyPairSync("ed25519");
   const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
@@ -2553,7 +2583,7 @@ test("issue 66: signed FOD directory CREATE followed by snapshot EIO keeps cold 
   assert.equal(JSON.stringify(store.list("alice")), oldStore);
 });
 
-test("issue 66: signed FOD directory UPDATE cannot relocate cached subtree without native custody", async (t) => {
+test("issue 66: signed FOD directory UPDATE cannot relocate cached subtree without native custody", { skip: NATIVE_PUBLISH_PENDING }, async (t) => {
   const { root, adapter, store, state, key } = await setup(t, {});
   const signer = crypto.generateKeyPairSync("ed25519");
   const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
@@ -2771,9 +2801,8 @@ test("issue 66: FIFO root marker fails closed in bounded cold subprocess opens a
 });
 
 test("issue 66: refuses unsafe cached refresh and preserves dirty cached bytes", async (t) => {
-  const { root, source, writer, open } = await setup(t, { "docs/version.txt": "version one" });
-  const client = await open();
-  await client.materializeRemote("docs/version.txt");
+  const { root, source, writer, openCached } = await setup(t, { "docs/version.txt": "version one" });
+  const client = await openCached("docs/version.txt");
   await fsp.writeFile(path.join(source, "docs", "version.txt"), "version two");
   await writer.syncOnce();
   const snapshotBefore = await fsp.readFile(path.join(root, ".rootark-sync-index.json"));
@@ -2788,10 +2817,9 @@ test("issue 66: refuses unsafe cached refresh and preserves dirty cached bytes",
   assert.equal(await fsp.readFile(path.join(root, "docs", "version.txt"), "utf8"), "offline local changes");
 });
 
-test("issue 66: local changes during remote fetch cannot be overwritten", async (t) => {
-  const { root, source, writer, open, adapter } = await setup(t, { "docs/race.txt": "clean cached" });
-  const client = await open();
-  await client.materializeRemote("docs/race.txt");
+test("issue 66: native-required fetch denial preserves a concurrent local edit", async (t) => {
+  const { root, source, writer, openCached, adapter } = await setup(t, { "docs/race.txt": "clean cached" });
+  const client = await openCached("docs/race.txt");
   await fsp.writeFile(path.join(source, "docs", "race.txt"), "new remote version");
   await writer.syncOnce();
   const oldList = adapter.list;
@@ -2800,14 +2828,14 @@ test("issue 66: local changes during remote fetch cannot be overwritten", async 
     await fsp.writeFile(path.join(root, "docs", "race.txt"), "edited during network request");
     return response;
   };
-  await assert.rejects(client.materializeRemote("docs/race.txt"), { code: "local_changes_pending" });
+  await assert.rejects(client.materializeRemote("docs/race.txt"),
+    { code: "local_changes_pending" });
   assert.equal(await fsp.readFile(path.join(root, "docs", "race.txt"), "utf8"), "edited during network request");
 });
 
 test("issue 66: a remote MOVE must not relocate unsynced local source bytes", async (t) => {
-  const { root, open, store, key } = await setup(t, { "docs/original.txt": "original verified bytes" });
-  const client = await open();
-  await client.materializeRemote("docs/original.txt");
+  const { root, openCached, store, key } = await setup(t, { "docs/original.txt": "original verified bytes" });
+  const client = await openCached("docs/original.txt");
   const before = store.list("alice")[0];
   const move = protocol.createOperation({
     operation: "move", objectId: before.objectId, fileId: before.fileId,
@@ -2825,9 +2853,8 @@ test("issue 66: a remote MOVE must not relocate unsynced local source bytes", as
 });
 
 test("issue 66: even a clean cached source cannot be renamed by legacy FOD MOVE without native custody", async (t) => {
-  const { root, open, store, key } = await setup(t, { "docs/original.txt": "signed move bytes" });
-  const client = await open();
-  await client.materializeRemote("docs/original.txt");
+  const { root, openCached, store, key } = await setup(t, { "docs/original.txt": "signed move bytes" });
+  const client = await openCached("docs/original.txt");
   const before = store.list("alice")[0];
   const move = protocol.createOperation({
     operation: "move", objectId: before.objectId, fileId: before.fileId,
@@ -2852,7 +2879,7 @@ test("issue 66: even a clean cached source cannot be renamed by legacy FOD MOVE 
   assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
 });
 
-test("issue 66: first hydration of authorized signed MOVE with no local source or destination stays available", async (t) => {
+test("issue 66: verified signed MOVE is rejected before unavailable native first hydration", async (t) => {
   const { root, adapter, store, key, state } = await setup(t, { "docs/original.txt": "verified first hydration" });
   const pair = crypto.generateKeyPairSync("ed25519");
   const publicKey = pair.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
@@ -2891,11 +2918,12 @@ test("issue 66: first hydration of authorized signed MOVE with no local source o
   assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
   assert.equal(await exists(path.join(root, "docs", "new.txt")), false);
   const remoteBefore = JSON.stringify(store.list("alice"));
-  assert.equal(await client.materializeRemote("docs/new.txt"), true);
+  await assert.rejects(client.materializeRemote("docs/new.txt"),
+    { code: "root_session_native_unavailable" });
   assert.ok(verified > 0, "real Ed25519 pinned-key verifier must run");
-  assert.equal(client.journal.hasSeen(move.operationId), true);
+  assert.equal(client.journal.hasSeen(move.operationId), false);
   assert.deepEqual(await client.journal.recover(), []);
-  assert.equal(await fsp.readFile(path.join(root, "docs", "new.txt"), "utf8"), "verified first hydration");
+  assert.equal(await exists(path.join(root, "docs", "new.txt")), false);
   assert.equal(await exists(path.join(root, "docs", "original.txt")), false);
   assert.equal(JSON.stringify(store.list("alice")), remoteBefore);
   assert.equal(state.pushes, 0);
@@ -2904,7 +2932,13 @@ test("issue 66: first hydration of authorized signed MOVE with no local source o
     selectedPaths: ["docs"], filesOnDemand: true, requireAuthorization: true,
     verifyIncoming: async (op) => verifyAuthorizationProof(op.authorization, op, trusted),
   }).open();
-  assert.equal(reopened.snapshot.files["docs/new.txt"].objectId, move.objectId);
-  assert.equal(reopened.snapshot.files["docs/new.txt"].versionId, move.versionId);
-  assert.equal(reopened.journal.hasSeen(move.operationId), true);
+  assert.equal(reopened.snapshot.files["docs/new.txt"], undefined);
+  assert.equal(reopened.journal.hasSeen(move.operationId), false);
 });
+
+// These are outstanding product acceptance cases. Keep them visibly pending:
+// denying legacy pathname publication is not positive native hydration proof.
+test.todo("issue 66: native FOD hydrates one selected signed object on open without downloading siblings");
+test.todo("issue 66: native FOD hydrates a later metadata page without fetching siblings");
+test.todo("issue 66: native FOD verifies signed MOVE and publishes first hydration with cold-reopen persistence");
+test.todo("issue 66: native FOD detects a late dirty-cache write at the held-handle publication boundary");
