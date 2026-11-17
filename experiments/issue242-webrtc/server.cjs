@@ -11,6 +11,7 @@ const MAX_MEMBERS = 4;
 const ROOM_TTL_MS = 5 * 60_000;
 const INVITE_TTL_MS = 60_000;
 const MAX_SIGNAL_BYTES = 16_384;
+const MAX_OUTBOUND_BUFFER_BYTES = 512 * 1024;
 const token = () => randomBytes(32).toString('hex');
 const shortId = () => randomBytes(8).toString('hex');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -23,7 +24,15 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
   let listener;
 
   function send(ws, data) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const payload = JSON.stringify(data);
+    // An authorized sender can keep signaling while a recipient stops reading.
+    // Drop the stalled recipient before queued WebSocket bytes grow without bound.
+    if (ws.bufferedAmount + Buffer.byteLength(payload) > MAX_OUTBOUND_BUFFER_BYTES) {
+      ws.terminate();
+      return;
+    }
+    ws.send(payload);
   }
   function error(ws, code) { send(ws, { type: 'error', code }); }
   function roomOf(ws) {
