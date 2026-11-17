@@ -1060,12 +1060,75 @@ class SyncEngine {
     return this.withMutationLock(() => this._enqueueChange(input));
   }
 
+  async assertOutgoingPinnedPolicy(operation) {
+    // Direct enqueueChange() does not go through _apply() or reconcileLocal().
+    // Check its final signed operation BEFORE admitting it to the durable
+    // outbox: a pinned tombstone would poison the next persisted snapshot.
+    const pinned = Object.values(this.snapshot.pinnedFiles || {});
+    if (!pinned.length) return;
+    const target = operation.metadata?.path?.toLowerCase();
+    const source = operation.operation === "move"
+      ? operation.metadata?.sourcePath?.toLowerCase() : null;
+    const affected = [target, source].filter(Boolean);
+    if (["update", "move", "delete"].includes(operation.operation)) {
+      for (const [relative, prior] of Object.entries(this.snapshot.files)) {
+        if (prior && !prior.deleted && prior.objectId === operation.objectId
+          && prior.fileId === operation.fileId) affected.push(relative.toLowerCase());
+      }
+    }
+    // A CREATE for an already existing ancestor is harmless only when it
+    // names that exact directory and does not replace a tracked identity.
+    // Case-folded aliases must not become parents of pinned files on Windows.
+    let safeAncestorCreate = false;
+    if (operation.operation === "create"
+      && operation.metadata?.contentType === "inode/directory"
+      && target && pinned.some((pin) => pin.path.toLowerCase().startsWith(`${target}/`))) {
+      const exactPrefix = `${operation.metadata.path}/`;
+      const tracked = Object.entries(this.snapshot.files).filter(([relative]) =>
+        relative.toLowerCase() === target);
+      if (pinned.some((pin) => pin.path.toLowerCase().startsWith(`${target}/`)
+          && !pin.path.startsWith(exactPrefix))
+        || tracked.length > 1
+        || tracked.some(([relative, prior]) => relative !== operation.metadata.path
+          || !prior || prior.deleted || !prior.directory
+          || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId)) {
+        fail("Pinned descendant requires the existing directory identity", "file_pinned");
+      }
+      const ancestor = await contained(this.rootDir, operation.metadata.path, true);
+      let stats;
+      try { stats = await fsp.lstat(ancestor); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      if (!stats?.isDirectory() || stats.isSymbolicLink()) {
+        fail("Pinned descendant requires an existing directory", "file_pinned");
+      }
+      safeAncestorCreate = true;
+    }
+    for (const pin of pinned) {
+      const pinnedPath = pin.path.toLowerCase();
+      const sameIdentity = pin.objectId === operation.objectId && pin.fileId === operation.fileId;
+      if (operation.operation === "delete" && (sameIdentity || target === pinnedPath)) {
+        fail("A pinned local file cannot be enqueued for deletion", "file_pinned");
+      }
+      if (affected.some((pathName) => pinnedPath.startsWith(`${pathName}/`))
+        && !safeAncestorCreate) {
+        fail("A pinned file is inside a directory affected by a local mutation", "file_pinned");
+      }
+      if (["create", "update", "move"].includes(operation.operation)
+        && (target === pinnedPath && (!sameIdentity
+          || operation.metadata?.contentType === "inode/directory")
+          || source === pinnedPath && !sameIdentity)) {
+        fail("A pinned file owns this local mutation path", "file_pinned");
+      }
+    }
+  }
+
   async _enqueueChange(input) {
     if (!this.opened) await this._open();
     const remoteOnly = this.snapshot.remoteOnly[input.objectId];
     if (remoteOnly?.reason === "evicted") fail("Materialize a remote-only file before enqueuing changes", "remote_only_object");
     const key = input.fileKey || await this.fileKeyResolver(input);
     const operation = protocol.validateOperation(await this.buildOperation({ ...input, fileKey: key }));
+    await this.assertOutgoingPinnedPolicy(operation);
     await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
     let hash;
     if (operation.operation === "move") {
@@ -2395,6 +2458,27 @@ class SyncEngine {
           if (typeof value !== "string") continue;
           try { protectedPaths.add(pathKey(protocol.safeRelativePath(decodeURIComponent(value).replace(/^\/+/, ""), "path"))); } catch {}
         }
+      }
+    }
+    // Preflight every missing retained file as a group. The snapshot normally
+    // lists parent directories before their children; detecting a missing pin
+    // inside the DELETE loop is too late once an ancestor has been journaled.
+    for (const pin of Object.values(this.snapshot.pinnedFiles || {})) {
+      if (current[pin.path]) continue;
+      // The scanner intentionally omits excluded files; pending UPDATE paths
+      // can also be protected from a second journal write. Neither condition
+      // licenses deleting their selected ancestor, so inspect the actual pin.
+      const retainedPath = await contained(this.rootDir, pin.path, true);
+      let stats;
+      try { stats = await fsp.lstat(retainedPath); }
+      catch (error) {
+        if (["ENOENT", "ENOTDIR"].includes(error.code)) {
+          fail("Pinned local file is missing; refusing to enqueue remote DELETE", "pinned_file_missing");
+        }
+        throw error;
+      }
+      if (!stats.isFile() || stats.isSymbolicLink()) {
+        fail("Pinned local file is no longer a regular file", "file_pinned");
       }
     }
     for (const [relative, prior] of Object.entries(this.snapshot.files)) {

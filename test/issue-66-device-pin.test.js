@@ -112,6 +112,167 @@ test("issue 66: exclusion cannot evict a pinned file, and a missing pinned file 
   assert.equal((await restarted.pinStatus("docs/a.txt")).pinned, true);
 });
 
+test("issue 66 P2 RED: missing pinned descendant cannot leave an ancestor DELETE in signed outbox", async (t) => {
+  const { rootDir, open, state, remote } = await fixture(t);
+  const client = await open();
+  await client.apply(await remote("create", "object-directory", "docs", "", 1,
+    undefined, "inode/directory"));
+  await client.pinLocal("docs/a.txt");
+  assert.deepEqual(Object.keys(client.snapshot.files).slice(0, 2), ["docs", "docs/a.txt"],
+    "tracked directory must precede its pinned child to reproduce the ordering hazard");
+  const priorFiles = structuredClone(client.snapshot.files);
+  const beforeJournal = await fsp.readFile(client.journal.filePath);
+  const snapshotPath = path.join(rootDir, ".rootark-sync-index.json");
+  const beforeDisk = await fsp.readFile(snapshotPath);
+
+  await fsp.rm(path.join(rootDir, "docs"), { recursive: true, force: true });
+  await assert.rejects(client.reconcileLocal(), { code: "pinned_file_missing" });
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal,
+    "failed pinned descendant preflight cannot durably enqueue ancestor DELETE");
+  assert.deepEqual(client.snapshot.files, priorFiles,
+    "failed reconciliation cannot stage a directory tombstone even in memory");
+  assert.deepEqual(await fsp.readFile(snapshotPath), beforeDisk);
+  assert.equal((await client.journal.recover()).some((op) => op.operation === "delete"
+    && op.metadata?.path === "docs"), false, "no delayed ancestor DELETE may be dispatched");
+  await fsp.mkdir(path.join(rootDir, "docs"), { recursive: true });
+  await fsp.writeFile(path.join(rootDir, "docs/a.txt"), "authenticated remote bytes");
+  await (await open()).syncOnce();
+  assert.equal(state.pushes, 0, "restoring the missing pin must not transmit any latent directory tombstone");
+});
+
+test("issue 66 P2 RED: enqueueChange rejects pinned DELETE without poisoning restart snapshot", async (t) => {
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  await client.pinLocal("docs/a.txt");
+  const prior = client.snapshot.files["docs/a.txt"];
+  assert.equal((await client.pinStatus("docs/a.txt")).pinned, true);
+  const snapshotPath = path.join(rootDir, ".rootark-sync-index.json");
+  const beforeDisk = await fsp.readFile(snapshotPath);
+  const beforeJournal = await fsp.readFile(client.journal.filePath);
+
+  await assert.rejects(client.enqueueChange({ operation: "delete",
+    objectId: prior.objectId, fileId: prior.fileId,
+    versionId: crypto.randomUUID(), baseRevision: prior.revision,
+    revision: { counter: prior.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/a.txt" } }), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal,
+    "public enqueue entry point cannot persist a forbidden signed DELETE");
+  assert.deepEqual(await fsp.readFile(snapshotPath), beforeDisk,
+    "failed public enqueue must preserve a reopenable pinned snapshot");
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true,
+    "a rejected local mutation may not poison CLI pin status after restart");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2 peer RED: excluded missing pinned child cannot enqueue selected ancestor DELETE", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  const initial = await open();
+  await initial.apply(await remote("create", "object-directory", "docs", "", 1,
+    undefined, "inode/directory"));
+  await initial.pinLocal("docs/a.txt");
+  const excluded = await open(["docs/a.txt"]);
+  const priorJournal = await fsp.readFile(excluded.journal.filePath);
+  const priorSnapshot = await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"));
+  await fsp.rm(path.join(rootDir, "docs"), { recursive: true, force: true });
+  await assert.rejects(excluded.reconcileLocal(), { code: "pinned_file_missing" },
+    "excluding a pinned child must not authorize the selected parent deletion");
+  assert.deepEqual(await fsp.readFile(excluded.journal.filePath), priorJournal,
+    "no delayed ancestor DELETE may be signed while the child is missing");
+  assert.deepEqual(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json")), priorSnapshot);
+  assert.equal((await excluded.journal.recover()).some((operation) =>
+    operation.operation === "delete" && operation.metadata?.path === "docs"), false);
+});
+
+test("issue 66 P2 peer RED: direct directory CREATE cannot replace pinned ancestor identity", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  const client = await open();
+  await client.apply(await remote("create", "object-directory", "docs", "", 1,
+    undefined, "inode/directory"));
+  await client.pinLocal("docs/a.txt");
+  const priorJournal = await fsp.readFile(client.journal.filePath);
+  const priorSnapshot = await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"));
+  await assert.rejects(client.enqueueChange({ operation: "create", objectId: "other-directory",
+    fileId: "other-file", versionId: crypto.randomUUID(), baseRevision: null,
+    revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "docs", contentType: "inode/directory" }, plaintext: Buffer.alloc(0) }),
+  { code: "file_pinned" }, "pinned child must not tolerate a conflicting parent directory identity");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), priorJournal);
+  assert.deepEqual(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json")), priorSnapshot);
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+});
+
+test("issue 66 P2 peer RED: pending pinned UPDATE cannot hide a missing child before ancestor DELETE", async (t) => {
+  const { rootDir, open, remote, state } = await fixture(t);
+  const client = await open();
+  await client.apply(await remote("create", "object-directory", "docs", "", 1,
+    undefined, "inode/directory"));
+  await client.pinLocal("docs/a.txt");
+  const prior = client.snapshot.files["docs/a.txt"];
+  await client.enqueueChange({ operation: "update", objectId: prior.objectId,
+    fileId: prior.fileId, versionId: crypto.randomUUID(),
+    baseRevision: prior.revision,
+    revision: { counter: prior.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/a.txt" }, plaintext: Buffer.from("pending signed update") });
+  assert.equal((await client.journal.recover()).some((op) => op.operation === "update"
+    && op.metadata?.path === "docs/a.txt"), true,
+  "fixture must contain a genuine signed pending child UPDATE");
+  const beforeJournal = await fsp.readFile(client.journal.filePath);
+  const indexPath = path.join(rootDir, ".rootark-sync-index.json");
+  const beforeIndex = await fsp.readFile(indexPath);
+  const beforeFiles = structuredClone(client.snapshot.files);
+
+  await fsp.rm(path.join(rootDir, "docs"), { recursive: true, force: true });
+  await assert.rejects(client.reconcileLocal(), { code: "pinned_file_missing" },
+    "a pending UPDATE cannot exempt a missing pin when its tracked parent is deleted");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal,
+    "the failed group preflight preserves only the existing signed UPDATE");
+  assert.deepEqual(await fsp.readFile(indexPath), beforeIndex);
+  assert.deepEqual(client.snapshot.files, beforeFiles);
+  assert.equal((await client.journal.recover()).some((op) => op.operation === "delete"
+    && op.metadata?.path === "docs"), false);
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2 peer RED: case-alias directory CREATE cannot adopt a pinned descendant", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  const client = await open();
+  await client.apply(await remote("create", "object-directory", "docs", "", 1,
+    undefined, "inode/directory"));
+  await client.pinLocal("docs/a.txt");
+  const tracked = client.snapshot.files.docs;
+  assert.ok(tracked?.directory);
+  const beforeJournal = await fsp.readFile(client.journal.filePath);
+  const indexPath = path.join(rootDir, ".rootark-sync-index.json");
+  const beforeIndex = await fsp.readFile(indexPath);
+  await assert.rejects(client.enqueueChange({ operation: "create",
+    objectId: tracked.objectId, fileId: tracked.fileId,
+    versionId: crypto.randomUUID(), baseRevision: null,
+    revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "DOCS", contentType: "inode/directory" },
+    plaintext: Buffer.alloc(0) }), { code: "file_pinned" },
+  "matching object identity cannot authorize an alternate-case ancestor of a pin");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal);
+  assert.deepEqual(await fsp.readFile(indexPath), beforeIndex);
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+});
+
+test("issue 66: a real untracked ancestor can be enrolled without replacing a pinned file", async (t) => {
+  const { rootDir, open } = await fixture(t);
+  const client = await open();
+  await client.pinLocal("docs/a.txt");
+  assert.equal(client.snapshot.files.docs, undefined,
+    "hydrating the child can create a physical parent before its sync identity arrives");
+  assert.equal((await fsp.lstat(path.join(rootDir, "docs"))).isDirectory(), true);
+  const operation = await client.enqueueChange({ operation: "create",
+    objectId: "directory-object", fileId: "directory-file", versionId: crypto.randomUUID(),
+    baseRevision: null, revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "docs", contentType: "inode/directory" },
+    plaintext: Buffer.alloc(0) });
+  assert.equal(operation.operation, "create");
+  assert.equal(client.snapshot.files.docs.objectId, "directory-object");
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+});
+
 test("issue 66: excluded file is evicted after explicit unpin, without remote DELETE", async (t) => {
   const { rootDir, open, state } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
