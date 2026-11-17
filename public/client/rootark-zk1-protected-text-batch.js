@@ -103,6 +103,9 @@
         || (input.isCancelled !== undefined && typeof input.isCancelled !== "function")
         || typeof preview?.open !== "function"
         || !input.grant || !input.ownerHead || !input.baseline) deny();
+      // Capture the session authority before a checked GET or CEK provider can
+      // await and replace the mutable caller-owned assertLive property.
+      const assertLive = input.assertLive.bind(input);
       const match = checkedMatcher(input);
       const items = checkedItems(input);
       const matches = [];
@@ -110,7 +113,7 @@
       // Never commit an earlier window if a later signed GET/CEK fails.
       const indexRows = input.onVerifiedBatch ? [] : null;
       const live = () => {
-        const current = input.assertLive();
+        const current = assertLive();
         const cancelled = input.isCancelled?.();
         if (current === false || current && typeof current.then === "function"
           || cancelled !== undefined && cancelled !== false) deny();

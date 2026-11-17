@@ -69,6 +69,29 @@ test("bounded signed GET and separately owner-pinned CEKs search several protect
   assert.equal(JSON.stringify(f.queried).includes("ORC"), false);
 });
 
+test("P2 RED: delayed checked GET cannot replace session guard and release protected matches", async () => {
+  const positive = await fixture();
+  assert.equal((await search.search(positive.input)).totalMatches, 1,
+    "genuine AES-GCM protected content must yield a positive matching baseline");
+
+  const f = await fixture();
+  const originalGet = f.input.getChecked;
+  const forgedGuard = () => {};
+  let checkedReads = 0;
+  f.input.getChecked = async (objectId, revision) => {
+    const checked = await originalGet(objectId, revision);
+    checkedReads += 1;
+    f.logout();
+    f.input.assertLive = forgedGuard;
+    return checked;
+  };
+  await assert.rejects(search.search(f.input), /ZK_BATCH_TEXT_SEARCH_DENIED/,
+    "the pre-await live-session guard must remain authoritative after logout");
+  assert.equal(checkedReads, 1, "the actual protected GET callback must be exercised");
+  assert.equal(f.queried.length, 1, "must deny before second remote signed GET");
+  assert.equal(f.input.assertLive, forgedGuard, "the callback was truly replaced during GET");
+});
+
 test("opt-in ALL TERMS matches reordered NFC/case-folded literals; default phrase remains unchanged", async () => {
   const f = await fixture();
   const query = "SeCrEtO   ORC\u0327AMENTO";
