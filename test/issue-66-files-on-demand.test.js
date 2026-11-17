@@ -121,6 +121,8 @@ test("issue 66: preexisting FOD cache fixture refuses unauthenticated remote byt
   await assert.rejects(openCached("docs/protected.txt"), (error) => {
     assert.notEqual(error.code, "root_session_native_unavailable",
       "real legacy sync must reject altered ciphertext before native FOD is enabled");
+    assert.match(String(error.message), /unable to authenticate data/i,
+      "the fixture must reach AES-GCM authentication, not fail on unrelated setup");
     return true;
   });
   assert.equal(await exists(path.join(root, "docs", "protected.txt")), false);
