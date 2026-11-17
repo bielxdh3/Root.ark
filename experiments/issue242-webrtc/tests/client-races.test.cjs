@@ -23,7 +23,10 @@ function makeChannel(overrides = {}) {
   };
 }
 
-function clientFixture() {
+function clientFixture({ cryptoApi = {
+  subtle: crypto.webcrypto.subtle,
+  randomUUID: () => crypto.randomUUID(),
+}, fetchImpl } = {}) {
   const elements = new Map(), sockets = [], peerConnections = [];
   const makeNode = () => ({
     children: [], dataset: {}, disabled: false, textContent: '',
@@ -43,14 +46,18 @@ function clientFixture() {
     send(wire) { this.sent.push(JSON.parse(wire)); }
   }
   class FakePeer {
-    constructor() { this.closed = false; peerConnections.push(this); }
+    constructor() { this.closed = false; this.channels = []; peerConnections.push(this); }
     createDataChannel(label, opts = {}) {
-      return makeChannel({
+      const channel = makeChannel({
         label: label || 'fixture-transfer',
         ordered: opts.ordered !== undefined ? opts.ordered : true,
         maxRetransmits: opts.maxRetransmits ?? null,
         maxPacketLifeTime: opts.maxPacketLifeTime ?? null
       });
+      channel.sent = [];
+      channel.send = wire => channel.sent.push(JSON.parse(wire));
+      this.channels.push(channel);
+      return channel;
     }
     async createOffer() { return { type: 'offer', sdp: 'disposable' }; }
     async setLocalDescription(description) { this.localDescription = description; }
@@ -61,13 +68,16 @@ function clientFixture() {
     window: { P2PFileWire: { ...fileWire } },
     WebSocket: FakeSocket,
     RTCPeerConnection: FakePeer,
-    crypto: crypto.webcrypto,
+    crypto: cryptoApi,
+    fetch: fetchImpl,
     TextEncoder,
     TextDecoder,
     Uint8Array,
     ArrayBuffer,
+    AbortController,
     location: { origin: 'http://127.0.0.1:1234' },
     setTimeout,
+    clearTimeout,
     console
   };
   vm.createContext(ctx);
@@ -77,6 +87,69 @@ function clientFixture() {
   }
   return { ...ctx.window.__poc, window: ctx.window, sockets, elements, incoming, peerConnections };
 }
+
+test('P2 RED: hashing old-room text must not deliver it to a newly joined room', async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const cryptoApi = { subtle: { digest: async (...args) => {
+    await blocked;
+    return crypto.webcrypto.subtle.digest(...args);
+  } } };
+  const f = clientFixture({ cryptoApi });
+  f.joinRoom('room-A', 'invite-A');
+  const old = f.sockets[0];
+  await f.incoming(old, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(old, { type: 'peer-accepted', peerId: 'peer-A' });
+  const oldChannel = f.peerConnections[0].channels[0];
+  assert.ok(oldChannel, 'real client peer setup must create DataChannel A');
+  const pending = f.sendText('confidential text intended only for room A');
+  f.joinRoom('room-B', 'invite-B');
+  const fresh = f.sockets[1];
+  await f.incoming(fresh, { type: 'joined', role: 'host', peerId: 'host-B' });
+  await f.incoming(fresh, { type: 'peer-accepted', peerId: 'peer-B' });
+  const newChannel = f.peerConnections[1].channels[0];
+  assert.ok(newChannel, 'real client peer setup must create DataChannel B');
+  release();
+  await pending;
+  assert.deepEqual(newChannel.sent.filter(item => item.type === 'text'), [],
+    'bytes authorized for old room must never be sent to a new recipient after async hash');
+  assert.deepEqual(oldChannel.sent.filter(item => item.type === 'text'), [],
+    'departed room must not receive a delayed transmission either');
+  await f.sendText('fresh text intended only for room B');
+  assert.equal(newChannel.sent.filter(item => item.type === 'text').length, 1,
+    'a legitimate send in the new room must still work');
+});
+
+test('P2 RED: hashing an old-room file cannot offer it to a revoked peer after room switch', async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const f = clientFixture();
+  f.joinRoom('room-A', 'invite-A');
+  const old = f.sockets[0];
+  await f.incoming(old, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(old, { type: 'peer-accepted', peerId: 'peer-A' });
+  const oldChannel = f.peerConnections[0].channels[0];
+  const payload = new TextEncoder().encode('private file bytes for room A');
+  const file = { name: 'private.txt', size: payload.length,
+    async arrayBuffer() { await blocked; return payload.buffer.slice(0); } };
+  const pending = f.sendFile(file);
+  f.joinRoom('room-B', 'invite-B');
+  const fresh = f.sockets[1];
+  await f.incoming(fresh, { type: 'joined', role: 'host', peerId: 'host-B' });
+  await f.incoming(fresh, { type: 'peer-accepted', peerId: 'peer-B' });
+  const newChannel = f.peerConnections[1].channels[0];
+  release();
+  await pending;
+  assert.deepEqual(oldChannel.sent.filter(item => item.type === 'offer-file'), [],
+    'a stale DataChannel from a revoked room must not receive a delayed file offer');
+  assert.deepEqual(newChannel.sent.filter(item => item.type === 'offer-file'), [],
+    'file selected for the old room must not be offered to the new room');
+  await f.sendFile(file);
+  assert.equal(newChannel.sent.filter(item => item.type === 'offer-file').length, 1,
+    'legitimate offer in the new room must still work: denial must not be vacuous; state=' +
+      f.elements.get('state').textContent);
+  fresh.onclose(); // Cancel the 60s consent timer; do not leak handles across tests.
+});
 
 test('P2: delayed old-room close cannot revoke or tear down new-room peer', async () => {
   const f = clientFixture();

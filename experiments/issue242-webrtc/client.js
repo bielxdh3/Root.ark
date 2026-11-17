@@ -436,14 +436,22 @@
     if (!file || file.size === 0 || file.size > MAX_FILE || preparingFile) {
       return log('Selecione arquivo de até 32 MiB');
     }
-    const receivers = [...peers.values()].filter(p => p.dc?.readyState === 'open' && !p.outgoing);
+    // A digest may take long enough for the user to leave this room. Never
+    // offer that room's file to a later session or a detached old DataChannel.
+    const sendingSocket = ws, sendingRoom = roomId, sendingSelf = selfId, sendingRole = role;
+    const sameRoom = () => ws === sendingSocket && roomId === sendingRoom &&
+      selfId === sendingSelf && role === sendingRole;
+    const receivers = [...peers.values()].filter(p => p.dc?.readyState === 'open' && !p.outgoing)
+      .map(p => ({ peer: p, channel: p.dc }));
     if (!receivers.length) return log('Nenhum par disponível');
     preparingFile = true;
     try {
       const digest = await sha(await file.arrayBuffer());
+      if (!sameRoom()) return;
       const name = file.name.slice(0, 100) || 'arquivo.bin';
-      for (const p of receivers) {
-        if (p.dc?.readyState !== 'open' || p.outgoing) continue;
+      for (const { peer: p, channel } of receivers) {
+        if (!sameRoom() || peers.get(p.id) !== p || p.dc !== channel ||
+          channel.readyState !== 'open' || p.outgoing) continue;
         const id = crypto.randomUUID().replace(/-/g, '');
         const tx = { id, name, size: file.size, digest, file, phase: 'offered',
           abort: new AbortController(), timer: null };
@@ -462,10 +470,17 @@
   }
   async function sendText(value) {
     if (!value || value.length > 1000) return;
+    // Do not enumerate the *new* room's peers after hashing text selected for
+    // the previous room. Preserve the exact socket, identity and channel set.
+    const sendingSocket = ws, sendingRoom = roomId, sendingSelf = selfId, sendingRole = role;
+    const receivers = [...peers.values()].map(p => ({ peer: p, channel: p.dc }));
     const digest = await sha(new TextEncoder().encode(value));
+    if (ws !== sendingSocket || roomId !== sendingRoom ||
+      selfId !== sendingSelf || role !== sendingRole) return;
     let count = 0;
-    for (const p of peers.values()) if (p.dc?.readyState === 'open') {
-      p.dc.send(JSON.stringify({ type: 'text', text: value, digest }));
+    for (const { peer: p, channel } of receivers) if (peers.get(p.id) === p &&
+      p.dc === channel && channel?.readyState === 'open') {
+      channel.send(JSON.stringify({ type: 'text', text: value, digest }));
       count++;
     }
     log('Texto enviado a ' + count + ' destinatário(s)');
