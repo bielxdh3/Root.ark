@@ -50,6 +50,71 @@ async function fixture({ forgedInventorySignature = false } = {}) {
   return { enrollment, signed, scope, keys, now, snapshot };
 }
 
+test("P2: hostile native key getter cannot replace Array checkpoint staging", async () => {
+  const f = await fixture();
+  const unrelatedSigned = await fixture();
+  const differentPin = checkpointDigest(unrelatedSigned.signed.checkpoints[0]);
+  assert.notEqual(differentPin, checkpointDigest(f.signed.checkpoints[0]),
+    "the independently retained B digest must belong to a different genuine signed checkpoint");
+  const OriginalArray = global.Array;
+  let replacedSlots = 0;
+  const injectedArray = function(length) {
+    const slots = new OriginalArray(length);
+    if (!new.target || length !== f.signed.checkpoints.length) return slots;
+    // One poisoned staging allocation, then restore ambient Array to avoid
+    // accidentally sabotaging unrelated built-in array construction later.
+    global.Array = OriginalArray;
+    return new Proxy(slots, { set(target, name, value) {
+      if (name === "0") {
+        replacedSlots++;
+        return Reflect.set(target, name, { ...value, recordDigest: differentPin });
+      }
+      return Reflect.set(target, name, value);
+    } });
+  };
+  // Preserve real Array static methods (Array.isArray, etc.), so only its
+  // constructor/staged index assignment is adversarial. An unadorned fake
+  // constructor would fail unrelated input checks before reaching the bug.
+  Object.setPrototypeOf(injectedArray, OriginalArray);
+  injectedArray.prototype = OriginalArray.prototype;
+  const owner = crypto.createPublicKey({ key: f.enrollment.ownerPublicKey.export({
+    type: "spki", format: "der",
+  }), type: "spki", format: "der" });
+  let callbackReads = 0;
+  Object.defineProperty(owner, "type", { configurable: true, get() {
+    callbackReads++;
+    global.Array = injectedArray;
+    return "public";
+  } });
+  try {
+    // An earlier verifier may encounter the hostile getter and leave the
+    // same realm's constructor poisoned for a later signed enrollment.
+    try { await verifyOwnerInventoryEnrollment({ ...f.enrollment, ownerPublicKey: owner }); }
+    catch (error) { assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/); }
+    assert.ok(callbackReads > 0, "a real owner-key callback must run");
+    assert.equal(global.Array, injectedArray, "the constructor poisoning must occur");
+    await assert.rejects(verifyOwnerInventoryEnrollment({
+      ...f.enrollment, independentRetainedCheckpointDigest: differentPin,
+    }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+    "signed A must not be certified as unrelated independently retained digest B");
+    assert.equal(replacedSlots, 0,
+      "the original native array constructor must bypass the adversarial staging setter");
+    assert.equal(global.Array, injectedArray,
+      "the verifier must not depend on the attacker restoring the original constructor");
+    const accepted = await verifyOwnerInventoryEnrollment(f.enrollment);
+    assert.equal(accepted.ownerSignatureVerified, true,
+      "valid A remains accepted while the hostile constructor remains installed");
+    assert.equal(global.Array, injectedArray,
+      "the legitimate positive must run with the same hostile ambient constructor");
+  } finally {
+    global.Array = OriginalArray;
+    delete owner.type;
+  }
+  const valid = await verifyOwnerInventoryEnrollment(f.enrollment);
+  assert.equal(valid.ownerSignatureVerified, true);
+  assert.equal(valid.authorizesIo, false);
+});
+
 test("independent offline owner process signs an externally pinned, verified inventory root", async () => {
   const f = await fixture();
   const verified = await verifyOwnerInventoryEnrollment(f.enrollment);

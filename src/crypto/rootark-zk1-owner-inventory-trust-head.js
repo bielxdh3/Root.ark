@@ -18,9 +18,13 @@ const {
   ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
   getPrototype: NATIVE_GET_PROTOTYPE, hasOwn: NATIVE_HAS_OWN,
   objectCreate: NATIVE_OBJECT_CREATE, arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  defineProperty: NATIVE_DEFINE_PROPERTY,
 } = require("./rootark-zk10-native-intrinsics-v1");
 const { types: { isProxy } } = require("node:util");
 const NATIVE_IS_BUFFER = Buffer.isBuffer.bind(Buffer);
+// A prior caller-controlled native KeyObject getter may replace the ambient
+// Array constructor; checkpoint storage must use the original native Array.
+const NATIVE_ARRAY_CTOR = Array;
 const z = require("./rootark-zk-1");
 const inventory = require("./rootark-zk-content-inventory-v1");
 // Resolve the nested inventory signature verifier once, before any
@@ -174,7 +178,7 @@ async function verifyOwnerInventoryEnrollment(input) {
     if (!NATIVE_ARRAY_IS_ARRAY(r.checkpoints) || isProxy(r.checkpoints) ||
         r.checkpoints.length < 1 || r.checkpoints.length > 64 ||
         NATIVE_OWN_KEYS(r.checkpoints).length !== r.checkpoints.length + 1) fail();
-    const checked = new Array(r.checkpoints.length);
+    const checked = new NATIVE_ARRAY_CTOR(r.checkpoints.length);
     for (let index = 0; index < checked.length; index += 1) {
       const descriptor = NATIVE_DESCRIPTOR(r.checkpoints, String(index));
       if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail();
@@ -186,7 +190,11 @@ async function verifyOwnerInventoryEnrollment(input) {
       }
       const current = statement(unsigned);
       const signature = b64(record.signature, 64);
-      checked[index] = { current, signature, recordDigest: checkpointDigest(record) };
+      // Own DATA slots bypass both poisoned constructors and inherited numeric setters.
+      NATIVE_DEFINE_PROPERTY(checked, String(index), {
+        value: { current, signature, recordDigest: checkpointDigest(record) },
+        enumerable: true, writable: true, configurable: true,
+      });
     }
     const ownerKey = key(r.ownerPublicKey, "public");
     const inventoryKey = key(r.inventoryPublicKey, "public");
