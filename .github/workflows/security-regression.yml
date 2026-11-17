@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - Root/main
+      - 'cdx/issue66-cfapi-native-w8-20261107'
   pull_request:
     branches:
       - Root/main
