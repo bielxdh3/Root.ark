@@ -122,6 +122,61 @@ test("P2: checked GET callback cannot replace the live-session guard after logou
     "the attacker actually replaced the caller-owned callback during the await");
 });
 
+test("P2: an awaited GET cannot swap the independently signed reader for the next item", async () => {
+  const baseline = await fixture();
+  assert.equal((await search.search({ ...baseline.input, query: "arroz" })).totalMatches, 1,
+    "real AEAD data and the original verified GET callback must produce a second-item match");
+
+  const f = await fixture();
+  f.input.query = "arroz";
+  const originalGet = f.input.getChecked;
+  const second = f.items[1].selected;
+  const preRevocationCache = f.checked.get(second.objectId + ":" + second.revision);
+  let firstReads = 0;
+  let staleReaderCalls = 0;
+  let revoked = false;
+  f.input.getChecked = async (objectId, revision) => {
+    if (revoked) throw Error("SIGNED_GET_REVOKED");
+    firstReads += 1;
+    const result = await originalGet(objectId, revision);
+    // A caller-controlled reader is replaced while the first signed read is
+    // pending. The forged replacement is a cached authenticated-looking row
+    // and must never stand in for a fresh second GET after the revocation.
+    revoked = true;
+    f.input.getChecked = async () => {
+      staleReaderCalls += 1;
+      return preRevocationCache;
+    };
+    return result;
+  };
+  await assert.rejects(search.search(f.input), /ZK_BATCH_TEXT_SEARCH_DENIED/,
+    "the originally captured reader must fail closed on a subsequent revoked GET");
+  assert.equal(firstReads, 1, "the first signed GET really completed before revocation");
+  assert.equal(staleReaderCalls, 0, "the substituted cached reader must never execute");
+  assert.equal(f.queried.length, 1, "only the pre-revocation GET may reach the original fixture");
+});
+
+test("P2: an awaited GET cannot expand the bounded selected revision set", async () => {
+  const f = await fixture();
+  const originalGet = f.input.getChecked;
+  let appended = 0;
+  f.input.getChecked = async (objectId, revision) => {
+    const result = await originalGet(objectId, revision);
+    if (appended === 0) {
+      // The authenticated selection had only two revisions. A callback that
+      // settles its first signed GET is able to mutate the caller-owned array.
+      // The old for..of re-read its length and opened nine EXTRA ciphertexts.
+      f.input.items.push(...Array(9).fill(f.items[0]));
+      appended = 9;
+    }
+    return result;
+  };
+  const result = await search.search(f.input);
+  assert.equal(appended, 9, "the async array mutation really occurred");
+  assert.equal(result.totalSearched, 2, "only the entry-validated revisions may be counted");
+  assert.equal(f.queried.length, 2, "no additional signed GET may escape the eight-item bound");
+});
+
 test("bounded explicit selection and local query reject duplicates, overflow and invalid input", async () => {
   const f = await fixture();
   for (const patch of [

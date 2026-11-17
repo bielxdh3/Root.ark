@@ -55,15 +55,20 @@
       // The signed GET is an async callback. It must not be able to replace
       // the session guard used after that await or by the local AEAD opener.
       const assertLive = input.assertLive.bind(input);
+      // The same boundary applies to the signed GET itself: do not let the
+      // callback for item N replace the verifier for item N+1 after an await.
+      const getChecked = input.getChecked.bind(input);
       const term = checkedQuery(input.query);
-      const items = checkedItems(input);
+      // for..of observes a live array length. A completed signed GET must
+      // not append extra revisions or remove validated ones while we await.
+      const items = checkedItems(input).slice();
       const matches = [];
       assertLive();
       for (const item of items) {
         assertLive();
         // This callback performs fresh signed LIST/HEAD/GET, not a cached
         // preview or server-provided plaintext. Never pass the query/CEK.
-        const checked = await input.getChecked(
+        const checked = await getChecked(
           item.selected.objectId, item.selected.revision);
         assertLive();
         const opened = await preview.open({
