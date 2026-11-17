@@ -27,6 +27,14 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    sourceSets {
+        getByName("test") {
+            // The signed Node fixture is owned by :core. Keep it shared
+            // for JVM unit tests only; do not package it in the app APK.
+            resources.srcDir(project(":core").file("src/test/resources"))
+        }
+    }
 }
 
 kotlin {

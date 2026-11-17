@@ -39,6 +39,9 @@ internal fun interface TrustedContentGrantProvider {
     fun obtain(username: String, objectId: String): ProtectedContentGrant?
 }
 
+/** Authenticated HTTP bytes, structurally parsed but NOT independently signature-verified. */
+internal data class FetchedCiphertextPacket(val bytes: ByteArray, val record: SyncRecord)
+
 /**
  * App-internal, HTTPS-only bounded ciphertext transport.
  *
@@ -63,6 +66,18 @@ internal class ProtectedSyncFetch(
         session: LoginOutcome.Authenticated,
         objectId: String,
     ): SyncRecord {
+        val packet = fetchPacket(origin, session, objectId)
+        packet.bytes.fill(0)
+        return packet.record
+    }
+
+    fun fetchPacket(
+        origin: ServerOrigin,
+        session: LoginOutcome.Authenticated,
+        objectId: String,
+        maxResponseBytes: Int = MAX_RESPONSE_BYTES,
+    ): FetchedCiphertextPacket {
+        require(maxResponseBytes in 1..MAX_RESPONSE_BYTES)
         // Validate before opening the connection; the server checks these anew.
         val url = origin.syncObjectUrl(objectId)
         if (!ReadOnlyFileListPolicy.canList(session.permissions) ||
@@ -90,7 +105,7 @@ internal class ProtectedSyncFetch(
                     !connection.contentEncoding.equals("identity", ignoreCase = true))) {
                 throw IOException("Invalid protected sync response")
             }
-            if (connection.contentLengthLong > MAX_RESPONSE_BYTES) {
+            if (connection.contentLengthLong > maxResponseBytes) {
                 throw IOException("Protected sync response exceeds limit")
             }
             val deadlineNanos = System.nanoTime() + BODY_READ_DEADLINE_NANOS
@@ -105,7 +120,7 @@ internal class ProtectedSyncFetch(
                     }
                     val read = input.read(buffer)
                     if (read < 0) break
-                    if (read > MAX_RESPONSE_BYTES - size) {
+                    if (read > maxResponseBytes - size) {
                         throw IOException("Protected sync response exceeds limit")
                     }
                     output.write(buffer, 0, read)
@@ -115,7 +130,7 @@ internal class ProtectedSyncFetch(
             }
             val record = StrictSyncRecordJson.parse(body)
             if (record.objectId != objectId) throw IOException("Protected sync object mismatch")
-            return record
+            return FetchedCiphertextPacket(body, record)
         } finally {
             connection.disconnect()
         }
@@ -164,7 +179,7 @@ internal class ProtectedSyncFetch(
 }
 
 /** Exact field/type validation before turning attacker-controlled JSON into a wire model. */
-private object StrictSyncRecordJson {
+internal object StrictSyncRecordJson {
     private val FIELDS = setOf(
         "protocolVersion", "operationId", "objectId", "fileId", "versionId",
         "operation", "revision", "baseRevision", "keyEpoch", "compartmentId",

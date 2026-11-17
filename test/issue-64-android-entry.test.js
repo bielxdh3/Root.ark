@@ -34,3 +34,12 @@ test("Android auth flow uses real auth routes and pins HTTPS requests without fo
   assert.match(activity, /ServerOrigin\.parse/);
   assert.doesNotMatch(transport, /Log\.|printStackTrace|SharedPreferences|CookieManager/);
 });
+
+test("ciphertext capture UI delegates duplicate handling before clearing cached state and Keystore", () => {
+  const activity = fs.readFileSync(path.join(base, "java/dev/rootark/android/MainActivity.kt"), "utf8");
+  const capture = activity.slice(activity.indexOf('button(layout, "Capturar ciphertext criptografado")'),
+    activity.indexOf('button(layout, "Voltar")', activity.indexOf('button(layout, "Capturar ciphertext criptografado")')));
+  assert.match(capture, /CiphertextCaptureFailurePolicy\.handle\(failure\)\s*\{\s*runCatching\s*\{\s*stored\.clear\(\)/);
+  assert.match(capture, /LocalCipherCacheKey\.erase\(\)/);
+  assert.match(capture, /CiphertextCaptureUiResult\.ALREADY_CAPTURED/);
+});
