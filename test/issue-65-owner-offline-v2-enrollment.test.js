@@ -20,7 +20,8 @@ const cekBatch = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-versioned-cek-batch"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
-const { openProtectedRecipientShareFile } = (() => {
+const { openProtectedRecipientShareFile, createProtectedRecipientShareOffer,
+  openPortableProtectedRecipientShareFile } = (() => {
   try { return require("../src/crypto/rootark-zk1-recipient-share-cek"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
@@ -782,6 +783,403 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       authority: { ...linked, nowSeconds: now + 9 },
       operatorMinimumSequence: signedCommittedHead.sequence,
       metadata, deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9 };
+    assert.equal(typeof createProtectedRecipientShareOffer, "function",
+      "owner must be able to prepare one transferable, recipient-pinned signed offer");
+    assert.equal(typeof openPortableProtectedRecipientShareFile, "function",
+      "recipient must be able to import the portable offer without owner CEK material");
+    const recipientPin = { recipientUsername: "recipient", deviceId: fresh.request.device_id,
+      authorizationPublicKey: fresh.request.authorization_public_key,
+      hpkePublicKey: fresh.request.hpke_public_key };
+    // This issuer pin is obtained from the owner's independently trusted
+    // device identity, NOT from a candidate grant, server ACK or recipient.
+    const issuerPin = { deviceId: originalDevice.device_id,
+      authorizationPublicKey: b64(originalDevice.authorization_public_key) };
+    const ownerOfferArgs = { grant, recipientPin, issuerPin, readIndependentAuthority,
+      ownerPrivateKey: owner.privateKey, ownerHeldCek: Buffer.from(ownerHeldCek),
+      metadata, objectRevision: 1, ciphertext: Buffer.from(sealed),
+      ciphertextRoot: Buffer.from(root), authority: publicAuthority,
+      nowSeconds: now + 9 };
+    const offer = await createProtectedRecipientShareOffer(ownerOfferArgs);
+    assert.equal(offer.schema, "rootark-zk1-recipient-share-offer-dev/v1");
+    assert.equal(offer.authorizesProductionIo, false);
+    assert.equal(offer.externalCustodyProven, false);
+    assert.equal(JSON.stringify(offer).includes(b64(ownerHeldCek)), false,
+      "portable handoff must not contain an unwrapped owner CEK");
+    const openedOffer = await openPortableProtectedRecipientShareFile({
+      offer: JSON.parse(JSON.stringify(offer)), redeemInput: recipientShareInput,
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9 });
+    assert.deepEqual(Buffer.from(openedOffer.data), bytes,
+      "a separately authenticated recipient account/device opens the real AEAD bytes");
+    openedOffer.data.fill(0);
+    // A poisoned array can have revoked REAL entries but override .map() to
+    // return an unrelated, healthy roster. A current owner-signed grant must
+    // never rely on that caller-controlled method for live membership.
+    let poisonedRosterReads = 0;
+    let poisonedMapCalls = 0;
+    await assert.rejects(createProtectedRecipientShareOffer({
+      ...ownerOfferArgs,
+      readIndependentAuthority: async () => {
+        poisonedRosterReads++;
+        const current = await readIndependentAuthority();
+        const actualDevices = current.devices.map((row) =>
+          row.deviceId === fresh.request.device_id
+            ? { ...row, revokedAtEpoch: metadata.epoch } : { ...row });
+        const apparentlyHealthyDevices = current.devices.map((row) => ({ ...row }));
+        Object.defineProperty(actualDevices, "map", { value: () => {
+          poisonedMapCalls++;
+          return apparentlyHealthyDevices;
+        } });
+        return { ...current, devices: actualDevices };
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "a poisoned array method must not hide the real recipient revocation");
+    assert.equal(poisonedRosterReads, 1,
+      "the revoked physical roster must fail before CEK sealing begins");
+    assert.equal(poisonedMapCalls, 0,
+      "authority inspection may not execute a caller-supplied array method");
+    // The recipient's final independent roster read follows HTTP, HPKE and
+    // file AEAD. A shadowed .filter() must not hide a revoked recipient here.
+    // The existing HTTP signer and owner-witness ceremony remain authentic.
+    let poisonedFilterReads = 0;
+    let poisonedFilterCalls = 0;
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer: JSON.parse(JSON.stringify(offer)),
+      redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+        poisonedFilterReads++;
+        const current = await readIndependentAuthority();
+        const actualDevices = current.devices.map((row) =>
+          row.deviceId === fresh.request.device_id
+            ? { ...row, revokedAtEpoch: metadata.epoch } : { ...row });
+        const apparentlyHealthyDevices = current.devices.map((row) => ({ ...row }));
+        Object.defineProperty(actualDevices, "filter", { value: (predicate) => {
+          poisonedFilterCalls++;
+          return apparentlyHealthyDevices.filter(predicate);
+        } });
+        return { ...current, devices: actualDevices };
+      } },
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "recipient release must reject physical revocation despite an overridden filter");
+    assert.equal(poisonedFilterReads, 3,
+      "exercise both signed HTTP roster reads and the post-AEAD release read");
+    assert.equal(poisonedFilterCalls, 4,
+      "HTTP admission verifies recipient and issuer at each of its two roster reads");
+    // Array.isArray(proxy) is true. A Proxy can also fake OWN INDEX DATA
+    // DESCRIPTORS, defeating descriptor-only snapshots (not just .map).
+    // Native isProxy must reject it before inspecting any forged descriptor.
+    let proxyDescriptorReads = 0;
+    let proxyFilterCalls = 0;
+    let proxyMapCalls = 0;
+    const forgedRoster = async () => {
+      const current = await readIndependentAuthority();
+      const physical = current.devices.map((row) =>
+        row.deviceId === fresh.request.device_id
+          ? { ...row, revokedAtEpoch: metadata.epoch } : { ...row });
+      const healthy = current.devices.map((row) => ({ ...row }));
+      const masked = new Proxy(physical, {
+        get(target, field, receiver) {
+          if (field === "map") return (callback) => {
+            proxyMapCalls++;
+            return healthy.map(callback);
+          };
+          if (field === "filter") return (callback) => {
+            proxyFilterCalls++;
+            return healthy.filter(callback);
+          };
+          return Reflect.get(target, field, receiver);
+        },
+        getOwnPropertyDescriptor(target, field) {
+          const descriptor = Reflect.getOwnPropertyDescriptor(target, field);
+          if (typeof field === "string" && /^(0|[1-9]\d*)$/.test(field)) {
+            proxyDescriptorReads++;
+            return { ...descriptor, value: healthy[Number(field)] };
+          }
+          return descriptor;
+        },
+      });
+      assert.equal(Array.isArray(masked), true, "exercise a genuine array Proxy");
+      return { ...current, devices: masked };
+    };
+    let proxyOfferReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, readIndependentAuthority: async () => {
+        proxyOfferReads++;
+        return forgedRoster();
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "no signed offer may be created from a Proxy masking revoked physical indices");
+    assert.equal(proxyOfferReads, 1);
+    assert.equal(proxyDescriptorReads, 0, "never consult forged index descriptors");
+    assert.equal(proxyMapCalls, 0, "never consult forged map");
+    let proxyRedeemReads = 0;
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer: JSON.parse(JSON.stringify(offer)),
+      redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+        proxyRedeemReads++;
+        return forgedRoster();
+      } },
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "recipient plaintext release must reject Proxy-forged revocation after real AEAD");
+    assert.equal(proxyRedeemReads, 3, "exercise two HTTP reads and final post-AEAD roster read");
+    assert.equal(proxyFilterCalls, 4, "early HTTP readers were truly fooled by filter");
+    assert.equal(proxyDescriptorReads, 0, "final Node gate must deny before descriptor traps");
+    // These P2 regressions use the same genuine owner V2 approval, witness
+    // receipt, signed grant, SQLite-reopened ciphertext and AEAD/HPKE ceremony
+    // as the successful offer above. An unrelated synthetic clock or raw GCM
+    // ciphertext would reject BEFORE reaching the intended checks.
+    const offerNow = () => Math.floor(Date.now() / 1000);
+    const freshOfferArgs = (overrides = {}) => ({ ...ownerOfferArgs,
+      nowSeconds: offerNow(), ...overrides });
+    assert.ok(offerNow() < grant.expiresAt, "real signed grant remains live");
+
+    // A newly signed but future-dated grant must not reach even the first
+    // independent roster read, despite valid issuer Ed25519 provenance.
+    const futureMessage = await shareGrantMessageV1({ ...grantInput,
+      authorization: { ...shareAuthorization, issued_at: offerNow() + 50 } });
+    const futureGrant = { ...grant,
+      shareStatementBase64: b64(futureMessage.subarray(Buffer.byteLength(
+        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: b64(crypto.sign(null, futureMessage, originalActor)) };
+    let futureReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer(freshOfferArgs({
+      grant: futureGrant, readIndependentAuthority: async () => {
+        futureReads++;
+        return readIndependentAuthority();
+      },
+    })), /ZK_SHARE_OFFER_DENIED/,
+    "valid owner signature must not allow a future-dated share grant");
+    assert.equal(futureReads, 0, "future-issued grant rejected before roster trust");
+
+    // An invalid *unrelated* roster row must be caught by snapshotAuthority,
+    // not the older issuer/recipient-only active-device checks.
+    let malformedReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer(freshOfferArgs({
+      readIndependentAuthority: async () => {
+        malformedReads++;
+        const current = await readIndependentAuthority();
+        return { ...current, devices: [...current.devices, {
+          ...current.devices[0], deviceId: "unrelated-roster-device", enrolledEpoch: 1.5,
+        }] };
+      },
+    })), /ZK_SHARE_OFFER_DENIED/,
+    "even a nonparticipant's malformed enrollment epoch invalidates the authority snapshot");
+    assert.equal(malformedReads, 1,
+      "malformed roster detected on the first actual authority read");
+
+    // The old isolated P2 fixture rejected at its unrelated synthetic-clock
+    // preflight. Cover every malformed head/device case against this valid
+    // signed V2 owner/witness ceremony instead, and prove the roster was read.
+    const invalidAuthority = [
+      ["negative head revision", (current) => ({ ...current,
+        head: { ...current.head, revision: -1 } })],
+      ["fractional head revision", (current) => ({ ...current,
+        head: { ...current.head, revision: 1.5 } })],
+      ["negative head epoch", (current) => ({ ...current,
+        head: { ...current.head, epoch: -1 } })],
+      ["text head revision", (current) => ({ ...current,
+        head: { ...current.head, revision: "1" } })],
+      ...[
+        ["negative enrollment", { enrolledEpoch: -1 }],
+        ["fractional enrollment", { enrolledEpoch: 1.5 }],
+        ["revocation before enrollment", { enrolledEpoch: 2, revokedAtEpoch: 1 }],
+        ["negative revocation", { revokedAtEpoch: -1 }],
+        ["text revocation", { revokedAtEpoch: "revoked" }],
+      ].map(([label, changes]) => [label, (current) => ({ ...current,
+        devices: [...current.devices, { ...current.devices[0],
+          deviceId: "unrelated-invalid-device", ...changes }],
+      })]),
+    ];
+    for (const [label, change] of invalidAuthority) {
+      let reads = 0;
+      await assert.rejects(createProtectedRecipientShareOffer(freshOfferArgs({
+        readIndependentAuthority: async () => {
+          reads++;
+          return change(await readIndependentAuthority());
+        },
+      })), /ZK_SHARE_OFFER_DENIED/, label);
+      assert.equal(reads, 1, `${label} must be rejected during the genuine first authority read`);
+    }
+
+    // Reach the second read AFTER authentic owner AEAD and HPKE sealing. The
+    // currentAuthority signed-head equality also rejects this rollback, so
+    // this is a boundary-coverage check, not a fabricated old-SHA RED claim.
+    let regressionReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer(freshOfferArgs({
+      readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++regressionReads === 2) current.head.revision--;
+        return current;
+      },
+    })), /ZK_SHARE_OFFER_DENIED/,
+    "the second independent authority read must reject head rollback");
+    assert.equal(regressionReads, 2,
+      "owner AEAD/HPKE sealing must complete before the rollback oracle runs");
+
+    // Feed a valid, successfully opened portable offer to this negative case.
+    // An own getter in the recipient login must be rejected WITHOUT firing.
+    const hostileRedeem = { ...recipientShareInput };
+    let recipientGetterReads = 0;
+    Object.defineProperty(hostileRedeem, "recipientUsername", { get() {
+      recipientGetterReads++;
+      return recipientShareInput.recipientUsername;
+    } });
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer: JSON.parse(JSON.stringify(offer)), redeemInput: hostileRedeem,
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "a real portable offer must not execute caller-owned login accessors");
+    assert.equal(recipientGetterReads, 0,
+      "portable offer matching must use own data descriptors, not getters");
+
+    for (const [label, changes] of [
+      ["wrong cross-account user", { recipientPin: { ...recipientPin,
+        recipientUsername: "attacker" } }],
+      ["different recipient Ed25519", { recipientPin: { ...recipientPin,
+        authorizationPublicKey: b64(crypto.randomBytes(32)) } }],
+      ["different recipient X25519", { recipientPin: { ...recipientPin,
+        hpkePublicKey: b64(crypto.randomBytes(32)) } }],
+      ["different recipient device", { recipientPin: { ...recipientPin,
+        deviceId: "other-device" } }],
+      ["forged owner share proof", { grant: { ...grant,
+        shareSignatureBase64: b64(crypto.randomBytes(64)) } }],
+      ["expired grant", { grant: { ...grant, expiresAt: now + 7 } }],
+      ["wrong object ciphertext", { ciphertext: crypto.randomBytes(sealed.length) }],
+      ["wrong owner epoch", { metadata: { ...metadata, epoch: metadata.epoch + 1 } }],
+      ["missing external authority", { readIndependentAuthority: null }],
+      ["owner revoked", { readIndependentAuthority: async () => ({
+        ...await readIndependentAuthority(), devices: (await readIndependentAuthority()).devices
+          .map((row) => row.deviceId === originalDevice.device_id
+            ? { ...row, revokedAtEpoch: metadata.epoch } : row) }) }],
+    ]) {
+      await assert.rejects(createProtectedRecipientShareOffer({ ...ownerOfferArgs,
+        ...changes }), /ZK_SHARE_OFFER_DENIED/, label);
+    }
+    let offerReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer({ ...ownerOfferArgs,
+      readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++offerReads === 2) current.devices.find((row) =>
+          row.deviceId === fresh.request.device_id).revokedAtEpoch = metadata.epoch;
+        return current;
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "revocation after real AEAD + HPKE sealing must stop owner offer release");
+    assert.equal(offerReads, 2);
+    // A recipient controls their own valid enrolled Ed25519 signer and can
+    // locally manufacture an ACK with the exact server response shape.
+    // Independent V2 roster membership is NOT proof that they are an owner
+    // trusted to authorize a share of the owner's retained file CEK.
+    const fakeGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
+      authorization: { ...shareAuthorization, device_id: fresh.request.device_id } };
+    const fakeGrantMessage = await shareGrantMessageV1(fakeGrantInput);
+    const fakeGrant = { grantId: fakeGrantInput.grantId,
+      expiresAt: fakeGrantInput.expiresAt,
+      shareStatementBase64: b64(fakeGrantMessage.subarray(Buffer.byteLength(
+        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: b64(crypto.sign(null, fakeGrantMessage,
+        fresh.signer.privateKey)) };
+    await assert.rejects(createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, grant: fakeGrant,
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "recipient-signed fake server-looking grant ACK may not unlock owner's CEK");
+    for (const [label, badPin] of [
+      ["recipient self-pins issuer", { deviceId: fresh.request.device_id,
+        authorizationPublicKey: fresh.request.authorization_public_key }],
+      ["wrong issuer identity", { ...issuerPin, deviceId: fresh.request.device_id }],
+      ["wrong issuer Ed25519 pin", { ...issuerPin,
+        authorizationPublicKey: fresh.request.authorization_public_key }],
+    ]) {
+      await assert.rejects(createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, grant: fakeGrant, issuerPin: badPin,
+      }), /ZK_SHARE_OFFER_DENIED/, label);
+    }
+    await assert.rejects(createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, issuerPin: { ...issuerPin,
+        authorizationPublicKey: b64(crypto.randomBytes(32)) },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "even a genuine owner signature cannot substitute an independently pinned issuer key");
+    await assert.rejects(createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, issuerPin: null,
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "an absent independently trusted issuer identity fails closed");
+    let issuerReads = 0;
+    await assert.rejects(createProtectedRecipientShareOffer({ ...ownerOfferArgs,
+      readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++issuerReads === 2) current.devices.find((row) =>
+          row.deviceId === issuerPin.deviceId).revokedAtEpoch = metadata.epoch;
+        return current;
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "owner-pinned issuer revoked after genuine HPKE sealing fails before export");
+    assert.equal(issuerReads, 2);
+    // The authentic owner-approved HPKE envelope has a shorter lifetime than
+    // this independently owner-signed grant. Advance only the wall clock in
+    // the SECOND authority read, after the real AEAD + HPKE sealing awaits.
+    const longGrantInput = { ...grantInput,
+      expiresAt: envelope.core.expires_at + 120 };
+    const longGrantBytes = await shareGrantMessageV1(longGrantInput);
+    const longGrant = { grantId: longGrantInput.grantId,
+      expiresAt: longGrantInput.expiresAt,
+      shareStatementBase64: b64(longGrantBytes.subarray(Buffer.byteLength(
+        "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+      shareSignatureBase64: b64(crypto.sign(null, longGrantBytes, originalActor)) };
+    assert.ok(longGrant.expiresAt > envelope.core.expires_at,
+      "signed grant remains current after the real CEK offer expires");
+    const expiryOriginalWallClock = Date.now;
+    let expiryReads = 0;
+    try {
+      await assert.rejects(createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, grant: longGrant,
+        readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++expiryReads === 2) {
+            Date.now = () => (envelope.core.expires_at + 1) * 1000;
+          }
+          return current;
+        },
+      }), /ZK_SHARE_OFFER_DENIED/,
+      "a valid grant cannot export a newly expired, owner-signed HPKE envelope");
+    } finally { Date.now = expiryOriginalWallClock; }
+    assert.equal(expiryReads, 2,
+      "the test must expire the envelope only at the second independent authority read");
+    const maliciousOffer = { ...ownerOfferArgs };
+    let getterRuns = 0;
+    Object.defineProperty(maliciousOffer, "recipientPin", { enumerable: true,
+      get() { getterRuns++; throw Error("GETTER_CALLED"); } });
+    await assert.rejects(createProtectedRecipientShareOffer(maliciousOffer),
+      /ZK_SHARE_OFFER_DENIED/);
+    assert.equal(getterRuns, 0, "owner input getters must not run");
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer: { ...offer, grant: { ...offer.grant, grantId: b64(crypto.randomBytes(32)) } },
+      redeemInput: recipientShareInput, authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "tampered portable grant must fail before ciphertext release");
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer, redeemInput: { ...recipientShareInput, recipientUsername: "attacker" },
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "recipient login cannot be relabelled while importing");
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer, redeemInput: { ...recipientShareInput,
+        fetchImpl: async () => new Response(JSON.stringify({ error: "ZK_SHARE_DENIED" }),
+          { status: 403, headers: { "content-type": "application/json" } }) },
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "revoked server grant cannot be bypassed by an otherwise valid portable CEK offer");
     const shared = await openProtectedRecipientShareFile(bridgeArgs);
     assert.deepEqual(Buffer.from(shared.data), bytes);
     assert.equal(shared.authorizesProductionIo, false);
@@ -790,25 +1188,25 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     // starts file AEAD, but its owner approval/witness expires DURING the
     // final file decrypt. Share grant expires later, so checking only the
     // share expiry at return is a false-green authorization boundary.
-    const longGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
+    const postDecryptGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
       expiresAt: Math.max(envelope.core.expires_at,
         issued.approval.expires_at, signedCommittedHead.expires_at) + 120 };
-    const longMessage = await shareGrantMessageV1(longGrantInput);
-    const longGrant = { grantId: longGrantInput.grantId,
-      expiresAt: longGrantInput.expiresAt,
+    const longMessage = await shareGrantMessageV1(postDecryptGrantInput);
+    const postDecryptGrant = { grantId: postDecryptGrantInput.grantId,
+      expiresAt: postDecryptGrantInput.expiresAt,
       shareStatementBase64: b64(longMessage.subarray(Buffer.byteLength(
         "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
       shareSignatureBase64: b64(crypto.sign(null, longMessage, originalActor)) };
-    const longShareInput = { ...recipientShareInput, grant: longGrant,
+    const longShareInput = { ...recipientShareInput, grant: postDecryptGrant,
       fetchImpl: async () => new Response(JSON.stringify({
         id: metadata.object_id, revision: 1, epoch: metadata.epoch,
         ciphertextBase64: b64(recoveredCiphertext),
-        shareStatementBase64: longGrant.shareStatementBase64,
-        shareSignatureBase64: longGrant.shareSignatureBase64,
+        shareStatementBase64: postDecryptGrant.shareStatementBase64,
+        shareSignatureBase64: postDecryptGrant.shareSignatureBase64,
       }), { status: 200, headers: { "content-type": "application/json" } }) };
     const firstExpiry = Math.min(envelope.core.expires_at,
       issued.approval.expires_at, signedCommittedHead.expires_at);
-    assert.ok(longGrant.expiresAt > firstExpiry + 2,
+    assert.ok(postDecryptGrant.expiresAt > firstExpiry + 2,
       "the genuinely signed share must still be live after owner/witness expiration");
     const encodedFile = JSON.parse(recoveredCiphertext.toString("utf8"));
     const fileAeadCipherLength = Buffer.from(encodedFile.ciphertext, "base64url").length;
