@@ -27,8 +27,11 @@ class SyncListingValidationException(message: String, cause: Throwable? = null) 
 
 /** HTTP adapter for canonical login/TOTP and the bounded, read-only sync listing. */
 internal class AuthHttpTransport(
+    private val clockNanos: () -> Long = System::nanoTime,
     private val openInventoryConnection: (URL) -> URLConnection = { it.openConnection() },
 ) {
+    companion object { const val INVENTORY_READ_DEADLINE_NANOS = 30_000_000_000L }
+
     fun login(origin: ServerOrigin, username: String, password: String): LoginOutcome {
         val (status, json) = post(origin.loginUrl(), JSONObject().put("username", username).put("password", password))
         if (status == 403) {
@@ -72,6 +75,7 @@ internal class AuthHttpTransport(
             connection.setRequestProperty("Accept", "application/json")
             connection.setRequestProperty("Accept-Encoding", "identity")
             connection.setRequestProperty("Cache-Control", "no-store")
+            val requestStartedAt = clockNanos()
             val status = connection.responseCode
             if (status != 200) throw RootArkApiException(status)
             val mime = connection.contentType?.substringBefore(';')?.trim()
@@ -86,7 +90,13 @@ internal class AuthHttpTransport(
                 val buffer = ByteArray(4096)
                 var total = 0
                 while (true) {
+                    if (clockNanos() - requestStartedAt >= INVENTORY_READ_DEADLINE_NANOS) {
+                        throw SyncListingException("Inventory response exceeded read deadline")
+                    }
                     val count = stream.read(buffer)
+                    if (clockNanos() - requestStartedAt >= INVENTORY_READ_DEADLINE_NANOS) {
+                        throw SyncListingException("Inventory response exceeded read deadline")
+                    }
                     if (count < 0) break
                     total += count
                     if (total > PagedInventoryPolicy.MAX_RESPONSE_BYTES) {

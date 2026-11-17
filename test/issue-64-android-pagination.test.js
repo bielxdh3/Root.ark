@@ -24,8 +24,8 @@ test("Android pages remain memory only and restart on revoked or changed cursor"
   assert.match(activity, /loadInventoryPage/);
   assert.match(activity, /showInventoryPage/);
   assert.match(activity, /401\s*->\s*showLogin/);
-  assert.match(activity, /403\s*->\s*showSession/);
-  assert.match(activity, /409\s*->\s*showSession/);
+  assert.match(activity, /403\s*->\s*showLogin/);
+  assert.match(activity, /409\s*->\s*\{\s*offlineInventory\?\.clear\(\)\s*showSession/);
   assert.match(activity, /onStop\(/);
   assert.doesNotMatch(activity, /\.ciphertext|\.nonce|\.aad|\.tag|\.authorization/);
 });
