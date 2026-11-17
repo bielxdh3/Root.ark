@@ -185,6 +185,21 @@
       || (typeof location === "object" && location.origin && location.origin !== url.origin)) deny();
     return url.origin + "/zk-1/v1/share/read";
   }
+  function cookieCsrfToken() {
+    // Root.ark's cookie session requires a double-submit CSRF header for POST.
+    // Bearer-based or Node callers can keep using their trusted fetchImpl.
+    if (typeof document !== "object" || typeof document.cookie !== "string") return "";
+    const matches = document.cookie.split(";").map((part) => part.trim())
+      .filter((part) => part.startsWith("rootark_csrf="));
+    if (matches.length === 0) return "";
+    if (matches.length !== 1) deny();
+    const encoded = matches[0].slice("rootark_csrf=".length);
+    if (!encoded || encoded.length > 512) deny();
+    let token;
+    try { token = decodeURIComponent(encoded); } catch (_) { deny(); }
+    if (!token || token.length > 512 || /[\r\n]/.test(token)) deny();
+    return token;
+  }
   async function limitedJson(response) {
     if (response?.status !== 200 || !response.body || !response.headers
       || !/^application\/json(?:;\s*charset=utf-8)?$/i.test(
@@ -219,8 +234,14 @@
         ...(Object.hasOwn(input, "nowSeconds") ? ["nowSeconds"] : [])];
       exact(input, keys);
       exact(input.grant, ["grantId", "expiresAt", "shareStatementBase64", "shareSignatureBase64"]);
+      // Capture the caller's OWN data callback once, before any crypto/network
+      // await. A mutable input must not replace the final independent trust
+      // reader with an older (but still active) roster during fetchImpl().
+      const authorityDescriptor = Object.getOwnPropertyDescriptor(input, "readIndependentAuthority");
+      if (!authorityDescriptor || !Object.hasOwn(authorityDescriptor, "value")
+        || typeof authorityDescriptor.value !== "function") deny();
+      const readIndependentAuthority = authorityDescriptor.value.bind(input);
       if (!crypto?.subtle || !protectedHttp?.signProtectedContentOperation
-        || typeof input.readIndependentAuthority !== "function"
         || typeof input.recipientUsername !== "string"
         || !/^[A-Za-z0-9_.@-]{1,128}$/.test(input.recipientUsername)
         || !input.signerKey || input.signerKey.type !== "private"
@@ -248,7 +269,7 @@
         if (value >= statement.expires_at) deny();
         return value;
       };
-      const first = trustedSnapshot(await input.readIndependentAuthority(),
+      const first = trustedSnapshot(await readIndependentAuthority(),
         statement, recipientDeviceId);
       const issuer = await crypto.subtle.importKey("raw", first.issuerKey,
         "Ed25519", false, ["verify"]);
@@ -280,10 +301,12 @@
           controller.abort(); rejectDeadline(new Error("ZK_SHARE_DEADLINE"));
         }, 15000);
         const work = (async () => {
+          const csrf = cookieCsrfToken();
           const response = await fetchImpl(url, {
             method: "POST", redirect: "error", credentials: "same-origin",
             cache: "no-store", mode: "same-origin", signal: controller.signal,
-            headers: { "content-type": "application/json", accept: "application/json" },
+            headers: { "content-type": "application/json", accept: "application/json",
+              ...(csrf ? { "x-csrf-token": csrf } : {}) },
             body: JSON.stringify({ grantId: grant.grantId,
               authorization: signed.authorization, signatureBase64: signed.signatureBase64 }),
           });
@@ -300,7 +323,7 @@
         ciphertext = from64(response.ciphertextBase64, 16, MAX_CIPHERTEXT);
         const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", ciphertext));
         if (!equals(digest, statement.ciphertext_digest)) deny();
-        const final = trustedSnapshot(await input.readIndependentAuthority(),
+        const final = trustedSnapshot(await readIndependentAuthority(),
           statement, recipientDeviceId);
         if (!equals(final.issuerKey, first.issuerKey)
           || !equals(final.recipientKey, first.recipientKey)) deny();
