@@ -3,20 +3,34 @@
 // DEV-OFF cryptographic protocol primitives. A signature or Merkle proof never
 // establishes independent off-host custody, freshness, or permission for I/O.
 const crypto = require("node:crypto");
+const { types: { isProxy } } = require("node:util");
 const DOMAIN_OWNER = Buffer.from("Root.ark/zk10/owner-account-cutover/v1\0");
 const DOMAIN_ROTATION = Buffer.from("Root.ark/zk10/owner-rotation/v1\0");
 // Read native identity from Node prototypes, not caller-shadowable .type,
 // .asymmetricKeyType or .export properties. Public KeyObjects must also be
 // reimported: a prototype-derived wrapper can change its internal kHandle
 // between an SPKI hash and crypto.verify, even with native methods.
-const PUBLIC_KEY_PROTOTYPE = Object.getPrototypeOf(crypto.createPublicKey({
+const PUBLIC_KEY_FIXTURE = crypto.createPublicKey({
   key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
   format: "der", type: "spki",
-}));
-const NATIVE_TYPE = Object.getOwnPropertyDescriptor(crypto.KeyObject.prototype, "type").get;
-const NATIVE_ALGORITHM = Object.getOwnPropertyDescriptor(
-  Object.getPrototypeOf(PUBLIC_KEY_PROTOTYPE), "asymmetricKeyType").get;
-const NATIVE_PUBLIC_EXPORT = Object.getOwnPropertyDescriptor(PUBLIC_KEY_PROTOTYPE, "export").value;
+});
+const GET_PROTOTYPE = Object.getPrototypeOf.bind(Object);
+const OWN_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
+const HAS_OWN = Object.hasOwn.bind(Object);
+const NATIVE_APPLY = Reflect.apply.bind(Reflect);
+const PUBLIC_KEY_PROTOTYPE = GET_PROTOTYPE(PUBLIC_KEY_FIXTURE);
+const PRIVATE_KEY_PROTOTYPE = GET_PROTOTYPE(crypto.generateKeyPairSync("ed25519").privateKey);
+const NATIVE_HANDLE = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
+  .find((symbol) => symbol.description === "kHandle");
+const NATIVE_KEY_TYPE = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
+  .find((symbol) => symbol.description === "kKeyType");
+const NATIVE_HANDLE_PROTOTYPE = GET_PROTOTYPE(OWN_DESCRIPTOR(PUBLIC_KEY_FIXTURE, NATIVE_HANDLE).value);
+const NATIVE_HANDLE_ALGORITHM = OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType").value;
+const NATIVE_HANDLE_EXPORT = OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "export").value;
+const NATIVE_TYPE = OWN_DESCRIPTOR(crypto.KeyObject.prototype, "type").get;
+const NATIVE_ALGORITHM = OWN_DESCRIPTOR(
+  GET_PROTOTYPE(PUBLIC_KEY_PROTOTYPE), "asymmetricKeyType").get;
+const NATIVE_PUBLIC_EXPORT = OWN_DESCRIPTOR(PUBLIC_KEY_PROTOTYPE, "export").value;
 const OWNER_FIELDS = Object.freeze(["type", "immutable_account_id", "zk_account_id",
   "generation", "previous_cutover_digest", "inventory_head", "complete_corpus",
   "covered_compartments", "legacy_egress_scope", "reference_disposition",
@@ -52,24 +66,44 @@ function decode(value, length) {
 function hex(value) { if (typeof value !== "string" || !HEX.test(value)) deny(); return value; }
 function key(value, type) {
   try {
-    if (!(value instanceof crypto.KeyObject) || NATIVE_TYPE.call(value) !== type
-      || NATIVE_ALGORITHM.call(value) !== "ed25519") deny();
+    // Neither a fake DATA kHandle nor an accessor-backed kKeyType may reach
+    // native KeyObject accessors: both can execute caller-controlled JS.
+    if (type !== "public" && type !== "private") deny();
+    if (isProxy(value) || !(value instanceof crypto.KeyObject)
+      || GET_PROTOTYPE(value) !== (type === "public"
+        ? PUBLIC_KEY_PROTOTYPE : PRIVATE_KEY_PROTOTYPE)) deny();
+    const handle = NATIVE_HANDLE && OWN_DESCRIPTOR(value, NATIVE_HANDLE);
+    const keyType = NATIVE_KEY_TYPE && OWN_DESCRIPTOR(value, NATIVE_KEY_TYPE);
+    if (!handle || !HAS_OWN(handle, "value")
+      || !keyType || !HAS_OWN(keyType, "value") || keyType.value !== type
+      || !handle.value || typeof handle.value !== "object"
+      || isProxy(handle.value)
+      || GET_PROTOTYPE(handle.value) !== NATIVE_HANDLE_PROTOTYPE
+      || HAS_OWN(handle.value, "getAsymmetricKeyType")
+      || HAS_OWN(handle.value, "export")
+      || OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType")?.value
+        !== NATIVE_HANDLE_ALGORITHM
+      || OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "export")?.value
+        !== NATIVE_HANDLE_EXPORT
+      || NATIVE_APPLY(NATIVE_HANDLE_ALGORITHM, handle.value, []) !== "ed25519"
+      || NATIVE_APPLY(NATIVE_TYPE, value, []) !== type
+      || NATIVE_APPLY(NATIVE_ALGORITHM, value, []) !== "ed25519") deny();
     if (type === "private") return value; // Never export private key material.
     if (type !== "public") deny();
     // Take one native SPKI snapshot, then discard the supplied reference.
     // Subsequent hash and signature checks use only the fresh, native key.
-    const der = NATIVE_PUBLIC_EXPORT.call(value, { format: "der", type: "spki" });
+    const der = NATIVE_APPLY(NATIVE_PUBLIC_EXPORT, value, [{ format: "der", type: "spki" }]);
     if (!Buffer.isBuffer(der) || der.length !== 44) deny();
     const canonical = crypto.createPublicKey({ key: Buffer.from(der),
       format: "der", type: "spki" });
-    if (NATIVE_TYPE.call(canonical) !== "public"
-      || NATIVE_ALGORITHM.call(canonical) !== "ed25519") deny();
+    if (NATIVE_APPLY(NATIVE_TYPE, canonical, []) !== "public"
+      || NATIVE_APPLY(NATIVE_ALGORITHM, canonical, []) !== "ed25519") deny();
     return canonical;
   } catch (_) { deny(); }
 }
 function spkiHash(publicKey) {
-  return H(NATIVE_PUBLIC_EXPORT.call(key(publicKey, "public"),
-    { format: "der", type: "spki" })).toString("hex");
+  return H(NATIVE_APPLY(NATIVE_PUBLIC_EXPORT, key(publicKey, "public"),
+    [{ format: "der", type: "spki" }])).toString("hex");
 }
 function ownerPayload(payload) {
   const p = exact(payload, OWNER_FIELDS);
