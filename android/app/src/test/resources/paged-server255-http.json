@@ -1,0 +1,3551 @@
+{
+  "generatedBy": "test/issue-64-android-pagination-real-http.test.js",
+  "source": "PR #255 3ccf955874271546b61ecac09d77227612d330fe",
+  "pages": [
+    {
+      "status": 200,
+      "body": {
+        "protocolVersion": 2,
+        "view": "metadata",
+        "objects": [
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-000",
+            "objectId": "alice-file-000",
+            "fileId": "file-alice-file-000",
+            "versionId": "version-alice-file-000",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-000",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-000.txt",
+              "path": "docs/alice-file-000.txt",
+              "size": 3,
+              "versionId": "version-alice-file-000"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-001",
+            "objectId": "alice-file-001",
+            "fileId": "file-alice-file-001",
+            "versionId": "version-alice-file-001",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-001",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-001.txt",
+              "path": "docs/alice-file-001.txt",
+              "size": 3,
+              "versionId": "version-alice-file-001"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-002",
+            "objectId": "alice-file-002",
+            "fileId": "file-alice-file-002",
+            "versionId": "version-alice-file-002",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-002",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-002.txt",
+              "path": "docs/alice-file-002.txt",
+              "size": 3,
+              "versionId": "version-alice-file-002"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-003",
+            "objectId": "alice-file-003",
+            "fileId": "file-alice-file-003",
+            "versionId": "version-alice-file-003",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-003",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-003.txt",
+              "path": "docs/alice-file-003.txt",
+              "size": 3,
+              "versionId": "version-alice-file-003"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-004",
+            "objectId": "alice-file-004",
+            "fileId": "file-alice-file-004",
+            "versionId": "version-alice-file-004",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-004",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-004.txt",
+              "path": "docs/alice-file-004.txt",
+              "size": 3,
+              "versionId": "version-alice-file-004"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-005",
+            "objectId": "alice-file-005",
+            "fileId": "file-alice-file-005",
+            "versionId": "version-alice-file-005",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-005",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-005.txt",
+              "path": "docs/alice-file-005.txt",
+              "size": 3,
+              "versionId": "version-alice-file-005"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-006",
+            "objectId": "alice-file-006",
+            "fileId": "file-alice-file-006",
+            "versionId": "version-alice-file-006",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-006",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-006.txt",
+              "path": "docs/alice-file-006.txt",
+              "size": 3,
+              "versionId": "version-alice-file-006"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-007",
+            "objectId": "alice-file-007",
+            "fileId": "file-alice-file-007",
+            "versionId": "version-alice-file-007",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-007",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-007.txt",
+              "path": "docs/alice-file-007.txt",
+              "size": 3,
+              "versionId": "version-alice-file-007"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-008",
+            "objectId": "alice-file-008",
+            "fileId": "file-alice-file-008",
+            "versionId": "version-alice-file-008",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-008",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-008.txt",
+              "path": "docs/alice-file-008.txt",
+              "size": 3,
+              "versionId": "version-alice-file-008"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-009",
+            "objectId": "alice-file-009",
+            "fileId": "file-alice-file-009",
+            "versionId": "version-alice-file-009",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-009",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-009.txt",
+              "path": "docs/alice-file-009.txt",
+              "size": 3,
+              "versionId": "version-alice-file-009"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-010",
+            "objectId": "alice-file-010",
+            "fileId": "file-alice-file-010",
+            "versionId": "version-alice-file-010",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-010",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-010.txt",
+              "path": "docs/alice-file-010.txt",
+              "size": 3,
+              "versionId": "version-alice-file-010"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-011",
+            "objectId": "alice-file-011",
+            "fileId": "file-alice-file-011",
+            "versionId": "version-alice-file-011",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-011",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-011.txt",
+              "path": "docs/alice-file-011.txt",
+              "size": 3,
+              "versionId": "version-alice-file-011"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-012",
+            "objectId": "alice-file-012",
+            "fileId": "file-alice-file-012",
+            "versionId": "version-alice-file-012",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-012",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-012.txt",
+              "path": "docs/alice-file-012.txt",
+              "size": 3,
+              "versionId": "version-alice-file-012"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-013",
+            "objectId": "alice-file-013",
+            "fileId": "file-alice-file-013",
+            "versionId": "version-alice-file-013",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-013",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-013.txt",
+              "path": "docs/alice-file-013.txt",
+              "size": 3,
+              "versionId": "version-alice-file-013"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-014",
+            "objectId": "alice-file-014",
+            "fileId": "file-alice-file-014",
+            "versionId": "version-alice-file-014",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-014",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-014.txt",
+              "path": "docs/alice-file-014.txt",
+              "size": 3,
+              "versionId": "version-alice-file-014"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-015",
+            "objectId": "alice-file-015",
+            "fileId": "file-alice-file-015",
+            "versionId": "version-alice-file-015",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-015",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-015.txt",
+              "path": "docs/alice-file-015.txt",
+              "size": 3,
+              "versionId": "version-alice-file-015"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-016",
+            "objectId": "alice-file-016",
+            "fileId": "file-alice-file-016",
+            "versionId": "version-alice-file-016",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-016",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-016.txt",
+              "path": "docs/alice-file-016.txt",
+              "size": 3,
+              "versionId": "version-alice-file-016"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-017",
+            "objectId": "alice-file-017",
+            "fileId": "file-alice-file-017",
+            "versionId": "version-alice-file-017",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-017",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-017.txt",
+              "path": "docs/alice-file-017.txt",
+              "size": 3,
+              "versionId": "version-alice-file-017"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-018",
+            "objectId": "alice-file-018",
+            "fileId": "file-alice-file-018",
+            "versionId": "version-alice-file-018",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-018",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-018.txt",
+              "path": "docs/alice-file-018.txt",
+              "size": 3,
+              "versionId": "version-alice-file-018"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-019",
+            "objectId": "alice-file-019",
+            "fileId": "file-alice-file-019",
+            "versionId": "version-alice-file-019",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-019",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-019.txt",
+              "path": "docs/alice-file-019.txt",
+              "size": 3,
+              "versionId": "version-alice-file-019"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-020",
+            "objectId": "alice-file-020",
+            "fileId": "file-alice-file-020",
+            "versionId": "version-alice-file-020",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-020",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-020.txt",
+              "path": "docs/alice-file-020.txt",
+              "size": 3,
+              "versionId": "version-alice-file-020"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-021",
+            "objectId": "alice-file-021",
+            "fileId": "file-alice-file-021",
+            "versionId": "version-alice-file-021",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-021",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-021.txt",
+              "path": "docs/alice-file-021.txt",
+              "size": 3,
+              "versionId": "version-alice-file-021"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-022",
+            "objectId": "alice-file-022",
+            "fileId": "file-alice-file-022",
+            "versionId": "version-alice-file-022",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-022",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-022.txt",
+              "path": "docs/alice-file-022.txt",
+              "size": 3,
+              "versionId": "version-alice-file-022"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-023",
+            "objectId": "alice-file-023",
+            "fileId": "file-alice-file-023",
+            "versionId": "version-alice-file-023",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-023",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-023.txt",
+              "path": "docs/alice-file-023.txt",
+              "size": 3,
+              "versionId": "version-alice-file-023"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-024",
+            "objectId": "alice-file-024",
+            "fileId": "file-alice-file-024",
+            "versionId": "version-alice-file-024",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-024",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-024.txt",
+              "path": "docs/alice-file-024.txt",
+              "size": 3,
+              "versionId": "version-alice-file-024"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-025",
+            "objectId": "alice-file-025",
+            "fileId": "file-alice-file-025",
+            "versionId": "version-alice-file-025",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-025",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-025.txt",
+              "path": "docs/alice-file-025.txt",
+              "size": 3,
+              "versionId": "version-alice-file-025"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-026",
+            "objectId": "alice-file-026",
+            "fileId": "file-alice-file-026",
+            "versionId": "version-alice-file-026",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-026",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-026.txt",
+              "path": "docs/alice-file-026.txt",
+              "size": 3,
+              "versionId": "version-alice-file-026"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-027",
+            "objectId": "alice-file-027",
+            "fileId": "file-alice-file-027",
+            "versionId": "version-alice-file-027",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-027",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-027.txt",
+              "path": "docs/alice-file-027.txt",
+              "size": 3,
+              "versionId": "version-alice-file-027"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-028",
+            "objectId": "alice-file-028",
+            "fileId": "file-alice-file-028",
+            "versionId": "version-alice-file-028",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-028",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-028.txt",
+              "path": "docs/alice-file-028.txt",
+              "size": 3,
+              "versionId": "version-alice-file-028"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-029",
+            "objectId": "alice-file-029",
+            "fileId": "file-alice-file-029",
+            "versionId": "version-alice-file-029",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-029",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-029.txt",
+              "path": "docs/alice-file-029.txt",
+              "size": 3,
+              "versionId": "version-alice-file-029"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-030",
+            "objectId": "alice-file-030",
+            "fileId": "file-alice-file-030",
+            "versionId": "version-alice-file-030",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-030",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-030.txt",
+              "path": "docs/alice-file-030.txt",
+              "size": 3,
+              "versionId": "version-alice-file-030"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-031",
+            "objectId": "alice-file-031",
+            "fileId": "file-alice-file-031",
+            "versionId": "version-alice-file-031",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-031",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-031.txt",
+              "path": "docs/alice-file-031.txt",
+              "size": 3,
+              "versionId": "version-alice-file-031"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-032",
+            "objectId": "alice-file-032",
+            "fileId": "file-alice-file-032",
+            "versionId": "version-alice-file-032",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-032",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-032.txt",
+              "path": "docs/alice-file-032.txt",
+              "size": 3,
+              "versionId": "version-alice-file-032"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-033",
+            "objectId": "alice-file-033",
+            "fileId": "file-alice-file-033",
+            "versionId": "version-alice-file-033",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-033",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-033.txt",
+              "path": "docs/alice-file-033.txt",
+              "size": 3,
+              "versionId": "version-alice-file-033"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-034",
+            "objectId": "alice-file-034",
+            "fileId": "file-alice-file-034",
+            "versionId": "version-alice-file-034",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-034",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-034.txt",
+              "path": "docs/alice-file-034.txt",
+              "size": 3,
+              "versionId": "version-alice-file-034"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-035",
+            "objectId": "alice-file-035",
+            "fileId": "file-alice-file-035",
+            "versionId": "version-alice-file-035",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-035",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-035.txt",
+              "path": "docs/alice-file-035.txt",
+              "size": 3,
+              "versionId": "version-alice-file-035"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-036",
+            "objectId": "alice-file-036",
+            "fileId": "file-alice-file-036",
+            "versionId": "version-alice-file-036",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-036",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-036.txt",
+              "path": "docs/alice-file-036.txt",
+              "size": 3,
+              "versionId": "version-alice-file-036"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-037",
+            "objectId": "alice-file-037",
+            "fileId": "file-alice-file-037",
+            "versionId": "version-alice-file-037",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-037",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-037.txt",
+              "path": "docs/alice-file-037.txt",
+              "size": 3,
+              "versionId": "version-alice-file-037"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-038",
+            "objectId": "alice-file-038",
+            "fileId": "file-alice-file-038",
+            "versionId": "version-alice-file-038",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-038",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-038.txt",
+              "path": "docs/alice-file-038.txt",
+              "size": 3,
+              "versionId": "version-alice-file-038"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-039",
+            "objectId": "alice-file-039",
+            "fileId": "file-alice-file-039",
+            "versionId": "version-alice-file-039",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-039",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-039.txt",
+              "path": "docs/alice-file-039.txt",
+              "size": 3,
+              "versionId": "version-alice-file-039"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-040",
+            "objectId": "alice-file-040",
+            "fileId": "file-alice-file-040",
+            "versionId": "version-alice-file-040",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-040",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-040.txt",
+              "path": "docs/alice-file-040.txt",
+              "size": 3,
+              "versionId": "version-alice-file-040"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-041",
+            "objectId": "alice-file-041",
+            "fileId": "file-alice-file-041",
+            "versionId": "version-alice-file-041",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-041",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-041.txt",
+              "path": "docs/alice-file-041.txt",
+              "size": 3,
+              "versionId": "version-alice-file-041"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-042",
+            "objectId": "alice-file-042",
+            "fileId": "file-alice-file-042",
+            "versionId": "version-alice-file-042",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-042",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-042.txt",
+              "path": "docs/alice-file-042.txt",
+              "size": 3,
+              "versionId": "version-alice-file-042"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-043",
+            "objectId": "alice-file-043",
+            "fileId": "file-alice-file-043",
+            "versionId": "version-alice-file-043",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-043",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-043.txt",
+              "path": "docs/alice-file-043.txt",
+              "size": 3,
+              "versionId": "version-alice-file-043"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-044",
+            "objectId": "alice-file-044",
+            "fileId": "file-alice-file-044",
+            "versionId": "version-alice-file-044",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-044",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-044.txt",
+              "path": "docs/alice-file-044.txt",
+              "size": 3,
+              "versionId": "version-alice-file-044"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-045",
+            "objectId": "alice-file-045",
+            "fileId": "file-alice-file-045",
+            "versionId": "version-alice-file-045",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-045",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-045.txt",
+              "path": "docs/alice-file-045.txt",
+              "size": 3,
+              "versionId": "version-alice-file-045"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-046",
+            "objectId": "alice-file-046",
+            "fileId": "file-alice-file-046",
+            "versionId": "version-alice-file-046",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-046",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-046.txt",
+              "path": "docs/alice-file-046.txt",
+              "size": 3,
+              "versionId": "version-alice-file-046"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-047",
+            "objectId": "alice-file-047",
+            "fileId": "file-alice-file-047",
+            "versionId": "version-alice-file-047",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-047",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-047.txt",
+              "path": "docs/alice-file-047.txt",
+              "size": 3,
+              "versionId": "version-alice-file-047"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-048",
+            "objectId": "alice-file-048",
+            "fileId": "file-alice-file-048",
+            "versionId": "version-alice-file-048",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-048",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-048.txt",
+              "path": "docs/alice-file-048.txt",
+              "size": 3,
+              "versionId": "version-alice-file-048"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-049",
+            "objectId": "alice-file-049",
+            "fileId": "file-alice-file-049",
+            "versionId": "version-alice-file-049",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-049",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-049.txt",
+              "path": "docs/alice-file-049.txt",
+              "size": 3,
+              "versionId": "version-alice-file-049"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-050",
+            "objectId": "alice-file-050",
+            "fileId": "file-alice-file-050",
+            "versionId": "version-alice-file-050",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-050",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-050.txt",
+              "path": "docs/alice-file-050.txt",
+              "size": 3,
+              "versionId": "version-alice-file-050"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-051",
+            "objectId": "alice-file-051",
+            "fileId": "file-alice-file-051",
+            "versionId": "version-alice-file-051",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-051",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-051.txt",
+              "path": "docs/alice-file-051.txt",
+              "size": 3,
+              "versionId": "version-alice-file-051"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-052",
+            "objectId": "alice-file-052",
+            "fileId": "file-alice-file-052",
+            "versionId": "version-alice-file-052",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-052",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-052.txt",
+              "path": "docs/alice-file-052.txt",
+              "size": 3,
+              "versionId": "version-alice-file-052"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-053",
+            "objectId": "alice-file-053",
+            "fileId": "file-alice-file-053",
+            "versionId": "version-alice-file-053",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-053",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-053.txt",
+              "path": "docs/alice-file-053.txt",
+              "size": 3,
+              "versionId": "version-alice-file-053"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-054",
+            "objectId": "alice-file-054",
+            "fileId": "file-alice-file-054",
+            "versionId": "version-alice-file-054",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-054",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-054.txt",
+              "path": "docs/alice-file-054.txt",
+              "size": 3,
+              "versionId": "version-alice-file-054"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-055",
+            "objectId": "alice-file-055",
+            "fileId": "file-alice-file-055",
+            "versionId": "version-alice-file-055",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-055",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-055.txt",
+              "path": "docs/alice-file-055.txt",
+              "size": 3,
+              "versionId": "version-alice-file-055"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-056",
+            "objectId": "alice-file-056",
+            "fileId": "file-alice-file-056",
+            "versionId": "version-alice-file-056",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-056",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-056.txt",
+              "path": "docs/alice-file-056.txt",
+              "size": 3,
+              "versionId": "version-alice-file-056"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-057",
+            "objectId": "alice-file-057",
+            "fileId": "file-alice-file-057",
+            "versionId": "version-alice-file-057",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-057",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-057.txt",
+              "path": "docs/alice-file-057.txt",
+              "size": 3,
+              "versionId": "version-alice-file-057"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-058",
+            "objectId": "alice-file-058",
+            "fileId": "file-alice-file-058",
+            "versionId": "version-alice-file-058",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-058",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-058.txt",
+              "path": "docs/alice-file-058.txt",
+              "size": 3,
+              "versionId": "version-alice-file-058"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-059",
+            "objectId": "alice-file-059",
+            "fileId": "file-alice-file-059",
+            "versionId": "version-alice-file-059",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-059",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-059.txt",
+              "path": "docs/alice-file-059.txt",
+              "size": 3,
+              "versionId": "version-alice-file-059"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-060",
+            "objectId": "alice-file-060",
+            "fileId": "file-alice-file-060",
+            "versionId": "version-alice-file-060",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-060",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-060.txt",
+              "path": "docs/alice-file-060.txt",
+              "size": 3,
+              "versionId": "version-alice-file-060"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-061",
+            "objectId": "alice-file-061",
+            "fileId": "file-alice-file-061",
+            "versionId": "version-alice-file-061",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-061",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-061.txt",
+              "path": "docs/alice-file-061.txt",
+              "size": 3,
+              "versionId": "version-alice-file-061"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-062",
+            "objectId": "alice-file-062",
+            "fileId": "file-alice-file-062",
+            "versionId": "version-alice-file-062",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-062",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-062.txt",
+              "path": "docs/alice-file-062.txt",
+              "size": 3,
+              "versionId": "version-alice-file-062"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-063",
+            "objectId": "alice-file-063",
+            "fileId": "file-alice-file-063",
+            "versionId": "version-alice-file-063",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-063",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-063.txt",
+              "path": "docs/alice-file-063.txt",
+              "size": 3,
+              "versionId": "version-alice-file-063"
+            },
+            "tombstone": false
+          }
+        ],
+        "nextCursor": "eyJ2ZXJzaW9uIjoxLCJzbmFwc2hvdCI6ImEwYzE0NmY3YWJmMDlhMzE0Y2ViNWM4ZDkxNTBlYTg4MjMwZGU5NmFmYTRkNjcwNDVmZjlhNGRjMGY3NDQ4NWMiLCJhZnRlciI6ImFsaWNlLWZpbGUtMDYzIn0"
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "protocolVersion": 2,
+        "view": "metadata",
+        "objects": [
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-064",
+            "objectId": "alice-file-064",
+            "fileId": "file-alice-file-064",
+            "versionId": "version-alice-file-064",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-064",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-064.txt",
+              "path": "docs/alice-file-064.txt",
+              "size": 3,
+              "versionId": "version-alice-file-064"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-065",
+            "objectId": "alice-file-065",
+            "fileId": "file-alice-file-065",
+            "versionId": "version-alice-file-065",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-065",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-065.txt",
+              "path": "docs/alice-file-065.txt",
+              "size": 3,
+              "versionId": "version-alice-file-065"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-066",
+            "objectId": "alice-file-066",
+            "fileId": "file-alice-file-066",
+            "versionId": "version-alice-file-066",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-066",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-066.txt",
+              "path": "docs/alice-file-066.txt",
+              "size": 3,
+              "versionId": "version-alice-file-066"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-067",
+            "objectId": "alice-file-067",
+            "fileId": "file-alice-file-067",
+            "versionId": "version-alice-file-067",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-067",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-067.txt",
+              "path": "docs/alice-file-067.txt",
+              "size": 3,
+              "versionId": "version-alice-file-067"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-068",
+            "objectId": "alice-file-068",
+            "fileId": "file-alice-file-068",
+            "versionId": "version-alice-file-068",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-068",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-068.txt",
+              "path": "docs/alice-file-068.txt",
+              "size": 3,
+              "versionId": "version-alice-file-068"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-069",
+            "objectId": "alice-file-069",
+            "fileId": "file-alice-file-069",
+            "versionId": "version-alice-file-069",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-069",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-069.txt",
+              "path": "docs/alice-file-069.txt",
+              "size": 3,
+              "versionId": "version-alice-file-069"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-070",
+            "objectId": "alice-file-070",
+            "fileId": "file-alice-file-070",
+            "versionId": "version-alice-file-070",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-070",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-070.txt",
+              "path": "docs/alice-file-070.txt",
+              "size": 3,
+              "versionId": "version-alice-file-070"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-071",
+            "objectId": "alice-file-071",
+            "fileId": "file-alice-file-071",
+            "versionId": "version-alice-file-071",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-071",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-071.txt",
+              "path": "docs/alice-file-071.txt",
+              "size": 3,
+              "versionId": "version-alice-file-071"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-072",
+            "objectId": "alice-file-072",
+            "fileId": "file-alice-file-072",
+            "versionId": "version-alice-file-072",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-072",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-072.txt",
+              "path": "docs/alice-file-072.txt",
+              "size": 3,
+              "versionId": "version-alice-file-072"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-073",
+            "objectId": "alice-file-073",
+            "fileId": "file-alice-file-073",
+            "versionId": "version-alice-file-073",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-073",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-073.txt",
+              "path": "docs/alice-file-073.txt",
+              "size": 3,
+              "versionId": "version-alice-file-073"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-074",
+            "objectId": "alice-file-074",
+            "fileId": "file-alice-file-074",
+            "versionId": "version-alice-file-074",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-074",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-074.txt",
+              "path": "docs/alice-file-074.txt",
+              "size": 3,
+              "versionId": "version-alice-file-074"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-075",
+            "objectId": "alice-file-075",
+            "fileId": "file-alice-file-075",
+            "versionId": "version-alice-file-075",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-075",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-075.txt",
+              "path": "docs/alice-file-075.txt",
+              "size": 3,
+              "versionId": "version-alice-file-075"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-076",
+            "objectId": "alice-file-076",
+            "fileId": "file-alice-file-076",
+            "versionId": "version-alice-file-076",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-076",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-076.txt",
+              "path": "docs/alice-file-076.txt",
+              "size": 3,
+              "versionId": "version-alice-file-076"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-077",
+            "objectId": "alice-file-077",
+            "fileId": "file-alice-file-077",
+            "versionId": "version-alice-file-077",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-077",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-077.txt",
+              "path": "docs/alice-file-077.txt",
+              "size": 3,
+              "versionId": "version-alice-file-077"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-078",
+            "objectId": "alice-file-078",
+            "fileId": "file-alice-file-078",
+            "versionId": "version-alice-file-078",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-078",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-078.txt",
+              "path": "docs/alice-file-078.txt",
+              "size": 3,
+              "versionId": "version-alice-file-078"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-079",
+            "objectId": "alice-file-079",
+            "fileId": "file-alice-file-079",
+            "versionId": "version-alice-file-079",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-079",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-079.txt",
+              "path": "docs/alice-file-079.txt",
+              "size": 3,
+              "versionId": "version-alice-file-079"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-080",
+            "objectId": "alice-file-080",
+            "fileId": "file-alice-file-080",
+            "versionId": "version-alice-file-080",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-080",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-080.txt",
+              "path": "docs/alice-file-080.txt",
+              "size": 3,
+              "versionId": "version-alice-file-080"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-081",
+            "objectId": "alice-file-081",
+            "fileId": "file-alice-file-081",
+            "versionId": "version-alice-file-081",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-081",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-081.txt",
+              "path": "docs/alice-file-081.txt",
+              "size": 3,
+              "versionId": "version-alice-file-081"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-082",
+            "objectId": "alice-file-082",
+            "fileId": "file-alice-file-082",
+            "versionId": "version-alice-file-082",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-082",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-082.txt",
+              "path": "docs/alice-file-082.txt",
+              "size": 3,
+              "versionId": "version-alice-file-082"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-083",
+            "objectId": "alice-file-083",
+            "fileId": "file-alice-file-083",
+            "versionId": "version-alice-file-083",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-083",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-083.txt",
+              "path": "docs/alice-file-083.txt",
+              "size": 3,
+              "versionId": "version-alice-file-083"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-084",
+            "objectId": "alice-file-084",
+            "fileId": "file-alice-file-084",
+            "versionId": "version-alice-file-084",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-084",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-084.txt",
+              "path": "docs/alice-file-084.txt",
+              "size": 3,
+              "versionId": "version-alice-file-084"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-085",
+            "objectId": "alice-file-085",
+            "fileId": "file-alice-file-085",
+            "versionId": "version-alice-file-085",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-085",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-085.txt",
+              "path": "docs/alice-file-085.txt",
+              "size": 3,
+              "versionId": "version-alice-file-085"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-086",
+            "objectId": "alice-file-086",
+            "fileId": "file-alice-file-086",
+            "versionId": "version-alice-file-086",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-086",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-086.txt",
+              "path": "docs/alice-file-086.txt",
+              "size": 3,
+              "versionId": "version-alice-file-086"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-087",
+            "objectId": "alice-file-087",
+            "fileId": "file-alice-file-087",
+            "versionId": "version-alice-file-087",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-087",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-087.txt",
+              "path": "docs/alice-file-087.txt",
+              "size": 3,
+              "versionId": "version-alice-file-087"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-088",
+            "objectId": "alice-file-088",
+            "fileId": "file-alice-file-088",
+            "versionId": "version-alice-file-088",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-088",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-088.txt",
+              "path": "docs/alice-file-088.txt",
+              "size": 3,
+              "versionId": "version-alice-file-088"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-089",
+            "objectId": "alice-file-089",
+            "fileId": "file-alice-file-089",
+            "versionId": "version-alice-file-089",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-089",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-089.txt",
+              "path": "docs/alice-file-089.txt",
+              "size": 3,
+              "versionId": "version-alice-file-089"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-090",
+            "objectId": "alice-file-090",
+            "fileId": "file-alice-file-090",
+            "versionId": "version-alice-file-090",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-090",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-090.txt",
+              "path": "docs/alice-file-090.txt",
+              "size": 3,
+              "versionId": "version-alice-file-090"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-091",
+            "objectId": "alice-file-091",
+            "fileId": "file-alice-file-091",
+            "versionId": "version-alice-file-091",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-091",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-091.txt",
+              "path": "docs/alice-file-091.txt",
+              "size": 3,
+              "versionId": "version-alice-file-091"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-092",
+            "objectId": "alice-file-092",
+            "fileId": "file-alice-file-092",
+            "versionId": "version-alice-file-092",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-092",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-092.txt",
+              "path": "docs/alice-file-092.txt",
+              "size": 3,
+              "versionId": "version-alice-file-092"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-093",
+            "objectId": "alice-file-093",
+            "fileId": "file-alice-file-093",
+            "versionId": "version-alice-file-093",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-093",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-093.txt",
+              "path": "docs/alice-file-093.txt",
+              "size": 3,
+              "versionId": "version-alice-file-093"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-094",
+            "objectId": "alice-file-094",
+            "fileId": "file-alice-file-094",
+            "versionId": "version-alice-file-094",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-094",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-094.txt",
+              "path": "docs/alice-file-094.txt",
+              "size": 3,
+              "versionId": "version-alice-file-094"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-095",
+            "objectId": "alice-file-095",
+            "fileId": "file-alice-file-095",
+            "versionId": "version-alice-file-095",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-095",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-095.txt",
+              "path": "docs/alice-file-095.txt",
+              "size": 3,
+              "versionId": "version-alice-file-095"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-096",
+            "objectId": "alice-file-096",
+            "fileId": "file-alice-file-096",
+            "versionId": "version-alice-file-096",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-096",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-096.txt",
+              "path": "docs/alice-file-096.txt",
+              "size": 3,
+              "versionId": "version-alice-file-096"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-097",
+            "objectId": "alice-file-097",
+            "fileId": "file-alice-file-097",
+            "versionId": "version-alice-file-097",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-097",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-097.txt",
+              "path": "docs/alice-file-097.txt",
+              "size": 3,
+              "versionId": "version-alice-file-097"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-098",
+            "objectId": "alice-file-098",
+            "fileId": "file-alice-file-098",
+            "versionId": "version-alice-file-098",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-098",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-098.txt",
+              "path": "docs/alice-file-098.txt",
+              "size": 3,
+              "versionId": "version-alice-file-098"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-099",
+            "objectId": "alice-file-099",
+            "fileId": "file-alice-file-099",
+            "versionId": "version-alice-file-099",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-099",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-099.txt",
+              "path": "docs/alice-file-099.txt",
+              "size": 3,
+              "versionId": "version-alice-file-099"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-100",
+            "objectId": "alice-file-100",
+            "fileId": "file-alice-file-100",
+            "versionId": "version-alice-file-100",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-100",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-100.txt",
+              "path": "docs/alice-file-100.txt",
+              "size": 3,
+              "versionId": "version-alice-file-100"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-101",
+            "objectId": "alice-file-101",
+            "fileId": "file-alice-file-101",
+            "versionId": "version-alice-file-101",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-101",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-101.txt",
+              "path": "docs/alice-file-101.txt",
+              "size": 3,
+              "versionId": "version-alice-file-101"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-102",
+            "objectId": "alice-file-102",
+            "fileId": "file-alice-file-102",
+            "versionId": "version-alice-file-102",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-102",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-102.txt",
+              "path": "docs/alice-file-102.txt",
+              "size": 3,
+              "versionId": "version-alice-file-102"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-103",
+            "objectId": "alice-file-103",
+            "fileId": "file-alice-file-103",
+            "versionId": "version-alice-file-103",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-103",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-103.txt",
+              "path": "docs/alice-file-103.txt",
+              "size": 3,
+              "versionId": "version-alice-file-103"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-104",
+            "objectId": "alice-file-104",
+            "fileId": "file-alice-file-104",
+            "versionId": "version-alice-file-104",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-104",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-104.txt",
+              "path": "docs/alice-file-104.txt",
+              "size": 3,
+              "versionId": "version-alice-file-104"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-105",
+            "objectId": "alice-file-105",
+            "fileId": "file-alice-file-105",
+            "versionId": "version-alice-file-105",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-105",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-105.txt",
+              "path": "docs/alice-file-105.txt",
+              "size": 3,
+              "versionId": "version-alice-file-105"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-106",
+            "objectId": "alice-file-106",
+            "fileId": "file-alice-file-106",
+            "versionId": "version-alice-file-106",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-106",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-106.txt",
+              "path": "docs/alice-file-106.txt",
+              "size": 3,
+              "versionId": "version-alice-file-106"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-107",
+            "objectId": "alice-file-107",
+            "fileId": "file-alice-file-107",
+            "versionId": "version-alice-file-107",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-107",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-107.txt",
+              "path": "docs/alice-file-107.txt",
+              "size": 3,
+              "versionId": "version-alice-file-107"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-108",
+            "objectId": "alice-file-108",
+            "fileId": "file-alice-file-108",
+            "versionId": "version-alice-file-108",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-108",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-108.txt",
+              "path": "docs/alice-file-108.txt",
+              "size": 3,
+              "versionId": "version-alice-file-108"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-109",
+            "objectId": "alice-file-109",
+            "fileId": "file-alice-file-109",
+            "versionId": "version-alice-file-109",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-109",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-109.txt",
+              "path": "docs/alice-file-109.txt",
+              "size": 3,
+              "versionId": "version-alice-file-109"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-110",
+            "objectId": "alice-file-110",
+            "fileId": "file-alice-file-110",
+            "versionId": "version-alice-file-110",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-110",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-110.txt",
+              "path": "docs/alice-file-110.txt",
+              "size": 3,
+              "versionId": "version-alice-file-110"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-111",
+            "objectId": "alice-file-111",
+            "fileId": "file-alice-file-111",
+            "versionId": "version-alice-file-111",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-111",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-111.txt",
+              "path": "docs/alice-file-111.txt",
+              "size": 3,
+              "versionId": "version-alice-file-111"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-112",
+            "objectId": "alice-file-112",
+            "fileId": "file-alice-file-112",
+            "versionId": "version-alice-file-112",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-112",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-112.txt",
+              "path": "docs/alice-file-112.txt",
+              "size": 3,
+              "versionId": "version-alice-file-112"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-113",
+            "objectId": "alice-file-113",
+            "fileId": "file-alice-file-113",
+            "versionId": "version-alice-file-113",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-113",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-113.txt",
+              "path": "docs/alice-file-113.txt",
+              "size": 3,
+              "versionId": "version-alice-file-113"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-114",
+            "objectId": "alice-file-114",
+            "fileId": "file-alice-file-114",
+            "versionId": "version-alice-file-114",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-114",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-114.txt",
+              "path": "docs/alice-file-114.txt",
+              "size": 3,
+              "versionId": "version-alice-file-114"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-115",
+            "objectId": "alice-file-115",
+            "fileId": "file-alice-file-115",
+            "versionId": "version-alice-file-115",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-115",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-115.txt",
+              "path": "docs/alice-file-115.txt",
+              "size": 3,
+              "versionId": "version-alice-file-115"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-116",
+            "objectId": "alice-file-116",
+            "fileId": "file-alice-file-116",
+            "versionId": "version-alice-file-116",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-116",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-116.txt",
+              "path": "docs/alice-file-116.txt",
+              "size": 3,
+              "versionId": "version-alice-file-116"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-117",
+            "objectId": "alice-file-117",
+            "fileId": "file-alice-file-117",
+            "versionId": "version-alice-file-117",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-117",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-117.txt",
+              "path": "docs/alice-file-117.txt",
+              "size": 3,
+              "versionId": "version-alice-file-117"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-118",
+            "objectId": "alice-file-118",
+            "fileId": "file-alice-file-118",
+            "versionId": "version-alice-file-118",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-118",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-118.txt",
+              "path": "docs/alice-file-118.txt",
+              "size": 3,
+              "versionId": "version-alice-file-118"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-119",
+            "objectId": "alice-file-119",
+            "fileId": "file-alice-file-119",
+            "versionId": "version-alice-file-119",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-119",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-119.txt",
+              "path": "docs/alice-file-119.txt",
+              "size": 3,
+              "versionId": "version-alice-file-119"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-120",
+            "objectId": "alice-file-120",
+            "fileId": "file-alice-file-120",
+            "versionId": "version-alice-file-120",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-120",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-120.txt",
+              "path": "docs/alice-file-120.txt",
+              "size": 3,
+              "versionId": "version-alice-file-120"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-121",
+            "objectId": "alice-file-121",
+            "fileId": "file-alice-file-121",
+            "versionId": "version-alice-file-121",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-121",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-121.txt",
+              "path": "docs/alice-file-121.txt",
+              "size": 3,
+              "versionId": "version-alice-file-121"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-122",
+            "objectId": "alice-file-122",
+            "fileId": "file-alice-file-122",
+            "versionId": "version-alice-file-122",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-122",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-122.txt",
+              "path": "docs/alice-file-122.txt",
+              "size": 3,
+              "versionId": "version-alice-file-122"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-123",
+            "objectId": "alice-file-123",
+            "fileId": "file-alice-file-123",
+            "versionId": "version-alice-file-123",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-123",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-123.txt",
+              "path": "docs/alice-file-123.txt",
+              "size": 3,
+              "versionId": "version-alice-file-123"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-124",
+            "objectId": "alice-file-124",
+            "fileId": "file-alice-file-124",
+            "versionId": "version-alice-file-124",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-124",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-124.txt",
+              "path": "docs/alice-file-124.txt",
+              "size": 3,
+              "versionId": "version-alice-file-124"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-125",
+            "objectId": "alice-file-125",
+            "fileId": "file-alice-file-125",
+            "versionId": "version-alice-file-125",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-125",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-125.txt",
+              "path": "docs/alice-file-125.txt",
+              "size": 3,
+              "versionId": "version-alice-file-125"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-126",
+            "objectId": "alice-file-126",
+            "fileId": "file-alice-file-126",
+            "versionId": "version-alice-file-126",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-126",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-126.txt",
+              "path": "docs/alice-file-126.txt",
+              "size": 3,
+              "versionId": "version-alice-file-126"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-127",
+            "objectId": "alice-file-127",
+            "fileId": "file-alice-file-127",
+            "versionId": "version-alice-file-127",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-127",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-127.txt",
+              "path": "docs/alice-file-127.txt",
+              "size": 3,
+              "versionId": "version-alice-file-127"
+            },
+            "tombstone": false
+          }
+        ],
+        "nextCursor": "eyJ2ZXJzaW9uIjoxLCJzbmFwc2hvdCI6ImEwYzE0NmY3YWJmMDlhMzE0Y2ViNWM4ZDkxNTBlYTg4MjMwZGU5NmFmYTRkNjcwNDVmZjlhNGRjMGY3NDQ4NWMiLCJhZnRlciI6ImFsaWNlLWZpbGUtMTI3In0"
+      }
+    },
+    {
+      "status": 200,
+      "body": {
+        "protocolVersion": 2,
+        "view": "metadata",
+        "objects": [
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-128",
+            "objectId": "alice-file-128",
+            "fileId": "file-alice-file-128",
+            "versionId": "version-alice-file-128",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-128",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-128.txt",
+              "path": "docs/alice-file-128.txt",
+              "size": 3,
+              "versionId": "version-alice-file-128"
+            },
+            "tombstone": false
+          },
+          {
+            "protocolVersion": 2,
+            "operationId": "create-alice-file-129",
+            "objectId": "alice-file-129",
+            "fileId": "file-alice-file-129",
+            "versionId": "version-alice-file-129",
+            "operation": "create",
+            "revision": {
+              "counter": 1,
+              "deviceId": "android-paged-fixture-device"
+            },
+            "baseRevision": null,
+            "keyEpoch": "epoch-1",
+            "compartmentId": "private",
+            "deviceId": "android-paged-fixture-device",
+            "metadata": {
+              "compartmentId": "private",
+              "deviceId": "android-paged-fixture-device",
+              "fileId": "file-alice-file-129",
+              "keyEpoch": "epoch-1",
+              "name": "alice-file-129.txt",
+              "path": "docs/alice-file-129.txt",
+              "size": 3,
+              "versionId": "version-alice-file-129"
+            },
+            "tombstone": false
+          }
+        ],
+        "nextCursor": null
+      }
+    }
+  ],
+  "status": {
+    "unauthorized": 401,
+    "forbidden": 403,
+    "changedSnapshot": 409
+  }
+}

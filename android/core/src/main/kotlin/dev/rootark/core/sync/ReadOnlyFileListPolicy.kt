@@ -2,6 +2,7 @@ package dev.rootark.core.sync
 
 /** Small in-memory display-only projection; ciphertext is never part of this object. */
 class ReadOnlyFileRow(
+    val objectId: String,
     val name: String,
     val path: String?,
     val size: Long?,
@@ -42,6 +43,7 @@ object ReadOnlyFileListPolicy {
         require(size == null || size >= 0L)
 
         return ReadOnlyFileRow(
+            objectId = objectId,
             name = name?.takeIf { it.isNotBlank() } ?: path?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: objectId,
             path = path,
             size = size,
