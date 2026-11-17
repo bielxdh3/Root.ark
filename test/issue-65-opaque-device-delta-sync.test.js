@@ -198,6 +198,88 @@ test("P2: independent CAS changing during real filename AEAD denies all local se
     "the final signed CAS readback must be performed after filename AEAD");
 });
 
+test("P2 RED: caller cannot replace the original session guard during genuine private-name AES-GCM", async () => {
+  const scopeBytes = { account_id: crypto.randomBytes(16),
+    compartment_id: crypto.randomBytes(16), keyring_id: crypto.randomBytes(16) };
+  const scope = Object.fromEntries(Object.entries(scopeBytes)
+    .map(([key, value]) => [key, value.toString("base64url")]));
+  const objectId = crypto.randomBytes(16).toString("base64url");
+  const rawKey = crypto.randomBytes(32);
+  const sealedName = await sealZk1CatalogMetadataV1({
+    scope: scopeBytes, objectId, revision: 1, epoch: 1,
+    metadataKey: rawKey, name: "private-revoked-filename.txt",
+  });
+  const row = { object_id: objectId, revision: 1, epoch: 1,
+    ciphertext_digest: crypto.randomBytes(32),
+    metadata_ciphertext: Uint8Array.from(sealedName) };
+  const snapshot = { head: { sequence: 9, digest: crypto.randomBytes(32) },
+    rows: [row] };
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const serial = () => Buffer.from(JSON.stringify({
+    head: { sequence: snapshot.head.sequence,
+      digest: Buffer.from(snapshot.head.digest).toString("base64url") },
+    entries: snapshot.rows.map(x => [x.object_id, x.revision, x.epoch,
+      Buffer.from(x.metadata_ciphertext).toString("base64url")]),
+  }));
+  const proof = crypto.sign(null, serial(), signer.privateKey);
+  let signedReads = 0, opened = 0;
+  let fixtureInput;
+  const catalog = {
+    createClient: () => ({ async readAll() {
+      signedReads++;
+      assert.ok(crypto.verify(null, serial(), signer.publicKey, proof),
+        "a real Ed25519-signed catalog snapshot is checked on each read");
+      return snapshot;
+    } }),
+    async openMetadata(input) {
+      const name = await realCatalog.openMetadata({
+        scope: Object.fromEntries(Object.entries(input.scope)),
+        objectId: input.objectId, revision: input.revision,
+        epoch: input.epoch, metadataKey: input.metadataKey,
+        ciphertext: Uint8Array.from(input.ciphertext),
+      });
+      opened++;
+      if (opened === 2) {
+        // Revocation is reported by the ORIGINAL session generation guard.
+        // Replacing its caller-owned method is not an authority update.
+        context.sessionActive = false;
+        fixtureInput.assertLive = () => true;
+      }
+      return name;
+    },
+  };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    sessionActive: true,
+    RootarkZk1BrowserOpaqueCatalogCommit: catalog,
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, "utf8"), context);
+  fixtureInput = vm.runInContext(`({
+    authority: { signedDeviceGrant: ${JSON.stringify(scope)},
+      pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => "fixture-csrf",
+      isSessionCurrent: () => true },
+    assertLive() { if (!sessionActive) throw Error("REVOKED_SESSION"); }
+  })`, context);
+  const client = context.RootarkZk1OpaqueDeviceDeltaSync.createClient(fixtureInput);
+  const baseline = await client.readCurrent();
+  const key = await crypto.webcrypto.subtle.importKey("raw", rawKey,
+    "AES-GCM", false, ["decrypt"]);
+  const positive = await client.readPrivateListing(baseline, key, "private");
+  assert.equal(positive.entries[0].name, "private-revoked-filename.txt",
+    "positive control must decrypt genuine AES-GCM filename before revocation");
+  await assert.rejects(client.readPrivateListing(baseline, key, "private"),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+    "a replaced guard cannot expose the private filename after revocation");
+  assert.equal(opened, 2, "the attack must occur after the second genuine AES-GCM open");
+  assert.equal(context.sessionActive, false);
+  assert.ok(signedReads >= 4 && signedReads <= 5,
+    "the baseline and both genuine signed checks of the positive listing must execute");
+});
+
 test("normal workspace routes historical restore through all three existing authorization gates", () => {
   const source = fs.readFileSync(path.join(__dirname,
     "../public/client/rootark-zk1-authenticated-workspace.js"), "utf8");

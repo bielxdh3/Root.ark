@@ -213,8 +213,12 @@
       const sessionCsrf = trust.csrfToken();
       if (typeof sessionCsrf !== "string" || !sessionCsrf || sessionCsrf.length > 512
         || /[\u0000-\u001f\u007f]/.test(sessionCsrf)) deny();
+      // A signed catalog reader can await while caller-owned input methods
+      // change. Pin the original generation guard at client construction:
+      // never permit a replacement property to authorize decrypted names.
+      const originalAssertLive = input.assertLive.bind(input);
       const assertLive = () => {
-        const result = input.assertLive();
+        const result = originalAssertLive();
         if (result === false || (result && typeof result.then === "function")
           || trust.isSessionCurrent() !== true
           || trust.csrfToken() !== sessionCsrf) deny();
