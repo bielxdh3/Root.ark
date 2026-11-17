@@ -950,6 +950,45 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       ownerHeldCek.fill(0);
       return;
     }
+    // P2: even a REAL signed recipient file can silently turn into an empty
+    // "successful" private output if the final independent authority callback
+    // rebinds a typed-array byteLength getter before the CLI writes plaintext.
+    // Capture the genuine post-AEAD returned buffer at its freeze boundary;
+    // never substitute fake decrypted bytes or bypass the HTTP/HPKE/AEAD path.
+    const originalFreezeForLength = Object.freeze;
+    const savedTypedByteLength = Object.getOwnPropertyDescriptor(
+      Uint8Array.prototype, "byteLength");
+    let sawActualFile = false, capturedFinalPlaintext;
+    try {
+      Object.freeze = function (value) {
+        const frozen = Reflect.apply(originalFreezeForLength, Object, [value]);
+        if (value?.schema === "rootark-zk1-recipient-share-file-dev/v1"
+          && value?.data instanceof Uint8Array) {
+          capturedFinalPlaintext = value.data;
+          sawActualFile = true;
+          Object.defineProperty(Uint8Array.prototype, "byteLength", {
+            configurable: true, get() { return 0; },
+          });
+        }
+        return frozen;
+      };
+      assert.equal(await runRecipientRedeem("portable-offer.json",
+        "recipient-native-byte-length.bin"), "ZK_RECIPIENT_FILE_REDEEMED");
+    } finally {
+      Object.freeze = originalFreezeForLength;
+      if (savedTypedByteLength) {
+        Object.defineProperty(Uint8Array.prototype, "byteLength", savedTypedByteLength);
+      } else delete Uint8Array.prototype.byteLength;
+    }
+    assert.equal(sawActualFile, true,
+      "the real signed recipient HPKE+AES file must reach the native output boundary");
+    assert.ok(capturedFinalPlaintext instanceof Uint8Array
+      && capturedFinalPlaintext.length === bytes.length && bytes.length > 0);
+    assert.deepEqual(fs.readFileSync(path.join(dir,
+      "recipient-native-byte-length.bin")), bytes,
+    "callback-poisoned typed-array byteLength must not truncate verified plaintext");
+    assert.ok(capturedFinalPlaintext.every((value) => value === 0),
+      "recipient CLI must wipe actual decrypted plaintext after private output");
     withoutTrustedAuthority = true;
     await assert.rejects(runOwnerExport("grant-ack.json", "no-authority-offer.json"),
       /ZK_RECIPIENT_OFFER_CLI_DENIED/,
