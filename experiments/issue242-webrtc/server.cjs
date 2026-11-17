@@ -15,15 +15,35 @@ const token = () => randomBytes(32).toString('hex');
 const shortId = () => randomBytes(8).toString('hex');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
-function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = ROOM_TTL_MS } = {}) {
+function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = ROOM_TTL_MS,
+  authenticateSession = null } = {}) {
   const rooms = new Map();
   const participants = new Map();
   const wss = new WebSocket.WebSocketServer({ noServer: true, maxPayload: MAX_SIGNAL_BYTES, perMessageDeflate: false });
+  const authenticated = typeof authenticateSession === 'function';
   let origin = '';
   let listener;
 
+  function identify(req) {
+    if (!authenticated) return null;
+    try {
+      const user = authenticateSession(req);
+      return user && typeof user.username === 'string' && user.username.length > 0 &&
+        Number.isInteger(user.sessionVersion) && Number.isFinite(user.expiresAt) &&
+        user.expiresAt > now() ? user : null;
+    } catch { return null; }
+  }
+  function sessionCurrent(ws) {
+    if (!authenticated) return true;
+    const user = identify(ws.upgradeRequest);
+    if (user && user.username === ws.identity.username &&
+      user.sessionVersion === ws.identity.sessionVersion) return true;
+    ws.close(1008, 'session revoked');
+    removePeer(ws);
+    return false;
+  }
   function send(ws, data) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+    if (ws.readyState === WebSocket.OPEN && sessionCurrent(ws)) ws.send(JSON.stringify(data));
   }
   function error(ws, code) { send(ws, { type: 'error', code }); }
   function roomOf(ws) {
@@ -63,6 +83,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
   }
   const pair = (a, b) => [a, b].sort().join(':');
   function onMessage(ws, raw) {
+    if (!sessionCurrent(ws)) return;
     if (raw.length > MAX_SIGNAL_BYTES) return ws.close(1009, 'too large');
     let message;
     try { message = JSON.parse(raw.toString()); } catch { return error(ws, 'BAD_MESSAGE'); }
@@ -74,34 +95,42 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       if (!validRoom(room)) return error(ws, 'INVALID_INVITE');
       if (room.members.size >= MAX_MEMBERS) return error(ws, 'FULL');
       let role;
-      if (message.hostKey === room.hostKey && ![...room.members.values()].some(p => p.role === 'host')) {
+      if (message.hostKey === room.hostKey && (!authenticated || (room.owner === ws.identity.username &&
+        room.ownerSessionVersion === ws.identity.sessionVersion)) &&
+        ![...room.members.values()].some(p => p.role === 'host')) {
         role = 'host';
       } else {
         const invite = typeof message.invitation === 'string' && room.invites.get(message.invitation);
-        if (!invite || invite.used || invite.expires <= now()) return error(ws, 'INVALID_INVITE');
+        if (!invite || invite.used || invite.expires <= now() ||
+          (authenticated && invite.recipient !== ws.identity.username)) return error(ws, 'INVALID_INVITE');
         room.invites.delete(message.invitation); // One-time join, never eligible for replay.
         role = 'guest';
       }
       const id = shortId();
-      const peer = { id, role, roomId: room.id, ws };
+      const peer = { id, role, roomId: room.id, ws, username: ws.identity?.username };
       participants.set(ws, peer);
       room.members.set(id, peer);
-      send(ws, { type: 'joined', peerId: id, role, members: [...room.members.values()].filter(p => p.id !== id).map(p => ({ peerId: p.id, role: p.role })) });
-      for (const other of room.members.values()) if (other.id !== id) send(other.ws, { type: 'peer-joined', peerId: id, role });
+      send(ws, { type: 'joined', peerId: id, role, username: peer.username,
+        members: [...room.members.values()].filter(p => p.id !== id).map(p => ({ peerId: p.id, role: p.role, username: p.username })) });
+      for (const other of room.members.values()) if (other.id !== id) send(other.ws, { type: 'peer-joined', peerId: id, role, username: peer.username });
       return;
     }
     const room = roomOf(ws);
     if (!validRoom(room)) return error(ws, 'ROOM_CLOSED');
     const target = typeof message.to === 'string' && room.members.get(message.to);
     if (message.type === 'invite' && current.role === 'host') {
+      const recipient = message.recipient;
+      if (authenticated && (typeof recipient !== 'string' || recipient.length < 1 ||
+        recipient.length > 128 || /[\x00-\x1f\x7f]/.test(recipient) ||
+        recipient === current.username)) return error(ws, 'BAD_RECIPIENT');
       for (const [key, invite] of room.invites) if (invite.expires <= now()) room.invites.delete(key);
       const outstanding = [...room.invites.values()].filter(i => !i.used && i.expires > now()).length;
       if (outstanding + room.members.size >= MAX_MEMBERS) return error(ws, 'FULL');
       const invitation = token();
       const id = shortId();
       const expires = now() + inviteTtlMs;
-      room.invites.set(invitation, { id, expires, used: false });
-      send(ws, { type: 'invited', inviteId: id, invitation, expires });
+      room.invites.set(invitation, { id, expires, used: false, recipient: authenticated ? recipient : null });
+      send(ws, { type: 'invited', inviteId: id, invitation, expires, recipient: authenticated ? recipient : undefined });
     } else if (message.type === 'revoke' && current.role === 'host' && typeof message.inviteId === 'string') {
       for (const [k, i] of room.invites) if (i.id === message.inviteId) room.invites.delete(k);
       send(ws, { type: 'revoked', inviteId: message.inviteId });
@@ -113,7 +142,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       if (room.pending.size >= MAX_MEMBERS) return error(ws, 'FULL');
       const requestId = shortId();
       room.pending.set(requestId, { from: current.id, to: target.id });
-      send(target.ws, { type: 'peer-request', peerId: current.id, requestId });
+      send(target.ws, { type: 'peer-request', peerId: current.id, username: current.username, requestId });
     } else if (message.type === 'consent' && typeof message.requestId === 'string' && typeof message.accept === 'boolean') {
       const pending = room.pending.get(message.requestId);
       if (!pending || pending.to !== current.id || !room.members.has(pending.from)) return error(ws, 'FORBIDDEN');
@@ -155,8 +184,11 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' ws://127.0.0.1:*; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'");
     if (req.method === 'POST' && url.pathname === '/rooms' && req.headers.origin === origin) {
+      const user = identify(req);
+      if (authenticated && !user) { res.writeHead(401).end(); return; }
       if (rooms.size >= 16) { res.writeHead(429).end(); return; }
       const room = { id: shortId(), hostKey: token(), expires: now() + roomTtlMs,
+        owner: user?.username, ownerSessionVersion: user?.sessionVersion,
         members: new Map(), invites: new Map(), pending: new Map(), allowed: new Set() };
       rooms.set(room.id, room);
       res.setHeader('Content-Type', 'application/json');
@@ -175,10 +207,21 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       socket.destroy();
       return;
     }
-    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+    const identity = identify(req);
+    if (authenticated && !identity) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, ws => {
+      ws.identity = identity;
+      ws.upgradeRequest = req;
+      wss.emit('connection', ws, req);
+    });
   });
   const expirySweep = setInterval(() => {
     for (const room of rooms.values()) validRoom(room);
+    if (authenticated) for (const ws of wss.clients) sessionCurrent(ws);
   }, 1000);
   expirySweep.unref();
   return {

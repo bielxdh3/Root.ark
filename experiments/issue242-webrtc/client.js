@@ -22,6 +22,9 @@
   const peers = new Map(), invites = new Map();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
+  // A file/text selected in room A must never be sent to room B after an await.
+  const stillInRoom = (socket, selectedRoom) => socket && socket === ws &&
+    socket.readyState === 1 && roomId === selectedRoom;
 
   function connect(credentials) {
     const oldSocket = ws;
@@ -50,13 +53,14 @@
       if (m.type === 'joined') {
         selfId = m.peerId; role = m.role;
         $('invite').disabled = role !== 'host';
-        log('Entrou na sala como ' + role);
+        log('Entrou na sala como ' + role + (m.username ? ' (' + m.username + ')' : ''));
       } else if (m.type === 'invited') {
         invites.set(m.inviteId, m);
         const div = document.createElement('div');
         div.className = 'entry';
         const title = document.createElement('span');
-        title.textContent = 'Convite: ' + m.invitation + ' (60 s) ';
+        title.textContent = 'Convite' + (m.recipient ? ' para ' + m.recipient : '') +
+          ': ' + m.invitation + ' (60 s) ';
         const revoke = document.createElement('button');
         revoke.textContent = 'Revogar';
         revoke.addEventListener('click', () => wire({ type: 'revoke', inviteId: m.inviteId }));
@@ -71,7 +75,7 @@
         const line = document.createElement('div');
         line.className = 'entry';
         line.dataset.peerId = m.peerId;
-        line.textContent = 'Convidado ' + m.peerId.slice(0, 5) + ' ';
+        line.textContent = 'Convidado ' + (m.username || m.peerId.slice(0, 5)) + ' ';
         const kick = document.createElement('button');
         kick.textContent = 'Revogar participante';
         kick.addEventListener('click', () => wire({ type: 'kick', to: m.peerId }));
@@ -81,7 +85,7 @@
       } else if (m.type === 'peer-request') {
         const div = document.createElement('div');
         div.className = 'entry';
-        div.textContent = 'Host solicita conexão: ';
+        div.textContent = (m.username ? 'Host ' + m.username : 'Host') + ' solicita conexão: ';
         for (const accept of [true, false]) {
           const button = document.createElement('button');
           button.textContent = accept ? 'Aceitar conexão' : 'Recusar';
@@ -249,8 +253,10 @@
   async function sendChunks(p) {
     const { dc, outgoing } = p;
     if (!outgoing) return;
+    const sourceSocket = ws, sourceRoom = roomId;
     for (let offset = 0; offset < outgoing.bytes.byteLength; offset += 16 * 1024) {
-      if (p.outgoing !== outgoing) return;
+      if (!stillInRoom(sourceSocket, sourceRoom) || peers.get(p.id) !== p ||
+        p.outgoing !== outgoing) return;
       if (dc.readyState !== 'open') { p.outgoing = null; return; }
       while (dc.bufferedAmount > 64 * 1024) {
         await new Promise(resolve => {
@@ -262,20 +268,24 @@
           dc.addEventListener('bufferedamountlow', wake, { once: true });
           dc.addEventListener('close', wake, { once: true });
         });
-        if (p.outgoing !== outgoing) return;
+        if (!stillInRoom(sourceSocket, sourceRoom) || peers.get(p.id) !== p ||
+          p.outgoing !== outgoing) return;
         if (dc.readyState !== 'open') { p.outgoing = null; return; }
       }
       dc.send(outgoing.bytes.slice(offset, offset + 16 * 1024));
     }
-    if (p.outgoing !== outgoing) return;
+    if (!stillInRoom(sourceSocket, sourceRoom) || peers.get(p.id) !== p ||
+      p.outgoing !== outgoing) return;
     dc.send(JSON.stringify({ type: 'end-file', id: outgoing.id }));
     p.outgoing = null;
     log('Enviado: ' + outgoing.name);
   }
   async function sendFile(file) {
     if (!file || file.size === 0 || file.size > MAX_FILE) return log('Arquivo fora do limite de 1 MiB');
+    const sourceSocket = ws, sourceRoom = roomId;
     const bytes = await file.arrayBuffer();
     const digest = await sha(bytes);
+    if (!stillInRoom(sourceSocket, sourceRoom)) return;
     const receivers = [...peers.values()].filter(p => p.dc && p.dc.readyState === 'open' && !p.outgoing);
     for (const p of receivers) {
       const id = crypto.randomUUID();
@@ -286,7 +296,9 @@
   }
   async function sendText(value) {
     if (!value || value.length > 1000) return;
+    const sourceSocket = ws, sourceRoom = roomId;
     const digest = await sha(new TextEncoder().encode(value));
+    if (!stillInRoom(sourceSocket, sourceRoom)) return;
     let count = 0;
     for (const p of peers.values()) if (p.dc?.readyState === 'open') {
       p.dc.send(JSON.stringify({ type: 'text', text: value, digest }));
@@ -307,14 +319,14 @@
     connect({ invitation });
   }
   $('create').onclick = () => createRoom().catch(e => log(e.message));
-  $('invite').onclick = () => wire({ type: 'invite' });
+  $('invite').onclick = () => wire({ type: 'invite', recipient: $('recipientInput').value.trim() });
   $('join').onclick = () => joinRoom($('roomInput').value, $('inviteInput').value);
   $('sendFile').onclick = () => sendFile($('fileInput').files[0]);
   $('sendText').onclick = () => sendText($('textInput').value);
   // Diagnostic surface is in-memory and only used by the disposable Edge CDP test.
   window.__poc = {
     createRoom, joinRoom, sendFile, sendText,
-    invite: () => wire({ type: 'invite' }),
+    invite: recipient => wire({ type: 'invite', recipient }),
     invitations: () => [...invites.values()],
     // Exposed only for disposable Edge CDP adversarial regression tests.
     testChannel: index => [...peers.values()][index]?.dc,
