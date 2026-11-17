@@ -4463,7 +4463,9 @@ function hasFileAccess(req, folder, fileName, entries = loadFilePermissions(), e
 
   return (
     permissions.public ||
-    sameUsername(permissions.owner, req.user?.username) ||
+    // Usernames are distinct case-sensitive account principals in login/DB.
+    // Case-folding would disclose another account's private file bytes.
+    permissions.owner === req.user?.username ||
     Boolean(userAccess?.read) ||
     Boolean(userAccess?.edit)
   );
@@ -4478,7 +4480,9 @@ function hasFileEditAccess(req, folder, fileName, entries = loadFilePermissions(
   if (!entry) return Boolean(req.user?.permissions?.delete);
 
   const permissions = normalizeFilePermissionEntry(entry);
-  if (sameUsername(permissions.owner, req.user?.username)) return true;
+  // A case-colliding account is not the original file owner and must not
+  // modify its ACL, content or other owner-controlled file state.
+  if (permissions.owner === req.user?.username) return true;
   if (permissions.public && Object.keys(permissions.users).length === 0) {
     return Boolean(req.user?.permissions?.delete);
   }
@@ -4491,7 +4495,11 @@ function hasPublicShareAccess(req, folder, fileName, entries = loadFilePermissio
   if (restoreProviderOrphans.isSuppressed(folder.id, fileName, "uploads", orphanSnapshot)) return canManageAccess(req);
   if (canManageAccess(req)) return true;
   const owner = getFilePermissionEntry(folder.id, fileName, entries)?.owner;
-  return typeof owner === "string" && owner.trim() !== "" && !sameUsername(owner, "sistema") && sameUsername(owner, req.user?.username);
+  // Authentication and the account store distinguish "Alice" from "alice".
+  // A different account with only a case-colliding name must never mint a
+  // public capability for the owner's private file.
+  return typeof owner === "string" && owner.trim() !== "" && !sameUsername(owner, "sistema")
+    && owner === req.user?.username;
 }
 
 function hasReadableFolderAccess(req, folder) {
@@ -12594,7 +12602,9 @@ app.delete("/share/capabilities/revoke", shareRateLimit, authenticate, requirePe
   if (!link || link.shareKind !== "capability-v1") {
     return res.status(404).json({ error: "Capacidade indisponivel" });
   }
-  if (!sameUsername(link.createdBy, req.user.username)) {
+  // The issuer must be the exact authenticated account. Case-folding here
+  // lets a distinct case-colliding recipient revoke someone else's bearer.
+  if (link.createdBy !== req.user.username) {
     return res.status(403).json({ error: "Acesso negado" });
   }
   delete links[token];

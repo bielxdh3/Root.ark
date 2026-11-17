@@ -271,8 +271,10 @@ function revokeCapability(token, username) {
     if (!row) return { status: "missing" };
     const metadata = safeJsonParse(row.metadata_json, {});
     if (metadata.shareKind !== "capability-v1") return { status: "missing" };
-    const owner = String(row.created_by || metadata.createdBy || "").trim().toLowerCase();
-    if (!owner || owner !== String(username || "").trim().toLowerCase()) {
+    // Account identifiers are case-sensitive in users.username and login.
+    // Never authorize a distinct case-colliding principal to revoke the grant.
+    const owner = row.created_by || metadata.createdBy;
+    if (typeof owner !== "string" || !owner || owner !== username) {
       return { status: "forbidden" };
     }
     const outcome = db.prepare(`UPDATE public_links SET revoked_at = ?
