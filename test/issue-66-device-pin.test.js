@@ -189,13 +189,13 @@ test("issue 66 P2 POSIX: signed legacy case-alias files cannot create a second d
 
 // Force the exact post-rename directory durability barrier to fail, not an
 // early JSON write: at this point the new snapshot is already visible on disk.
-function interceptSnapshotDirectoryFsync(t, directory, failures) {
+function interceptSnapshotDirectoryFsync(t, directory, failures, enabled = () => true) {
   const realOpen = fsp.open;
   let injected = 0;
   fsp.open = async (...args) => {
     const handle = await realOpen(...args);
     if (String(args[0]) !== directory || args[1] !== fs.constants.O_RDONLY
-      || injected >= failures) return handle;
+      || injected >= failures || !enabled()) return handle;
     injected++;
     return {
       close: () => handle.close(),
@@ -205,6 +205,100 @@ function interceptSnapshotDirectoryFsync(t, directory, failures) {
   t.after(() => { fsp.open = realOpen; });
   return { restore: () => { fsp.open = realOpen; }, count: () => injected };
 }
+
+// Cross-platform equivalent of a post-rename fsync/lstat failure: first let
+// the REAL durable snapshot transaction finish, then throw as its caller
+// resumes. This proves a failed PIN cannot leave opposite policies in memory
+// and on disk even where Windows does not support directory fsync.
+function failAfterDurablePinCommit(t, client, count) {
+  const original = client.persistSnapshot;
+  let injected = 0;
+  let armed = false;
+  client.persistSnapshot = async function (...args) {
+    const result = await original.apply(this, args);
+    armed ||= Object.values(client.snapshot.pinnedFiles || {}).some((pin) => pin.objectId === "object-a");
+    if (armed && injected < count) {
+      injected++;
+      throw Object.assign(new Error("simulated failure after real PIN disk commit"), { code: "EIO" });
+    }
+    return result;
+  };
+  t.after(() => { client.persistSnapshot = original; });
+  return { count: () => injected };
+}
+
+test("issue 66 P2 cross-platform: completed PIN disk write then thrown EIO rolls back durably", async (t) => {
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  const injected = failAfterDurablePinCommit(t, client, 1);
+  await assert.rejects(client.pinLocal("docs/a.txt"), { code: "EIO" });
+  assert.equal(injected.count(), 1, "must throw after first real pinned snapshot was written");
+  assert.equal((await client.pinStatus("docs/a.txt")).pinned, false);
+  const onDisk = JSON.parse(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"), "utf8"));
+  assert.deepEqual(onDisk.pinnedFiles || {}, {},
+    "failed pin may not persist a policy the process denies");
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, false);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2 cross-platform: failed PIN rollback holds recovery lock", async (t) => {
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  const injected = failAfterDurablePinCommit(t, client, 2);
+  await assert.rejects(client.pinLocal("docs/a.txt"), { code: "pinned_policy_indeterminate" });
+  assert.equal(injected.count(), 2, "failed initial PIN and failed compensation both write to disk");
+  await assert.rejects(client.evictLocal("docs/a.txt"), { code: "sync_root_busy" });
+  await assert.rejects(open(), { code: "sync_root_busy" });
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: failed post-rename PIN fsync compensates disk and memory together", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX directory fsync failure boundary");
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  // Reach the actual pin-policy commit, not an earlier signed hydration fsync.
+  let armed = false;
+  const injector = interceptSnapshotDirectoryFsync(t, rootDir, 1, () => {
+    armed ||= Object.values(client.snapshot.pinnedFiles || {}).some((pin) => pin.objectId === "object-a");
+    return armed;
+  });
+  try {
+    await assert.rejects(client.pinLocal("docs/a.txt"), { code: "EIO" });
+    assert.equal(injector.count(), 1, "the failed barrier followed the pinned snapshot rename");
+  } finally { injector.restore(); }
+  assert.equal((await client.pinStatus("docs/a.txt")).pinned, false,
+    "a failed pin cannot leave a phantom in-memory retention policy");
+  const resumed = await open();
+  assert.equal((await resumed.pinStatus("docs/a.txt")).pinned, false,
+    "post-rename failure must not leave a different durable retention policy");
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes", "failed pin compensation must preserve hydrated bytes");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: failed PIN compensation quarantines the root before a local eviction", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX directory fsync failure boundary");
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  let armed = false;
+  const injector = interceptSnapshotDirectoryFsync(t, rootDir, 2, () => {
+    armed ||= Object.values(client.snapshot.pinnedFiles || {}).some((pin) => pin.objectId === "object-a");
+    return armed;
+  });
+  try {
+    await assert.rejects(client.pinLocal("docs/a.txt"), { code: "pinned_policy_indeterminate" });
+    assert.equal(injector.count(), 2, "both PIN commit and compensation failed after rename");
+  } finally { injector.restore(); }
+  await assert.rejects(client.evictLocal("docs/a.txt"), { code: "sync_root_busy" },
+    "the same process must not evict while its retained PIN is indeterminate");
+  await assert.rejects(open(), { code: "sync_root_busy" },
+    "a second process must not assume the partially committed PIN was removed");
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes");
+  assert.equal(state.pushes, 0);
+});
 
 test("issue 66 P2 POSIX: post-rename unpin fsync EIO compensates durable pin before allowing restart", async (t) => {
   if (process.platform === "win32") return t.skip("POSIX directory fsync failure boundary");

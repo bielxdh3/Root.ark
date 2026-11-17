@@ -2525,7 +2525,26 @@ class SyncEngine {
     this.snapshot.pinnedFiles = { ...oldPins,
       [pinnedKey(tracked.objectId)]: { objectId: tracked.objectId, fileId: tracked.fileId, path: safePath } };
     try { await this.persistSnapshot(); }
-    catch (error) { this.snapshot.pinnedFiles = previous; throw error; }
+    catch (error) {
+      this.snapshot.pinnedFiles = previous;
+      // The atomic snapshot rename can succeed before a directory fsync
+      // reports failure. A memory-only rollback would leave a durable PIN
+      // that this running process does not enforce during later eviction.
+      // Compensate under the same root lock, then verify the on-disk policy.
+      try {
+        await this.persistSnapshot();
+        const disk = JSON.parse(await fsp.readFile(this.snapshotPath, "utf8"));
+        if (JSON.stringify(disk.pinnedFiles || {}) !== JSON.stringify(previous || {})) {
+          throw new Error("Compensated pin policy does not match durable snapshot");
+        }
+      } catch (rollbackError) {
+        this.pinnedPolicyIndeterminate = true;
+        throw Object.assign(new Error("Pinned policy persistence is indeterminate; recover the root explicitly", {
+          cause: error,
+        }), { code: "pinned_policy_indeterminate", rollbackCause: rollbackError });
+      }
+      throw error;
+    }
     return { path: safePath, pinned: true, objectId: tracked.objectId };
   }
 
