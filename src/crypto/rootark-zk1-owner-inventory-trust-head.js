@@ -180,7 +180,10 @@ async function verifyOwnerInventoryEnrollment(input) {
         NATIVE_OWN_KEYS(r.checkpoints).length !== r.checkpoints.length + 1) fail();
     const checked = new NATIVE_ARRAY_CTOR(r.checkpoints.length);
     for (let index = 0; index < checked.length; index += 1) {
-      const descriptor = NATIVE_DESCRIPTOR(r.checkpoints, String(index));
+      // Numeric keys are converted by the native descriptor operation. The
+      // ambient String constructor may have been replaced by an earlier
+      // caller-owned KeyObject getter in this same realm.
+      const descriptor = NATIVE_DESCRIPTOR(r.checkpoints, index);
       if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail();
       const record = exact(descriptor.value, SIGNED_FIELDS);
       const unsigned = NATIVE_OBJECT_CREATE(null);
@@ -190,8 +193,9 @@ async function verifyOwnerInventoryEnrollment(input) {
       }
       const current = statement(unsigned);
       const signature = b64(record.signature, 64);
-      // Own DATA slots bypass both poisoned constructors and inherited numeric setters.
-      NATIVE_DEFINE_PROPERTY(checked, String(index), {
+      // Native numeric keys plus own DATA slots bypass poisoned String,
+      // Array constructors and inherited numeric setters.
+      NATIVE_DEFINE_PROPERTY(checked, index, {
         value: { current, signature, recordDigest: checkpointDigest(record) },
         enumerable: true, writable: true, configurable: true,
       });
@@ -202,7 +206,9 @@ async function verifyOwnerInventoryEnrollment(input) {
     const signerFingerprint = spkiHash(inventoryKey);
     let previous = null;
     for (let index = 0; index < checked.length; index += 1) {
-      const { current, signature, recordDigest } = checked[index];
+      const slot = NATIVE_DESCRIPTOR(checked, index);
+      if (!slot || !NATIVE_HAS_OWN(slot, "value")) fail();
+      const { current, signature, recordDigest } = slot.value;
       if (!NATIVE_VERIFY(null, bytes(current), ownerKey, signature)) fail();
       compareScope(current, expectedScope);
       if (current.inventory_spki_sha256 !== signerFingerprint

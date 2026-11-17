@@ -50,6 +50,78 @@ async function fixture({ forgedInventorySignature = false } = {}) {
   return { enrollment, signed, scope, keys, now, snapshot };
 }
 
+test("P2: a previous KeyObject getter cannot redirect String(index) into an inherited checkpoint slot", async () => {
+  const a = await fixture();
+  const b = await fixture();
+  const signedA = a.signed.checkpoints[0];
+  const digestA = checkpointDigest(signedA);
+  const digestB = checkpointDigest(b.signed.checkpoints[0]);
+  assert.notEqual(digestA, digestB,
+    "checkpoint B is independently and genuinely signed, with a different pinned digest");
+  const originalString = global.String;
+  const inheritedBefore = Object.getOwnPropertyDescriptor(Array.prototype, "0");
+  assert.equal(inheritedBefore, undefined, "the adversarial inherited slot must be new");
+
+  // This is the exact verified A (payload + real Ed25519 signature), paired
+  // with B's independently retained digest. Only the digest is substituted.
+  const fieldsA = Object.fromEntries(FIELDS.map((name) => [name, signedA[name]]));
+  const inherited = {
+    current: fieldsA,
+    signature: Buffer.from(signedA.signature, "base64url"),
+    recordDigest: digestB,
+  };
+  let zeroConversions = 0;
+  const divertedString = new Proxy(originalString, { apply(target, receiver, args) {
+    if (args.length === 1 && args[0] === 0) {
+      zeroConversions += 1;
+      return zeroConversions % 2 === 1 ? "0" : "injected-nonindex";
+    }
+    return Reflect.apply(target, receiver, args);
+  } });
+  const hostileKey = crypto.createPublicKey({
+    key: a.enrollment.ownerPublicKey.export({ type: "spki", format: "der" }),
+    format: "der", type: "spki",
+  });
+  let callbackReads = 0;
+  Object.defineProperty(hostileKey, "type", { configurable: true, get() {
+    callbackReads += 1;
+    global.String = divertedString;
+    Object.defineProperty(Array.prototype, "0", {
+      value: inherited, enumerable: false, configurable: true, writable: true,
+    });
+    throw new Error("stop prior owner verification after mutating the same realm");
+  } });
+  try {
+    await assert.rejects(verifyOwnerInventoryEnrollment({
+      ...a.enrollment, ownerPublicKey: hostileKey,
+    }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
+    assert.equal(callbackReads, 1, "the actual owner KeyObject getter must run");
+    assert.equal(global.String, divertedString);
+    assert.equal(Object.getOwnPropertyDescriptor(Array.prototype, "0").value, inherited);
+
+    // Old implementation reads signed A using String(0) -> "0", then writes
+    // to String(0) -> "injected-nonindex". checked[0] remains a hole and
+    // inherits A + digest B. This must reject even though A itself is valid.
+    await assert.rejects(verifyOwnerInventoryEnrollment({
+      ...a.enrollment, independentRetainedCheckpointDigest: digestB,
+    }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+    "signed A cannot be accepted under independently signed checkpoint B's digest");
+    const valid = await verifyOwnerInventoryEnrollment(a.enrollment);
+    assert.equal(valid.ownerSignatureVerified, true,
+      "the genuine checkpoint A remains accepted in the poisoned realm");
+    assert.equal(valid.authorizesIo, false);
+  } finally {
+    global.String = originalString;
+    if (inheritedBefore) {
+      Object.defineProperty(Array.prototype, "0", inheritedBefore);
+    } else {
+      delete Array.prototype[0];
+    }
+    delete hostileKey.type;
+  }
+  assert.equal((await verifyOwnerInventoryEnrollment(a.enrollment)).ownerSignatureVerified, true);
+});
+
 test("P2: hostile native key getter cannot replace Array checkpoint staging", async () => {
   const f = await fixture();
   const unrelatedSigned = await fixture();
