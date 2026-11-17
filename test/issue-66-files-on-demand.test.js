@@ -282,6 +282,19 @@ test("issue 66: verified cache eviction survives offline and hydrates again afte
   assert.equal(store.list("alice")[0].operationId, before.operationId);
   state.offline = false;
   const restarted = await open();
+  assert.deepEqual((await restarted.journal.recover()).map((operation) => ({
+    operation: operation.operation, path: operation.metadata?.path,
+    sourcePath: operation.metadata?.sourcePath,
+  })), [{ operation: "create", path: "docs", sourcePath: undefined }],
+  "offline sync retains a real unacknowledged parent CREATE");
+  await assert.rejects(restarted.materializeRemote("docs/cache.txt"),
+    { code: "sync_operation_pending" },
+    "hydration cannot step inside the durable pending directory authority");
+  const reconnected = await restarted.syncOnce();
+  assert.equal(reconnected.pushed, 1,
+    "a real acknowledged reconnect sync must commit the pending signed parent CREATE");
+  assert.deepEqual((await restarted.journal.recover()).map((operation) => operation.metadata.path), [],
+    "an acknowledged reconnect sync must drain pending ancestor authority");
   assert.equal(await restarted.materializeRemote("docs/cache.txt"), true);
   assert.equal(await fsp.readFile(path.join(root, "docs", "cache.txt"), "utf8"), "cache me");
   assert.equal(restarted.snapshot.remoteOnly[before.objectId], undefined);

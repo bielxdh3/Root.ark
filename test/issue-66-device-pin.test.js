@@ -1089,8 +1089,10 @@ test("issue 66 #292 P2 POSIX: realpath delay cannot hide a late hardlink swap", 
 }, async (t) => {
   const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
   const client = await open([], true, false, ["docs"]);
-  await client.pullRemote({ pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false });
   const original = state.records.get("object-a");
+  // The fixture's object-filtered LIST does not materialize on pullRemote().
+  // Apply the real signed CREATE so the alias test exercises a tracked inode.
+  await client.apply(original);
   const aPath = path.join(rootDir, "docs/a.txt");
   const bPath = path.join(rootDir, "docs/b.txt");
   const bContents = "separate local B before realpath";
@@ -1155,12 +1157,19 @@ test(`issue 66 #292 P2 POSIX: real ${aliasType} alias cannot advance signed 409 
 }, async (t) => {
   const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
   const client = await open([], true, false, ["docs"]);
-  await client.pullRemote({ pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false });
   const original = state.records.get("object-a");
+  await client.apply(original);
   const aPath = path.join(rootDir, "docs/a.txt");
   const bPath = path.join(rootDir, "docs/b.txt");
   const dPath = path.join(rootDir, "docs/d.txt");
   assert.equal(await fsp.readFile(aPath, "utf8"), "authenticated remote bytes");
+
+  // Pull uses the signed unscoped LIST, while this fixture's default
+  // list(objectId) is one-object-only. Without the explicit LIST both E
+  // and C disappear and the test cannot prove independent E progressed.
+  const listOne = adapter.list.bind(adapter);
+  adapter.list = async (objectId) => objectId === undefined
+    ? [...state.records.values()] : listOne(objectId);
 
   const pendingA = await remote("update", "object-a", "docs/a.txt", "uncommitted A", 2);
   state.records.set("object-a", original);
@@ -1244,8 +1253,11 @@ test("issue 66 #292 P2 Windows: unavailable or rejecting native reparse probe ca
 }, async (t) => {
   const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
   const client = await open([], true, false, ["docs"]);
-  await client.pullRemote({ pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false });
   const original = state.records.get("object-a");
+  await client.apply(original);
+  const listOne = adapter.list.bind(adapter);
+  adapter.list = async (objectId) => objectId === undefined
+    ? [...state.records.values()] : listOne(objectId);
   const pendingA = await remote("update", "object-a", "docs/a.txt", "uncommitted A", 2);
   state.records.set("object-a", original);
   const signedCurrent = await remote("update", "object-a", "docs/a.txt",
@@ -1309,7 +1321,7 @@ test("issue 66 #292 P2 Windows: real NTFS 8.3 alias cannot escape an unresolved 
   const longRelative = "docs/longfilename.txt";
   const initial = await remote("create", "object-physical-a", longRelative, "signed original bytes");
   const client = await open([], true, false, ["docs"]);
-  await client.pullRemote({ pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false });
+  await client.apply(initial);
   const longAbsolute = path.join(rootDir, "docs", "longfilename.txt");
   assert.equal(await fsp.readFile(longAbsolute, "utf8"), "signed original bytes");
   // Ask Windows itself for the existing file's real short pathname, rather
@@ -1345,6 +1357,9 @@ test("issue 66 #292 P2 Windows: real NTFS 8.3 alias cannot escape an unresolved 
   state.records.delete("object-foreign-push");
   const incomingAlias = await remote("create", "object-foreign-pull", shortRelative, "foreign pull bytes");
   assert.equal(await verifyAuthorizationProof(incomingAlias.authorization, incomingAlias, trusted), true);
+  const listOne = adapter.list.bind(adapter);
+  adapter.list = async (objectId) => objectId === undefined
+    ? [...state.records.values()] : listOne(objectId);
   await client.journal.enqueue(pendingA);
   await client.journal.enqueue(pendingAlias);
   const beforePending = (await client.journal.recover()).map((item) => item.operationId);
@@ -1388,7 +1403,7 @@ test("issue 66 #292 P2 Windows: 8.3 ancestor aliases block a missing child after
   const initialDir = await remote("create", "object-long-dir", longDir, "", 1,
     undefined, "inode/directory");
   const client = await open([], true, false, ["docs"]);
-  await client.pullRemote({ pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false });
+  await client.apply(initialDir);
   const longAbsolute = path.join(rootDir, "docs", "longdirectoryname");
   assert.equal((await fsp.stat(longAbsolute)).isDirectory(), true);
   const shortResult = spawnSync("cmd.exe", ["/d", "/q"], {
@@ -1421,6 +1436,9 @@ test("issue 66 #292 P2 Windows: 8.3 ancestor aliases block a missing child after
   const pendingChild = await remote("create", "object-child-push", missingChild, "unsent child bytes");
   state.records.delete("object-child-push");
   const incomingChild = await remote("create", "object-child-pull", missingChild, "untrusted child bytes");
+  const listOne = adapter.list.bind(adapter);
+  adapter.list = async (objectId) => objectId === undefined
+    ? [...state.records.values()] : listOne(objectId);
   await client.journal.enqueue(pendingDir);
   await client.journal.enqueue(pendingChild);
   let rejectedDirPushes = 0;
