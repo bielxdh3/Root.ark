@@ -76,7 +76,7 @@ async function exists(filePath) {
 }
 
 // Hydrate through a real legacy sync before the FOD mode marker exists. This
-// exercises the signed envelope/AEAD and on-disk snapshot service boundary;
+// exercises AES-GCM authentication and the on-disk snapshot service boundary;
 // current FOD publication must remain denied after the marker is created.
 async function openPreexistingCachedFodFixture({ root, source, writer, open, store }, relativePaths) {
   const legacy = await open(["docs"], false);
@@ -88,7 +88,7 @@ async function openPreexistingCachedFodFixture({ root, source, writer, open, sto
     const received = legacy.snapshot.files[relative];
     assert.ok(received && !received.deleted, `real pre-FOD sync must hydrate ${relative}`);
     for (const field of ["objectId", "fileId", "versionId", "hash"]) {
-      assert.equal(received[field], tracked[field], `pre-FOD ${field} must match the signed source`);
+      assert.equal(received[field], tracked[field], `pre-FOD ${field} must match the remote source`);
     }
     assert.ok(store.list("alice").some((record) => record.objectId === received.objectId
       && record.fileId === received.fileId && record.versionId === received.versionId),
