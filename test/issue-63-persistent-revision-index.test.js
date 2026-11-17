@@ -213,6 +213,56 @@ test("unrelated valid signed catalog CAS advance preserves previously selected h
   assert.deepEqual(now.entries.map((row) => row.revision), [1, 2, 3]);
 });
 
+test("P2 RED: index reader cannot swap out the revoked live-session guard during signed await", async () => {
+  const f = await fixture();
+  await f.scan([f.selected[0]]);
+  const positive = await index.search({ ...f.core(), query: "histórico" });
+  assert.equal(positive.totalMatches, 1,
+    "the genuine AES-GCM sealed revision index must release one valid match");
+
+  const input = { ...f.core(), query: "histórico" };
+  let loggedIn = true, verifications = 0;
+  input.assertLive = () => { if (!loggedIn) throw Error("LOGOUT"); };
+  const signedGrant = input.verifyOwnerGrant;
+  const forgedGuard = () => true;
+  input.verifyOwnerGrant = async () => {
+    const verified = await signedGrant();
+    if (++verifications === 1) {
+      loggedIn = false;
+      input.assertLive = forgedGuard;
+    }
+    return verified;
+  };
+  await assert.rejects(index.search(input), /ZK_REVISION_INDEX_DENIED/,
+    "logout during an authentic signed owner-grant read must prohibit plaintext excerpts");
+  assert.equal(verifications, 1, "the real owner signature verifier ran before logout");
+  assert.equal(input.assertLive, forgedGuard, "the callback changed during the awaited verification");
+});
+
+test("P2 RED: index append cannot persist signed plaintext after an awaited logout guard swap", async () => {
+  const f = await fixture();
+  const selected = f.selected[0].selected;
+  const input = { ...f.core(), entries: [{ ...selected, name: "local-private.txt",
+    mediaType: "text/plain", text: "confidential index content" }] };
+  let loggedIn = true, verifications = 0;
+  input.assertLive = () => { if (!loggedIn) throw Error("LOGOUT"); };
+  const signedGrant = input.verifyOwnerGrant;
+  const forgedGuard = () => true;
+  input.verifyOwnerGrant = async () => {
+    const verified = await signedGrant();
+    if (++verifications === 1) {
+      loggedIn = false;
+      input.assertLive = forgedGuard;
+    }
+    return verified;
+  };
+  await assert.rejects(index.append(input), /ZK_REVISION_INDEX_DENIED/,
+    "logout during genuine owner approval must prevent a durable encrypted plaintext write");
+  assert.equal(verifications, 1, "a signed owner-grant check was genuinely completed");
+  assert.equal(input.assertLive, forgedGuard);
+  assert.equal(f.database.rows.size, 0, "denied append cannot write a local index");
+});
+
 test("one explicitly owner-selected 128-revision batch verifies all 16 windows before one encrypted commit", async () => {
   const f = await fixture(128);
   let saves = 0;

@@ -220,24 +220,24 @@
       info: encoder.encode("Root.ark/zk-1/protected-revision-text-index/aes-gcm/v1") },
     root, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
   }
-  async function verifiedHead(input, pinned) {
-    live(input.assertLive);
+  async function verifiedHead(input, pinned, assertLive) {
+    live(assertLive);
     if (typeof input.client?.verifyPrivateListingHead !== "function") deny();
     const result = await input.client.verifyPrivateListingHead(input.baseline);
-    live(input.assertLive);
+    live(assertLive);
     if (result?.head?.sequence !== pinned.catalogHead.sequence
       || result.head.digest !== pinned.catalogHead.digest
       || !["account_id", "compartment_id", "keyring_id"]
         .every((name) => result.scope?.[name] === pinned.scope[name])) deny();
   }
-  async function verifiedOwnerGrant(input, pinned) {
+  async function verifiedOwnerGrant(input, pinned, assertLive) {
     // The caller independently re-imports and validates the current signed
     // owner/grant evidence against its monotonic trust floor. Catalog CAS alone
     // cannot detect a revoked device if its snapshot head has not changed.
-    live(input.assertLive);
+    live(assertLive);
     if (typeof input.verifyOwnerGrant !== "function") deny();
     const current = await input.verifyOwnerGrant();
-    live(input.assertLive);
+    live(assertLive);
     if (current?.verifiedCurrent !== true
       || !current.grant || current.grant.revoked_at_epoch !== null
       || JSON.stringify(current.grant) !== JSON.stringify(input.grant)
@@ -286,13 +286,16 @@
   async function append(input) {
     try {
       live(input?.assertLive);
+      // A signed verifier may await and later mutate the caller-owned input.
+      // Never let it replace the session guard already trusted at invocation.
+      const assertLive = input.assertLive.bind(input);
       if (input.replaceExisting !== undefined
         && typeof input.replaceExisting !== "boolean") deny();
       const replaceExisting = input.replaceExisting === true;
       const key = cacheKey(scopeOf(input.grant));
       const initialGeneration = captureGeneration(key);
       const assertCurrent = () => {
-        live(input.assertLive);
+        live(assertLive);
         checkGeneration(key, initialGeneration);
       };
       const db = store(input.indexedDBImpl);
@@ -311,8 +314,8 @@
         || (tombstone && Object.keys(record).sort().join(",") !== "format,nonce")
         || (!tombstone && record.format !== FORMAT))) deny();
       if (record) checkRecordGeneration(record, initialGeneration);
-      await verifiedOwnerGrant(input, pinned);
-      await verifiedHead(input, pinned);
+      await verifiedOwnerGrant(input, pinned, assertLive);
+      await verifiedHead(input, pinned, assertLive);
       assertCurrent();
       const secret = await keyFor(input.metadataRaw, pinned.scope);
       assertCurrent();
@@ -370,8 +373,8 @@
         secret, plain);
       } finally { plain.fill(0); }
       assertCurrent();
-      await verifiedOwnerGrant(input, pinned);
-      await verifiedHead(input, pinned);
+      await verifiedOwnerGrant(input, pinned, assertLive);
+      await verifiedHead(input, pinned, assertLive);
       assertCurrent();
       await db.save(key, { format: FORMAT, context: JSON.stringify(pinned),
         nonce: to64(webCrypto.getRandomValues(new Uint8Array(16))),
@@ -417,18 +420,19 @@
   async function search(input) {
     try {
       live(input?.assertLive);
+      const assertLive = input.assertLive.bind(input);
       const key = cacheKey(scopeOf(input.grant));
       const initialGeneration = captureGeneration(key);
       const assertCurrent = () => {
-        live(input.assertLive);
+        live(assertLive);
         checkGeneration(key, initialGeneration);
       };
       const match = checkedMatcher(input.query, input.matchMode);
       const pinned = await context(input);
       assertCurrent();
       if (cacheKey(pinned.scope) !== key) deny();
-      await verifiedOwnerGrant(input, pinned);
-      await verifiedHead(input, pinned);
+      await verifiedOwnerGrant(input, pinned, assertLive);
+      await verifiedHead(input, pinned, assertLive);
       const db = store(input.indexedDBImpl);
       const record = await db.read(key);
       assertCurrent();
@@ -438,8 +442,8 @@
       assertCurrent();
       let rows = await openRows(record, pinned, secret, input.baseline);
       assertCurrent();
-      await verifiedOwnerGrant(input, pinned);
-      await verifiedHead(input, pinned);
+      await verifiedOwnerGrant(input, pinned, assertLive);
+      await verifiedHead(input, pinned, assertLive);
       const matches = [];
       for (const row of rows) {
         const normalized = row.text.normalize("NFC");
@@ -471,8 +475,8 @@
       const readPage = async (offset) => {
         try {
           assertCurrent();
-          await verifiedOwnerGrant(input, pinned);
-          await verifiedHead(input, pinned);
+          await verifiedOwnerGrant(input, pinned, assertLive);
+          await verifiedHead(input, pinned, assertLive);
           // A previously loaded result may outlive a scoped clear or a new
           // encrypted snapshot with the same signed catalog head. Never emit
           // another page from an index that was deleted/replaced meanwhile.
@@ -508,6 +512,7 @@
   async function clear(input) {
     try {
       live(input?.assertLive);
+      const assertLive = input.assertLive.bind(input);
       const key = cacheKey(scopeOf(input.grant));
       // Increment synchronously at invocation, even while IndexedDB is still
       // opening. The durable tombstone handles other tabs and restarts.
@@ -531,7 +536,7 @@
           format: CLEARED, nonce: newest,
         });
       });
-      live(input.assertLive);
+      live(assertLive);
     } catch (_) { deny(); }
   }
   return Object.freeze({ append, search, clear });
