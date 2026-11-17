@@ -22,6 +22,9 @@
   const peers = new Map(), invites = new Map();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
+  // A file/text selected in room A must never be sent to room B after an await.
+  const stillInRoom = (socket, selectedRoom) => socket && socket === ws &&
+    socket.readyState === 1 && roomId === selectedRoom;
 
   function connect(credentials) {
     const oldSocket = ws;
@@ -250,8 +253,10 @@
   async function sendChunks(p) {
     const { dc, outgoing } = p;
     if (!outgoing) return;
+    const sourceSocket = ws, sourceRoom = roomId;
     for (let offset = 0; offset < outgoing.bytes.byteLength; offset += 16 * 1024) {
-      if (p.outgoing !== outgoing) return;
+      if (!stillInRoom(sourceSocket, sourceRoom) || peers.get(p.id) !== p ||
+        p.outgoing !== outgoing) return;
       if (dc.readyState !== 'open') { p.outgoing = null; return; }
       while (dc.bufferedAmount > 64 * 1024) {
         await new Promise(resolve => {
@@ -263,20 +268,24 @@
           dc.addEventListener('bufferedamountlow', wake, { once: true });
           dc.addEventListener('close', wake, { once: true });
         });
-        if (p.outgoing !== outgoing) return;
+        if (!stillInRoom(sourceSocket, sourceRoom) || peers.get(p.id) !== p ||
+          p.outgoing !== outgoing) return;
         if (dc.readyState !== 'open') { p.outgoing = null; return; }
       }
       dc.send(outgoing.bytes.slice(offset, offset + 16 * 1024));
     }
-    if (p.outgoing !== outgoing) return;
+    if (!stillInRoom(sourceSocket, sourceRoom) || peers.get(p.id) !== p ||
+      p.outgoing !== outgoing) return;
     dc.send(JSON.stringify({ type: 'end-file', id: outgoing.id }));
     p.outgoing = null;
     log('Enviado: ' + outgoing.name);
   }
   async function sendFile(file) {
     if (!file || file.size === 0 || file.size > MAX_FILE) return log('Arquivo fora do limite de 1 MiB');
+    const sourceSocket = ws, sourceRoom = roomId;
     const bytes = await file.arrayBuffer();
     const digest = await sha(bytes);
+    if (!stillInRoom(sourceSocket, sourceRoom)) return;
     const receivers = [...peers.values()].filter(p => p.dc && p.dc.readyState === 'open' && !p.outgoing);
     for (const p of receivers) {
       const id = crypto.randomUUID();
@@ -287,7 +296,9 @@
   }
   async function sendText(value) {
     if (!value || value.length > 1000) return;
+    const sourceSocket = ws, sourceRoom = roomId;
     const digest = await sha(new TextEncoder().encode(value));
+    if (!stillInRoom(sourceSocket, sourceRoom)) return;
     let count = 0;
     for (const p of peers.values()) if (p.dc?.readyState === 'open') {
       p.dc.send(JSON.stringify({ type: 'text', text: value, digest }));
