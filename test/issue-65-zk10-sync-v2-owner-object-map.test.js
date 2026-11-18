@@ -1431,6 +1431,84 @@ test("P2 rotated owner signer must NEVER double as independently pinned mapping 
   }), deny, "the same real owner key cannot masquerade as a distinct authority via .export");
 });
 
+test("P2: global String(index) cannot erase a legitimate owner root from CURRENT signer separation", async () => {
+  const f = await fixture();
+  const rotated = crypto.generateKeyPairSync("ed25519");
+  assert.notEqual(spkiHash(rotated.publicKey), spkiHash(keys.owner.publicKey));
+  const rotation = signOwnerRotation({
+    type: "rootark-zk10-owner-rotation/v1", immutable_account_id: immutableId,
+    generation: 1, from_spki_sha256: spkiHash(keys.owner.publicKey),
+    next_public_key: b64(rotated), previous_rotation_digest: null,
+  }, keys.owner.privateKey, rotated.privateKey);
+  const { signature: _oldSignature, ...body } = f.zkAuthority.ownerCutoverHistory[0];
+  const rotatedCutover = signOwnerCutover(body, rotated.privateKey);
+  const cutoverDigest = digestOwnerCutover(rotatedCutover);
+  const signedMap = signOwnerObjectMap({ ...f.payload, owner_cutover_digest: cutoverDigest },
+    rotated.privateKey);
+  const mapDigest = digestOwnerObjectMap(signedMap);
+  const zkAuthority = { ...f.zkAuthority, ownerRotations: [rotation],
+    ownerCutoverHistory: [rotatedCutover], independentlyRetainedCutoverDigest: cutoverDigest };
+  const makeHead = (signer) => async (challenge) => signCurrentMappingHead({
+    type: "rootark-zk10-sync-v2-current-map-head/v1", challenge,
+    sync_account_id: identity.accountId, zk_immutable_account_id: immutableId,
+    mapping_sequence: f.payload.mapping_sequence, mapping_digest: mapDigest,
+  }, signer);
+  const verifyWith = (root, headAuthority) => createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority,
+    zkAuthority: { ...zkAuthority, ownerRootPublicKey: root },
+    mappingAuthority: headAuthority,
+  });
+  const signedInput = { ...f.input, ownerMapping: signedMap };
+  // Positive control: A -> B rotation, B-signed cutover/map and distinct C CURRENT authority.
+  const good = await verifyWith(keys.owner.publicKey,
+    { ...f.authority, readCurrentHead: makeHead(keys.authority.privateKey) })(signedInput);
+  assert.equal(good.ownerMappingVerified, true);
+  assert.equal(good.freshPinnedAuthorityHeadVerified, true);
+  assert.equal(good.authorizesIo, false);
+  const rootAsAuthority = { ...f.authority, pinnedPublicKey: keys.owner.publicKey,
+    readCurrentHead: makeHead(keys.owner.privateKey) };
+  // Both signatures are genuinely valid, but old owner root A is NEVER independent.
+  assert.throws(() => verifyWith(keys.owner.publicKey, rootAsAuthority), deny);
+  const kHandle = Object.getOwnPropertySymbols(keys.owner.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(kHandle, "actual Node Ed25519 KeyObject handle is needed");
+  const hostileRoot = Object.create(keys.owner.publicKey);
+  const originalString = global.String;
+  let nativeGetterReads = 0, redirectedIndex = 0;
+  const poisonedString = new Proxy(originalString, {
+    apply(target, receiver, args) {
+      if (args.length === 1 && args[0] === 1) {
+        redirectedIndex++;
+        return "0";
+      }
+      return Reflect.apply(target, receiver, args);
+    },
+  });
+  Object.defineProperty(hostileRoot, kHandle, { get() {
+    nativeGetterReads++;
+    global.String = poisonedString;
+    return keys.owner.publicKey[kHandle];
+  } });
+  try {
+    // Critical nonvacuous control: the same poisoned root MUST still accept
+    // genuine rotated B with an actually independent C-signed CURRENT head.
+    const underPoison = await verifyWith(hostileRoot, {
+      ...f.authority, readCurrentHead: makeHead(keys.authority.privateKey),
+    })(signedInput);
+    assert.equal(underPoison.ownerMappingVerified, true);
+    assert.equal(underPoison.freshPinnedAuthorityHeadVerified, true);
+    assert.equal(underPoison.authorizesIo, false);
+    // Legacy: rotation appends B to accepted[0] instead of accepted[1],
+    // deleting A from the key set. Real CURRENT A then masquerades as independent.
+    assert.throws(() => verifyWith(hostileRoot, rootAsAuthority), deny,
+      "the exact owner root signer must be rejected during synchronous role separation");
+    assert.ok(nativeGetterReads > 0, "the native key getter actually ran");
+    assert.equal(global.String, poisonedString, "the actual native getter poisoned the ambient realm");
+  } finally {
+    global.String = originalString;
+  }
+});
+
 test("native Ed25519 roles use actual key material despite shadowed type and export metadata", async () => {
   const f = await fixture();
   const copy = (publicKey) => crypto.createPublicKey({

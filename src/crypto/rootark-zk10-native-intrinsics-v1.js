@@ -190,7 +190,9 @@ function canonicalStringify(value, depth = 0, sortKeys = false) {
     // getter could replace signed field 5 while leaving the statement at B.
     const fields = SET_PROTOTYPE([], null);
     for (let index = 0; index < value.length; index += 1) {
-      const descriptor = OWN_DESCRIPTOR(value, String(index));
+      // A prior native KeyObject getter can replace ambient String(). Keep
+      // canonical signed array access on intrinsic numeric property keys.
+      const descriptor = OWN_DESCRIPTOR(value, index);
       if (!descriptor || !HAS_OWN(descriptor, "value")) {
         throw new TypeError("noncanonical signed array element");
       }

@@ -132,7 +132,7 @@ function ownerPayload(payload) {
   let previous = "";
   const names = [];
   for (let index = 0; index < p.covered_compartments.length; index += 1) {
-    const descriptor = NATIVE_OWN_DESCRIPTOR(p.covered_compartments, String(index));
+    const descriptor = NATIVE_OWN_DESCRIPTOR(p.covered_compartments, index);
     if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
     const item = descriptor.value;
     decode(item, 16);
@@ -140,7 +140,7 @@ function ownerPayload(payload) {
     previous = item;
     // Define an own DATA property directly: even a captured native Array.push
     // would invoke Array.prototype[7] installed by a hostile KeyObject getter.
-    NATIVE_DEFINE_PROPERTY(names, String(index), { value: item,
+    NATIVE_DEFINE_PROPERTY(names, index, { value: item,
       enumerable: true, writable: true, configurable: true });
   }
   // The verified statement is retained by the history caller alongside its
@@ -216,7 +216,9 @@ function verifyOwnerRotationKeys(rotations, pinnedRoot, immutableAccountId) {
     previousDigest = NATIVE_BUFFER_TO_STRING.call(H(bytes, decode(signed.signature_from, 64),
       decode(signed.signature_next, 64)), "hex");
     current = next;
-    NATIVE_DEFINE_PROPERTY(accepted, String(accepted.length), { value: current,
+    // Keep every genuine generation key. A previous native KeyObject getter
+    // can replace global String and redirect String(length) to an old slot.
+    NATIVE_DEFINE_PROPERTY(accepted, accepted.length, { value: current,
       enumerable: true, writable: true, configurable: true });
   }
   return NATIVE_FREEZE(accepted);
@@ -236,16 +238,16 @@ function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
   // processing. Reject accessors, holes and Proxies instead of invoking them.
   const pinnedKeys = [];
   for (let index = 0; index < ownerKeys.length; index += 1) {
-    const entry = NATIVE_OWN_DESCRIPTOR(ownerKeys, String(index));
+    const entry = NATIVE_OWN_DESCRIPTOR(ownerKeys, index);
     if (!entry || !NATIVE_HAS_OWN(entry, "value")) deny();
-    NATIVE_DEFINE_PROPERTY(pinnedKeys, String(index), { value: key(entry.value, "public"),
+    NATIVE_DEFINE_PROPERTY(pinnedKeys, index, { value: key(entry.value, "public"),
       enumerable: true, writable: true, configurable: true });
   }
   let previous = null;
   let keyIndex = 0;
   let last;
   for (let index = 0; index < history.length; index += 1) {
-    const entry = NATIVE_OWN_DESCRIPTOR(history, String(index));
+    const entry = NATIVE_OWN_DESCRIPTOR(history, index);
     if (!entry || !NATIVE_HAS_OWN(entry, "value")) deny();
     const signed = exact(entry.value, OWNER_WIRE_FIELDS);
     const payload = ownerPayload(NATIVE_PICK_SIGNED_FIELDS(signed, OWNER_FIELDS));
@@ -253,9 +255,9 @@ function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
     // signed record, not two independently read versions of the same slot.
     const compartments = [];
     for (let offset = 0; offset < payload.covered_compartments.length; offset += 1) {
-      const part = NATIVE_OWN_DESCRIPTOR(payload.covered_compartments, String(offset));
+      const part = NATIVE_OWN_DESCRIPTOR(payload.covered_compartments, offset);
       if (!part || !NATIVE_HAS_OWN(part, "value")) deny();
-      NATIVE_DEFINE_PROPERTY(compartments, String(offset), { value: part.value,
+      NATIVE_DEFINE_PROPERTY(compartments, offset, { value: part.value,
         enumerable: true, writable: true, configurable: true });
     }
     const wire = NATIVE_FREEZE({ ...payload,
