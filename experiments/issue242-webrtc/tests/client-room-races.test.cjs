@@ -1,6 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const vm = require('node:vm');
@@ -161,6 +162,56 @@ test('pending plaintext SHA must not send into a newly joined ciphertext-bound r
   assert.equal(b.window.__poc.snapshot().boundObject.sha256, boundObject.sha256);
   assert.deepEqual(protectedChannel.sent, [], 'old plaintext leaked to protected DataChannel');
   assert.deepEqual(oldChannel.sent, [], 'stale text was sent after room switch');
+});
+
+test('P2: a received plaintext text digest cannot finish into a different protected room', async () => {
+  const pendingDigests = [];
+  let created = 0;
+  const b = browser({
+    digest: (algorithm, bytes) => {
+      assert.equal(algorithm, 'SHA-256', 'exercise the real browser SubtleCrypto.digest API contract');
+      return new Promise(resolve => pendingDigests.push({ bytes: Buffer.from(bytes), resolve }));
+    },
+    fetch: async () => ({ ok: true, json: async () => created++ === 0
+      ? { roomId: 'old-manual', hostKey: 'old' }
+      : { roomId: 'new-protected', hostKey: 'new', boundObject } }),
+  });
+  const digestFor = value => createHash('sha256').update(value).digest();
+  const messageFor = value => JSON.stringify({
+    type: 'text', text: value, digest: digestFor(value).toString('hex'),
+  });
+
+  await b.window.__poc.createRoom();
+  b.joined(b.sockets[0]);
+  const oldDc = b.channel(b.sockets[0], 'reused-peer-id');
+
+  // Positive control: a real SHA-256 match in the still-live manual room
+  // must continue to be admitted, rather than disabling text altogether.
+  const accepted = oldDc.onmessage({ data: messageFor('LIVE_MANUAL_TEXT') });
+  assert.equal(pendingDigests.length, 1);
+  assert.deepEqual(pendingDigests[0].bytes, Buffer.from('LIVE_MANUAL_TEXT'));
+  pendingDigests[0].resolve(Uint8Array.from(digestFor('LIVE_MANUAL_TEXT')).buffer);
+  await accepted;
+  assert.deepEqual(Array.from(b.window.__poc.snapshot().diagnostics.verifiedTexts,
+    entry => entry.text), ['LIVE_MANUAL_TEXT']);
+
+  // The old DataChannel callback starts while valid, then waits on a real
+  // digest's asynchronous boundary while the user replaces the entire room.
+  const stale = oldDc.onmessage({ data: messageFor('STALE_PRIVATE_ROOM_TEXT') });
+  assert.equal(pendingDigests.length, 2, 'the old authenticated message reached SHA-256');
+  assert.deepEqual(pendingDigests[1].bytes, Buffer.from('STALE_PRIVATE_ROOM_TEXT'));
+
+  await b.window.__poc.createRoom({ folderId: 'root', fileName: 'sealed.bin' });
+  b.joined(b.sockets[1], boundObject);
+  const newDc = b.channel(b.sockets[1], 'reused-peer-id');
+  assert.equal(b.peerConnections[0].closed, true, 'old WebRTC peer must have retired');
+  assert.equal(b.window.__poc.snapshot().boundObject.sha256, boundObject.sha256);
+  pendingDigests[1].resolve(Uint8Array.from(digestFor('STALE_PRIVATE_ROOM_TEXT')).buffer);
+  await stale;
+  assert.deepEqual(Array.from(b.window.__poc.snapshot().diagnostics.verifiedTexts,
+    entry => entry.text), ['LIVE_MANUAL_TEXT'],
+  'old-room plaintext must not enter the new protected room after a suspended digest');
+  assert.deepEqual(newDc.sent, [], 'no stale room content may reach the new DataChannel');
 });
 
 test('starting a protected room intent cancels pending plaintext before HTTP completes', async () => {

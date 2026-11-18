@@ -283,6 +283,7 @@
     }
     dc.onmessage = async event => {
       if (peers.get(p.id) !== p || p.dc !== dc) return;
+      const messageRoomIntent = roomIntent;
       if (event.data instanceof ArrayBuffer) {
         const rx = p.incoming;
         if (!rx) { record(diagnostics.rejected, 'UNEXPECTED_CHUNK'); return; }
@@ -311,6 +312,12 @@
       }
       if (m.type === 'text' && typeof m.text === 'string' && m.text.length <= 1000 && /^[0-9a-f]{64}$/.test(m.digest)) {
         const hash = await sha(new TextEncoder().encode(m.text));
+        // A digest may finish after a room switch, peer retirement or the
+        // beginning of a protected-room intent. Never admit old plaintext
+        // into the new room's verified-text diagnostics or status.
+        if (messageRoomIntent !== roomIntent || peers.get(p.id) !== p ||
+          p.dc !== dc || dc.readyState !== 'open' ||
+          protectedRoomRequired || activeBoundObject) return;
         if (hash === m.digest) {
           record(diagnostics.verifiedTexts, { from: p.id, text: m.text, sha256: hash });
           log('Texto SHA-256 OK de ' + p.id.slice(0, 5));
