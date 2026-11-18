@@ -29,7 +29,7 @@ class MainActivity : Activity() {
     private var sessionToken: String? = null
     private var sessionUsername: String? = null
     private var authenticatedSession: LoginOutcome.Authenticated? = null
-    private var securePreviewText: TextView? = null
+    private val securePreviewText = SecurePreviewBuffer()
     private var sessionCanListFiles = false
     @Volatile private var generation = 0
     @Volatile private var isForeground = false
@@ -54,8 +54,7 @@ class MainActivity : Activity() {
     }
 
     private fun clearSensitiveState() {
-        securePreviewText?.text = ""
-        securePreviewText = null
+        securePreviewText.clear()
         sessionToken = null
         sessionUsername = null
         authenticatedSession = null
@@ -262,21 +261,24 @@ class MainActivity : Activity() {
                     if (characters != null) {
                         try {
                             val view = screen("Texto verificado", "Conteúdo autenticado localmente. Feche para descartá-lo da tela.")
-                            securePreviewText = TextView(this).apply {
-                                setText(characters, 0, characters.size)
+                            val previewText = TextView(this).apply {
                                 isSaveEnabled = false
                                 importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
                                 setTextIsSelectable(false)
                                 setPadding(0, 0, 0, (16 * resources.displayMetrics.density).toInt())
                             }
-                            view.addView(securePreviewText)
+                            securePreviewText.show(characters, { retained ->
+                                previewText.setText(retained, 0, retained.size)
+                                view.addView(previewText)
+                            }, { previewText.text = "" })
                             button(view, "Fechar conteúdo") {
-                                securePreviewText?.text = ""
-                                securePreviewText = null
+                                securePreviewText.clear()
                                 backToPage()
                             }
-                        } finally {
+                        } catch (failure: Throwable) {
                             characters.fill('\u0000')
+                            securePreviewText.clear()
+                            throw failure
                         }
                     } else when ((failure as? RootArkApiException)?.statusCode) {
                         401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
@@ -321,8 +323,7 @@ class MainActivity : Activity() {
     }
 
     private fun screen(title: String, description: String): LinearLayout {
-        securePreviewText?.text = ""
-        securePreviewText = null
+        securePreviewText.clear()
         val scroll = ScrollView(this)
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
