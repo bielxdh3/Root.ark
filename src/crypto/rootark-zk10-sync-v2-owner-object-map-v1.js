@@ -327,10 +327,12 @@ function snapshotSparseProof(proof) {
     || NATIVE_OWN_KEYS(proof).length !== 257) deny();
   const result = [];
   for (let index = 0; index < 256; index += 1) {
-    const descriptor = NATIVE_OWN_DESCRIPTOR(proof, String(index));
+    // Native numeric property keys cannot be redirected by a previous
+    // caller-owned KeyObject getter replacing global String().
+    const descriptor = NATIVE_OWN_DESCRIPTOR(proof, index);
     if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
     const sibling = hex(descriptor.value);
-    NATIVE_DEFINE_PROPERTY(result, String(index), { value: sibling,
+    NATIVE_DEFINE_PROPERTY(result, index, { value: sibling,
       enumerable: true, configurable: false, writable: false });
   }
   return NATIVE_FREEZE(result);

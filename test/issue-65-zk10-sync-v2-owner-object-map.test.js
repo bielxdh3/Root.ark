@@ -170,6 +170,61 @@ async function fixture(overrides = {}, { coveredCompartments = [id(9)] } = {}) {
       zkMembershipProof: proof.siblings, ownerMapping: mapping } };
 }
 
+
+test("P2 owner map: poisoned String cannot permute a foreign Merkle sibling wire into a genuine proof", async () => {
+  const f = await fixture();
+  const reversed = f.proof.siblings.slice().reverse();
+  assert.notDeepEqual(reversed, f.proof.siblings,
+    "the forged 256-slot proof is not the owner-inventory proof");
+  const originalString = global.String;
+  const callCounts = new Map();
+  let attackActive = false;
+  let getterReads = 0;
+  const poisonedString = new Proxy(originalString, {
+    apply(target, receiver, args) {
+      if (attackActive && args.length === 1 && Number.isInteger(args[0])
+        && args[0] >= 0 && args[0] < 256) {
+        const index = args[0];
+        const reads = callCounts.get(index) || 0;
+        callCounts.set(index, reads + 1);
+        // Legacy code reads proof[255-index], then writes result[index].
+        return Reflect.apply(target, receiver, [reads % 2 ? index : 255 - index]);
+      }
+      return Reflect.apply(target, receiver, args);
+    },
+  });
+  const nativeHandle = Object.getOwnPropertySymbols(keys.source.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(nativeHandle, "requires an actual Ed25519 KeyObject callback");
+  const hostileProvisioner = Object.create(keys.source.publicKey);
+  Object.defineProperty(hostileProvisioner, nativeHandle, { get() {
+    getterReads++;
+    global.String = poisonedString;
+    return keys.source.publicKey[nativeHandle];
+  } });
+  try {
+    const verifier = createOwnerObjectMapVerifier({
+      sourceAuthority: { ...f.sourceAuthority, provisionerPublicKey: hostileProvisioner },
+      zkAuthority: f.zkAuthority, mappingAuthority: f.authority,
+    });
+    assert.ok(getterReads > 0, "native provisioning key getter poisoned the realm");
+    assert.equal(global.String, poisonedString);
+    await assert.rejects(verifier({ ...f.input, zkMembershipProof: reversed }), deny,
+      "the reversed signed-inventory proof is invalid under native String");
+    callCounts.clear();
+    attackActive = true;
+    await assert.rejects(verifier({ ...f.input, zkMembershipProof: reversed }), deny,
+      "hostile String(index) must not reassemble a genuine proof from forged sibling wire");
+    attackActive = false;
+    const valid = await verifier(f.input);
+    assert.equal(valid.zkSignedInventoryMembershipVerified, true);
+    assert.equal(valid.authorizesIo, false);
+  } finally {
+    attackActive = false;
+    global.String = originalString;
+  }
+});
+
 test("P2: proxy-backed revocation policy cannot hide a real revoked source device", () => {
   const revoked = new Proxy(["source-device-4"], {
     get(target, property, receiver) {
