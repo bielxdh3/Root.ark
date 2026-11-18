@@ -24,7 +24,8 @@ import org.junit.Test
 class PagedProtectedInventoryTest {
     private val origin = ServerOrigin.parse("https://files.example.org:9443")
     private val fixture by lazy {
-        val bytes = javaClass.classLoader.getResourceAsStream("paged-server255-http.json")
+        val loader = requireNotNull(javaClass.classLoader) { "Missing test fixture classloader" }
+        val bytes = loader.getResourceAsStream("paged-server255-http.json")
             ?: throw IOException("Missing captured #255 HTTP response fixture")
         JSONObject(bytes.bufferedReader(Charsets.UTF_8).use { it.readText() })
     }
