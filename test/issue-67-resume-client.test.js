@@ -22,10 +22,10 @@ const { readResumeCredentials, resume } = require("../sync-client/rootark-sync-v
 const CLI = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
 const PASSWORD = "secret-resume-password";
 
-function runResume(config, target, credentials) {
+function runResume(config, target, credentials, extraArgs = []) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, "resume", "--config", config,
-      "--device-id", target, "--credentials-stdin"], {
+      "--device-id", target, ...extraArgs, "--credentials-stdin"], {
       windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -33,6 +33,10 @@ function runResume(config, target, credentials) {
     const timeout = setTimeout(() => child.kill(), 12000);
     child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.stdin.on("error", (error) => {
+      // Invalid argv may exit before the test fixture completes its stdin write.
+      if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") reject(error);
+    });
     child.once("error", (error) => { clearTimeout(timeout); reject(error); });
     child.once("close", (status) => {
       clearTimeout(timeout);
@@ -59,6 +63,11 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
   const storagePath = path.join(root, "objects.json");
   const app = express();
   app.use("/sync/v1", express.json());
+  let resumeHttpRequests = 0;
+  app.use("/sync/v1/devices/:deviceId/resume", (_req, _res, next) => {
+    resumeHttpRequests += 1;
+    next();
+  });
   const passwordHash = bcrypt.hashSync(PASSWORD, 4);
   const user = { username: "alice", password: passwordHash, sessionVersion: 0 };
   const authenticate = (req, res, next) => {
@@ -100,6 +109,18 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
   assert.doesNotMatch(denied.stderr + denied.stdout, /wrong-password|test-resume-token/);
   assert.equal(routes.store.pauseFence("alice", "device-a") !== null, true);
 
+  // With duplicate --device-id, the previous parser silently selected the
+  // second target and lifted a real paused-device fence with valid stdin.
+  const beforeAmbiguousRequests = resumeHttpRequests;
+  const ambiguous = await runResume(config, "device-b", credentials, ["--device-id", "device-a"]);
+  assert.notEqual(routes.store.pauseFence("alice", "device-a"), null,
+    "ambiguous CLI arguments must not lift the pause on the unexpected device");
+  assert.equal(resumeHttpRequests, beforeAmbiguousRequests,
+    "ambiguous target must be rejected before HTTP");
+  assert.notEqual(ambiguous.status, 0);
+  assert.match(ambiguous.stderr, /Unsupported resume option/i);
+  assert.doesNotMatch(ambiguous.stdout + ambiguous.stderr, /secret-resume-password|test-resume-token/);
+
   const resumed = await runResume(config, "device-a", credentials);
   assert.equal(resumed.status, 0, resumed.stderr);
   assert.deepEqual(JSON.parse(resumed.stdout), {
@@ -117,7 +138,7 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
     "the exported programmatic stream contract must still work");
 });
 
-test("#67: resume CLI rejects equals-form secret flags before stdin or HTTP", async (t) => {
+test("#67: resume CLI rejects secret flags and ambiguous arguments before stdin or HTTP", async (t) => {
   const root = createPrivateAuthorityFixture("rootark-67-resume-argv-");
   let requests = 0;
   const server = http.createServer((_request, response) => {
@@ -135,11 +156,16 @@ test("#67: resume CLI rejects equals-form secret flags before stdin or HTTP", as
     username: "alice", token: "test-resume-token", deviceId: "device-b",
   }));
 
-  for (const forbiddenArgs of [["--password=secret"], ["--code=123456"],
-    ["--credentialsStream", "secret-json-on-argv"]]) {
+  const validArgs = ["--config", config, "--device-id", "device-a", "--credentials-stdin"];
+  for (const { argv, provideStdin = false } of [
+    { argv: [...validArgs, "--password=secret"] },
+    { argv: [...validArgs, "--code=123456"] },
+    { argv: [...validArgs, "--credentialsStream", "secret-json-on-argv"] },
+    { argv: ["unexpected-positional", ...validArgs], provideStdin: true },
+    { argv: ["--config", config, "--device-id", "device-a", "--device-id", "device-b", "--credentials-stdin"], provideStdin: true },
+  ]) {
     const result = await new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [CLI, "resume", "--config", config,
-        "--device-id", "device-a", "--credentials-stdin", ...forbiddenArgs], {
+      const child = spawn(process.execPath, [CLI, "resume", ...argv], {
         windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
       });
       let stdout = "";
@@ -148,13 +174,18 @@ test("#67: resume CLI rejects equals-form secret flags before stdin or HTTP", as
       const timeout = setTimeout(() => { timedOut = true; child.kill(); }, 8000);
       child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
       child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      child.stdin.on("error", (error) => {
+        // Immediate argv rejection may close the pipe before the fixture writes.
+        if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") reject(error);
+      });
       child.once("error", (error) => { clearTimeout(timeout); reject(error); });
       child.once("close", (status) => {
         clearTimeout(timeout);
         resolve({ status, stdout, stderr, timedOut });
       });
-      // Deliberately leave stdin open: any attempt to read credentials must
-      // hang until the deadline, whereas argv validation must exit immediately.
+      if (provideStdin) child.stdin.end(JSON.stringify({ password: "synthetic-test-only" }));
+      // For secret-bearing options, deliberately leave stdin open. Rejection
+      // must occur before stdin is read. Ambiguous targets also must not POST.
     });
     assert.equal(result.timedOut, false, "invalid argv must not wait for credentials on stdin");
     assert.notEqual(result.status, 0);
