@@ -16,10 +16,10 @@ Targets: minSdk 29 (proposed in the architecture doc, owner to confirm), compile
 ## Build requirements
 
 - JDK 17
-- Android SDK with platform 35 and build-tools (Android Studio's SDK Manager, or `sdkmanager`)
-- A Gradle 8.x distribution, or Android Studio, to generate the wrapper
+- Android SDK with `platforms;android-35`, `build-tools;34.0.0` (AGP 8.7.3 default) and `build-tools;35.0.0` (matching CI), installed via Android Studio's SDK Manager or `sdkmanager`.
+- A Gradle 8.10.2 distribution (matching CI), or Android Studio, to generate the wrapper
 
-The Gradle wrapper (`gradlew`, `gradle/wrapper/`) is not checked in. Generate it once with a local Gradle 8.10+ install:
+The Gradle wrapper (`gradlew`, `gradle/wrapper/`) is not checked in. Generate it once with a local Gradle 8.10.2 install:
 
 ```
 cd android
