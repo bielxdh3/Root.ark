@@ -16,8 +16,8 @@ Targets: minSdk 29 (proposed in the architecture doc, owner to confirm), compile
 ## Build requirements
 
 - JDK 17
-- Android SDK with platform 35 and build-tools (Android Studio's SDK Manager, or `sdkmanager`)
-- A Gradle 8.x distribution, or Android Studio, to generate the wrapper
+- Android SDK with `platforms;android-35`, `build-tools;34.0.0` and `build-tools;35.0.0` (Android Studio's SDK Manager, or `sdkmanager`). AGP 8.7.3 can require 34.0.0 even when 35.0.0 is installed.
+- A Gradle 8.10.2 distribution (the version used by CI), or Android Studio configured to use that version.
 
 The Gradle wrapper (`gradlew`, `gradle/wrapper/`) is not checked in. Generate it once with a local Gradle 8.10+ install:
 
@@ -32,6 +32,20 @@ Then:
 ./gradlew :core:test          # pure JVM path-validator and contract tests
 ./gradlew :app:assembleDebug  # Android launcher build (requires the Android SDK)
 ```
+
+On Windows PowerShell, run the same build after generating the wrapper:
+
+```powershell
+.\gradlew.bat :core:test :app:assembleDebug
+```
+
+Alternatively, with Gradle 8.10.2 already installed, run the same task pair as CI directly from `android/` without generating a wrapper:
+
+```
+gradle --no-daemon :core:test :app:assembleDebug
+```
+
+These JVM tests and the debug APK build do not replace the separate JavaScript contract or physical-device validation gates.
 
 Set `ANDROID_HOME` or create `android/local.properties` with `sdk.dir=...` (not committed).
 
