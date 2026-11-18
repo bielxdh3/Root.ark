@@ -1225,6 +1225,23 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     }), /ZK_SHARE_OFFER_DENIED/,
     "owner-pinned issuer revoked after genuine HPKE sealing fails before export");
     assert.equal(issuerReads, 2);
+    let forgedMapCalls = 0;
+    await assert.rejects(createProtectedRecipientShareOffer({ ...ownerOfferArgs,
+      readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        const stale = current.devices.map((device) => ({ ...device }));
+        current.devices.find((device) =>
+          device.deviceId === issuerPin.deviceId).revokedAtEpoch = metadata.epoch;
+        Object.defineProperty(current.devices, "map", { value() {
+          forgedMapCalls++;
+          return stale;
+        } });
+        return current;
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "a forged roster map cannot hide a truly revoked issuer before owner CEK export");
+    assert.equal(forgedMapCalls, 0,
+      "independent roster snapshot must read array slots, not a supplied map method");
     // The authentic owner-approved HPKE envelope has a shorter lifetime than
     // this independently owner-signed grant. Advance only the wall clock in
     // the SECOND authority read, after the real AEAD + HPKE sealing awaits.
@@ -1376,6 +1393,32 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     "issuer revoked during HPKE/file AEAD awaits cannot yield plaintext");
     assert.equal(authorityReads, 3,
       "additional current authority check must occur after owner CEK and file AEAD");
+    // A hostile shared realm can attach an own array method to the *third*
+    // independent authority result. Genuine Ed25519, HTTP, HPKE and file AEAD
+    // have already passed; the final recipient release must inspect the real
+    // revoked roster row instead of calling that array's forged filter().
+    let poisonedReads = 0;
+    let forgedFilterCalls = 0;
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++poisonedReads === 3) {
+          const stale = current.devices.map((device) => ({ ...device }));
+          current.devices.find((device) =>
+            device.deviceId === originalDevice.device_id).revokedAtEpoch = metadata.epoch;
+          Object.defineProperty(current.devices, "filter", { value(predicate) {
+            forgedFilterCalls++;
+            return stale.filter(predicate);
+          } });
+        }
+        return current;
+      } },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "a late revoked signer cannot be made active by an own array filter method");
+    assert.equal(poisonedReads, 3,
+      "attack must be installed at the genuine post-HPKE/file-AEAD authority read");
+    assert.equal(forgedFilterCalls, 0,
+      "authority arrays must never dispatch caller-owned filter methods");
     // This proof covers the three explicitly owner-selected versions, never
     // unknown historical versions or externally held backup copies.
     assert.equal(typeof cekBatch.sealOwnerAuthorizedVersionedCeks, "function",

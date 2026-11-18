@@ -122,17 +122,27 @@ function snapshotAuthority(value) {
     digest: Buffer.from(h.digest.value) };
   const sourceDevices = fields.devices.value;
   if (!Array.isArray(sourceDevices) || sourceDevices.length > 128) denyOffer();
-  const devices = sourceDevices.map((device) => {
+  // Do not dispatch a caller-supplied array's map/filter methods. A hostile
+  // realm or a custom own method could conceal a revoked/duplicate signer.
+  const slots = Object.getOwnPropertyDescriptors(sourceDevices);
+  const count = slots.length?.value;
+  if (!Number.isSafeInteger(count) || count < 0 || count > 128
+    || Reflect.ownKeys(slots).length !== count + 1) denyOffer();
+  const devices = [];
+  for (let index = 0; index < count; index++) {
+    const entry = slots[index];
+    if (!entry || !Object.hasOwn(entry, "value")) denyOffer();
+    const device = entry.value;
     strict(device, ["deviceId", "authorizationPublicKey",
       "enrolledEpoch", "revokedAtEpoch"]);
     const d = Object.getOwnPropertyDescriptors(device);
     if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))
       || !(d.authorizationPublicKey.value instanceof Uint8Array)
       || d.authorizationPublicKey.value.length !== 32) denyOffer();
-    return { deviceId: d.deviceId.value,
+    devices[index] = { deviceId: d.deviceId.value,
       authorizationPublicKey: Buffer.from(d.authorizationPublicKey.value),
       enrolledEpoch: d.enrolledEpoch.value, revokedAtEpoch: d.revokedAtEpoch.value };
-  });
+  }
   return { scope, head, devices };
 }
 async function verifyOfferAuthority(authority, statement, bytes, signature, pin,
@@ -141,15 +151,23 @@ async function verifyOfferAuthority(authority, statement, bytes, signature, pin,
   currentAuthority(current, statement, signature, bytes);
   // Independent roster membership does NOT grant issuer/owner authority:
   // a recipient may have a legitimate active Ed25519 signing device.
-  const issuer = current.devices.filter((device) =>
-    device.deviceId === issuerPin.deviceId);
-  if (issuer.length !== 1
-    || !same(issuer[0].authorizationPublicKey,
+  let issuer = null, recipient = null;
+  for (let index = 0; index < current.devices.length; index++) {
+    const device = current.devices[index];
+    if (device.deviceId === issuerPin.deviceId) {
+      if (issuer) denyOffer();
+      issuer = device;
+    }
+    if (device.deviceId === pin.deviceId) {
+      if (recipient) denyOffer();
+      recipient = device;
+    }
+  }
+  if (!issuer
+    || !same(issuer.authorizationPublicKey,
       from64(issuerPin.authorizationPublicKey, 32))) denyOffer();
-  const recipient = current.devices.filter((device) =>
-    device.deviceId === pin.deviceId);
-  if (recipient.length !== 1
-    || !same(recipient[0].authorizationPublicKey,
+  if (!recipient
+    || !same(recipient.authorizationPublicKey,
       from64(pin.authorizationPublicKey, 32))) denyOffer();
   return current;
 }
@@ -280,20 +298,26 @@ function safeEnvelope(value) {
   return Object.freeze({ ...other, core });
 }
 function currentAuthority(snapshotValue, statement, shareSignature, statementBytes) {
-  strict(snapshotValue, ["scope", "head", "devices"]);
-  strict(snapshotValue.scope, SCOPE);
-  strict(snapshotValue.head, ["revision", "epoch", "digest"]);
-  if (snapshotValue.head.revision !== statement.manifest_revision
-    || snapshotValue.head.epoch !== statement.epoch
-    || !Buffer.from(snapshotValue.head.digest || []).equals(statement.manifest_digest)
-    || !Array.isArray(snapshotValue.devices) || snapshotValue.devices.length > 128) deny();
+  // The final post-AEAD read must get the same descriptor-only custody check
+  // as the earlier read. Getter and array-method reentry cannot rewrite the
+  // authority we compare to the signed grant.
+  const current = snapshotAuthority(snapshotValue);
+  if (current.head.revision !== statement.manifest_revision
+    || current.head.epoch !== statement.epoch
+    || !current.head.digest.equals(statement.manifest_digest)) deny();
   for (const field of SCOPE) {
-    if (snapshotValue.scope[field] !== b64(statement[field])) deny();
+    if (current.scope[field] !== b64(statement[field])) deny();
   }
   const active = (deviceId) => {
-    const hits = snapshotValue.devices.filter((device) => device?.deviceId === deviceId);
-    if (hits.length !== 1) deny();
-    const device = hits[0];
+    let device = null;
+    for (let index = 0; index < current.devices.length; index++) {
+      const candidate = current.devices[index];
+      if (candidate.deviceId === deviceId) {
+        if (device) deny();
+        device = candidate;
+      }
+    }
+    if (!device) deny();
     if (device.revokedAtEpoch !== null || !Number.isSafeInteger(device.enrolledEpoch)
       || device.enrolledEpoch < 1 || device.enrolledEpoch > statement.epoch
       || !(device.authorizationPublicKey instanceof Uint8Array)
