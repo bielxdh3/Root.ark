@@ -120,6 +120,58 @@ test('recipient-bound single-use invite and host session prevent impersonation a
   assert.equal((await replay.next('error')).code, 'INVALID_INVITE');
 });
 
+test('1:N guest membership remains private from other recipients before consent', async t => {
+  const f = await fixture(t);
+  const room = (await f.createRoom(f.cookie('alice'))).data;
+  const host = await f.connect(f.cookie('alice'));
+  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  const hostJoined = await host.next('joined');
+
+  host.send({ type: 'invite', recipient: 'bob' });
+  const bobInvite = await host.next('invited');
+  const bob = await f.connect(f.cookie('bob'));
+  bob.send({ type: 'join', roomId: room.roomId, invitation: bobInvite.invitation });
+  const bobJoined = await bob.next('joined');
+  assert.deepEqual(bobJoined.members.map(m => m.username), ['alice']);
+  await host.next('peer-joined');
+  host.send({ type: 'request-peer', to: bobJoined.peerId });
+  const request = await bob.next('peer-request');
+  assert.equal(request.peerId, hostJoined.peerId);
+  bob.send({ type: 'consent', requestId: request.requestId, accept: true });
+  assert.equal((await host.next('peer-accepted')).peerId, bobJoined.peerId);
+  host.send({ type: 'signal', to: bobJoined.peerId, signal: { kind: 'ice', candidate: { candidate: 'consented' } } });
+  assert.equal((await bob.next('signal')).peerId, hostJoined.peerId);
+
+  host.send({ type: 'invite', recipient: 'eve' });
+  const eveInvite = await host.next('invited');
+  const eve = await f.connect(f.cookie('eve'));
+  const bobSawGuest = [];
+  bob.ws.on('message', bytes => {
+    const message = JSON.parse(bytes.toString());
+    if (message.type === 'peer-joined' || message.type === 'peer-left') bobSawGuest.push(message);
+  });
+  eve.send({ type: 'join', roomId: room.roomId, invitation: eveInvite.invitation });
+  const eveJoined = await eve.next('joined');
+  assert.deepEqual(eveJoined.members.map(m => m.username), ['alice'],
+    'a recipient must not learn another invited recipient name or peer ID');
+  assert.equal((await host.next('peer-joined')).username, 'eve', 'host still sees every invited recipient');
+
+  // Consent with Alice never grants Bob signaling rights to another guest.
+  bob.send({ type: 'signal', to: eveJoined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'cross-guest' } } });
+  assert.equal((await bob.next('error')).code, 'FORBIDDEN');
+
+  host.send({ type: 'kick', to: eveJoined.peerId });
+  assert.equal((await eve.next('error')).code, 'REVOKED');
+  assert.equal((await host.next('peer-left')).peerId, eveJoined.peerId);
+  // A round-trip error reply on Bob's socket is a protocol-order barrier:
+  // any earlier peer-left broadcast on that same socket precedes this reply.
+  bob.send({ type: 'invite', recipient: 'eve' });
+  assert.equal((await bob.next('error')).code, 'FORBIDDEN');
+  assert.deepEqual(bobSawGuest, []);
+  assert.equal(hostJoined.role, 'host');
+});
+
 test('revoked or expired Root.ark session closes its previously consented peer channel', async t => {
   const f = await fixture(t);
   const room = (await f.createRoom(f.cookie('alice'))).data;
