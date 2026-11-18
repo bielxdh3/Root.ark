@@ -116,7 +116,13 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     room.members.delete(peer.id);
     room.pending.forEach((p, id) => { if (p.from === peer.id || p.to === peer.id) room.pending.delete(id); });
     for (const key of room.allowed) if (key.split(':').includes(peer.id)) room.allowed.delete(key);
-    for (const other of room.members.values()) send(other.ws, { type: 'peer-left', peerId: peer.id });
+    // A 1:N guest has not consented to reveal their participation to peers.
+    // Preserve host-to-guest state without broadcasting guest-to-guest roster.
+    for (const other of room.members.values()) {
+      if (peer.role === 'host' || other.role === 'host') {
+        send(other.ws, { type: 'peer-left', peerId: peer.id });
+      }
+    }
     if (peer.role === 'host') expireRoom(room);
   }
   const pair = (a, b) => [a, b].sort().join(':');
@@ -298,8 +304,14 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       send(ws, { type: 'joined', peerId: id, role, username: peer.username,
         ...(room.boundObject ? { boundObject: { ...room.boundObject, sha256: room.objectDigest,
           size: room.objectSize } } : {}),
-        members: [...room.members.values()].filter(p => p.id !== id).map(p => ({ peerId: p.id, role: p.role, username: p.username })) });
-      for (const other of room.members.values()) if (other.id !== id) send(other.ws, { type: 'peer-joined', peerId: id, role, username: peer.username });
+        members: [...room.members.values()]
+          .filter(p => p.id !== id && (role === 'host' || p.role === 'host'))
+          .map(p => ({ peerId: p.id, role: p.role, username: p.username })) });
+      for (const other of room.members.values()) {
+        if (other.id !== id && (role === 'host' || other.role === 'host')) {
+          send(other.ws, { type: 'peer-joined', peerId: id, role, username: peer.username });
+        }
+      }
       return;
     }
     const room = roomOf(ws);
