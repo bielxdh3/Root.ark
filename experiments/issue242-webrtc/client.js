@@ -447,6 +447,7 @@
       cancelOutgoing(p, true);
       record(diagnostics.rejected, error?.message === 'P2P_SEND_BUFFER_STALLED'
         ? 'P2P_SEND_BUFFER_STALLED' : 'SEND_FAILED');
+      log('Falha ao enviar arquivo para o par ' + p.id.slice(0, 5));
     }
   }
   function cancelOutgoing(p, notify) {

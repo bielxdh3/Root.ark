@@ -161,11 +161,17 @@ test('1:N full sender path cancels only stalled peer; healthy sibling still rece
   assert.deepEqual(Array.from(b.window.__poc.snapshot().peers, p => p.outgoingPhase),
     [null, 'verifying']);
   assert.ok(b.window.__poc.snapshot().diagnostics.rejected.includes('P2P_SEND_BUFFER_STALLED'));
+  const failureStatus = 'Falha ao enviar arquivo para o par slow-';
+  assert.equal(b.getElement('state').textContent, failureStatus,
+    'the failed transfer must be visible before the healthy peer confirms receipt');
   await healthy.onmessage({ data: JSON.stringify({
     type: 'verified-file', id: offered(healthy).id, digest: '0'.repeat(64),
   }) });
   assert.deepEqual(Array.from(b.window.__poc.snapshot().peers, p => p.outgoingPhase),
     [null, null]);
+  assert.equal(b.getElement('state').textContent, 'Recebimento confirmado SHA-256: secret.txt');
+  assert.ok(b.getElement('events').textContent.split('\n').includes(failureStatus),
+    'the failure must remain visible in the event history after the healthy peer confirms receipt');
 });
 
 test('P2: sender resumes after drain below send-window limit without waiting for 64 KiB', async () => {
