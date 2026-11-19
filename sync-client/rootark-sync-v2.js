@@ -617,7 +617,13 @@ if (require.main === module) {
   else if (command === "restore") start({ ...args(rest), restore: true }).catch((error) => { console.error(`Sync restore failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "resume") resume({ ...args(rest) }).catch((error) => { console.error(`Sync resume failed: ${error.message}`); process.exitCode = 1; });
   else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js preview --config <private-config> --object-id <id> --version-id <id> (requires independently injected custody and current grant; never mutates files)\nOr: node sync-client/rootark-sync-v2.js preview-plan --config <private-config> --plan-stdin (JSON array of up to 32 {objectId,versionId}; independent custody required; never mutates)\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)"
-    + "\nOr: node sync-client/rootark-sync-v2.js browse|hydrate|evict|pin|unpin|status --config <private-config> [--path relative/file]");
+    + "\nFiles On-Demand:\n"
+    + "  node sync-client/rootark-sync-v2.js browse --config <private-config> [--limit 64] [--cursor <nextCursor>]\n"
+    + "  node sync-client/rootark-sync-v2.js hydrate --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js evict --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js pin --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js unpin --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js status --config <private-config> --path relative/file");
 }
 
 module.exports = { args, fileKeyResolver, normalizeTrustedDevicePolicy,

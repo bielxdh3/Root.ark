@@ -441,12 +441,15 @@ Para listar e baixar um arquivo especifico, use:
 
 ```powershell
 node sync-client/rootark-sync-v2.js browse --config E:\sync-private\.rootark-sync.json --limit 64
+node sync-client/rootark-sync-v2.js browse --config E:\sync-private\.rootark-sync.json --limit 64 --cursor '<nextCursor>'
 node sync-client/rootark-sync-v2.js hydrate --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 node sync-client/rootark-sync-v2.js evict --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 node sync-client/rootark-sync-v2.js pin --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 node sync-client/rootark-sync-v2.js status --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 node sync-client/rootark-sync-v2.js unpin --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 ```
+
+Para listar a pagina seguinte, substitua `<nextCursor>` pelo valor `nextCursor` da resposta anterior. Quando nao houver proximo cursor, a listagem terminou. Se o inventario mudar durante a navegacao (HTTP 409), reinicie a listagem sem `--cursor`.
 
 `hydrate` identifica o objeto pelo inventario e baixa **somente** seu envelope completo; o motor valida identidade, revisao, autorizacao assinada e integridade AEAD antes de materializar os bytes. Se houver modificacao local nao sincronizada, arquivo nao rastreado, ambiguidades ou mudanca entre a consulta de metadados e o download, a hidratacao e recusada sem sobrescrever o arquivo. `evict` preserva a copia remota e exige que o arquivo local esteja limpo e que seus bytes sejam iguais ao objeto remoto verificado. Arquivos evictados continuam remotos, nao viram tombstones; offline, os arquivos ja materializados permanecem acessiveis e novas hidratacoes aguardam conexao.
 
