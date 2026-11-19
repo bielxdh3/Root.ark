@@ -67,7 +67,8 @@ function browser({ fetch, digest = async () => new Uint8Array(32).buffer,
     peerConnections.at(-1).ondatachannel({ channel: dc });
     return dc;
   };
-  return { window, sockets, peerConnections, joined, channel };
+  return { window, sockets, peerConnections, joined, channel,
+    getElement: id => elements.get(id) };
 }
 
 function smallFile() {
@@ -76,6 +77,60 @@ function smallFile() {
     arrayBuffer: async () => bytes.buffer.slice(0),
     slice: (start, end) => ({ arrayBuffer: async () => bytes.slice(start, end).buffer }) };
 }
+
+test('file offer count excludes a peer that leaves while SHA-256 is pending', async () => {
+  const hashes = [];
+  const b = browser({
+    digest: () => new Promise(resolve => hashes.push(resolve)),
+    fetch: async () => ({ ok: true, json: async () => ({ roomId: 'test', hostKey: 'local' }) }),
+  });
+  await b.window.__poc.createRoom();
+  b.joined(b.sockets[0]);
+  const departed = b.channel(b.sockets[0], 'departed-peer');
+  const remaining = b.channel(b.sockets[0], 'remaining-peer');
+  const offering = b.window.__poc.sendFile(smallFile());
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(hashes.length, 1, 'file SHA-256 must remain pending before peer-left');
+
+  await b.sockets[0].onmessage({ data: JSON.stringify({
+    type: 'peer-left', peerId: 'departed-peer',
+  }) });
+  hashes[0](new Uint8Array(32).buffer);
+  await offering;
+
+  const offers = dc => dc.sent.filter(message => message.type === 'offer-file');
+  assert.equal(b.peerConnections[0].closed, true, 'departed peer connection must close');
+  assert.equal(offers(departed).length, 0, 'departed peer must not receive an offer');
+  assert.equal(offers(remaining).length, 1, 'remaining peer must receive exactly one offer');
+  assert.equal(b.getElement('state').textContent, 'Arquivo oferecido a 1 destinatário(s)',
+    'status count must reflect offers sent after the digest completes');
+});
+
+test('file offer count reports zero when the only peer leaves during SHA-256', async () => {
+  const hashes = [];
+  const b = browser({
+    digest: () => new Promise(resolve => hashes.push(resolve)),
+    fetch: async () => ({ ok: true, json: async () => ({ roomId: 'test', hostKey: 'local' }) }),
+  });
+  await b.window.__poc.createRoom();
+  b.joined(b.sockets[0]);
+  const departed = b.channel(b.sockets[0], 'only-peer');
+  const offering = b.window.__poc.sendFile(smallFile());
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(hashes.length, 1, 'file SHA-256 must remain pending before peer-left');
+
+  await b.sockets[0].onmessage({ data: JSON.stringify({
+    type: 'peer-left', peerId: 'only-peer',
+  }) });
+  hashes[0](new Uint8Array(32).buffer);
+  await offering;
+
+  assert.equal(b.peerConnections[0].closed, true, 'departed peer connection must close');
+  assert.equal(departed.sent.filter(message => message.type === 'offer-file').length, 0,
+    'no offer may be sent after the only peer leaves');
+  assert.equal(b.getElement('state').textContent, 'Nenhum destinatário permaneceu disponível',
+    'zero successful offers must not be reported as a successful send');
+});
 
 test('1:N full sender path cancels only stalled peer; healthy sibling still receives SHA ACK', async () => {
   let stalled;
