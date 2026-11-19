@@ -482,6 +482,7 @@
     if (!canView) { noAccess(target, "A auditoria exige a permissão viewAuditLogs."); return; }
     target.innerHTML = auditMarkup();
     let currentPage = 1, totalPages = 1, currentFilters = {}, currentLogs = [];
+    let logsGeneration = 0;
     const body = document.getElementById("audit-body"), prev = target.querySelector('[data-action="audit-previous"]');
     const next = target.querySelector('[data-action="audit-next"]'), pageInfo = document.getElementById("audit-page-info");
     function updatePagination(page, pages) {
@@ -512,13 +513,20 @@
       } catch (error) { const message = publicError(error, "Não foi possível carregar o resumo da auditoria."); if (message) setFeedback(document.getElementById("audit-filter-feedback"), message, "error"); }
     }
     async function loadLogs() {
+      const generation = ++logsGeneration, requestedPage = currentPage;
+      currentLogs = [];
+      prev.disabled = true;
+      next.disabled = true;
+      pageInfo.textContent = "Carregando registros…";
       body.innerHTML = tableState(8, "Carregando registros…", "loading");
       try {
-        const data = await api.get(api.query("/audit/logs", Object.assign({ page: currentPage, limit: 50 }, currentFilters)));
+        const data = await api.get(api.query("/audit/logs", Object.assign({ page: requestedPage, limit: 50 }, currentFilters)));
+        if (generation !== logsGeneration) return;
         const pages = Math.max(1, Math.ceil(numeric(data.total) / Math.max(1, numeric(data.limit) || 50)));
-        updatePagination(numeric(data.page) || currentPage, pages); renderLogs(data.logs);
+        updatePagination(numeric(data.page) || requestedPage, pages); renderLogs(data.logs);
       } catch (error) {
         const message = publicError(error, "Não foi possível carregar os registros de auditoria.");
+        if (generation !== logsGeneration) return;
         body.innerHTML = tableState(8, message || "Não foi possível carregar os registros.", "error"); pageInfo.textContent = "Registros indisponíveis";
       }
     }
@@ -538,8 +546,8 @@
     });
     target.addEventListener("click", (event) => {
       const button = event.target.closest("button[data-action]"); if (!button) return;
-      if (button.dataset.action === "audit-previous" && currentPage > 1) { currentPage -= 1; loadLogs(); }
-      else if (button.dataset.action === "audit-next" && currentPage < totalPages) { currentPage += 1; loadLogs(); }
+      if (button.dataset.action === "audit-previous" && !prev.disabled && currentPage > 1) { currentPage -= 1; loadLogs(); }
+      else if (button.dataset.action === "audit-next" && !next.disabled && currentPage < totalPages) { currentPage += 1; loadLogs(); }
       else if (button.dataset.action === "refresh-audit") {
         button.disabled = true; Promise.all([loadSummary(), loadLogs()]).finally(() => { button.disabled = false; });
       } else if (button.dataset.action === "audit-details") {
