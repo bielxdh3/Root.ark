@@ -249,7 +249,7 @@ class MainActivity : Activity() {
                     runCatching { LocalCipherCacheKey.erase() }
                     showSession("Inventário mudou no servidor. Reinicie a listagem para obter um novo snapshot.")
                 }
-                else -> showSession("Não foi possível carregar a página de inventário (limite: 128 KiB / 64 registros).")
+                else -> showSession(inventoryPageFailureMessage(failure))
             }
         }
     }
