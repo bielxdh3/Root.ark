@@ -56,9 +56,15 @@ function args(argv) {
     const separator = item.indexOf("=");
     const key = item.slice(2, separator < 0 ? undefined : separator);
     if (Object.hasOwn(result, key)) throw new Error(`Invalid Sync v2 duplicate --${key}`);
-    if (key === "once" && separator < 0) {
-      const next = argv[index + 1];
-      result.once = next === "true" || next === "false" ? (index++, next === "true") : true;
+    if (key === "once") {
+      if (separator < 0) {
+        const next = argv[index + 1];
+        result.once = next === "true" || next === "false" ? (index++, next === "true") : true;
+      } else {
+        const value = item.slice(separator + 1);
+        if (value !== "true" && value !== "false") throw new Error("Invalid Sync v2 --once value");
+        result.once = value === "true";
+      }
     } else if (valuedOptions.has(key)) {
       const value = separator < 0 ? argv[index + 1] : item.slice(separator + 1);
       if (!value || (separator < 0 && value.startsWith("--"))) {

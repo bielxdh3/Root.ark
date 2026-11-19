@@ -23,6 +23,9 @@ test("issue 66: Sync v2 CLI --once parses boolean values instead of truthy strin
   assert.strictEqual(args(["--once"]).once, true);
   assert.strictEqual(args(["--once", "true"]).once, true);
   assert.strictEqual(args(["--once", "false"]).once, false);
+  assert.strictEqual(args(["--once=true"]).once, true);
+  assert.strictEqual(args(["--once=false"]).once, false);
+  assert.throws(() => args(["--once=bad"]), /Invalid Sync v2 --once value/);
 });
 
 test("issue 66: malformed or ambiguous --path fails before reading config", () => {
