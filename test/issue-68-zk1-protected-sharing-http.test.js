@@ -9,6 +9,7 @@ const vm = require("node:vm");
 const express = require("express");
 const jwt = require("jsonwebtoken");
 const { createAuthenticate } = require("../src/middlewares/auth");
+const { createRequirePermission } = require("../src/middlewares/permissions");
 const z = require("../src/crypto/rootark-zk-1");
 const manifestV2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const historyV2 = require("../src/crypto/rootark-zk-recovery-history-v2");
@@ -97,26 +98,59 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   });
   let server;
   const sessionJwtSecret = crypto.randomBytes(32).toString("base64url");
+  // These principals are local test fixtures with HS256 tokens minted by this
+  // test. No HTTP header may directly assign req.user or bypass verification.
+  const fixtureUsers = Object.freeze({
+    owner: Object.freeze({ username: "owner", sessionVersion: 1,
+      role: "owner", totpEnabled: true }),
+    recipient: Object.freeze({ username: "recipient", sessionVersion: 1,
+      role: "viewer", totpEnabled: true }),
+    attacker: Object.freeze({ username: "attacker", sessionVersion: 1,
+      role: "viewer", totpEnabled: true }),
+  });
+  const fixtureTokens = Object.freeze(Object.fromEntries(
+    Object.keys(fixtureUsers).map((username) => [username,
+      jwt.sign({ username, sessionVersion: 1 }, sessionJwtSecret,
+        { algorithm: "HS256", expiresIn: "8h" })])));
+  // Match the production route requirements: owner can upload/commit and
+  // list; recipient and attacker can list but must never gain upload.
+  const fixturePermissions = (user) => ({
+    listFiles: true, upload: user.username === "owner",
+  });
+  const authenticateBearer = createAuthenticate({
+    jwt, jwtSecret: sessionJwtSecret,
+    loadUser: (username) => Object.hasOwn(fixtureUsers, username)
+      ? fixtureUsers[username] : null,
+    normalizeUserPermissions: fixturePermissions,
+  });
   const authenticateCookie = createAuthenticate({ jwt, jwtSecret: sessionJwtSecret,
-    loadUser: (username) => username === "recipient"
-      ? { username, sessionVersion: 1, role: "viewer", totpEnabled: true } : null,
-    normalizeUserPermissions: () => ({ listFiles: true }),
+    loadUser: (username) => username === "recipient" ? fixtureUsers.recipient : null,
+    normalizeUserPermissions: fixturePermissions,
+  });
+  const registerRoutes = (app, authenticate) => registerZk1ProtectedObjectRoutes({
+    app, store, authenticate, requirePermission: createRequirePermission(),
+    resolveTrustedScope: (user) => user.username === "owner" ? scope : null,
   });
   const mount = async () => {
     const app = express();
-    const authenticate = (req, res, next) => {
-      if (req.get("cookie")) return authenticateCookie(req, res, next);
-      const username = req.get("x-fixture-account");
-      if (!["owner", "recipient", "attacker"].includes(username)) return res.sendStatus(401);
-      req.user = { username, sessionVersion: 1 }; next();
-    };
-    registerZk1ProtectedObjectRoutes({ app, store, authenticate,
-      requirePermission: () => (_req, _res, next) => next(),
-      resolveTrustedScope: (user) => user.username === "owner" ? scope : null });
+    // Every request uses the real JWT verifier and real permission middleware.
+    registerRoutes(app, authenticateBearer);
     server = await new Promise((resolve) => {
       const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
     });
     return `http://127.0.0.1:${server.address().port}`;
+  };
+  const mountCookieOnly = async () => {
+    // Separate listener with production cookie/CSRF authentication only.
+    // Header-controlled downgrades cannot switch it to bearer/test identity.
+    const app = express();
+    registerRoutes(app, authenticateCookie);
+    const listener = await new Promise((resolve) => {
+      const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+    });
+    return { origin: `http://127.0.0.1:${listener.address().port}`,
+      close: () => new Promise((resolve, reject) => listener.close((error) =>
+        error ? reject(error) : resolve())) };
   };
   t.after(async () => {
     if (server) await new Promise((resolve) => server.close(resolve));
@@ -125,9 +159,12 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   });
   let base = await mount();
   const post = async (endpoint, username, body) => {
+    if (username !== null && !Object.hasOwn(fixtureTokens, username)) {
+      throw new Error("UNKNOWN_TEST_IDENTITY");
+    }
     const response = await fetch(base + endpoint, { method: "POST",
       headers: { "content-type": "application/json", ...(username
-        ? { "x-fixture-account": username } : {}) },
+        ? { authorization: `Bearer ${fixtureTokens[username]}` } : {}) },
       body: JSON.stringify(body) });
     const responseText = await response.text();
     let parsed;
@@ -151,10 +188,13 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   const ciphertext = crypto.randomBytes(256);
   const digest = crypto.createHash("sha256").update(ciphertext).digest();
   const put = await sign(owner, "put", id, null, digest);
-  const putResponse = await post("/zk-1/v1/content/put", "owner", {
+  const putBody = {
     authorization: wire(put.authorization), signatureBase64: b64(put.signature),
     ciphertextBase64: b64(ciphertext),
-  });
+  };
+  assert.equal((await post("/zk-1/v1/content/put", "recipient", putBody)).status, 403,
+    "a recipient session cannot upload even with the genuine owner's signed PUT");
+  const putResponse = await post("/zk-1/v1/content/put", "owner", putBody);
   assert.equal(putResponse.status, 201, JSON.stringify(putResponse.body));
 
   const getOwner = await sign(owner, "get", id, 1, digest);
@@ -166,6 +206,14 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   const grantBody = { ...grantInput, authorization: wire(getOwner.authorization),
     signatureBase64: b64(getOwner.signature), shareSignatureBase64: b64(shareSignature) };
   assert.equal((await post("/zk-1/v1/share/grant", null, grantBody)).status, 401);
+  const forgedBearer = await fetch(base + "/zk-1/v1/share/grant", {
+    method: "POST", headers: { "content-type": "application/json",
+      authorization: `Bearer ${fixtureTokens.attacker}`,
+      "x-fixture-account": "owner" }, body: JSON.stringify(grantBody),
+  });
+  assert.equal(forgedBearer.status, 403,
+    "a correctly signed attacker session cannot become owner via a forged fixture header");
+  await forgedBearer.arrayBuffer();
   assert.equal((await post("/zk-1/v1/share/grant", "attacker", grantBody)).status, 403);
   assert.equal((await post("/zk-1/v1/share/grant", "owner",
     { ...grantBody, recipientUsername: "attacker" })).status, 403,
@@ -267,7 +315,8 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     recipientKey.export({ format: "der", type: "pkcs8" }),
     "Ed25519", false, ["sign"]);
   const clientFetch = (url, options) => fetch(url, {
-    ...options, headers: { ...options.headers, "x-fixture-account": "recipient" },
+    ...options, headers: { ...options.headers,
+      authorization: `Bearer ${fixtureTokens.recipient}` },
   });
   const redeem = (overrides = {}) => redeemProtectedCiphertextShare({
     origin: base, grant: issued.body, recipientUsername: "recipient",
@@ -286,27 +335,55 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal(redeemed.authorizesPlaintextRelease, false);
   assert.equal(redeemed.serverRevocationProofVerified, false);
   // Real Root.ark cookie sessions reject POST without the double-submit CSRF
-  // header. Earlier x-fixture-account HTTP tests bypass that middleware and
-  // would not catch a broken browser recipient redemption.
+  // header. Bearer tests above run through production JWT/permission checks,
+  // while this distinct listener exercises the browser cookie/CSRF boundary.
   const csrf = b64(crypto.randomBytes(32));
   const session = jwt.sign({ username: "recipient", sessionVersion: 1 },
     sessionJwtSecret, { algorithm: "HS256", expiresIn: "8h" });
   const sessionCookie = `rootark_session=${session}; rootark_csrf=${csrf}`;
-  const sessionFetch = (url, options) => fetch(url, { ...options,
-    headers: { ...options.headers, cookie: sessionCookie },
-  });
+  const cookieMount = await mountCookieOnly();
+  const cookieHttpStatuses = [];
+  const sessionFetch = async (url, options) => {
+    const response = await fetch(url, { ...options,
+      headers: { ...options.headers, cookie: sessionCookie },
+    });
+    cookieHttpStatuses.push(response.status);
+    return response;
+  };
   const hadDocument = Object.hasOwn(global, "document");
   const previousDocument = global.document;
   try {
+    // A former test fixture identity header must not authenticate either
+    // listener, with no JWT and no cookie. No forged req.user may be assigned.
+    for (const origin of [base, cookieMount.origin]) {
+      const forged = await fetch(origin + "/zk-1/v1/share/read", {
+        method: "POST", headers: { "content-type": "application/json",
+          "x-fixture-account": "recipient" }, body: "{}",
+      });
+      assert.equal(forged.status, 401,
+        "unverified fixture identity header cannot reach protected HTTP");
+      await forged.arrayBuffer();
+    }
     global.document = { cookie: `rootark_csrf=${csrf}` };
-    const missingHeader = (url, options) => fetch(url, { ...options,
-      headers: { ...options.headers, cookie: sessionCookie, "x-csrf-token": "" },
-    });
-    await assert.rejects(redeem({ fetchImpl: missingHeader }),
+    const missingCsrfStatuses = [];
+    const missingHeader = async (url, options) => {
+      const response = await fetch(url, { ...options,
+        headers: { ...options.headers, cookie: sessionCookie,
+          "x-fixture-account": "recipient", "x-csrf-token": "" },
+      });
+      missingCsrfStatuses.push(response.status);
+      await response.arrayBuffer(); // Drain real 403 before closing the cookie-only listener.
+      return response;
+    };
+    await assert.rejects(redeem({ origin: cookieMount.origin, fetchImpl: missingHeader }),
       /ZK_SHARE_REDEMPTION_DENIED/,
       "real cookie authentication must deny the same signed request without CSRF");
-    assert.deepEqual(await redeem({ fetchImpl: sessionFetch }), redeemed,
+    assert.deepEqual(missingCsrfStatuses, [403],
+      "cookie middleware must deny missing CSRF despite a forged identity header");
+    assert.deepEqual(await redeem({ origin: cookieMount.origin, fetchImpl: sessionFetch }), redeemed,
       "real cookie-authenticated recipient redemption must supply the current CSRF header");
+    assert.deepEqual(cookieHttpStatuses, [200],
+      "valid cookie and signed recipient request reached the real HTTP route");
     // P2 TOCTOU: a mutable caller can swap its own authority provider while
     // the REAL signed cookie-authenticated HTTP fetch is awaiting a response.
     // The original provider revokes the issuer on its second read; substituting
@@ -315,7 +392,7 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     let substitutedAuthorityReads = 0;
     let fetchedSignedCiphertext = false;
     const mutableInput = {
-      origin: base, grant: issued.body, recipientUsername: "recipient",
+      origin: cookieMount.origin, grant: issued.body, recipientUsername: "recipient",
       recipientDeviceId: recipient.device_id, signerKey,
       nowSeconds: () => now,
       readIndependentAuthority: async () => {
@@ -348,9 +425,12 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
       "both initial and final independent checks must use the SAME original reader");
     assert.equal(substitutedAuthorityReads, 0,
       "a newly substituted stale authority callback must never run");
+    assert.deepEqual(cookieHttpStatuses, [200, 200],
+      "swapped authority test also received authenticated signed HTTP ciphertext");
   } finally {
     if (hadDocument) global.document = previousDocument;
     else delete global.document;
+    await cookieMount.close();
   }
   // P2 review: a hostile ciphertext transport can replay an authentic owner
   // grant and bytes while ignoring the recipient's unrelated GET signature.
