@@ -1452,7 +1452,7 @@ async function authenticateWebDavRequest(req, res) {
   let credentialVerified = false;
   if (!parseFailure) {
     credentialKey = webDavCredentialCache.keyFor(username, password);
-    cachedUser = loadUsers().find((entry) => sameUsername(entry.username, username));
+    cachedUser = loadUsers().find((entry) => entry.username === username);
     credentialVerified = webDavCredentialCache.isVerified(credentialKey, cachedUser);
   }
   const rejection = credentialVerified ? null : getLoginRejection(security);
@@ -1488,7 +1488,7 @@ async function authenticateWebDavRequest(req, res) {
     }
     // Re-validate against fresh data after every await: still exists, enabled, same password hash and sessionVersion.
     if (passwordOk) {
-      const current = loadUsers().find((entry) => sameUsername(entry.username, username));
+      const current = loadUsers().find((entry) => entry.username === username);
       const unchanged = Boolean(current) && !current.disabled && String(current.password || "") === snapshot.password && (current.sessionVersion || 0) === snapshot.sessionVersion;
       if (unchanged) {
         user = current;
@@ -4075,7 +4075,10 @@ function canAccessEncryptedFile(req, metadata) {
   }
 
   if (level === "user-key" || level === "dual") {
-    return Array.from(getEncryptedAuthorizedUsers(metadata)).some((username) => sameUsername(username, req.user?.username));
+    // The stored key owner is an exact SQLite account principal. Case-folding
+    // here would let a distinct account with file ACL read access decrypt
+    // another principal's user-key ciphertext using that stored owner key.
+    return Array.from(getEncryptedAuthorizedUsers(metadata)).some((username) => username === req.user?.username);
   }
 
   return false;
@@ -5423,7 +5426,9 @@ async function findPendingApprovalTarget(req, requestedFolder, fileName, { allow
 function canAccessPendingFile(req, folderId, fileName) {
   if (req.user?.permissions?.listPending) return true;
   const owner = getPendingUploadOwner(folderId, fileName);
-  return Boolean(owner && sameUsername(owner, req.user?.username));
+  // Account principals are case-sensitive in login and SQLite. A user with
+  // upload permission must not preview a case-colliding owner's pending bytes.
+  return Boolean(owner && owner === req.user?.username);
 }
 
 function resolveScopedFile(scope, rawName, rawFolderId = ROOT_FOLDER_ID) {
