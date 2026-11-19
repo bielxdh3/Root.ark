@@ -611,9 +611,10 @@ test("#262 P2: CBOR snapshot bounds expanded aliases before cloning and preserve
     });
     const poisonedArrayIteratorNextDescriptor = Object.getOwnPropertyDescriptor(
       arrayIteratorPrototype, "next");
-    assert.deepEqual(Array.prototype.values.call([9]).next(),
-      { done: true, value: undefined },
+    const positiveControlResult = Array.prototype.values.call([9]).next();
+    assert.equal(positiveControlResult.done, true,
       "positive control proves the iterator-prototype poison is active");
+    assert.equal(positiveControlResult.value, undefined);
     assert.equal(poisonedArrayIteratorNextCalls, 1);
     assert.deepEqual(await pendingArrayEncoding, expectedArrayEncoding,
       "the awaited encoder must not let mutable ArrayIteratorPrototype.next replace validated array items");
