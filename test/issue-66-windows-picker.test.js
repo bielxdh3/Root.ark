@@ -11,7 +11,14 @@ const picker = path.join(__dirname, "..", "sync-client", "rootark-sync-windows-p
 const powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const harness = `
 $ErrorActionPreference = 'Stop'
+function Get-Command {
+  [CmdletBinding()]
+  param([string]$Name)
+  if ($env:ROOTARK_TEST_MODE -eq ('missing-' + $Name)) { return }
+  Microsoft.PowerShell.Core\\Get-Command -Name $Name -ErrorAction SilentlyContinue
+}
 function node {
+  if ($env:ROOTARK_TEST_MODE -like 'missing-*') { throw 'Unexpected Node call' }
   $argv = @($args)
   Add-Content -LiteralPath $env:ROOTARK_TEST_TRACE -Value ($argv -join '|')
   if ($argv[1] -eq 'browse') {
@@ -35,7 +42,10 @@ function node {
 function Out-GridView {
   [CmdletBinding()]
   param([string]$Title, [string]$OutputMode, [Parameter(ValueFromPipeline=$true)]$InputObject)
-  begin { if ($OutputMode -ne 'Single') { throw 'Picker must use single selection' } }
+  begin {
+    if ($env:ROOTARK_TEST_MODE -like 'missing-*') { throw 'Unexpected GUI call' }
+    if ($OutputMode -ne 'Single') { throw 'Picker must use single selection' }
+  }
   process { if ($env:ROOTARK_TEST_MODE -ne 'cancel' -and $InputObject.Path -eq $env:ROOTARK_TEST_CHOICE) { $InputObject } }
 }
 function Start-Process {
@@ -64,6 +74,21 @@ async function runPicker(t, mode, selectedPath = "docs/verified.txt") {
   });
   return { result, local, trace: await fs.readFile(trace, "utf8").catch(() => ""),
     launch: await fs.readFile(launch, "utf8").then(JSON.parse, () => null) };
+}
+
+for (const [mode, message] of [
+  ["missing-Out-GridView", "Out-GridView requires Windows PowerShell with the GraphicalTools feature."],
+  ["missing-node", "Node.js is required to run the Root.ark Windows picker. Ensure node is available on PATH."],
+]) {
+  test(`issue 66 Windows: picker rejects ${mode} before querying inventory`, { skip: process.platform !== "win32" }, () => {
+    const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", harness], {
+      env: { ...process.env, ROOTARK_TEST_MODE: mode,
+        ROOTARK_TEST_CONFIG: "synthetic-unused-config.json", ROOTARK_TEST_PICKER: picker },
+      encoding: "utf8", timeout: 20000,
+    });
+    assert.equal(result.status, 42, result.stderr);
+    assert.equal(result.stdout.trim(), message);
+  });
 }
 
 test("issue 66 Windows: Explorer picker pages metadata then reveals only a verified hydrated file", { skip: process.platform !== "win32" }, async (t) => {
