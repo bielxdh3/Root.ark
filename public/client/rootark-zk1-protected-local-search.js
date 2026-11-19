@@ -15,6 +15,7 @@
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const id = /^[A-Za-z0-9_-]{22}$/;
   const digest = /^[A-Za-z0-9_-]{43}$/;
+  const emptyHeadDigest = "A".repeat(43);
   function deny() { throw new Error("ZK_LOCAL_SEARCH_DENIED"); }
   function live(check) {
     const value = check();
@@ -36,8 +37,9 @@
       keyring_id: grant.keyring_id };
   }
   function headOf(value) {
-    if (!Number.isSafeInteger(value?.sequence) || value.sequence < 1
-      || !digest.test(value?.digest)) deny();
+    if (!Number.isSafeInteger(value?.sequence) || value.sequence < 0
+      || !digest.test(value?.digest)
+      || (value.sequence === 0 && value.digest !== emptyHeadDigest)) deny();
     return { sequence: value.sequence, digest: value.digest };
   }
   function context(input) {
