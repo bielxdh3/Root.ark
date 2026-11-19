@@ -16,15 +16,15 @@ const { createSyncBurstGuard } = require("../src/services/syncBurstGuard");
 const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 const { writePrivateSyncConfig } = require("../sync-client/rootark-sync-private-config");
-const { readResumeCredentials } = require("../sync-client/rootark-sync-v2");
+const { readResumeCredentials, resume } = require("../sync-client/rootark-sync-v2");
 
 const CLI = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
 const PASSWORD = "secret-resume-password";
 
-function runResume(config, target, credentials) {
+function runResume(config, target, credentials, extraArgs = []) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLI, "resume", "--config", config,
-      "--device-id", target, "--credentials-stdin"], {
+      "--device-id", target, ...extraArgs, "--credentials-stdin"], {
       windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -32,6 +32,10 @@ function runResume(config, target, credentials) {
     const timeout = setTimeout(() => child.kill(), 12000);
     child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.stdin.on("error", (error) => {
+      // Rejected argv can close stdin before this fixture finishes writing.
+      if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") reject(error);
+    });
     child.once("error", (error) => { clearTimeout(timeout); reject(error); });
     child.once("close", (status) => {
       clearTimeout(timeout);
@@ -58,6 +62,11 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
   const storagePath = path.join(root, "objects.json");
   const app = express();
   app.use("/sync/v1", express.json());
+  let resumeHttpRequests = 0;
+  app.use("/sync/v1/devices/:deviceId/resume", (_req, _res, next) => {
+    resumeHttpRequests += 1;
+    next();
+  });
   const passwordHash = bcrypt.hashSync(PASSWORD, 4);
   const user = { username: "alice", password: passwordHash, sessionVersion: 0 };
   const authenticate = (req, res, next) => {
@@ -99,6 +108,37 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
   assert.doesNotMatch(denied.stderr + denied.stdout, /wrong-password|test-resume-token/);
   assert.equal(routes.store.pauseFence("alice", "device-a") !== null, true);
 
+  // On the original parser, a second --device-id overrides the visible first
+  // target and releases the wrong durable pause with otherwise valid stdin.
+  const beforeAmbiguousRequests = resumeHttpRequests;
+  const ambiguous = await runResume(config, "device-b", credentials, ["--device-id", "device-a"]);
+  assert.notEqual(routes.store.pauseFence("alice", "device-a"), null,
+    "ambiguous targets must not lift the unexpected device's pause");
+  assert.equal(resumeHttpRequests, beforeAmbiguousRequests,
+    "ambiguous argv must be rejected before any HTTP request");
+  assert.notEqual(ambiguous.status, 0);
+  assert.match(ambiguous.stderr, /Unsupported resume option/i);
+  assert.doesNotMatch(ambiguous.stdout + ambiguous.stderr,
+    /secret-resume-password|test-resume-token/);
+
+  const stray = await runResume(config, "device-a", credentials, ["unexpected-positional"]);
+  assert.notEqual(stray.status, 0, "extra positional arguments must be rejected");
+  assert.match(stray.stderr, /Unsupported resume option/i);
+  assert.equal(resumeHttpRequests, beforeAmbiguousRequests,
+    "stray positional arguments must not trigger HTTP or consume credentials");
+
+  for (const extras of [["--password=secret-on-argv"], ["--code=123456"],
+    ["--credentialsStream", "secret-json-on-argv"], ["--path", "other-file"],
+    ["--once"], ["--plan-stdin"], ["--unrecognized"]]) {
+    const forbidden = await runResume(config, "device-a", credentials, extras);
+    assert.notEqual(forbidden.status, 0, "unsupported CLI options must fail");
+    assert.match(forbidden.stderr, /Unsupported resume option/i);
+    assert.doesNotMatch(forbidden.stdout + forbidden.stderr,
+      /secret-on-argv|123456|secret-json-on-argv|secret-resume-password|test-resume-token/);
+    assert.equal(resumeHttpRequests, beforeAmbiguousRequests,
+      "unsupported CLI options must not contact the server");
+  }
+
   const resumed = await runResume(config, "device-a", credentials);
   assert.equal(resumed.status, 0, resumed.stderr);
   assert.deepEqual(JSON.parse(resumed.stdout), {
@@ -108,6 +148,12 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
   assert.equal(routes.store.pauseFence("alice", "device-a"), null);
   const again = await runResume(config, "device-a", credentials);
   assert.equal(JSON.parse(again.stdout).wasPaused, false);
+  const embedded = await resume({ config, "device-id": "device-a",
+    "credentials-stdin": true,
+    credentialsStream: Readable.from([JSON.stringify({ password: PASSWORD })]),
+  });
+  assert.equal(embedded.wasPaused, false,
+    "the existing programmatic credentials stream must remain supported");
 });
 
 test("#67: resume adapter refuses self-resume, unsafe ids, missing password and forged success", async () => {
