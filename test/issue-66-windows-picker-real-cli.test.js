@@ -43,7 +43,8 @@ $ErrorActionPreference = 'Stop'
 if ($env:ROOTARK_TEST_CWD) { Set-Location -LiteralPath $env:ROOTARK_TEST_CWD }
 function Out-GridView {
   [CmdletBinding()]
-  param([string]$Title, [switch]$PassThru, [Parameter(ValueFromPipeline = $true)]$InputObject)
+  param([string]$Title, [string]$OutputMode, [Parameter(ValueFromPipeline = $true)]$InputObject)
+  begin { if ($OutputMode -ne 'Single') { throw 'Picker must use single selection' } }
   process { $InputObject }
 }
 function Start-Process {

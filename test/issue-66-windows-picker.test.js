@@ -49,7 +49,8 @@ function node {
 }
 function Out-GridView {
   [CmdletBinding()]
-  param([string]$Title, [switch]$PassThru, [Parameter(ValueFromPipeline=$true)]$InputObject)
+  param([string]$Title, [string]$OutputMode, [Parameter(ValueFromPipeline=$true)]$InputObject)
+  begin { if ($OutputMode -ne 'Single') { throw 'Picker must use single selection' } }
   process { if ($env:ROOTARK_TEST_MODE -ne 'cancel' -and $InputObject.Path -eq $env:ROOTARK_TEST_CHOICE) { $InputObject } }
 }
 function Start-Process {
