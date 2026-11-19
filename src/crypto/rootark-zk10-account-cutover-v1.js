@@ -3,8 +3,34 @@
 // DEV-OFF cryptographic protocol primitives. A signature or Merkle proof never
 // establishes independent off-host custody, freshness, or permission for I/O.
 const crypto = require("node:crypto");
+const { types: { isProxy } } = require("node:util");
 const DOMAIN_OWNER = Buffer.from("Root.ark/zk10/owner-account-cutover/v1\0");
 const DOMAIN_ROTATION = Buffer.from("Root.ark/zk10/owner-rotation/v1\0");
+// Read native identity from Node prototypes, not caller-shadowable .type,
+// .asymmetricKeyType or .export properties. Public KeyObjects must also be
+// reimported: a prototype-derived wrapper can change its internal kHandle
+// between an SPKI hash and crypto.verify, even with native methods.
+const PUBLIC_KEY_FIXTURE = crypto.createPublicKey({
+  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
+  format: "der", type: "spki",
+});
+const GET_PROTOTYPE = Object.getPrototypeOf.bind(Object);
+const OWN_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
+const HAS_OWN = Object.hasOwn.bind(Object);
+const NATIVE_APPLY = Reflect.apply.bind(Reflect);
+const PUBLIC_KEY_PROTOTYPE = GET_PROTOTYPE(PUBLIC_KEY_FIXTURE);
+const PRIVATE_KEY_PROTOTYPE = GET_PROTOTYPE(crypto.generateKeyPairSync("ed25519").privateKey);
+const NATIVE_HANDLE = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
+  .find((symbol) => symbol.description === "kHandle");
+const NATIVE_KEY_TYPE = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
+  .find((symbol) => symbol.description === "kKeyType");
+const NATIVE_HANDLE_PROTOTYPE = GET_PROTOTYPE(OWN_DESCRIPTOR(PUBLIC_KEY_FIXTURE, NATIVE_HANDLE).value);
+const NATIVE_HANDLE_ALGORITHM = OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType").value;
+const NATIVE_HANDLE_EXPORT = OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "export").value;
+const NATIVE_TYPE = OWN_DESCRIPTOR(crypto.KeyObject.prototype, "type").get;
+const NATIVE_ALGORITHM = OWN_DESCRIPTOR(
+  GET_PROTOTYPE(PUBLIC_KEY_PROTOTYPE), "asymmetricKeyType").get;
+const NATIVE_PUBLIC_EXPORT = OWN_DESCRIPTOR(PUBLIC_KEY_PROTOTYPE, "export").value;
 const OWNER_FIELDS = Object.freeze(["type", "immutable_account_id", "zk_account_id",
   "generation", "previous_cutover_digest", "inventory_head", "complete_corpus",
   "covered_compartments", "legacy_egress_scope", "reference_disposition",
@@ -39,12 +65,45 @@ function decode(value, length) {
 }
 function hex(value) { if (typeof value !== "string" || !HEX.test(value)) deny(); return value; }
 function key(value, type) {
-  if (!(value instanceof crypto.KeyObject) || value.type !== type
-    || value.asymmetricKeyType !== "ed25519") deny();
-  return value;
+  try {
+    // Neither a fake DATA kHandle nor an accessor-backed kKeyType may reach
+    // native KeyObject accessors: both can execute caller-controlled JS.
+    if (type !== "public" && type !== "private") deny();
+    if (isProxy(value) || !(value instanceof crypto.KeyObject)
+      || GET_PROTOTYPE(value) !== (type === "public"
+        ? PUBLIC_KEY_PROTOTYPE : PRIVATE_KEY_PROTOTYPE)) deny();
+    const handle = NATIVE_HANDLE && OWN_DESCRIPTOR(value, NATIVE_HANDLE);
+    const keyType = NATIVE_KEY_TYPE && OWN_DESCRIPTOR(value, NATIVE_KEY_TYPE);
+    if (!handle || !HAS_OWN(handle, "value")
+      || !keyType || !HAS_OWN(keyType, "value") || keyType.value !== type
+      || !handle.value || typeof handle.value !== "object"
+      || isProxy(handle.value)
+      || GET_PROTOTYPE(handle.value) !== NATIVE_HANDLE_PROTOTYPE
+      || HAS_OWN(handle.value, "getAsymmetricKeyType")
+      || HAS_OWN(handle.value, "export")
+      || OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType")?.value
+        !== NATIVE_HANDLE_ALGORITHM
+      || OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "export")?.value
+        !== NATIVE_HANDLE_EXPORT
+      || NATIVE_APPLY(NATIVE_HANDLE_ALGORITHM, handle.value, []) !== "ed25519"
+      || NATIVE_APPLY(NATIVE_TYPE, value, []) !== type
+      || NATIVE_APPLY(NATIVE_ALGORITHM, value, []) !== "ed25519") deny();
+    if (type === "private") return value; // Never export private key material.
+    if (type !== "public") deny();
+    // Take one native SPKI snapshot, then discard the supplied reference.
+    // Subsequent hash and signature checks use only the fresh, native key.
+    const der = NATIVE_APPLY(NATIVE_PUBLIC_EXPORT, value, [{ format: "der", type: "spki" }]);
+    if (!Buffer.isBuffer(der) || der.length !== 44) deny();
+    const canonical = crypto.createPublicKey({ key: Buffer.from(der),
+      format: "der", type: "spki" });
+    if (NATIVE_APPLY(NATIVE_TYPE, canonical, []) !== "public"
+      || NATIVE_APPLY(NATIVE_ALGORITHM, canonical, []) !== "ed25519") deny();
+    return canonical;
+  } catch (_) { deny(); }
 }
 function spkiHash(publicKey) {
-  return H(key(publicKey, "public").export({ format: "der", type: "spki" })).toString("hex");
+  return H(NATIVE_APPLY(NATIVE_PUBLIC_EXPORT, key(publicKey, "public"),
+    [{ format: "der", type: "spki" }])).toString("hex");
 }
 function ownerPayload(payload) {
   const p = exact(payload, OWNER_FIELDS);
@@ -86,18 +145,25 @@ function signOwnerCutover(payload, privateKey) {
   return Object.freeze({ ...p, signature: crypto.sign(null,
     signatureBytes(DOMAIN_OWNER, p), key(privateKey, "private")).toString("base64url") });
 }
-function verifyOwnerCutover(wire, publicKey) {
+function snapshotOwnerCutover(wire) {
   const signed = exact(wire, [...OWNER_FIELDS, "signature"]);
   const p = ownerPayload(Object.fromEntries(OWNER_FIELDS.map((f) => [f, signed[f]])));
-  if (!crypto.verify(null, signatureBytes(DOMAIN_OWNER, p), key(publicKey, "public"),
-    decode(signed.signature, 64))) deny();
-  return Object.freeze(p);
+  // Keep the statement and its digest on the same byte snapshot. In particular,
+  // never re-read a Proxy wire after verifying its owner signature, and do not
+  // retain references to caller-controlled nested arrays.
+  const body = Object.freeze({ ...p, grants: Object.freeze([]),
+    covered_compartments: Object.freeze(p.covered_compartments) });
+  return { body, bytes: signatureBytes(DOMAIN_OWNER, body),
+    signature: decode(signed.signature, 64) };
+}
+function verifyOwnerCutover(wire, publicKey) {
+  const { body, bytes, signature } = snapshotOwnerCutover(wire);
+  if (!crypto.verify(null, bytes, key(publicKey, "public"), signature)) deny();
+  return body;
 }
 function digestOwnerCutover(wire) {
-  const record = exact(wire, [...OWNER_FIELDS, "signature"]);
-  const p = ownerPayload(Object.fromEntries(OWNER_FIELDS.map((f) => [f, record[f]])));
-  decode(record.signature, 64);
-  return H(signatureBytes(DOMAIN_OWNER, p), decode(record.signature, 64)).toString("hex");
+  const { bytes, signature } = snapshotOwnerCutover(wire);
+  return H(bytes, signature).toString("hex");
 }
 function rotationPayload(p) {
   const v = exact(p, ROTATION_FIELDS);
@@ -158,10 +224,16 @@ function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
   let keyIndex = 0;
   let last;
   for (let index = 0; index < history.length; index += 1) {
+    const { body, bytes, signature } = snapshotOwnerCutover(history[index]);
     let verified;
     for (let cursor = keyIndex; cursor < ownerKeys.length; cursor += 1) {
-      try { verified = verifyOwnerCutover(history[index], ownerKeys[cursor]);
-        keyIndex = cursor; break; } catch (_) { /* try later signed owner rotation */ }
+      try {
+        if (crypto.verify(null, bytes, key(ownerKeys[cursor], "public"), signature)) {
+          verified = body;
+          keyIndex = cursor;
+          break;
+        }
+      } catch (_) { /* try later signed owner rotation */ }
     }
     if (!verified || verified.immutable_account_id !== immutableAccountId
       || verified.generation !== index + 1 || verified.previous_cutover_digest !== previous
@@ -169,7 +241,7 @@ function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
         || verified.issued_at < last.issued_at
         || JSON.stringify(verified.covered_compartments)
           !== JSON.stringify(last.covered_compartments)))) deny();
-    previous = digestOwnerCutover(history[index]);
+    previous = H(bytes, signature).toString("hex");
     last = verified;
   }
   if (keyIndex !== ownerKeys.length - 1) deny();

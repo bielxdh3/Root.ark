@@ -28,6 +28,111 @@ function makeScope() {
   };
 }
 
+test("P2 computeRoot must not assimilate a forged SHA256 Buffer through inherited then", async () => {
+  const scope = makeScope();
+  const actual = await inventory.computeRoot(scope, 0, null, []);
+  assert.equal(Buffer.isBuffer(actual), true);
+  const forged = Buffer.alloc(32, 0x5b);
+  // Prevent the attack fixture itself from recursively re-assimilating its
+  // replacement bytes; the target is the independently computed digest.
+  Object.defineProperty(forged, "then", { value: undefined, configurable: false });
+  assert.notDeepEqual(actual, forged);
+  const priorThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+  let poisonedRootReads = 0;
+  try {
+    Object.defineProperty(Object.prototype, "then", { configurable: true,
+      get() {
+        if (Buffer.isBuffer(this) && this.length === 32) {
+          poisonedRootReads++;
+          return (resolve) => resolve(forged);
+        }
+        return undefined;
+      },
+    });
+    const result = await inventory.computeRoot(scope, 0, null, []);
+    assert.equal(Buffer.isBuffer(result), true);
+    assert.deepEqual(result, actual,
+      "native root hash must retain actual bytes after hostile Promise resolution");
+    assert.equal(poisonedRootReads, 0,
+      "computed digest must be returned as an own non-thenable Buffer");
+  } finally {
+    if (priorThen) Object.defineProperty(Object.prototype, "then", priorThen);
+    else delete Object.prototype.then;
+  }
+});
+
+test("P2 genuine Ed25519 receipts with a false intermediate root cannot bypass independent root recomputation", async () => {
+  const f = await testFixture();
+  const minimumSnapshot = await signedGenesis(f);
+  const baseline = await decodedSnapshot(minimumSnapshot);
+  const first = makeTuple(Buffer.alloc(16, 0x21), 1, 1);
+  const second = makeTuple(Buffer.alloc(16, 0x22), 1, 1);
+  const genuineFirstRoot = await inventory.computeRoot(f.scope, 1, baseline.root, [first]);
+  const forgedFirstRoot = Buffer.alloc(32, 0x5b);
+  Object.defineProperty(forgedFirstRoot, "then", { value: undefined, configurable: false });
+  assert.notDeepEqual(genuineFirstRoot, forgedFirstRoot);
+  const genuineFinalRoot = await inventory.computeRoot(f.scope, 2, forgedFirstRoot, [first, second]);
+  const nonce = crypto.randomBytes(32);
+  const signedFinalSnapshot = await rawSignedSnapshot({ scope: f.scope,
+    signerKeyId: f.signerKeyId, privateKey: f.keys.privateKey,
+    sequence: 2, previousRoot: forgedFirstRoot, entries: [first, second], nonce });
+  const finalWire = await decodedSnapshot(signedFinalSnapshot);
+  assert.equal(Buffer.compare(Buffer.from(finalWire.root), Buffer.from(genuineFinalRoot)), 0);
+
+  async function signedReceipt(sequence, prevRoot, claimedRoot, entry) {
+    const operation = { operation_id: crypto.randomBytes(16),
+      expected_sequence: sequence - 1, expected_root: prevRoot, ...entry };
+    const unsigned = { type: ENTRY_TYPE, version: 1,
+      signer_key_id: f.signerKeyId, scope: f.scope, sequence,
+      previous_root: prevRoot, root: claimedRoot,
+      operation_id: operation.operation_id, expected_sequence: sequence - 1,
+      expected_root: prevRoot, request_digest: crypto.createHash("sha256")
+        .update(await z.encodeDeterministic(operation)).digest(), entry };
+    const signature = crypto.sign(null, Buffer.concat([
+      ENTRY_DOMAIN, await z.encodeDeterministic(unsigned) ]), f.keys.privateKey);
+    return z.encodeDeterministic({ ...unsigned, signature });
+  }
+  const signedFalseFirst = await signedReceipt(1, baseline.root, forgedFirstRoot, first);
+  const signedValidSecond = await signedReceipt(2, forgedFirstRoot, genuineFinalRoot, second);
+  const args = { serialized: signedFinalSnapshot, pinnedPublicKey: f.keys.publicKey,
+    pinnedSignerKeyId: f.signerKeyId, expectedScope: f.scope,
+    requested: requestFor(second), minimumHead: { sequence: 0, root: baseline.root },
+    minimumSnapshot, nonce,
+    committedProofChain: [signedFalseFirst, signedValidSecond] };
+  await assert.rejects(inventory.verifySnapshot(args), /INVENTORY_CHAIN/,
+    "authentic Ed25519 signatures cannot make a false signed ledger root physically correct");
+
+  const handle = Object.getOwnPropertySymbols(f.keys.publicKey)
+    .find((s) => s.description === "kHandle");
+  assert.ok(handle, "real native Ed25519 getter must exist");
+  const poisonedKey = Object.create(f.keys.publicKey);
+  const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+  let nativeGetterReads = 0, poisonedRootReads = 0;
+  Object.defineProperty(poisonedKey, handle, { get() {
+    nativeGetterReads++;
+    Object.defineProperty(Object.prototype, "then", { configurable: true,
+      get() {
+        if (Buffer.isBuffer(this) && this.length === 32) {
+          poisonedRootReads++;
+          if (poisonedRootReads === 1) return (resolve) => resolve(forgedFirstRoot);
+        }
+        return undefined;
+      },
+    });
+    return f.keys.publicKey[handle];
+  } });
+  try {
+    await assert.rejects(inventory.verifySnapshot({ ...args, pinnedPublicKey: poisonedKey }),
+      /INVENTORY_CHAIN/,
+      "hostile native getter cannot replace the first recomputed digest with signed false root");
+  } finally {
+    if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
+    else delete Object.prototype.then;
+  }
+  assert.ok(nativeGetterReads > 0, "the attacker must reach a genuine native key getter");
+  assert.equal(poisonedRootReads, 0, "native computed roots must never consult inherited then");
+});
+
 function makeTuple(objectId, revision, epoch, digest = crypto.randomBytes(32)) {
   return {
     object_id: Buffer.isBuffer(objectId) ? Buffer.from(objectId) : Buffer.from(objectId),
@@ -1397,6 +1502,123 @@ test("multiple inventory revisions require a complete signed operation chain fro
   await assert.rejects(inventory.verifySnapshot({
     ...args, committedProofChain: [receipts[0], tampered, receipts[2]],
   }));
+  // A Proxy(array) passes Array.isArray(). Its ownKeys trap runs in the
+  // signed-proof snapshot path and can replace mutable Array.prototype.push.
+  // That must never replace the ACTUAL caller-supplied corrupted B1 bytes
+  // with the authentic Ed25519-signed A1 receipt in the verifier's copy.
+  const nativePush = Array.prototype.push;
+  let proxyOwnKeys = 0;
+  let forgedCopies = 0;
+  const injectedChain = new Proxy([receipts[0], tampered, receipts[2]], {
+    ownKeys(target) {
+      proxyOwnKeys++;
+      Array.prototype.push = function (...values) {
+        const caller = (new Error().stack || "").split("\n")[2] || "";
+        if (/\bnormalizeCommittedProofChain \(/.test(caller)
+          && values.length === 1 && Buffer.isBuffer(values[0])
+          && values[0].equals(tampered)) {
+          forgedCopies++;
+          return Reflect.apply(nativePush, this, [Buffer.from(receipts[1])]);
+        }
+        return Reflect.apply(nativePush, this, values);
+      };
+      return Reflect.ownKeys(target);
+    },
+  });
+  let observedError = null;
+  let accepted = null;
+  try {
+    try {
+      accepted = await inventory.verifySnapshot({
+        ...args, committedProofChain: injectedChain,
+      });
+    } catch (error) { observedError = error; }
+  } finally {
+    Array.prototype.push = nativePush;
+  }
+  assert.equal(observedError?.code, "INVENTORY_CHAIN",
+    `untrusted Proxy laundered signed A1 over supplied B1: accepted=${accepted?.outcome}` +
+    ` traps=${proxyOwnKeys} substitutedPushes=${forgedCopies}`);
+  assert.equal(proxyOwnKeys, 0, "Proxy trap must be refused before enumeration");
+  assert.equal(forgedCopies, 0, "native proof-chain copying must not use poisoned Array.push");
+  const afterProxyAttack = await inventory.verifySnapshot({
+    ...args, committedProofChain: receipts,
+  });
+  assert.equal(afterProxyAttack.verifiedInterveningReceipts, 3,
+    "genuine signed A0/A1/A2 chain still works");
+  // Real signer issued A0/A1/A2, but the caller supplies the DIFFERENT,
+  // tampered B1 bytes. A native public-key getter can change this realm's
+  // iterator after the B bytes are copied and before proof-chain verification.
+  // A forged iterator may yield valid A1 instead of the supplied B1.
+  const inherited = Object.create(f.keys.publicKey);
+  const originalIterator = Array.prototype[Symbol.iterator];
+  let getterReads = 0;
+  let replacedReceipts = 0;
+  Object.defineProperty(inherited, "type", { get() {
+    getterReads++;
+    Array.prototype[Symbol.iterator] = function*() {
+      if (this.length === 3 && Buffer.isBuffer(this[1])
+        && this[1].equals(tampered)
+        && /\bverifyInterveningProofChain\b/.test(new Error().stack)) {
+        replacedReceipts++;
+        yield receipts[0]; yield receipts[1]; yield receipts[2];
+        return;
+      }
+      yield* Reflect.apply(originalIterator, this, []);
+    };
+    return "public";
+  } });
+  try {
+    await assert.rejects(inventory.verifySnapshot({
+      ...args, pinnedPublicKey: inherited,
+      committedProofChain: [receipts[0], tampered, receipts[2]],
+    }), /INVENTORY_/,
+    "signed genuine A1 must not replace physically supplied corrupt B1 via a post-key iterator");
+  } finally {
+    Array.prototype[Symbol.iterator] = originalIterator;
+  }
+  assert.ok(getterReads > 0, "real native pinned KeyObject getter must execute");
+  assert.equal(replacedReceipts, 0,
+    "proof-chain verifier must not consult an iterator replaced after the key callback");
+  const afterAttack = await inventory.verifySnapshot({
+    ...args, committedProofChain: receipts,
+  });
+  assert.equal(afterAttack.verifiedInterveningReceipts, 3,
+    "actual authentic A0/A1/A2 chain remains accepted");
+  // An attacker callback must not be allowed to poison the array-copy or
+  // sorting primitive and deny a genuine three-receipt Ed25519 history.
+  for (const method of ["slice", "sort"]) {
+    const native = Array.prototype[method];
+    const pinned = Object.create(f.keys.publicKey);
+    let keyReads = 0;
+    let intercepted = 0;
+    Object.defineProperty(pinned, "type", { get() {
+      keyReads++;
+      Array.prototype[method] = function(...arguments_) {
+        // Target only the verifier's DIRECT late array operation, not
+        // unrelated internals in the canonical CBOR library's call stack.
+        const directCaller = (new Error().stack || "").split("\n")[2] || "";
+        if (/\bverifyInterveningProofChain\b/.test(directCaller)) {
+          intercepted++;
+          throw new Error("HOSTILE_ARRAY_" + method.toUpperCase());
+        }
+        return Reflect.apply(native, this, arguments_);
+      };
+      return "public";
+    } });
+    try {
+      const valid = await inventory.verifySnapshot({
+        ...args, pinnedPublicKey: pinned, committedProofChain: receipts,
+      });
+      assert.equal(valid.verifiedInterveningReceipts, 3,
+        `signed A chain remains valid when late Array.${method} is poisoned`);
+    } finally {
+      Array.prototype[method] = native;
+    }
+    assert.ok(keyReads > 0, `native getter exercised in ${method} attack`);
+    assert.equal(intercepted, 0,
+      `proof-chain reconstruction must not use late Array.${method}`);
+  }
   await assert.rejects(inventory.verifySnapshot({
     ...args, committedProofChain: [Buffer.alloc(inventory.MAX_COMMITTED_PROOF_BYTES + 1)],
   }), /INVENTORY_LIMIT/);
