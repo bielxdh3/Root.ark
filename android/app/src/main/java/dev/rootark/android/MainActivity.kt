@@ -209,7 +209,7 @@ class MainActivity : Activity() {
                         is SyncListingValidationException ->
                             "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
                         else ->
-                            "Não foi possível carregar a página de inventário (limite: 128 KiB / 64 registros)."
+                            inventoryPageFailureMessage(failure)
                     }
                     showSession(message)
                 }
