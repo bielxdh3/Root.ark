@@ -107,6 +107,24 @@ function fixture(database, names = ["Relato\u0301rio [2026].txt", "secret-privat
     revoke() { denied = true; }, scope };
 }
 
+test("an authenticated empty catalog accepts only its zero sequence and zero digest", async () => {
+  for (const database of [indexedDBMemory(), null]) {
+    const f = fixture(database, []);
+    f.baseline.head = { sequence: 0, digest: Buffer.alloc(32).toString("base64url") };
+    const result = await search.search(f.input(crypto.randomBytes(32), ""));
+    assert.equal(result.totalMatches, 0);
+    assert.deepEqual(result.entries, []);
+    assert.equal(f.opened, 1);
+  }
+
+  const invalid = fixture(null, []);
+  invalid.baseline.head = { sequence: 0,
+    digest: crypto.randomBytes(32).toString("base64url") };
+  await assert.rejects(search.search(invalid.input(crypto.randomBytes(32), "")),
+    /ZK_LOCAL_SEARCH_DENIED/);
+  assert.equal(invalid.opened, 0, "an invalid empty-head digest is rejected before catalog I/O");
+});
+
 test("local protected index persists encrypted names; reload uses verified CAS and no plaintext outbound", async () => {
   const database = indexedDBMemory();
   const f = fixture(database);
