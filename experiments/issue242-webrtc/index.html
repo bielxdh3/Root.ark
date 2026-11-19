@@ -56,7 +56,7 @@
   <div id="transfers" aria-live="polite"></div>
   <div id="downloads"></div>
 </fieldset>
-<p id="state">Sem conexão</p>
+<p id="state" role="status" aria-atomic="true">Sem conexão</p>
 <pre id="events" aria-live="polite"></pre>
 <small>O destinatário deve aceitar o arquivo. Baixe somente após SHA-256 OK. O limite é 32 MiB por arquivo, em memória; não testa TURN, NAT externo, retomada nem armazenamento permanente. Autenticação Root.ark somente no modo de sessão assinado.</small>
 <script src="transfer-protocol.js"></script>
