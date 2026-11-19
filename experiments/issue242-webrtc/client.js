@@ -483,6 +483,7 @@
         return log('O SHA-256 não corresponde ao ciphertext da sala');
       }
       const name = file.name.slice(0, 100) || 'arquivo.bin';
+      let offered = 0;
       for (const p of receivers) {
         if (sendingIntent !== roomIntent) break;
         if (peers.get(p.id) !== p || p.dc?.readyState !== 'open' || p.outgoing) continue;
@@ -497,8 +498,11 @@
         tx.timer = setTimeout(() => {
           if (p.outgoing === tx) cancelOutgoing(p, true);
         }, 60_000);
+        offered++;
       }
-      log('Arquivo oferecido a ' + receivers.length + ' destinatário(s)');
+      log(offered
+        ? 'Arquivo oferecido a ' + offered + ' destinatário(s)'
+        : 'Nenhum destinatário permaneceu disponível');
     } catch { log('Falha ao ler ou oferecer arquivo'); }
     finally { preparingFile = false; }
   }
