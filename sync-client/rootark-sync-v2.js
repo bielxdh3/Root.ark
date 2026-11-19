@@ -423,7 +423,13 @@ if (require.main === module) {
       process.exitCode = 1;
     });
   } else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\n"
-    + "Files On-Demand: node sync-client/rootark-sync-v2.js browse|hydrate|evict|pin|unpin|status --config <private-config> [--path relative/file]");
+    + "Files On-Demand:\n"
+    + "  node sync-client/rootark-sync-v2.js browse --config <private-config> [--limit 64] [--cursor <nextCursor>]\n"
+    + "  node sync-client/rootark-sync-v2.js hydrate --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js evict --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js pin --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js unpin --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js status --config <private-config> --path relative/file");
 }
 
 module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,
