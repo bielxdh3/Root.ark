@@ -1289,6 +1289,7 @@
           const raw = await fileBytes("catalog-write-key", 32, 32);
           const list = field("catalog-delta-private-list");
           list.replaceChildren();
+          field("catalog-delta-summary").textContent = "";
           const term = field("catalog-delta-query")?.value || "";
           let opened;
           try {
