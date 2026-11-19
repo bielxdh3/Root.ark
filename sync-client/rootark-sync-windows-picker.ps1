@@ -6,6 +6,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
+  throw 'Out-GridView requires Windows PowerShell with the GraphicalTools feature.'
+}
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+  throw 'Node.js is required to run the Root.ark Windows picker. Ensure node is available on PATH.'
+}
 $previousOutputEncoding = [Console]::OutputEncoding
 try {
 # Windows PowerShell 5.1 otherwise decodes Node's UTF-8 JSON using the OEM
@@ -45,9 +51,6 @@ for ($pageNumber = 0; $pageNumber -lt 1024; $pageNumber++) {
 
 if (-not $complete) { throw 'Remote metadata inventory exceeds 65536 entries.' }
 if ($files.Count -eq 0) { Write-Output 'No remote files in the selected device scope.'; return }
-if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
-  throw 'Out-GridView requires Windows PowerShell with the GraphicalTools feature.'
-}
 
 $chosen = @($files | Out-GridView -Title 'Root.ark - select a remote file to hydrate' -OutputMode Single)
 if ($chosen.Count -eq 0) { return }
