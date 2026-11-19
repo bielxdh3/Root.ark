@@ -569,6 +569,7 @@
     let recoveryBlocked = false;
     const body = document.getElementById("backups-body"), warning = document.getElementById("backup-warning");
     const manifestPanel = document.getElementById("manifest-panel"), manifestContent = document.getElementById("manifest-content");
+    let manifestGeneration = 0;
     function blockForRestoreRecovery(message) {
       recoveryBlocked = true;
       warning.textContent = message;
@@ -640,7 +641,12 @@
       const button = event.target.closest("button[data-action]"); if (!button) return;
       const action = button.dataset.action;
       if (action === "refresh-backups") { button.disabled = true; await loadBackups(); button.disabled = recoveryBlocked; return; }
-      if (action === "close-manifest") { manifestPanel.hidden = true; manifestContent.textContent = ""; return; }
+      if (action === "close-manifest") {
+        ++manifestGeneration;
+        manifestPanel.hidden = true;
+        manifestContent.textContent = "";
+        return;
+      }
       const backup = backups[Number(button.dataset.backupIndex)]; if (!backup) return;
       if (action === "download-backup") {
         button.disabled = true;
@@ -654,14 +660,18 @@
         return;
       }
       if (action === "show-manifest") {
+        const generation = ++manifestGeneration;
         manifestPanel.hidden = false; manifestContent.textContent = "Carregando manifesto…";
-        try { manifestContent.textContent = JSON.stringify(await api.get(`/backups/${encodeURIComponent(backup.id)}/manifest`), null, 2); }
+        manifestPanel.scrollIntoView({ block: "nearest" });
+        try {
+          const result = await api.get(`/backups/${encodeURIComponent(backup.id)}/manifest`);
+          if (generation === manifestGeneration) manifestContent.textContent = JSON.stringify(result, null, 2);
+        }
         catch (error) {
           const message = publicError(error, "Não foi possível carregar o manifesto.");
-          manifestContent.textContent = message;
+          if (generation === manifestGeneration) manifestContent.textContent = message;
           blockOnRestoreRecovery(error, message);
         }
-        manifestPanel.scrollIntoView({ block: "nearest" });
         return;
       }
       if (action === "restore-backup") {
