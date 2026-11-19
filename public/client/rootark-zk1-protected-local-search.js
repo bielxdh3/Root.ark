@@ -14,6 +14,7 @@
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const id = /^[A-Za-z0-9_-]{22}$/;
   const digest = /^[A-Za-z0-9_-]{43}$/;
+  const emptyHeadDigest = "A".repeat(43);
   function deny() { throw new Error("ZK_LOCAL_SEARCH_DENIED"); }
   function live(check) {
     const value = check();
@@ -35,8 +36,9 @@
       keyring_id: grant.keyring_id };
   }
   function headOf(value) {
-    if (!Number.isSafeInteger(value?.sequence) || value.sequence < 1
-      || !digest.test(value?.digest)) deny();
+    if (!Number.isSafeInteger(value?.sequence) || value.sequence < 0
+      || !digest.test(value?.digest)
+      || (value.sequence === 0 && value.digest !== emptyHeadDigest)) deny();
     return { sequence: value.sequence, digest: value.digest };
   }
   function context(input) {
@@ -220,7 +222,13 @@
         || input.term.length > 120
         || typeof input.client?.readPrivateListing !== "function"
         || typeof input.client?.verifyPrivateListingHead !== "function") deny();
-      live(input.assertLive);
+      // Keep the original session guard and independently signed readers across
+      // IndexedDB/WebCrypto awaits. Caller-owned callbacks can be replaced while
+      // an operation is pending; the replacement must never become authority.
+      const assertLive = input.assertLive.bind(input);
+      const readPrivateListing = input.client.readPrivateListing.bind(input.client);
+      const verifyPrivateListingHead = input.client.verifyPrivateListingHead.bind(input.client);
+      live(assertLive);
       const pinned = context(input);
       let database = null, record;
       const key = cacheKey(pinned.scope);
@@ -228,41 +236,45 @@
         database = store(input.indexedDBImpl);
         record = await database.read(key);
       } catch (_) { database = null; }
-      live(input.assertLive);
+      live(assertLive);
       const aad = encoder.encode(JSON.stringify(pinned));
       let rows, usedCache = false;
       const matching = record?.format === FORMAT && record.context === JSON.stringify(pinned);
       if (matching) {
         // Revalidate CAS, witness and device grant before any cached name is released.
-        const verified = await input.client.verifyPrivateListingHead(input.baseline);
-        live(input.assertLive);
+        const verified = await verifyPrivateListingHead(input.baseline);
+        live(assertLive);
         if (!sameScope(verified?.scope, pinned.scope)
           || verified.head?.sequence !== pinned.head.sequence
           || verified.head.digest !== pinned.head.digest) deny();
         const secret = await sealingKey(input.metadataRaw, pinned.scope);
-        live(input.assertLive);
+        live(assertLive);
         const opened = await webCrypto.subtle.decrypt({ name: "AES-GCM",
           iv: decode64(record.iv, 12), additionalData: aad, tagLength: 128 },
         secret, decode64(record.ciphertext, 16, 4 * 1024 * 1024 + 16));
-        live(input.assertLive);
+        live(assertLive);
         if (opened.byteLength > 4 * 1024 * 1024) deny();
         rows = validRows(JSON.parse(decoder.decode(opened)), latestEntries(input.baseline));
         usedCache = true;
       } else {
         const sourceKey = await webCrypto.subtle.importKey("raw", input.metadataRaw,
           { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
-        const opened = await input.client.readPrivateListing(input.baseline, sourceKey, "");
-        live(input.assertLive);
+        const opened = await readPrivateListing(input.baseline, sourceKey, "");
+        live(assertLive);
         rows = verifyOpening(opened, pinned, input.baseline);
         if (database) {
           const secret = await sealingKey(input.metadataRaw, pinned.scope);
           const raw = encoder.encode(JSON.stringify(rows));
-          if (raw.byteLength > 4 * 1024 * 1024) deny();
-          const iv = webCrypto.getRandomValues(new Uint8Array(12));
-          const ciphertext = await webCrypto.subtle.encrypt({ name: "AES-GCM",
-            iv, additionalData: aad, tagLength: 128 }, secret, raw);
-          raw.fill(0);
-          live(input.assertLive);
+          let iv, ciphertext;
+          try {
+            if (raw.byteLength > 4 * 1024 * 1024) deny();
+            iv = webCrypto.getRandomValues(new Uint8Array(12));
+            ciphertext = await webCrypto.subtle.encrypt({ name: "AES-GCM",
+              iv, additionalData: aad, tagLength: 128 }, secret, raw);
+          } finally {
+            raw.fill(0);
+          }
+          live(assertLive);
           try {
             await database.write(key, { format: FORMAT, context: JSON.stringify(pinned),
               iv: encode64(iv), ciphertext: encode64(new Uint8Array(ciphertext)) });
@@ -271,7 +283,7 @@
             // Continue in-memory, never falling back to unverified cached bytes.
             database = null;
           }
-          live(input.assertLive);
+          live(assertLive);
         }
       }
       return Object.freeze({ ...filtered(rows, input.term, pinned.head, Boolean(database)),
@@ -281,9 +293,10 @@
   async function clear(input) {
     try {
       if (!input?.grant || typeof input.assertLive !== "function") deny();
-      live(input.assertLive);
+      const assertLive = input.assertLive.bind(input);
+      live(assertLive);
       await store(input.indexedDBImpl).delete(cacheKey(scopeOf(input.grant)));
-      live(input.assertLive);
+      live(assertLive);
     } catch (_) { deny(); }
   }
   return Object.freeze({ search, clear, renderVerifiedResults });
