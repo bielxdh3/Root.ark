@@ -79,7 +79,7 @@ if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
   throw 'Out-GridView requires Windows PowerShell with the GraphicalTools feature.'
 }
 
-$chosen = @($files | Out-GridView -Title 'Root.ark - select a remote file to hydrate' -PassThru)
+$chosen = @($files | Out-GridView -Title 'Root.ark - select a remote file to hydrate' -OutputMode Single)
 if ($chosen.Count -eq 0) { return }
 if ($chosen.Count -ne 1) { throw 'Select exactly one file.' }
 
