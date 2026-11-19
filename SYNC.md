@@ -261,12 +261,15 @@ Para listar e baixar um arquivo especifico, use:
 
 ```powershell
 node sync-client/rootark-sync-v2.js browse --config E:\sync-private\.rootark-sync.json --limit 64
+node sync-client/rootark-sync-v2.js browse --config E:\sync-private\.rootark-sync.json --limit 64 --cursor '<nextCursor>'
 node sync-client/rootark-sync-v2.js hydrate --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 node sync-client/rootark-sync-v2.js evict --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 node sync-client/rootark-sync-v2.js pin --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 node sync-client/rootark-sync-v2.js status --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 node sync-client/rootark-sync-v2.js unpin --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 ```
+
+Para listar a pagina seguinte, substitua `<nextCursor>` pelo valor `nextCursor` da resposta anterior. Quando nao houver proximo cursor, a listagem terminou. Se o inventario mudar durante a navegacao (HTTP 409), reinicie a listagem sem `--cursor`.
 
 **Restricao S0 atual:** sem RootSession nativa com custodia independente e
 publicacao atomica sem substituir arquivos estrangeiros, **toda operacao
