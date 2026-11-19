@@ -376,12 +376,15 @@ async function start(options = {}) {
     console.log(JSON.stringify(page));
     return engine;
   }
-  if (options.action === "hydrate" || options.action === "evict") {
+  if (["hydrate", "evict", "pin", "unpin", "status"].includes(options.action)) {
     if (config.filesOnDemand !== true) throw new Error("Enable filesOnDemand in the private sync config");
-    if (typeof options.path !== "string") throw new Error("Files On-Demand requires --path");
-    const result = options.action === "hydrate"
-      ? await engine.materializeRemote(options.path) : await engine.evictLocal(options.path);
-    console.log(JSON.stringify({ path: options.path, action: options.action, applied: result }));
+    if (options.action !== "status" && typeof options.path !== "string") throw new Error("Files On-Demand requires --path");
+    const result = options.action === "hydrate" ? await engine.materializeRemote(options.path)
+      : options.action === "evict" ? await engine.evictLocal(options.path)
+        : options.action === "pin" ? await engine.pinLocal(options.path)
+          : options.action === "unpin" ? await engine.unpinLocal(options.path)
+            : await engine.pinStatus(typeof options.path === "string" ? options.path : null);
+    console.log(JSON.stringify({ path: options.path || null, action: options.action, result }));
     return engine;
   }
   const once = options.once === true || options.once === "true";
@@ -397,7 +400,7 @@ async function start(options = {}) {
 
 if (require.main === module) {
   const [command = "help", ...rest] = process.argv.slice(2);
-  if (["start", "browse", "hydrate", "evict"].includes(command)) {
+  if (["start", "browse", "hydrate", "evict", "pin", "unpin", "status"].includes(command)) {
     start({ ...args(rest), action: command }).catch((error) => {
       console.error(`Sync v2 failed: ${error.message}`);
       process.exitCode = 1;
@@ -406,7 +409,10 @@ if (require.main === module) {
     + "Files On-Demand:\n"
     + "  node sync-client/rootark-sync-v2.js browse --config <private-config> [--limit 64] [--cursor <nextCursor>]\n"
     + "  node sync-client/rootark-sync-v2.js hydrate --config <private-config> --path relative/file\n"
-    + "  node sync-client/rootark-sync-v2.js evict --config <private-config> --path relative/file");
+    + "  node sync-client/rootark-sync-v2.js evict --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js pin --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js unpin --config <private-config> --path relative/file\n"
+    + "  node sync-client/rootark-sync-v2.js status --config <private-config> [--path relative/file]");
 }
 
 module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,
