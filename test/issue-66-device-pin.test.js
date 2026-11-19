@@ -299,6 +299,28 @@ test("issue 66 P2 POSIX: signed legacy case-alias files cannot create a second d
   assert.equal(state.pushes, 0);
 });
 
+test("issue 66: aggregate pin status enumerates the persisted pin map only once", async (t) => {
+  const { open, remote } = await fixture(t);
+  const client = await open();
+  await client.apply(await remote("create", "object-b", "docs/b.txt", "second authenticated bytes"));
+  await client.pinLocal("docs/a.txt");
+  await client.pinLocal("docs/b.txt");
+
+  let enumerations = 0;
+  const persistedPins = client.snapshot.pinnedFiles;
+  client.snapshot.pinnedFiles = new Proxy(persistedPins, {
+    ownKeys(target) {
+      enumerations++;
+      return Reflect.ownKeys(target);
+    },
+  });
+
+  const status = await client.pinStatus();
+  assert.deepEqual(status.files.map((item) => item.path), ["docs/a.txt", "docs/b.txt"]);
+  assert.equal(enumerations, 1,
+    "aggregate status must reuse each known pin instead of rescanning the whole map");
+});
+
 // Force the exact post-rename directory durability barrier to fail, not an
 // early JSON write: at this point the new snapshot is already visible on disk.
 function interceptSnapshotDirectoryFsync(t, directory, failures) {
