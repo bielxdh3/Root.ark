@@ -47,12 +47,19 @@ function normalizeTrustedDevicePolicy(config) {
     revokedDeviceIds: Object.freeze([...revoked]) });
 }
 
-function args(argv) {
+function args(argv, strict = false) {
   const result = {};
   for (let index = 0; index < argv.length; index += 1) {
     const item = argv[index];
-    if (!item.startsWith("--")) continue;
+    if (!item.startsWith("--")) {
+      if (strict) throw new Error("Unsupported resume option or argument");
+      continue;
+    }
     const key = item.slice(2);
+    if (strict && ((key !== "config" && key !== "device-id" && key !== "credentials-stdin")
+      || Object.hasOwn(result, key))) {
+      throw new Error("Unsupported resume option or argument");
+    }
     const value = argv[index + 1];
     result[key] = value && !value.startsWith("--") ? value : true;
     if (result[key] !== true) index += 1;
@@ -553,6 +560,10 @@ async function resume(options = {}) {
   return outcome;
 }
 
+async function resumeFromCli(argv) {
+  return resume(args(argv, true));
+}
+
 if (require.main === module) {
   const [command = "help", ...rest] = process.argv.slice(2);
   if (command === "start") start({ ...args(rest) }).catch((error) => { console.error(`Sync v2 failed: ${error.message}`); process.exitCode = 1; });
@@ -560,7 +571,7 @@ if (require.main === module) {
   else if (command === "preview") start({ ...args(rest), preview: true }).catch((error) => { console.error(`Sync preview failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "preview-plan") previewPlan(args(rest)).catch((error) => { console.error(`Sync preview plan failed: ${error.message}`); process.exitCode = 1; });
   else if (command === "restore") start({ ...args(rest), restore: true }).catch((error) => { console.error(`Sync restore failed: ${error.message}`); process.exitCode = 1; });
-  else if (command === "resume") resume({ ...args(rest) }).catch((error) => { console.error(`Sync resume failed: ${error.message}`); process.exitCode = 1; });
+  else if (command === "resume") resumeFromCli(rest).catch((error) => { console.error(`Sync resume failed: ${error.message}`); process.exitCode = 1; });
   else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js preview --config <private-config> --object-id <id> --version-id <id> (requires independently injected custody and current grant; never mutates files)\nOr: node sync-client/rootark-sync-v2.js preview-plan --config <private-config> --plan-stdin (JSON array of up to 32 {objectId,versionId}; independent custody required; never mutates)\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)");
 }
 
