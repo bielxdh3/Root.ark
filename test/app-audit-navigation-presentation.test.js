@@ -35,11 +35,18 @@ async function fixture() {
     if (selector === '[data-action="audit-next"]') return next;
     assert.fail("Unexpected fixture selector: " + selector);
   };
-  const requests = [];
+  const requests = [], summaries = [];
+  let refreshSummary;
   const api = {
     query(route, values) { return { route, values }; },
     get(request) {
-      if (request === "/audit/summary") return Promise.resolve({ totalLogs: 120, bySeverity: { critical: 0 }, failedLogins: 0 });
+      if (request === "/audit/summary") {
+        if (!summaries.length) {
+          summaries.push({});
+          return Promise.resolve({ totalLogs: 120, bySeverity: { critical: 0 }, failedLogins: 0 });
+        }
+        return new Promise((resolve, reject) => summaries.push({ resolve, reject }));
+      }
       assert.equal(request.route, "/audit/logs");
       if (!requests.length) {
         requests.push({ values: request.values });
@@ -51,7 +58,7 @@ async function fixture() {
   const window = {
     RootarkApi: api,
     RootarkUI: { escape: String, formatDate: () => "Fixture date" },
-    setInterval: () => 1,
+    setInterval: callback => { refreshSummary = callback; return 1; },
     addEventListener() {},
   };
   const document = {
@@ -81,7 +88,12 @@ async function fixture() {
     });
   }
   return {
-    requests, previous, next, refresh, filter,
+    requests, summaries, previous, next, refresh, filter,
+    refreshSummary: () => refreshSummary(),
+    summaryTotal: nodes["audit-total"],
+    summaryCritical: nodes["audit-critical"],
+    summaryFailed: nodes["audit-failed-logins"],
+    feedback: nodes["audit-filter-feedback"],
     goNext: () => click("audit-next", next),
     goPrevious: () => click("audit-previous", previous),
     reload: () => click("refresh-audit", refresh),
@@ -153,6 +165,7 @@ test("a failed page shows unavailable state and refresh retries the selected pag
   assert.equal(f.refresh.disabled, true);
   assert.equal(f.requests[2].values.page, 2);
   f.requests[2].resolve(page(2, "Retried page"));
+  f.summaries[1].resolve({ totalLogs: 120, bySeverity: { critical: 0 }, failedLogins: 0 });
   await flush();
   assert.equal(f.refresh.disabled, false);
   assert.match(f.body.innerHTML, /Retried page/);
@@ -169,4 +182,30 @@ test("an empty filtered result restores a consistent empty state", async () => {
   assert.equal(f.info.textContent, "Página 1 de 1");
   assert.equal(f.previous.disabled, true);
   assert.equal(f.next.disabled, true);
+});
+
+test("audit summary retains the latest counts when an earlier refresh resolves later", async () => {
+  const f = await fixture();
+  const earlier = f.refreshSummary();
+  const later = f.refreshSummary();
+  f.summaries[2].resolve({ totalLogs: 21, bySeverity: { critical: 7 }, failedLogins: 3 });
+  await later;
+  const latest = [f.summaryTotal.textContent, f.summaryCritical.textContent, f.summaryFailed.textContent];
+  assert.deepEqual(latest, ["21", "7", "3"]);
+  f.summaries[1].resolve({ totalLogs: 11, bySeverity: { critical: 2 }, failedLogins: 1 });
+  await earlier;
+  assert.deepEqual([f.summaryTotal.textContent, f.summaryCritical.textContent, f.summaryFailed.textContent], latest);
+});
+
+test("an earlier summary failure does not replace feedback after a current refresh succeeds", async () => {
+  const f = await fixture();
+  const earlier = f.refreshSummary();
+  const later = f.refreshSummary();
+  f.summaries[2].resolve({ totalLogs: 21, bySeverity: { critical: 0 }, failedLogins: 0 });
+  await later;
+  const feedback = f.feedback.textContent;
+  f.summaries[1].reject(Object.assign(new Error("Fixture failure"), { status: 500 }));
+  await earlier;
+  assert.equal(f.feedback.textContent, feedback);
+  assert.equal(f.summaryTotal.textContent, "21");
 });

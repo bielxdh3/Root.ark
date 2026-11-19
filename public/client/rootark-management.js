@@ -482,7 +482,7 @@
     if (!canView) { noAccess(target, "A auditoria exige a permissão viewAuditLogs."); return; }
     target.innerHTML = auditMarkup();
     let currentPage = 1, totalPages = 1, currentFilters = {}, currentLogs = [];
-    let logsGeneration = 0;
+    let logsGeneration = 0, summaryGeneration = 0;
     const body = document.getElementById("audit-body"), prev = target.querySelector('[data-action="audit-previous"]');
     const next = target.querySelector('[data-action="audit-next"]'), pageInfo = document.getElementById("audit-page-info");
     function updatePagination(page, pages) {
@@ -505,12 +505,18 @@
       }).join("");
     }
     async function loadSummary() {
+      const generation = ++summaryGeneration;
       try {
         const summary = await api.get("/audit/summary");
+        if (generation !== summaryGeneration) return;
         document.getElementById("audit-total").textContent = count(summary.totalLogs);
         document.getElementById("audit-critical").textContent = count(summary.bySeverity && summary.bySeverity.critical);
         document.getElementById("audit-failed-logins").textContent = count(summary.failedLogins);
-      } catch (error) { const message = publicError(error, "Não foi possível carregar o resumo da auditoria."); if (message) setFeedback(document.getElementById("audit-filter-feedback"), message, "error"); }
+      } catch (error) {
+        if (generation !== summaryGeneration) return;
+        const message = publicError(error, "Não foi possível carregar o resumo da auditoria.");
+        if (message) setFeedback(document.getElementById("audit-filter-feedback"), message, "error");
+      }
     }
     async function loadLogs() {
       const generation = ++logsGeneration, requestedPage = currentPage;
