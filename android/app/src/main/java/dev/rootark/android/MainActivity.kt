@@ -247,6 +247,11 @@ class MainActivity : Activity() {
 
     private fun field(layout: LinearLayout, label: String, value: String, secret: Boolean): EditText =
         EditText(this).also {
+            it.id = View.generateViewId()
+            layout.addView(TextView(this).apply {
+                text = label
+                labelFor = it.id
+            })
             it.hint = label
             it.setText(value)
             it.inputType = if (secret) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
