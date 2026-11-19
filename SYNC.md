@@ -446,6 +446,7 @@ node sync-client/rootark-sync-v2.js hydrate --config E:\sync-private\.rootark-sy
 node sync-client/rootark-sync-v2.js evict --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 node sync-client/rootark-sync-v2.js pin --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 node sync-client/rootark-sync-v2.js status --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
+node sync-client/rootark-sync-v2.js status --config E:\sync-private\.rootark-sync.json
 node sync-client/rootark-sync-v2.js unpin --config E:\sync-private\.rootark-sync.json --path docs/relatorio.txt
 ```
 
