@@ -25,7 +25,9 @@
 </fieldset>
 <fieldset>
   <legend>Entrar em sala existente</legend>
+  <label for="roomInput">ID da sala</label>
   <input id="roomInput" placeholder="Room ID" autocomplete="off">
+  <label for="inviteInput">Convite de uso único</label>
   <input id="inviteInput" type="password" placeholder="Convite (uso único)" autocomplete="off">
   <button id="join">Entrar</button>
 </fieldset>
@@ -35,8 +37,10 @@
 </fieldset>
 <fieldset>
   <legend>Enviar aos pares autorizados</legend>
+  <label for="textInput">Texto de teste</label>
   <input id="textInput" maxlength="1000" placeholder="Texto de teste" aria-label="Texto de teste">
   <button id="sendText">Enviar texto</button>
+  <label for="fileInput">Arquivo a enviar</label>
   <input type="file" id="fileInput">
   <button id="sendFile">Enviar arquivo (até 32 MiB)</button>
   <div id="incoming"></div>
