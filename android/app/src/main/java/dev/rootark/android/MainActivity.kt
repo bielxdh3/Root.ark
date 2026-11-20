@@ -165,9 +165,9 @@ class MainActivity : Activity() {
         layout.addView(it)
     }
 
-    private fun field(layout: LinearLayout, label: String, value: String, secret: Boolean): EditText =
-        EditText(this).also {
-            it.hint = label
+    private fun field(layout: LinearLayout, label: String, value: String, secret: Boolean): EditText {
+        val input = EditText(this).also {
+            it.id = View.generateViewId()
             it.setText(value)
             it.inputType = if (secret) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 else InputType.TYPE_CLASS_TEXT
@@ -176,8 +176,14 @@ class MainActivity : Activity() {
             it.layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
             )
-            layout.addView(it)
         }
+        layout.addView(TextView(this).apply {
+            text = label
+            labelFor = input.id
+        })
+        layout.addView(input)
+        return input
+    }
 
     private fun button(layout: LinearLayout, label: String, action: () -> Unit) {
         val view = Button(this)
