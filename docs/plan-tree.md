@@ -9,6 +9,12 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+## 2026-11-20 continuation update — Android #64
+
+- `[IMPLEMENTED-UNVERIFIED]` The Android read-only metadata inventory now supports forward and previous-page navigation using the existing opaque cursor contract. PR #291 HEAD `a4b3eae049b7724d03669888c361e51f96b6b1c4` adds previous-cursor history and a native `Página anterior` action without changing the wire protocol, authorization, protected-content gate, or offline capture format. The focused `InventoryPagingTrackerTest` passes 1/1 locally; the `ZK65 Provider and Android Focused Regression` workflow passes on this exact SHA (run `44806154252`); an independent Codex review comment reports no actionable findings. PR #291 remains Draft with no formal approval, merge, device/emulator, or production acceptance.
+- `[IMPLEMENTED-UNVERIFIED]` The same previous-page change is only a local candidate in the separate #275 worktree; PR #275's current published SHA `41331568212f395e7f5a5ace8dd53542f876c2ca` has a failing focused CI assertion concerning plaintext `String` heap copies. That sensitive finding is not modified here and remains a separate review gate.
+- `[BLOCKED]` This bounded UI improvement does not complete Issue #64: Android registration, sync APIs, device revocation, recovery, protected-data access, offline synchronization, device/emulator runtime validation, and full client acceptance remain open.
+
 2026-11-06 — Issue #66, etapa parcial em revisao: inventario de metadados
 autenticado, paginado e limitado por resposta, com cursores invalidaveis por
 mudanca na biblioteca e isolamento por conta. Adapter e SyncEngine expõem
