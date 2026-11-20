@@ -265,7 +265,7 @@ class MainActivity : Activity() {
                 row.contentType?.let { "Tipo: $it" },
             ).joinToString(" · ")
             if (details.isNotEmpty()) text(layout, details)
-            if (!row.deleted) button(layout, "Conteúdo protegido") {
+            if (!row.deleted) button(layout, "Conteúdo protegido", accessibilityLabel = "Conteúdo protegido: ${row.name}") {
                 showProtectedObject(row.objectId) { showInventoryPage(page, pageNumber, usedCursors) }
             }
         }
@@ -499,9 +499,10 @@ class MainActivity : Activity() {
             layout.addView(it)
         }
 
-    private fun button(layout: LinearLayout, label: String, action: () -> Unit) {
+    private fun button(layout: LinearLayout, label: String, accessibilityLabel: String? = null, action: () -> Unit) {
         val view = Button(this)
         view.text = label
+        if (accessibilityLabel != null) view.contentDescription = accessibilityLabel
         view.filterTouchesWhenObscured = true
         view.setOnClickListener { action() }
         layout.addView(view)
