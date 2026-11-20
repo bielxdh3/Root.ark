@@ -1,5 +1,6 @@
 package dev.rootark.android
 
+import dev.rootark.core.sync.RootArkApiException
 import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
@@ -16,6 +17,11 @@ internal fun inventoryPageFailureMessage(failure: Exception?): String = when (fa
         "Não foi possível conectar ao servidor. Verifique a conexão e tente novamente."
     is SSLException ->
         "Não foi possível estabelecer uma conexão segura com o servidor. Verifique o endereço e tente novamente."
+    is RootArkApiException -> when (failure.statusCode) {
+        429 -> "Muitas solicitações de inventário. Aguarde um pouco antes de tentar novamente."
+        503 -> "O inventário está temporariamente indisponível no servidor. Tente novamente mais tarde."
+        else -> "Não foi possível carregar a página de inventário. Tente novamente."
+    }
     else ->
         "Não foi possível carregar a página de inventário. Tente novamente."
 }
