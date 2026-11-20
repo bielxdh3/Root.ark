@@ -265,7 +265,7 @@ class MainActivity : Activity() {
                 row.contentType?.let { "Tipo: $it" },
             ).joinToString(" · ")
             if (details.isNotEmpty()) text(layout, details)
-            if (!row.deleted) button(layout, "Conteúdo protegido", accessibilityLabel = "Conteúdo protegido: ${row.name}") {
+            if (!row.deleted) button(layout, "Conteúdo protegido", accessibilityLabel = protectedContentAccessibilityLabel(row)) {
                 showProtectedObject(row.objectId) { showInventoryPage(page, pageNumber, usedCursors) }
             }
         }
