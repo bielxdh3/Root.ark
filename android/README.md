@@ -1,16 +1,11 @@
-> **Source scope — PR #273 standalone checkout:** This commit implements
-> metadata pagination, not protected-content fetch. `ProtectedSyncContent.kt`,
-> `ProtectedSyncFetch.kt`, `withVerifiedContent` and their app-JVM tests are
-> **ABSENT from this PR HEAD**; they exist only in its separately integrated
-> configured parent branch `cdx/rootark-issue64-filelist-20261106` (`83b0e147`).
-> References to those APIs, build targets, security checks and capabilities
-> below describe **the intended combined parent + child tree**, not features
-> or tests delivered by the standalone #273 checkout. No forward merge,
-> trusted-grant provisioner, device validation or deployment is claimed.
+> This Android prototype supports authenticated sign-in and bounded,
+> read-only metadata browsing. It also includes internal ciphertext
+> fetch/verification APIs, but no trusted-grant provider is installed and
+> the native UI cannot decrypt protected content.
 
 # Root.ark Android client (authentication + read-only metadata prototype)
 
-Status: **native launcher with online login, 2FA and bounded, authenticated read-only sync metadata listing with pagination.** Protected-content fetch and verification are upstream dependencies, absent from this standalone checkout. No Android device runtime validation has been performed. This is a bounded step toward issue #64; it implements no Keystore, device enrollment, recovery or sync engine, and is not an approved release. The design gates in `docs/architecture/android-client-architecture.md` remain open.
+Status: **native launcher with online login, 2FA, bounded authenticated read-only metadata pagination, plus an internal gated HTTPS ciphertext fetch/verification adapter.** The app-internal adapter calls the pure-JVM cryptographic core only when an external source supplies current independently pinned trust and a one-shot file CEK. No such trusted provider is installed; the native UI remains metadata-only. The app does not implement Keystore enrollment, device enrollment, recovery or a sync engine. Physical-device networking remains unvalidated; the design gates in `docs/architecture/android-client-architecture.md` remain open.
 
 ## Layout
 
@@ -21,6 +16,8 @@ Status: **native launcher with online login, 2FA and bounded, authenticated read
 | `app/` | Native Activity, HTTPS auth and read-only listing adapter. Internet permission only, `allowBackup=false`, `usesCleartextTraffic=false`, screenshot/task-switcher `FLAG_SECURE`. No file/storage permissions. |
 | `core/src/main/kotlin/dev/rootark/core/auth/ServerOrigin.kt` | Pure Kotlin strict HTTPS origin parser with independent JUnit rejection tests. |
 | `core/src/main/kotlin/dev/rootark/core/sync/ReadOnlyFileListPolicy.kt` | Explicit `listFiles` gate, protocol/version and metadata bounds; produces display-only rows with no ciphertext, nonce, key material or signatures. |
+| `core/src/main/kotlin/dev/rootark/core/sync/ProtectedSyncContent.kt` | Explicit, fail-closed Sync v2 signed-envelope verifier and AES-256-GCM decryptor, with canonical JSON AAD and RFC 8949 deterministic CBOR Ed25519 proof bytes; requires independently pinned device public keys, explicit current revocation/epoch, and a fresh trust snapshot. |
+| `app/src/main/java/dev/rootark/android/ProtectedSyncFetch.kt` | Internal HTTPS-only `GET /sync/v1/objects/:objectId` adapter, limited to 12 MiB/one object/identity encoding, no redirects or cache, strictly parsed full signed response. No native UI integration. |
 
 Targets: minSdk 29 (proposed in the architecture doc, owner to confirm), compileSdk/targetSdk 35, Kotlin 2.0.21, AGP 8.7.3, JDK 17.
 
@@ -41,21 +38,21 @@ Then:
 
 ```
 ./gradlew :core:test          # pure JVM path-validator and contract tests
-./gradlew :app:testDebugUnitTest # app JVM tests present in this checkout
+./gradlew :app:testDebugUnitTest # HTTPS transport, pagination and trust-gated fetch JVM tests
 ./gradlew :app:assembleDebug  # Android launcher build (requires the Android SDK)
 ```
 
 Set `ANDROID_HOME` or create `android/local.properties` with `sdk.dir=...` (not committed).
 
-## Issue #64 — paginated metadata browsing (stacked PR #273)
+## Paginated metadata browsing
 
-This child replaces the **native browsing UI's** former full-record list request with authenticated metadata-only pages at `GET /sync/v1/objects?view=metadata&limit=64[&cursor=...]`. The server independently checks `listFiles` on every page. Each response must declare `view:"metadata"`, protocol v2, at most 64 entries and at most 128 KiB; the client accepts only a valid bounded cursor and never requests the ciphertext-bearing legacy list endpoint while browsing. The older unpaginated list limitations described above apply to the legacy API, **not** this new native paged UI.
+The **native browsing UI** uses authenticated metadata-only pages at `GET /sync/v1/objects?view=metadata&limit=64[&cursor=...]` instead of the former full-record list request. The server independently checks `listFiles` on every page. Each response must declare `view:"metadata"`, protocol v2, at most 64 entries and at most 128 KiB; the client accepts only a valid bounded cursor and never requests the ciphertext-bearing legacy list endpoint while browsing. The older unpaginated list limitations described above apply to the legacy API, **not** this native paged UI.
 
 The UI retains one page in memory and follows an opaque cursor without merging inventory snapshots. Unauthorized 401 drops the session; 403 displays denial; 409 invalidates the page and requires a fresh start. "Atualizar desde o início" restarts at page one. Malformed/repeated cursors, changed snapshots and invalid metadata are rejected instead of silently showing partial results.
 
-The pagination code depends on PR #255's server endpoint and the separately delivered login and metadata-listing branches. A merged server PR is **not** proof the endpoint is deployed: verify its presence in the approved server release before using this Android screen. The child also adds `test/issue-64-android-pagination.test.js` to the Node contract list and `test/issue-64-android-pagination-real-http.test.js` against a pinned disposable server checkout in hosted focused CI. The latter is required without skip in the focused workflow. These contract and hosted JVM checks do not establish physical-device/emulator HTTP behavior.
+The pagination code depends on server support for the metadata-only inventory endpoint. The presence of the Android adapter does not imply that the endpoint is deployed: verify server support before using this screen. Contract and focused HTTP tests validate the response shape but do not establish physical-device/emulator networking behavior.
 
-The upstream `ProtectedSyncFetch`/`ProtectedSyncContent` implementations are **not present in this checkout** and are not connected to this UI. Metadata names/paths remain server-visible; this is not a Zero-Knowledge release. No merge, deployment or Ready status is claimed for this stacked feature.
+The internal `ProtectedSyncFetch`/`ProtectedSyncContent` APIs are not connected to this UI. The native screen remains metadata-only and cannot decrypt without a trusted grant provider and CEK. Metadata names/paths remain server-visible; this is not a Zero-Knowledge native client.
 
 ## Contract tests (run in Node, no JDK needed)
 
@@ -67,13 +64,15 @@ node --test --test-reporter=tap test/issue-64-android-contract.test.js test/issu
 - Wire models: every field of the Kotlin data classes in `core/src/main/kotlin/dev/rootark/core/sync/` must match a real server response in `core/src/test/resources/server-responses.json` (names, nullability, JSON types).
 - The fixture is captured by calling the real route handlers in-process. Refresh it with `node scripts/issue-64-android-fixtures.js --write`. The contract test fails if the committed fixture drifts from a fresh capture.
 
-## Verification and remaining gaps
+## Security and platform boundaries
 
-- The `ZK65 Provider and Android Focused Regression` workflow runs `gradle --no-daemon :core:test :app:testDebugUnitTest :app:assembleDebug` with pinned Gradle 8.10.2, Temurin JDK 17 and Android SDK 35 on hosted Ubuntu. Exact draft PR #268 head `1f5793aa` passed the Kotlin core tests, app transport/ephemeral cryptography JVM tests, and native app compilation. The Node server/fixture contracts passed on hosted Ubuntu and Windows-2022, **3/3 jobs green**. This is compile/JVM evidence, not an emulator, physical Android, or live TLS handshake test.
-- **Upstream dependency:** the protected-content verifier, ciphertext-fetch adapter, `withVerifiedContent` and associated JVM tests must be integrated separately. The historical #268 results above are not evidence that these APIs or tests exist in #273.
+- The Kotlin/JVM tests exercise the portable core, HTTPS transport, and ephemeral cryptographic fixtures; `assembleDebug` compiles the native launcher. These checks do not establish emulator or physical-device compatibility, nor a live TLS handshake.
+- The internal `ProtectedSyncContent.verifyAndDecrypt(record, fileKey, pinnedContext)` API is available to Kotlin callers only after a separate trusted provisioning path exists. The core requires a 32-byte caller-owned CEK; exact object/file/version/compartment/epoch scope; an independently provisioned device-to-Ed25519-SPKI binding; current revocation information; an independently obtained trust snapshot valid for no more than five minutes; a nonexpired signing proof; canonical AAD and signed SHA-256 byte digests; and AES-GCM authentication. It rejects MOVE/DELETE payloads, expired historical proofs, unsupported protocol versions, malformed paths and all untrusted identities. It holds keys and plaintext only in memory and does not log them. The tests verify actual Node CREATE/UPDATE route signatures and CBOR encoding, then exercise decryption and adversarial mutations with disposable in-memory test keys.
 - **Integration gate:** native login/list grants no signing trust or CEK. The server cannot provision its own signing key pin, current epoch or revocation state to make data trusted. Missing authenticated device enrollment, owner-approved key transfer, current trusted registry/epoch snapshots, and protected-metadata contract block actual UI access and usable protected content. There is no plaintext download/export flow.
+- **Bounded ciphertext fetch (internal only):** `ProtectedSyncFetch.fetchCiphertext(origin, authenticatedSession, objectId)` sends one bearer-authenticated HTTPS GET to `/sync/v1/objects/:objectId`, checks local `listFiles` before the server rechecks it, rejects redirects/HTTP errors, JSON responses larger than 12 MiB, encoded/compressed responses, invalid UTF-8, unrecognized fields and malformed records. It returns an **untrusted** `SyncRecord`, never plaintext. `withVerifiedContent(..., TrustedContentGrantProvider, callback)` refuses to fetch without a short-lived independently provisioned device pin/revocation/epoch context plus a caller-owned 32-byte CEK; it invokes `ProtectedSyncContent.verifyAndDecrypt`, passes authenticated plaintext only to an internal callback, and wipes plaintext and the one-shot CEK on exit. The grant provider has deliberately **no implementation in the app**, so ordinary login cannot enable decryption. No UI, Keystore or persistent decrypted cache is added.
+- The app-JVM tests use a real captured Node `GET /sync/v1/objects/:id` response and an injectable `HttpsURLConnection` fixture to verify URL/header/HTTP/size/parser/permission/trust boundaries without connecting to the user's server. These do not establish emulator or physical-device compatibility, nor certificate-chain behavior on a real network.
 - **Platform gate:** the JVM test environment provides Ed25519 through JDK 17. Android API 29 provider availability/behavior remains unverified; missing Ed25519 or AES/GCM is rejected by the core. Instrumented minimum-API and physical-device tests are required before app integration, with no fallback to server-supplied public keys.
 - The native screen sends `POST /auth/login` and `POST /auth/login/2fa` to a strictly validated HTTPS origin and handles authenticated, TOTP challenge, mandatory 2FA-enrollment and generic error states. It disables redirects and caching, bounds responses, clears sensitive UI fields, drops sessions on backgrounding, disables view-state saving, and retains session data only in process memory. Enrollment itself still requires the web client.
-- The Android adapter also supports authenticated read-only `GET /sync/v1/objects` after a login with explicit `listFiles: true`; the server independently enforces `listFiles` on this endpoint. Only name/path/size/content-type and tombstone state reach native TextViews. A 401 discards the local session; a 403 is displayed as a denial. Android revocation and privilege changes are enforced by the server on each request.
-- The legacy list endpoint returns **complete records including ciphertext**, even though the Android UI never displays protected bytes. It has no pagination. The Android transport refuses a body over **1 MiB** or over **128 objects**, validates protocol v2 and display metadata, and reports an explicit error without showing a partial inventory. Large remote inventories therefore cannot be listed until a server-approved paginated metadata-only protocol exists.
-- The native UI remains only a metadata viewer. This standalone checkout has **no protected-content fetch and verification implementation, trusted key provisioning, key enrollment/revocation delivery, offline copies, protected metadata protocol, recovery or sync writes**. Metadata names and paths are **currently server visible**, so this must not be presented as a fully zero-knowledge native client. No physical-device/emulator HTTP behavior has been validated.
+- The compatibility adapter retains authenticated read-only `GET /sync/v1/objects` for legacy callers after a login with explicit `listFiles: true`; the server independently enforces `listFiles` on this endpoint. The native browsing UI uses the paginated metadata-only endpoint. Only name/path/size/content-type and tombstone state reach native TextViews. A 401 discards the local session; a 403 is displayed as a denial. Android revocation and privilege changes are enforced by the server on each request.
+- The legacy list endpoint returns **complete records including ciphertext**, even though the Android UI never displays protected bytes. It has no pagination. The legacy transport refuses a body over **1 MiB** or over **128 objects**, validates protocol v2 and display metadata, and reports an explicit error without showing a partial inventory. The new paginated metadata-only endpoint is the supported path for large inventories and remains dependent on the server-side #255 implementation being present in the approved release.
+- The native UI remains only a metadata viewer. The internal fetch and verification path has **no trusted key provisioning, key enrollment/revocation delivery, offline copies, protected metadata protocol, recovery or sync writes**. Metadata names and paths are **currently server visible**, so this must not be presented as a fully zero-knowledge native client. No physical-device/emulator HTTP behavior has been validated.

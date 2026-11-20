@@ -9,10 +9,66 @@ import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
+import java.io.InputStream
 import java.math.BigDecimal
 import java.math.BigInteger
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import dev.rootark.core.auth.ServerOrigin
 
 class AuthHttpTransportTest {
+
+    @Test
+    fun `adversarial slow-drip sync listing exhausts total response budget before EOF`() {
+        val origin = ServerOrigin.parse("https://sync.example.test")
+        val expected = """{"protocolVersion":2,"objects":[]}""".toByteArray(StandardCharsets.UTF_8)
+        val elapsed = AtomicLong(0L)
+        val reads = AtomicInteger(0)
+        var offset = 0
+        var disconnected = false
+        // Each successful socket read supplies data in under its 10-second
+        // per-read timeout. Without a cumulative BODY deadline this stream
+        // can keep the authenticated listing worker alive indefinitely.
+        val dripper = object : InputStream() {
+            override fun read(): Int = if (offset < expected.size) {
+                reads.incrementAndGet()
+                elapsed.addAndGet(4_000_000_000L)
+                expected[offset++].toInt() and 0xff
+            } else -1
+
+            override fun read(buffer: ByteArray, start: Int, length: Int): Int {
+                if (length == 0) return 0
+                val next = read()
+                if (next < 0) return -1
+                buffer[start] = next.toByte()
+                return 1
+            }
+        }
+        val connection = object : HttpURLConnection(URL("https://sync.example.test/sync/v1/objects")) {
+            override fun connect() = Unit
+            override fun disconnect() { disconnected = true }
+            override fun usingProxy() = false
+            override fun getResponseCode() = 200
+            override fun getInputStream() = dripper
+        }
+        val transport = AuthHttpTransport(
+            openSyncConnection = { requested ->
+                assertEquals("https://sync.example.test/sync/v1/objects", requested.toString())
+                connection
+            },
+            monotonicNanos = elapsed::get,
+        )
+        val failure = assertThrows(SyncListingLimitException::class.java) {
+            transport.listSyncObjects(origin, "independent-bearer")
+        }
+        assertTrue(failure.message?.contains("deadline") == true)
+        assertEquals("the third short read crosses the body budget", 3, reads.get())
+        assertEquals("Bearer independent-bearer", connection.getRequestProperty("Authorization"))
+        assertTrue("failed listing must release the authenticated connection", disconnected)
+    }
 
     private fun createValidSyncListing(): JSONObject {
         val json = JSONObject()
@@ -34,6 +90,46 @@ class AuthHttpTransportTest {
         objects.put(record)
         json.put("objects", objects)
         return json
+    }
+
+    @Test
+    fun `paged inventory uses injected connection with the requested cursor URL`() {
+        val origin = ServerOrigin.parse("https://sync.example.test")
+        val response = JSONObject().apply {
+            put("protocolVersion", 2)
+            put("view", "metadata")
+            put("objects", org.json.JSONArray().put(JSONObject().apply {
+                put("protocolVersion", 2)
+                put("objectId", "obj-1")
+                put("operation", "create")
+                put("tombstone", false)
+                put("revision", JSONObject().put("counter", 1L).put("deviceId", "dev-1"))
+                put("metadata", JSONObject().put("name", "test.txt").put("path", "docs/test.txt")
+                    .put("size", 100L).put("contentType", "text/plain"))
+            }))
+            put("nextCursor", "cursor-next")
+        }.toString().toByteArray(StandardCharsets.UTF_8)
+        var requestedUrl: URL? = null
+        var disconnected = false
+        val connection = object : HttpURLConnection(origin.syncInventoryUrl("cursor-prev")) {
+            override fun connect() = Unit
+            override fun disconnect() { disconnected = true }
+            override fun usingProxy() = false
+            override fun getResponseCode() = 200
+            override fun getInputStream() = response.inputStream()
+        }
+        val transport = AuthHttpTransport(openSyncConnection = { requested ->
+            requestedUrl = requested
+            connection
+        })
+
+        val page = transport.listInventoryPage(origin, "paged-bearer", "cursor-prev")
+
+        assertEquals(origin.syncInventoryUrl("cursor-prev").toString(), requestedUrl?.toString())
+        assertEquals("Bearer paged-bearer", connection.getRequestProperty("Authorization"))
+        assertEquals(1, page.rows.size)
+        assertEquals("cursor-next", page.nextCursor)
+        assertTrue("paged request must release the authenticated connection", disconnected)
     }
 
     @Test

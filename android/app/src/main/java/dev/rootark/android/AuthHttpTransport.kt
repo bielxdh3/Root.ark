@@ -12,6 +12,7 @@ import java.io.IOException
 import java.math.BigDecimal
 import java.math.BigInteger
 import java.net.HttpURLConnection
+import java.net.URL
 import java.nio.charset.StandardCharsets
 import org.json.JSONException
 import org.json.JSONObject
@@ -21,7 +22,16 @@ class SyncListingLimitException(message: String) : SyncListingException(message)
 class SyncListingValidationException(message: String, cause: Throwable? = null) : SyncListingException(message, cause)
 
 /** HTTP adapter for canonical login/TOTP and the bounded, read-only sync listing. */
-internal class AuthHttpTransport {
+internal class AuthHttpTransport(
+    private val openSyncConnection: (URL) -> HttpURLConnection = { it.openConnection() as HttpURLConnection },
+    private val monotonicNanos: () -> Long = System::nanoTime,
+) {
+    companion object {
+        // Socket readTimeout applies to EACH read. This cumulative budget
+        // covers BODY reads only, starting after responseCode and inputStream
+        // acquisition. It does not impose a total header/connect deadline.
+        private const val MAX_SYNC_LIST_BODY_DURATION_NANOS = 10_000_000_000L
+    }
     fun login(origin: ServerOrigin, username: String, password: String): LoginOutcome {
         val (status, json) = post(origin.loginUrl(), JSONObject().put("username", username).put("password", password))
         if (status == 403) {
@@ -44,10 +54,10 @@ internal class AuthHttpTransport {
         return authenticated(json)
     }
 
-    /** The issue #66 endpoint returns metadata only; one page is retained at a time. */
-    fun listInventoryPage(origin: ServerOrigin, token: String, cursor: String? = null): InventoryPage {
+    /** Legacy unpaginated listing retained for existing callers and compatibility tests. */
+    fun listSyncObjects(origin: ServerOrigin, token: String): List<ReadOnlyFileRow> {
         require(token.isNotBlank() && token.length <= 4096)
-        val connection = origin.syncInventoryUrl(cursor).openConnection() as HttpURLConnection
+        val connection = openSyncConnection(origin.syncListUrl())
         try {
             connection.requestMethod = "GET"
             connection.instanceFollowRedirects = false
@@ -60,11 +70,67 @@ internal class AuthHttpTransport {
             val status = connection.responseCode
             if (status != 200) throw RootArkApiException(status)
             val json = connection.inputStream.use { stream ->
+                val startedNanos = monotonicNanos()
+                fun checkDeadline() {
+                    if (monotonicNanos() - startedNanos >= MAX_SYNC_LIST_BODY_DURATION_NANOS) {
+                        throw SyncListingLimitException("Sync listing read deadline exceeded")
+                    }
+                }
                 val out = ByteArrayOutputStream()
                 val buffer = ByteArray(4096)
                 var total = 0
                 while (true) {
+                    checkDeadline()
                     val count = stream.read(buffer)
+                    checkDeadline()
+                    if (count < 0) break
+                    total += count
+                    if (total > ReadOnlyFileListPolicy.MAX_RESPONSE_BYTES) {
+                        throw SyncListingLimitException("Sync listing exceeds limit")
+                    }
+                    out.write(buffer, 0, count)
+                }
+                try {
+                    JSONObject(String(out.toByteArray(), StandardCharsets.UTF_8))
+                } catch (e: JSONException) {
+                    throw SyncListingValidationException("Malformed JSON in sync listing", e)
+                }
+            }
+            return projectList(json)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    /** The issue #66 endpoint returns metadata only; one page is retained at a time. */
+    fun listInventoryPage(origin: ServerOrigin, token: String, cursor: String? = null): InventoryPage {
+        require(token.isNotBlank() && token.length <= 4096)
+        val connection = openSyncConnection(origin.syncInventoryUrl(cursor))
+        try {
+            connection.requestMethod = "GET"
+            connection.instanceFollowRedirects = false
+            connection.useCaches = false
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 10_000
+            connection.setRequestProperty("Authorization", "Bearer $token")
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("Cache-Control", "no-store")
+            val status = connection.responseCode
+            if (status != 200) throw RootArkApiException(status)
+            val json = connection.inputStream.use { stream ->
+                val startedNanos = monotonicNanos()
+                fun checkDeadline() {
+                    if (monotonicNanos() - startedNanos >= MAX_SYNC_LIST_BODY_DURATION_NANOS) {
+                        throw SyncListingLimitException("Sync listing read deadline exceeded")
+                    }
+                }
+                val out = ByteArrayOutputStream()
+                val buffer = ByteArray(4096)
+                var total = 0
+                while (true) {
+                    checkDeadline()
+                    val count = stream.read(buffer)
+                    checkDeadline()
                     if (count < 0) break
                     total += count
                     if (total > PagedInventoryPolicy.MAX_RESPONSE_BYTES) {
