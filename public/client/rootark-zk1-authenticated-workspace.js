@@ -1003,6 +1003,12 @@
       "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-pull", "catalog-delta-import",
       "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
       "catalog-delta-restore"].includes(action)) return;
+    if (action === "catalog-delta-list") {
+      // Clear the previous result display as soon as the refresh starts.
+      field("catalog-delta-private-list")?.replaceChildren();
+      const summary = field("catalog-delta-summary");
+      if (summary) summary.textContent = "";
+    }
     clearLocalPreview();
     const operationPreviewGeneration = previewGeneration;
     busy = true;
@@ -1308,8 +1314,6 @@
           if (!window.RootarkZk1ProtectedLocalSearch?.search) fail();
           const raw = await fileBytes("catalog-write-key", 32, 32);
           const list = field("catalog-delta-private-list");
-          list.replaceChildren();
-          field("catalog-delta-summary").textContent = "";
           const term = field("catalog-delta-query")?.value || "";
           let opened;
           try {
