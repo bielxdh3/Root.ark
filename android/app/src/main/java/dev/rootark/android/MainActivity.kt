@@ -20,6 +20,15 @@ import dev.rootark.core.sync.PagedInventoryPolicy
 import dev.rootark.core.sync.RootArkApiException
 
 /** Online auth and read-only metadata listing; protected files and device keys remain gated. */
+/** Listing-specific presentation; keep the two explicit response categories separate. */
+internal fun inventoryPageFailureMessage(failure: Exception?): String = when (failure) {
+    is SyncListingLimitException ->
+        "Não foi possível carregar a página de inventário. A resposta excede o limite (128 KiB / 64 registros)."
+    is SyncListingValidationException ->
+        "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
+    else -> inventoryPageRequestFailureMessage(failure)
+}
+
 class MainActivity : Activity() {
     private val transport = AuthHttpTransport()
     private var serverField: EditText? = null
