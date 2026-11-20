@@ -120,6 +120,54 @@ test('recipient-bound single-use invite and host session prevent impersonation a
   assert.equal((await replay.next('error')).code, 'INVALID_INVITE');
 });
 
+test('1:N guest roster and membership events remain private between recipients', async t => {
+  const f = await fixture(t);
+  const room = (await f.createRoom(f.cookie('alice'))).data;
+  const host = await f.connect(f.cookie('alice'));
+  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  const hostJoined = await host.next('joined');
+
+  host.send({ type: 'invite', recipient: 'bob' });
+  const bobInvite = await host.next('invited');
+  const bob = await f.connect(f.cookie('bob'));
+  bob.send({ type: 'join', roomId: room.roomId, invitation: bobInvite.invitation });
+  const bobJoined = await bob.next('joined');
+  assert.deepEqual(bobJoined.members, [
+    { peerId: hostJoined.peerId, role: 'host', username: 'alice' },
+  ]);
+  assert.equal((await host.next('peer-joined')).username, 'bob');
+
+  const bobSawGuestEvents = [];
+  bob.ws.on('message', bytes => {
+    const message = JSON.parse(bytes.toString());
+    if (message.type === 'peer-joined' || message.type === 'peer-left') {
+      bobSawGuestEvents.push(message);
+    }
+  });
+  host.send({ type: 'invite', recipient: 'eve' });
+  const eveInvite = await host.next('invited');
+  const eve = await f.connect(f.cookie('eve'));
+  eve.send({ type: 'join', roomId: room.roomId, invitation: eveInvite.invitation });
+  const eveJoined = await eve.next('joined');
+  assert.deepEqual(eveJoined.members, [
+    { peerId: hostJoined.peerId, role: 'host', username: 'alice' },
+  ], 'Eve must not learn Bob\'s username or peer ID');
+  assert.equal((await host.next('peer-joined')).username, 'eve',
+    'the host still sees every invited recipient');
+
+  // The error reply is an ordering barrier for earlier messages on Bob's socket.
+  bob.send({ type: 'invite', recipient: 'eve' });
+  assert.equal((await bob.next('error')).code, 'FORBIDDEN');
+  assert.deepEqual(bobSawGuestEvents, [], 'Bob must not receive Eve\'s peer-joined event');
+
+  host.send({ type: 'kick', to: eveJoined.peerId });
+  assert.equal((await eve.next('error')).code, 'REVOKED');
+  assert.equal((await host.next('peer-left')).peerId, eveJoined.peerId);
+  bob.send({ type: 'invite', recipient: 'eve' });
+  assert.equal((await bob.next('error')).code, 'FORBIDDEN');
+  assert.deepEqual(bobSawGuestEvents, [], 'Bob must not receive Eve\'s peer-left event');
+});
+
 test('revoked or expired Root.ark session closes its previously consented peer channel', async t => {
   const f = await fixture(t);
   const room = (await f.createRoom(f.cookie('alice'))).data;
