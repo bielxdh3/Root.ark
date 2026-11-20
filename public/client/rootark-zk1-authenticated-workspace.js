@@ -967,6 +967,12 @@
       "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
       "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
       "catalog-delta-restore"].includes(action)) return;
+    if (action === "catalog-delta-list") {
+      // Clear the previous result display as soon as the refresh starts.
+      field("catalog-delta-private-list")?.replaceChildren();
+      const summary = field("catalog-delta-summary");
+      if (summary) summary.textContent = "";
+    }
     busy = true;
     dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
@@ -1268,7 +1274,6 @@
             { name: "AES-GCM", length: 256 }, false, ["decrypt"]); }
           finally { raw.fill(0); }
           const list = field("catalog-delta-private-list");
-          list.replaceChildren();
           const term = field("catalog-delta-query")?.value || "";
           const opened = await held.client.readPrivateListing(held.baseline, metadataKey, term);
           assertLive();
