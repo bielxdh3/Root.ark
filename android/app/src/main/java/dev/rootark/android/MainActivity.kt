@@ -19,6 +19,15 @@ import dev.rootark.core.sync.ReadOnlyFileRow
 import dev.rootark.core.sync.RootArkApiException
 
 /** Online auth and read-only metadata listing; protected files and device keys remain gated. */
+/** Listing-specific presentation; keep the two explicit response categories separate. */
+internal fun inventoryListFailureMessage(failure: Exception?): String = when (failure) {
+    is SyncListingLimitException ->
+        "Não foi possível carregar a lista. A resposta excede o limite do protótipo (1 MiB / 128 registros)."
+    is SyncListingValidationException ->
+        "Não foi possível carregar a lista. Os dados de sincronização retornados pelo servidor são inválidos."
+    else -> inventoryListRequestFailureMessage(failure)
+}
+
 class MainActivity : Activity() {
     private val transport = AuthHttpTransport()
     private var serverField: EditText? = null
