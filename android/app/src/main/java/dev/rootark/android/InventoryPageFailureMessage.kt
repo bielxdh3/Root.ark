@@ -8,7 +8,7 @@ import java.net.UnknownHostException
 import javax.net.ssl.SSLException
 
 /** Presentation only: never include raw exception text in a user-facing message. */
-internal fun inventoryPageFailureMessage(failure: Exception?): String = when (failure) {
+internal fun inventoryPageRequestFailureMessage(failure: Exception?): String = when (failure) {
     is SocketTimeoutException ->
         "A solicitação do inventário excedeu o tempo limite. Tente novamente."
     is UnknownHostException ->

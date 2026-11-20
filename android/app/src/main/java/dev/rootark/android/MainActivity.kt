@@ -23,6 +23,15 @@ import dev.rootark.core.sync.SessionOfflineInventory
 import java.util.UUID
 
 /** Authenticated metadata browsing with an explicit, provisioned-only protected text viewer. */
+/** Listing-specific presentation; keep the two explicit response categories separate. */
+internal fun inventoryPageFailureMessage(failure: Exception?): String = when (failure) {
+    is SyncListingLimitException ->
+        "Não foi possível carregar a página de inventário. A resposta excede o limite (128 KiB / 64 registros)."
+    is SyncListingValidationException ->
+        "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
+    else -> inventoryPageRequestFailureMessage(failure)
+}
+
 class MainActivity : Activity() {
     private val transport = AuthHttpTransport()
     private var serverField: EditText? = null
@@ -236,17 +245,7 @@ class MainActivity : Activity() {
                     offlineInventory?.clear()
                     showSession("Inventário mudou no servidor. Reinicie a listagem para obter um novo snapshot.")
                 }
-                else -> {
-                    val message = when (failure) {
-                        is SyncListingLimitException ->
-                            "Não foi possível carregar a página de inventário. A resposta excede o limite (128 KiB / 64 registros)."
-                        is SyncListingValidationException ->
-                            "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
-                        else ->
-                            inventoryPageFailureMessage(failure)
-                    }
-                    showSession(message)
-                }
+                else -> showSession(inventoryPageFailureMessage(failure))
             }
         }
     }
