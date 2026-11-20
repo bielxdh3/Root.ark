@@ -10,6 +10,16 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class InventoryPageFailureMessageTest {
+    @Test fun knownLimitKeepsPageBounds() {
+        assertEquals("Não foi possível carregar a página de inventário. A resposta excede o limite (128 KiB / 64 registros).",
+            inventoryPageFailureMessage(SyncListingLimitException("fixture")))
+    }
+
+    @Test fun invalidResponseKeepsItsMessage() {
+        assertEquals("Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos.",
+            inventoryPageFailureMessage(SyncListingValidationException("fixture")))
+    }
+
     @Test fun timeoutHasItsOwnMessage() {
         assertEquals("A solicitação do inventário excedeu o tempo limite. Tente novamente.",
             inventoryPageFailureMessage(SocketTimeoutException("fixture")))

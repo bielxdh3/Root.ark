@@ -9,6 +9,10 @@ import javax.net.ssl.SSLException
 
 /** Presentation only: never include raw exception text in a user-facing message. */
 internal fun inventoryPageFailureMessage(failure: Exception?): String = when (failure) {
+    is SyncListingLimitException ->
+        "Não foi possível carregar a página de inventário. A resposta excede o limite (128 KiB / 64 registros)."
+    is SyncListingValidationException ->
+        "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
     is SocketTimeoutException ->
         "A solicitação do inventário excedeu o tempo limite. Tente novamente."
     is UnknownHostException ->
