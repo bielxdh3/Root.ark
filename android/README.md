@@ -1,6 +1,6 @@
 # Root.ark Android client (scaffold)
 
-Status: **scaffold only; the pure Kotlin/JVM core has been compiled and tested in hosted Ubuntu CI.** This directory is step 1 of the native Android client tracked in issue #64. It implements no UI, no key storage, no networking, and no sync engine. The Android application module has not been built. It is not an approved release, and the design gates in `docs/architecture/android-client-architecture.md` remain open.
+Status: **buildable scaffold; the pure Kotlin/JVM core has been compiled and tested in hosted Ubuntu CI.** This directory is step 1 of the native Android client tracked in issue #64. The application module can produce a debug APK, but implements no UI, no key storage, no networking, and no sync engine. It is not an approved release, and the design gates in `docs/architecture/android-client-architecture.md` remain open.
 
 ## Layout
 
