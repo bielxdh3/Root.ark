@@ -20,11 +20,15 @@ const cli = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
 const { args } = require("../sync-client/rootark-sync-v2");
 
 test("issue 66: Sync v2 CLI --once parses boolean values instead of truthy strings", () => {
+  assert.strictEqual(args([]).once, undefined);
   assert.strictEqual(args(["--once"]).once, true);
   assert.strictEqual(args(["--once", "true"]).once, true);
   assert.strictEqual(args(["--once", "false"]).once, false);
   assert.strictEqual(args(["--once=true"]).once, true);
   assert.strictEqual(args(["--once=false"]).once, false);
+  const withConfig = args(["--once", "false", "--config", "example.json"]);
+  assert.strictEqual(withConfig.once, false);
+  assert.strictEqual(withConfig.config, "example.json");
   assert.throws(() => args(["--once=bad"]), /Invalid Sync v2 --once value/);
 });
 
