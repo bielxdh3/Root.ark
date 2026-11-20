@@ -8,11 +8,7 @@ import java.net.UnknownHostException
 import javax.net.ssl.SSLException
 
 /** Presentation for the legacy, non-paginated inventory list. */
-internal fun inventoryListFailureMessage(failure: Exception?): String = when (failure) {
-    is SyncListingLimitException ->
-        "Não foi possível carregar a lista. A resposta excede o limite do protótipo (1 MiB / 128 registros)."
-    is SyncListingValidationException ->
-        "Não foi possível carregar a lista. Os dados de sincronização retornados pelo servidor são inválidos."
+internal fun inventoryListRequestFailureMessage(failure: Exception?): String = when (failure) {
     is SocketTimeoutException ->
         "A solicitação da lista excedeu o tempo limite. Tente novamente."
     is UnknownHostException ->
