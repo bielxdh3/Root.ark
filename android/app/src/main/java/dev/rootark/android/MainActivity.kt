@@ -23,6 +23,46 @@ import dev.rootark.core.sync.SessionOfflineInventory
 import java.io.File
 import java.util.UUID
 
+internal data class InventoryPagingTracker(
+    val cursor: String? = null,
+    val pageNumber: Int = 1,
+    val usedCursors: Set<String> = emptySet(),
+    val previousCursors: List<String?> = emptyList(),
+) {
+    fun advance(nextCursor: String?): InventoryPagingTracker {
+        val history = previousCursors + cursor
+        return InventoryPagingTracker(
+            cursor = nextCursor,
+            pageNumber = pageNumber + 1,
+            usedCursors = history.filterNotNull().toSet(),
+            previousCursors = history,
+        )
+    }
+
+    fun previous(): InventoryPagingTracker? {
+        if (pageNumber <= 1 || !isValid()) return null
+        val history = previousCursors.dropLast(1)
+        return InventoryPagingTracker(
+            cursor = previousCursors.last(),
+            pageNumber = pageNumber - 1,
+            usedCursors = history.filterNotNull().toSet(),
+            previousCursors = history,
+        ).takeIf { it.isValid() }
+    }
+
+    fun isValid(): Boolean {
+        if (pageNumber !in 1..100_000 || previousCursors.size != pageNumber - 1) return false
+        if (pageNumber == 1) return cursor == null && usedCursors.isEmpty()
+        if (previousCursors.firstOrNull() != null) return false
+        val priorCursors = previousCursors.filterNotNull()
+        if (priorCursors.size != previousCursors.size - 1 ||
+            priorCursors.toSet().size != priorCursors.size || usedCursors != priorCursors.toSet()
+        ) return false
+        val currentCursor = cursor ?: return false
+        return runCatching { PagedInventoryPolicy.checkCursor(currentCursor, usedCursors) }.isSuccess
+    }
+}
+
 /** Authenticated metadata browsing with an explicit, provisioned-only protected text viewer. */
 class MainActivity : Activity() {
     private val transport = AuthHttpTransport()
@@ -213,31 +253,30 @@ class MainActivity : Activity() {
         button(layout, "Encerrar acesso local") { showLogin() }
     }
 
-    private fun loadInventoryPage(cursor: String? = null, pageNumber: Int = 1, usedCursors: Set<String> = emptySet()) {
+    private fun loadInventoryPage(tracker: InventoryPagingTracker = InventoryPagingTracker()) {
         if (!sessionCanListFiles) return
         val origin = activeOrigin ?: return
         val token = sessionToken ?: return
-        if (cursor != null && (pageNumber <= 1 || pageNumber > 100_000 ||
-                runCatching { PagedInventoryPolicy.checkCursor(cursor, usedCursors) }.isFailure)) {
+        if (!tracker.isValid()) {
             showSession("Cursor de inventário inválido. Reinicie a listagem.")
             return
         }
-        runRequest({ transport.listInventoryPage(origin, token, cursor) }) { page, failure ->
+        runRequest({ transport.listInventoryPage(origin, token, tracker.cursor) }) { page, failure ->
             if (page != null) {
-                val used = usedCursors + listOfNotNull(cursor)
+                val nextTracker = tracker.advance(page.nextCursor)
                 val next = page.nextCursor
                 if (next != null && runCatching {
-                    PagedInventoryPolicy.checkCursor(next, used)
+                    PagedInventoryPolicy.checkCursor(next, nextTracker.usedCursors)
                 }.isFailure) {
                     showSession("Inventário retornou cursor repetido. Reinicie a listagem.")
                 } else {
                     val binding = offlineSession
                     val cache = offlineInventory
                     if (binding != null && cache != null &&
-                        runCatching { cache.capture(binding, pageNumber, page) }.isFailure) {
+                        runCatching { cache.capture(binding, tracker.pageNumber, page) }.isFailure) {
                         cache.clear()
                     }
-                    showInventoryPage(page, pageNumber, used)
+                    showInventoryPage(page, tracker, nextTracker)
                 }
             } else when ((failure as? RootArkApiException)?.statusCode) {
                 401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
@@ -254,8 +293,8 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showInventoryPage(page: InventoryPage, pageNumber: Int, usedCursors: Set<String>) {
-        val layout = screen("Inventário · página $pageNumber", "${page.rows.size} metadados de sincronização. Nenhum conteúdo descriptografado.")
+    private fun showInventoryPage(page: InventoryPage, tracker: InventoryPagingTracker, nextTracker: InventoryPagingTracker) {
+        val layout = screen("Inventário · página ${tracker.pageNumber}", "${page.rows.size} metadados de sincronização. Nenhum conteúdo descriptografado.")
         if (page.rows.isEmpty()) text(layout, "Nenhum registro disponível.")
         for (row in page.rows) {
             text(layout, row.name + if (row.deleted) " (excluído)" else "")
@@ -266,11 +305,13 @@ class MainActivity : Activity() {
             ).joinToString(" · ")
             if (details.isNotEmpty()) text(layout, details)
             if (!row.deleted) button(layout, "Conteúdo protegido", accessibilityLabel = protectedContentAccessibilityLabel(row)) {
-                showProtectedObject(row.objectId) { showInventoryPage(page, pageNumber, usedCursors) }
+                showProtectedObject(row.objectId) { showInventoryPage(page, tracker, nextTracker) }
             }
         }
-        val next = page.nextCursor
-        if (next != null) button(layout, "Próxima página") { loadInventoryPage(next, pageNumber + 1, usedCursors) }
+        val previous = tracker.previous()
+        if (previous != null) button(layout, "Página anterior") { loadInventoryPage(previous) }
+        val next = nextTracker.cursor
+        if (next != null) button(layout, "Próxima página") { loadInventoryPage(nextTracker) }
         val binding = offlineSession
         val cache = offlineInventory
         if (binding != null && cache != null && cache.pages(binding).isNotEmpty()) {
