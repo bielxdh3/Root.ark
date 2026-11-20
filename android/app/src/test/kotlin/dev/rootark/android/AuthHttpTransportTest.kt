@@ -93,6 +93,46 @@ class AuthHttpTransportTest {
     }
 
     @Test
+    fun `paged inventory uses injected connection with the requested cursor URL`() {
+        val origin = ServerOrigin.parse("https://sync.example.test")
+        val response = JSONObject().apply {
+            put("protocolVersion", 2)
+            put("view", "metadata")
+            put("objects", org.json.JSONArray().put(JSONObject().apply {
+                put("protocolVersion", 2)
+                put("objectId", "obj-1")
+                put("operation", "create")
+                put("tombstone", false)
+                put("revision", JSONObject().put("counter", 1L).put("deviceId", "dev-1"))
+                put("metadata", JSONObject().put("name", "test.txt").put("path", "docs/test.txt")
+                    .put("size", 100L).put("contentType", "text/plain"))
+            }))
+            put("nextCursor", "cursor-next")
+        }.toString().toByteArray(StandardCharsets.UTF_8)
+        var requestedUrl: URL? = null
+        var disconnected = false
+        val connection = object : HttpURLConnection(origin.syncInventoryUrl("cursor-prev")) {
+            override fun connect() = Unit
+            override fun disconnect() { disconnected = true }
+            override fun usingProxy() = false
+            override fun getResponseCode() = 200
+            override fun getInputStream() = response.inputStream()
+        }
+        val transport = AuthHttpTransport(openSyncConnection = { requested ->
+            requestedUrl = requested
+            connection
+        })
+
+        val page = transport.listInventoryPage(origin, "paged-bearer", "cursor-prev")
+
+        assertEquals(origin.syncInventoryUrl("cursor-prev").toString(), requestedUrl?.toString())
+        assertEquals("Bearer paged-bearer", connection.getRequestProperty("Authorization"))
+        assertEquals(1, page.rows.size)
+        assertEquals("cursor-next", page.nextCursor)
+        assertTrue("paged request must release the authenticated connection", disconnected)
+    }
+
+    @Test
     fun `malformed JSON throws SyncListingValidationException which is an IOException`() {
         assertThrows(IOException::class.java) {
             try {
@@ -108,12 +148,12 @@ class AuthHttpTransportTest {
         val sizeLimitEx = SyncListingLimitException("Sync listing exceeds limit")
         val validationEx = SyncListingValidationException("Invalid sync listing")
 
-        assertTrue(sizeLimitEx is IOException)
-        assertTrue(validationEx is IOException)
-        assertTrue(sizeLimitEx is SyncListingLimitException)
-        assertFalse(validationEx is SyncListingLimitException)
-        assertTrue(validationEx is SyncListingValidationException)
-        assertFalse(sizeLimitEx is SyncListingValidationException)
+        assertTrue(IOException::class.java.isInstance(sizeLimitEx))
+        assertTrue(IOException::class.java.isInstance(validationEx))
+        assertTrue(SyncListingLimitException::class.java.isInstance(sizeLimitEx))
+        assertFalse(SyncListingLimitException::class.java.isInstance(validationEx))
+        assertTrue(SyncListingValidationException::class.java.isInstance(validationEx))
+        assertFalse(SyncListingValidationException::class.java.isInstance(sizeLimitEx))
     }
 
     @Test

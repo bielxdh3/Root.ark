@@ -12,6 +12,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.net.URL
 import java.net.URLConnection
 import java.security.Principal
@@ -21,6 +22,7 @@ import java.security.SecureRandom
 import java.security.Signature
 import java.security.cert.Certificate
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -112,8 +114,9 @@ class ProtectedSyncFetchTest {
     ) : HttpsURLConnection(url) {
         var opened = 0
         var disconnected = false
+        var bodyStream: InputStream? = null
         override fun getResponseCode(): Int = status
-        override fun getInputStream() = ByteArrayInputStream(payload).also { opened++ }
+        override fun getInputStream() = (bodyStream ?: ByteArrayInputStream(payload)).also { opened++ }
         override fun getContentType(): String? = mime
         override fun getContentEncoding(): String? = encoding
         override fun getContentLengthLong(): Long = declaredSize
@@ -228,6 +231,40 @@ class ProtectedSyncFetchTest {
             }
             assertTrue(fake.disconnected)
         }
+    }
+
+    @Test fun rejectsBodyThatFinishesAfterTotalReadDeadlineEvenWhenFinalReadIsEof() {
+        val clock = AtomicLong(0L)
+        val fake = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = response)
+        fake.bodyStream = object : InputStream() {
+            private var offset = 0
+
+            override fun read(): Int {
+                if (offset < response.size) return response[offset++].toInt() and 0xff
+                clock.set(ProtectedSyncFetch.BODY_READ_DEADLINE_NANOS + 1L)
+                return -1
+            }
+
+            override fun read(buffer: ByteArray, start: Int, length: Int): Int {
+                if (length == 0) return 0
+                if (offset < response.size) {
+                    val count = minOf(length, response.size - offset)
+                    System.arraycopy(response, offset, buffer, start, count)
+                    offset += count
+                    return count
+                }
+                clock.set(ProtectedSyncFetch.BODY_READ_DEADLINE_NANOS + 1L)
+                return -1
+            }
+        }
+
+        val failure = assertThrows(IOException::class.java) {
+            ProtectedSyncFetch(openConnection = { fake }, monotonicNanos = clock::get)
+                .fetchCiphertext(origin, session, "fixture-object-1")
+        }
+        assertTrue("EOF after the total body budget must be rejected", failure.message?.contains("deadline") == true)
+        assertEquals(1, fake.opened)
+        assertTrue(fake.disconnected)
     }
 
     @Test fun expiredOrUnpinnedContentCannotReachPlaintextCallbackAndCekIsCleared() {
