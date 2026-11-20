@@ -1,5 +1,6 @@
 package dev.rootark.android
 
+import dev.rootark.core.sync.RootArkApiException
 import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.SocketTimeoutException
@@ -34,5 +35,16 @@ class InventoryPageFailureMessageTest {
         val expected = "Não foi possível carregar a página de inventário. Tente novamente."
         assertEquals(expected, inventoryPageFailureMessage(IllegalStateException("fixture")))
         assertEquals(expected, inventoryPageFailureMessage(null))
+        assertEquals(expected, inventoryPageFailureMessage(RootArkApiException(500)))
+    }
+
+    @Test fun rateLimitHasItsOwnMessage() {
+        assertEquals("Muitas solicitações de inventário. Aguarde um pouco antes de tentar novamente.",
+            inventoryPageFailureMessage(RootArkApiException(429)))
+    }
+
+    @Test fun serviceUnavailableHasItsOwnMessage() {
+        assertEquals("O inventário está temporariamente indisponível no servidor. Tente novamente mais tarde.",
+            inventoryPageFailureMessage(RootArkApiException(503)))
     }
 }
