@@ -15,6 +15,27 @@ const sourceFile = path.join(__dirname,
 const probeFile = path.join(__dirname, "support/issue-65-opaque-delta-browser-probe.js");
 const restoreProbeFile = path.join(__dirname, "support/issue-65-opaque-restore-probe.js");
 
+test("fresh protected catalog listing clears stale UI before asynchronous trust or key loading", () => {
+  const source = fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-authenticated-workspace.js"), "utf8");
+  const start = source.indexOf("async function perform(action)");
+  const end = source.indexOf("function showEntry()", start);
+  assert.ok(start >= 0 && end > start, "authenticated workspace action handler must exist");
+  const perform = source.slice(start, end);
+  const clearBranch = perform.indexOf('if (action === "catalog-delta-list") {');
+  const listReset = perform.indexOf('field("catalog-delta-private-list")?.replaceChildren()', clearBranch);
+  const summaryReset = perform.indexOf('summary.textContent = ""', clearBranch);
+  const scriptLoad = perform.indexOf("await ensureScripts()", clearBranch);
+  const capabilityLoad = perform.indexOf('await api.get("/zk-1/v1/workspace-capability")', clearBranch);
+  const grantLoad = perform.indexOf("await grantAndOwner()", clearBranch);
+  assert.ok(clearBranch >= 0 && listReset > clearBranch && summaryReset > clearBranch,
+    "a new catalog listing must synchronously clear the prior list and summary");
+  for (const reset of [listReset, summaryReset]) {
+    assert.ok(reset < scriptLoad && reset < capabilityLoad && reset < grantLoad,
+      "stale local results must be cleared before any asynchronous prerequisite can fail");
+  }
+});
+
 test("independently authorized opaque delta client boots without generic sync-v2", () => {
   const source = fs.readFileSync(path.join(__dirname,
     "../public/client/rootark-zk1-opaque-device-delta-sync.js"), "utf8");

@@ -1064,6 +1064,13 @@
       "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-index-search", "catalog-delta-pull", "catalog-delta-import",
       "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
       "catalog-delta-restore"].includes(action)) return;
+    if (action === "catalog-delta-list") {
+      // A failed refresh must never leave the previous query's local names or
+      // count visible while scripts, trust, or key material are being loaded.
+      field("catalog-delta-private-list")?.replaceChildren();
+      const summary = field("catalog-delta-summary");
+      if (summary) summary.textContent = "";
+    }
     // Capture the owner's checkboxes synchronously at this click, and consume
     // them before any asynchronous trust, network, file or IndexedDB work.
     const batchConsent = action === "catalog-delta-text-search" ? {
@@ -1411,8 +1418,6 @@
           if (!window.RootarkZk1ProtectedLocalSearch?.search) fail();
           const raw = await fileBytes("catalog-write-key", 32, 32);
           const list = field("catalog-delta-private-list");
-          list.replaceChildren();
-          field("catalog-delta-summary").textContent = "";
           const term = field("catalog-delta-query")?.value || "";
           let opened;
           try {
