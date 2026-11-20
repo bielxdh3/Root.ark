@@ -212,6 +212,40 @@ test("issue 68 Windows Unicode alias cannot select a different physical director
     "real file must survive");
 });
 
+test("issue 68 Windows physical-name scan skips a sibling removed after readdir", (t) => {
+  if (process.platform !== "win32") return t.skip("NTFS-specific name equivalence");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-physical-enoent-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const physicalName = "File.txt";
+  const requestedAlias = "file.txt";
+  const sibling = path.join(dir, "unrelated.txt");
+  fs.writeFileSync(path.join(dir, physicalName), "physical identity survives");
+  fs.writeFileSync(sibling, "removed during directory scan");
+  if (!fs.existsSync(path.join(dir, requestedAlias))) {
+    return t.skip("this NTFS directory is case-sensitive");
+  }
+  const { resolvePhysicalFileName } = require("../services/trashService");
+  const originalLstat = fs.lstatSync;
+  let injected = false;
+  fs.lstatSync = function (target, ...args) {
+    if (!injected && path.resolve(target) === path.resolve(sibling)) {
+      injected = true;
+      fs.unlinkSync(sibling);
+      const error = new Error("simulated concurrent sibling unlink");
+      error.code = "ENOENT";
+      throw error;
+    }
+    return originalLstat.call(this, target, ...args);
+  };
+  try {
+    assert.equal(resolvePhysicalFileName(dir, requestedAlias), physicalName);
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
+  assert.equal(injected, true, "the sibling must disappear during the identity scan");
+  assert.equal(fs.readFileSync(path.join(dir, physicalName), "utf8"), "physical identity survives");
+});
+
 test("issue 68 Windows non-exact hardlink alias is ambiguous and cannot select a victim", (t) => {
   if (process.platform !== "win32") return t.skip("NTFS-specific hardlink names");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-physical-hardlink-"));
@@ -333,4 +367,80 @@ test("issue 68 Windows trash does not rescan the directory per legacy capability
     timeout: 30_000, windowsHide: true, encoding: "utf8",
   });
   assert.match(result, /LINEAR_ALIAS_SCAN_PASS/);
+});
+
+test("issue 68 Windows trash skips a sibling removed during capability identity verification", (t) => {
+  if (process.platform !== "win32") return t.skip("Windows capability alias enumeration");
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-alias-enoent-"));
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
+  const script = `
+    "use strict";
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const root = ${JSON.stringify(path.resolve(__dirname, ".."))};
+    const repository = require(path.join(root, "repositories/publicLinksRepository"));
+    const trash = require(path.join(root, "services/trashService"));
+    require(path.join(root, "db/migrations")).runMigrations({ backup: false });
+    const dir = path.join(process.cwd(), "uploads");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "File.txt"), "known physical bytes");
+    const sibling = path.join(dir, "unrelated.txt");
+    fs.writeFileSync(sibling, "removed during identity verification");
+    if (!fs.existsSync(path.join(dir, "file.txt"))) {
+      console.log("CASE_SENSITIVE_DIRECTORY");
+      process.exit(0);
+    }
+    const folder = { id: "root", name: "Root", uploadDir: dir };
+    const token = "C" + "a".repeat(47);
+    const entry = { folderId: "root", fileName: "file.txt",
+      shareKind: "capability-v1", createdBy: "tester",
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 600000).toISOString(),
+      resourceBinding: { version: 2, folderId: "root",
+        fileName: "file.txt", identity: "e".repeat(64) },
+      permissions: ["download"] };
+    assert.equal(repository.createCapability(token, entry).status, "ok");
+    const empty = () => ({});
+    const loaders = {
+      loadFilePermissions: empty, saveFilePermissions: () => {},
+      loadFileExpirations: empty, saveFileExpirations: () => {},
+      loadFileVersions: empty, saveFileVersions: () => {},
+      loadEncryptedFiles: empty, saveEncryptedFiles: () => {},
+      loadPublicLinks: () => repository.loadPublicLinks(),
+      savePublicLinks: (entries, options) => repository.savePublicLinks(entries, options),
+    };
+    const originalLstat = fs.lstatSync;
+    let injected = false;
+    fs.lstatSync = function (target, ...args) {
+      if (!injected && path.resolve(target) === path.resolve(sibling)) {
+        injected = true;
+        fs.unlinkSync(sibling);
+        const error = new Error("simulated concurrent sibling unlink");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return originalLstat.call(this, target, ...args);
+    };
+    let item;
+    try {
+      item = trash.moveFileToTrash({ folder, fileName: "File.txt",
+        deletedBy: "tester", loaders });
+    } finally { fs.lstatSync = originalLstat; }
+    assert.ok(injected, "the sibling must disappear during capability identity verification");
+    assert.equal(fs.existsSync(path.join(dir, "File.txt")), false);
+    assert.equal(item.status, "trashed");
+    assert.equal(fs.readFileSync(path.join(process.cwd(), "data", "trash", item.trashPath), "utf8"),
+      "known physical bytes");
+    assert.equal(repository.loadPublicLinks()[token], undefined);
+    console.log("TRASH_ALIAS_ENOENT_PASS");
+  `;
+  const result = execFileSync(process.execPath, ["-e", script], {
+    cwd: sandbox,
+    env: { ...process.env, DB_ENABLED: "true",
+      DATABASE_URL: path.join(sandbox, "rootark.sqlite") },
+    timeout: 30_000, windowsHide: true, encoding: "utf8",
+  });
+  if (result.includes("CASE_SENSITIVE_DIRECTORY")) return t.skip("NTFS directory is case-sensitive");
+  assert.match(result, /TRASH_ALIAS_ENOENT_PASS/);
 });

@@ -343,6 +343,14 @@ function safeName(name) {
   return path.basename(String(name || ""));
 }
 
+function lstatIfPresentSync(target, options) {
+  try { return fs.lstatSync(target, options); }
+  catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 // Resolve Windows aliases by the actual filesystem entry, not JS Unicode case
 // folding: an NTFS directory may be case-sensitive or have distinct hardlinks.
 function resolvePhysicalFileName(directory, name) {
@@ -363,8 +371,8 @@ function resolvePhysicalFileName(directory, name) {
   }
   if (identity.ino === 0n) throw new Error("Identidade fisica indisponivel");
   const matches = names.filter((entry) => {
-    const actual = fs.lstatSync(path.join(directory, entry), { bigint: true });
-    return actual.dev === identity.dev && actual.ino === identity.ino;
+    const actual = lstatIfPresentSync(path.join(directory, entry), { bigint: true });
+    return actual !== null && actual.dev === identity.dev && actual.ino === identity.ino;
   });
   if (matches.length !== 1) throw new Error("Nome fisico ambiguo para exclusao");
   return matches[0];
@@ -540,8 +548,8 @@ function moveFileToTrash({ folder, fileName, deletedBy, loaders, expectedCanonic
       // Multiple real directory entries may be hardlinks to the same inode.
       // A non-exact alias cannot safely select one of them for revocation.
       const identityEntries = physicalNames.filter((name) => {
-        const entry = fs.lstatSync(path.join(folder.uploadDir, name), { bigint: true });
-        return entry.dev === sourceIdentity.dev && entry.ino === sourceIdentity.ino;
+        const entry = lstatIfPresentSync(path.join(folder.uploadDir, name), { bigint: true });
+        return entry !== null && entry.dev === sourceIdentity.dev && entry.ino === sourceIdentity.ino;
       });
       if (identityEntries.length !== 1 || identityEntries[0] !== cleanName) {
         throw new Error("Nome fisico ambiguo para exclusao");
