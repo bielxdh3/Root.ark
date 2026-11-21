@@ -13,7 +13,10 @@ function browser({ fetch, digest = async () => new Uint8Array(32).buffer }) {
   const sockets = [];
   const peerConnections = [];
   const element = () => ({
-    hidden: false, disabled: false, textContent: '', dataset: {},
+    hidden: false, disabled: false, textContent: '', dataset: {}, attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, String(value)); },
+    getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; },
+    removeAttribute(name) { this.attributes.delete(name); },
     replaceChildren() {}, append() {}, remove() {}, addEventListener() {},
   });
   const document = {
@@ -153,21 +156,30 @@ test('starting a protected room intent cancels pending plaintext before HTTP com
   assert.equal(b.window.__poc.snapshot().roomId, 'protected');
 });
 
-test('late response to older unbound createRoom cannot downgrade newer protected room', async () => {
+test('pending unbound create cannot overlap a protected create or downgrade it later', async () => {
   const requests = [];
   const b = browser({ fetch: () => new Promise(resolve => requests.push(resolve)) });
   const older = b.window.__poc.createRoom();
+  assert.equal(await b.window.__poc.createRoom({ folderId: 'root', fileName: 'sealed.bin' }),
+    false, 'concurrent room creation must be rejected before a second HTTP request');
+  assert.equal(requests.length, 1, 'create-room lock prevents overlapping responses');
+  requests[0]({ ok: true, json: async () =>
+    ({ roomId: 'unbound', hostKey: 'obsolete' }) });
+  await older;
+  b.joined(b.sockets[0]);
+  const obsoleteSocket = b.sockets[0];
   const newer = b.window.__poc.createRoom({ folderId: 'root', fileName: 'sealed.bin' });
   assert.equal(requests.length, 2);
   requests[1]({ ok: true, json: async () =>
     ({ roomId: 'protected', hostKey: 'current', boundObject }) });
   await newer;
-  b.joined(b.sockets[0], boundObject);
-  const protectedSocket = b.sockets[0];
-  requests[0]({ ok: true, json: async () =>
-    ({ roomId: 'unbound', hostKey: 'obsolete' }) });
-  await older;
-  assert.equal(b.sockets.length, 1, 'obsolete response replaced protected WebSocket');
+  b.joined(b.sockets[1], boundObject);
+  const protectedSocket = b.sockets[1];
+  obsoleteSocket.onmessage({ data: JSON.stringify({
+    type: 'joined', role: 'host', peerId: 'late-old-room', boundObject: null,
+  }) });
+  obsoleteSocket.onclose();
+  assert.equal(b.sockets.length, 2, 'stale callbacks must not open another WebSocket');
   assert.equal(protectedSocket.readyState, 1, 'obsolete response closed protected WebSocket');
   assert.equal(b.window.__poc.snapshot().roomId, 'protected');
   assert.equal(b.window.__poc.snapshot().boundObject.sha256, boundObject.sha256);
