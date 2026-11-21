@@ -273,6 +273,54 @@ test("issue 68 P2: snapshotAuthority validates non-negative safe integers for re
 // AEAD/HPKE sealing, and regressionReads === 2 in the owner ceremony suite.
 // This reduced fixture cannot reach that boundary and must not claim it does.
 
+test("issue 68: poisoned scope iterator and Array.some cannot suppress an independent owner scope mismatch", async () => {
+  const f = await createMinimalOfferFixture();
+  const originalIterator = Array.prototype[Symbol.iterator];
+  const originalSome = Array.prototype.some;
+  let iteratedSignedScope = 0;
+  let poisonedScopeChecks = 0;
+  let authorityReads = 0;
+  const mismatched = { ...f.baseAuthority,
+    scope: { ...f.baseAuthority.scope, account_id: b64(crypto.randomBytes(16)) },
+  };
+  try {
+    await assert.rejects(createProtectedRecipientShareOffer({
+      grant: f.grant, recipientPin: f.recipientPin, issuerPin: f.issuerPin,
+      readIndependentAuthority: async () => {
+        authorityReads++;
+        Array.prototype[Symbol.iterator] = function* () {
+          if (this.length === 3 && this[0] === "account_id") {
+            iteratedSignedScope++;
+            // Legacy for-of scope checking could silently skip all fields.
+            return;
+          }
+          yield* Reflect.apply(originalIterator, this, []);
+        };
+        Array.prototype.some = function (...args) {
+          if (this.length === 3 && this[0] === "scope") {
+            poisonedScopeChecks++;
+            return false;
+          }
+          return Reflect.apply(originalSome, this, args);
+        };
+        return mismatched;
+      },
+      ownerPrivateKey: f.owner.privateKey, ownerHeldCek: f.ownerHeldCek,
+      metadata: f.metadata, objectRevision: 1, ciphertext: f.ciphertext,
+      ciphertextRoot: f.ciphertextRoot, authority: f.baseAuthority,
+      nowSeconds: f.now,
+    }), /ZK_SHARE_OFFER_DENIED/);
+  } finally {
+    Array.prototype[Symbol.iterator] = originalIterator;
+    Array.prototype.some = originalSome;
+  }
+  assert.equal(authorityReads, 1, "the independently read mismatched scope must be checked");
+  assert.equal(iteratedSignedScope, 0,
+    "the authority-scope guard must use indexed checks, not a replaceable iterator");
+  assert.equal(poisonedScopeChecks, 0,
+    "the authority-scope guard must not dispatch a replaceable Array.some");
+});
+
 test("issue 68: revoked owner roster does not consult poisoned Array.filter after authority await", async () => {
   const f = await createMinimalOfferFixture();
   const revoked = {

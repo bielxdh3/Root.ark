@@ -1336,6 +1336,42 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "the real physical revocation must occur only after signed GET and file AEAD");
     assert.equal(descriptorSpoofCalls, 0,
       "the release boundary must never call the callback-replaced descriptor factory");
+    // A second attack mutates the returned descriptor records themselves,
+    // rather than replacing their provider. Object.values() may be replaced
+    // while the last independent authority read is awaiting completion.
+    const originalObjectValues = Object.values;
+    let valueSpoofReads = 0;
+    let valueSpoofCalls = 0;
+    try {
+      await assert.rejects(openProtectedRecipientShareFile({
+        ...bridgeArgs,
+        redeemInput: { ...recipientShareInput,
+          readIndependentAuthority: async () => {
+            const current = await readIndependentAuthority();
+            if (++valueSpoofReads === 3) {
+              const revoked = current.devices.find((device) =>
+                device.deviceId === fresh.request.device_id);
+              assert.ok(revoked);
+              revoked.revokedAtEpoch = metadata.epoch;
+              Object.values = (record) => {
+                if (record && record.revokedAtEpoch?.value === metadata.epoch
+                  && record.authorizationPublicKey?.value) {
+                  valueSpoofCalls++;
+                  record.revokedAtEpoch.value = null;
+                }
+                return originalObjectValues(record);
+              };
+            }
+            return current;
+          },
+        },
+      }), /ZK_SHARE_FILE_OPEN_DENIED/,
+      "a late Object.values replacement must never hide physically revoked recipient authority");
+    } finally { Object.values = originalObjectValues; }
+    assert.equal(valueSpoofReads, 3,
+      "the real revoked roster must arrive after the authenticated file AEAD");
+    assert.equal(valueSpoofCalls, 0,
+      "release must inspect known own descriptor fields without dispatching Object.values");
     // The longer owner-signed share grant cannot extend the shorter owner
     // approval/witness. Global Date.now rebinding after real file AEAD is
     // *not* genuine wall-clock passage; a pinned native clock must ignore

@@ -41,12 +41,16 @@ const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
 const nativeCreatePublicKey = crypto.createPublicKey.bind(crypto);
 const nativeVerify = crypto.verify.bind(crypto);
 const nativeFreeze = Object.freeze.bind(Object);
+const nativeCreateObject = Object.create.bind(Object);
+const nativeObjectPrototype = Object.prototype;
 
 const SHARE_DOMAIN = Buffer.from("Root.ark/zk-1/protected-ciphertext-share/v1\0");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
 const METADATA = [...SCOPE, "object_id", "version_id", "parent_version_id", "epoch", "kind"];
 const ENVELOPE = ["schema", "core", "enc", "ciphertext", "owner_signature",
+  "authorizesProductionRestore", "externalCustodyProven"];
+const ENVELOPE_OTHER = ["schema", "enc", "ciphertext", "owner_signature",
   "authorizesProductionRestore", "externalCustodyProven"];
 const SHARE = ["type", "grant_id", "account_id", "compartment_id", "keyring_id",
   "object_id", "object_revision", "ciphertext_digest", "epoch", "manifest_revision",
@@ -112,10 +116,20 @@ function from64(value, length) {
 function same(a, b) {
   return a.length === b.length && nativeTimingSafeEqual(a, b);
 }
+function allOwnData(descriptors, names) {
+  // External callbacks can replace Array#some, Array#every, Object.values,
+  // and their prototype iterators between signed checks. No user callback
+  // participates in checking the captured descriptors.
+  for (let index = 0; index < names.length; index++) {
+    const field = descriptors[names[index]];
+    if (!field || !nativeHasOwn(field, "value")) return false;
+  }
+  return true;
+}
 function strict(value, names) {
   if (!value || typeof value !== "object" || nativeIsArray(value)
     || isNativeProxy(value)
-    || (nativeGetPrototype(value) !== Object.prototype
+    || (nativeGetPrototype(value) !== nativeObjectPrototype
       && nativeGetPrototype(value) !== null)
     || nativeOwnKeys(value).length !== names.length) deny();
   for (let index = 0; index < names.length; index++) {
@@ -126,8 +140,9 @@ function strict(value, names) {
 function snapshot(value, names) {
   strict(value, names);
   const descriptors = nativeAllDescriptors(value);
-  const copy = Object.create(null);
-  for (const name of names) {
+  const copy = nativeCreateObject(null);
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
     const descriptor = descriptors[name];
     if (!descriptor || !nativeHasOwn(descriptor, "value")) deny();
     const part = descriptor.value;
@@ -146,8 +161,7 @@ function snapshotAuthority(value) {
   if (isNativeProxy(value)) denyOffer();
   strict(value, ["scope", "head", "devices"]);
   const fields = nativeAllDescriptors(value);
-  if (["scope", "head", "devices"].some((key) =>
-    !Object.hasOwn(fields[key], "value"))) denyOffer();
+  if (!allOwnData(fields, ["scope", "head", "devices"])) denyOffer();
   if (isNativeProxy(fields.scope.value)
     || isNativeProxy(fields.head.value)
     || isNativeProxy(fields.devices.value)) denyOffer();
@@ -155,39 +169,41 @@ function snapshotAuthority(value) {
   const headValue = fields.head.value;
   strict(headValue, ["revision", "epoch", "digest"]);
   const h = nativeAllDescriptors(headValue);
-  if (["revision", "epoch", "digest"].some((key) =>
-    !Object.hasOwn(h[key], "value"))
-    || !Number.isSafeInteger(h.revision.value) || h.revision.value < 0
-    || !Number.isSafeInteger(h.epoch.value) || h.epoch.value < 0
+  if (!h.revision || !nativeHasOwn(h.revision, "value")
+    || !h.epoch || !nativeHasOwn(h.epoch, "value")
+    || !h.digest || !nativeHasOwn(h.digest, "value")
+    || !nativeIsSafeInteger(h.revision.value) || h.revision.value < 0
+    || !nativeIsSafeInteger(h.epoch.value) || h.epoch.value < 0
     || isNativeProxy(h.digest.value)
     || !(h.digest.value instanceof Uint8Array)
     || h.digest.value.length !== 32) denyOffer();
   const head = { revision: h.revision.value, epoch: h.epoch.value,
     digest: copyNativeBytes32(h.digest.value) };
   const sourceDevices = fields.devices.value;
-  if (!Array.isArray(sourceDevices) || sourceDevices.length > 128) denyOffer();
+  if (!nativeIsArray(sourceDevices)) denyOffer();
   // Do not invoke an untrusted array's own map/iterator: it can substitute a
   // healthy roster while the actual authority entries are revoked.
   const entries = nativeAllDescriptors(sourceDevices);
   const length = entries.length?.value;
-  if (!Number.isSafeInteger(length) || length > 128
-    || Reflect.ownKeys(entries).length !== length + 1) denyOffer();
+  if (!nativeIsSafeInteger(length) || length > 128
+    || nativeOwnKeys(entries).length !== length + 1) denyOffer();
   const devices = [];
   for (let index = 0; index < length; ++index) {
     const entry = entries[index];
-    if (!entry || !Object.hasOwn(entry, "value")) denyOffer();
+    if (!entry || !nativeHasOwn(entry, "value")) denyOffer();
     const device = entry.value;
     if (isNativeProxy(device)) denyOffer();
     strict(device, ["deviceId", "authorizationPublicKey",
       "enrolledEpoch", "revokedAtEpoch"]);
     const d = nativeAllDescriptors(device);
-    if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))
+    if (!allOwnData(d, ["deviceId", "authorizationPublicKey",
+      "enrolledEpoch", "revokedAtEpoch"])
       || isNativeProxy(d.authorizationPublicKey.value)
       || !(d.authorizationPublicKey.value instanceof Uint8Array)
       || d.authorizationPublicKey.value.length !== 32
-      || !Number.isSafeInteger(d.enrolledEpoch.value) || d.enrolledEpoch.value < 0
+      || !nativeIsSafeInteger(d.enrolledEpoch.value) || d.enrolledEpoch.value < 0
       || !(d.revokedAtEpoch.value === null
-        || (Number.isSafeInteger(d.revokedAtEpoch.value)
+        || (nativeIsSafeInteger(d.revokedAtEpoch.value)
           && d.revokedAtEpoch.value >= d.enrolledEpoch.value))) denyOffer();
     devices[index] = { deviceId: d.deviceId.value,
       authorizationPublicKey: copyNativeBytes32(d.authorizationPublicKey.value),
@@ -234,7 +250,9 @@ async function createProtectedRecipientShareOffer(input) {
       "ownerPrivateKey", "ownerHeldCek", "metadata", "objectRevision",
       "ciphertext", "ciphertextRoot", "authority", "nowSeconds"]);
     const d = nativeAllDescriptors(input);
-    if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))) denyOffer();
+    if (!allOwnData(d, ["grant", "recipientPin", "issuerPin", "readIndependentAuthority",
+      "ownerPrivateKey", "ownerHeldCek", "metadata", "objectRevision",
+      "ciphertext", "ciphertextRoot", "authority", "nowSeconds"])) denyOffer();
     const grant = snapshot(d.grant.value, GRANT);
     const pin = snapshot(d.recipientPin.value, RECIPIENT_PIN);
     const issuerPin = snapshot(d.issuerPin.value, ISSUER_PIN);
@@ -294,7 +312,8 @@ async function createProtectedRecipientShareOffer(input) {
       || statement.epoch !== metadata.epoch
       || !same(Buffer.from(statement.ciphertext_digest || []),
         crypto.createHash("sha256").update(ciphertext).digest())) denyOffer();
-    for (const field of SCOPE) {
+    for (let index = 0; index < SCOPE.length; index++) {
+      const field = SCOPE[index];
       if (metadata[field] !== b64(statement[field])) denyOffer();
     }
     const signature = from64(grant.shareSignatureBase64, 64);
@@ -341,15 +360,18 @@ async function createProtectedRecipientShareOffer(input) {
 function safeEnvelope(value) {
   strict(value, ENVELOPE);
   const d = nativeAllDescriptors(value);
-  if (ENVELOPE.some((name) => !Object.hasOwn(d[name], "value"))) deny();
-  const keys = Reflect.ownKeys(d.core.value);
-  if (keys.length > 40 || keys.some((key) => typeof key !== "string")) deny();
+  if (!allOwnData(d, ENVELOPE) || isNativeProxy(d.core.value)) deny();
+  const keys = nativeOwnKeys(d.core.value);
+  if (keys.length > 40) deny();
+  for (let index = 0; index < keys.length; index++) {
+    if (typeof keys[index] !== "string") deny();
+  }
   const core = snapshot(d.core.value, keys);
   const other = snapshot({ schema: d.schema.value, enc: d.enc.value,
     ciphertext: d.ciphertext.value, owner_signature: d.owner_signature.value,
     authorizesProductionRestore: d.authorizesProductionRestore.value,
     externalCustodyProven: d.externalCustodyProven.value },
-  ENVELOPE.filter((field) => field !== "core"));
+  ENVELOPE_OTHER);
   return Object.freeze({ ...other, core });
 }
 function currentAuthority(snapshotValue, statement, shareSignature, statementBytes) {
@@ -361,7 +383,8 @@ function currentAuthority(snapshotValue, statement, shareSignature, statementByt
     || !same(copyNativeBytes32(snapshotValue.head.digest),
       copyNativeBytes32(statement.manifest_digest))
     || !nativeIsArray(snapshotValue.devices) || snapshotValue.devices.length > 128) deny();
-  for (const field of SCOPE) {
+  for (let index = 0; index < SCOPE.length; index++) {
+    const field = SCOPE[index];
     if (snapshotValue.scope[field] !== b64(statement[field])) deny();
   }
   const active = (deviceId) => {
@@ -385,7 +408,8 @@ async function openProtectedRecipientShareFile(input) {
     strict(input, ["redeemInput", "envelope", "authority", "operatorMinimumSequence",
       "metadata", "deviceHpkePrivateKey", "nowSeconds"]);
     const entry = nativeAllDescriptors(input);
-    if (Object.values(entry).some((field) => !Object.hasOwn(field, "value"))) deny();
+    if (!allOwnData(entry, ["redeemInput", "envelope", "authority", "operatorMinimumSequence",
+      "metadata", "deviceHpkePrivateKey", "nowSeconds"])) deny();
     const metadata = snapshot(entry.metadata.value, METADATA);
     const envelope = safeEnvelope(entry.envelope.value);
     const redeemInput = entry.redeemInput.value;
@@ -432,7 +456,8 @@ async function openProtectedRecipientShareFile(input) {
       || core.owner_revision !== statement.manifest_revision
       || core.owner_digest !== b64(statement.manifest_digest)
       || core.owner_epoch !== statement.epoch) deny();
-    for (const field of SCOPE) {
+    for (let index = 0; index < SCOPE.length; index++) {
+      const field = SCOPE[index];
       if (core[field] !== b64(statement[field])
         || metadata[field] !== core[field]) deny();
     }
@@ -480,13 +505,12 @@ async function openPortableProtectedRecipientShareFile(input) {
     strict(input, ["offer", "redeemInput", "authority", "operatorMinimumSequence",
       "deviceHpkePrivateKey", "nowSeconds"]);
     const inputDescriptors = nativeAllDescriptors(input);
-    if (Object.values(inputDescriptors).some((entry) =>
-      !Object.hasOwn(entry, "value"))) deny();
+    if (!allOwnData(inputDescriptors, ["offer", "redeemInput", "authority",
+      "operatorMinimumSequence", "deviceHpkePrivateKey", "nowSeconds"])) deny();
     const offer = inputDescriptors.offer.value;
     strict(offer, OFFER);
     const offerDescriptors = nativeAllDescriptors(offer);
-    if (Object.values(offerDescriptors).some((entry) =>
-      !Object.hasOwn(entry, "value"))) deny();
+    if (!allOwnData(offerDescriptors, OFFER)) deny();
     if (offer.schema !== "rootark-zk1-recipient-share-offer-dev/v1"
       || offer.authorizesProductionIo !== false
       || offer.externalCustodyProven !== false) deny();
@@ -494,14 +518,17 @@ async function openPortableProtectedRecipientShareFile(input) {
     const redeemInput = inputDescriptors.redeemInput.value;
     if (!redeemInput || typeof redeemInput !== "object") deny();
     const redeemDescriptors = nativeAllDescriptors(redeemInput);
-    if (!["grant", "recipientUsername", "recipientDeviceId"].every((key) =>
-      Object.hasOwn(redeemDescriptors, key) && Object.hasOwn(redeemDescriptors[key], "value"))) deny();
+    if (!allOwnData(redeemDescriptors, ["grant", "recipientUsername", "recipientDeviceId"])) deny();
     const expectedGrant = snapshot(redeemDescriptors.grant.value, GRANT);
     const recipientUsername = redeemDescriptors.recipientUsername.value;
     const recipientDeviceId = redeemDescriptors.recipientDeviceId.value;
     if (typeof recipientUsername !== "string" || typeof recipientDeviceId !== "string") deny();
-    if (GRANT.some((key) => grant[key] !== expectedGrant[key])
-      || offer.recipientUsername !== recipientUsername
+    let grantMatches = true;
+    for (let index = 0; index < GRANT.length; index++) {
+      const field = GRANT[index];
+      if (grant[field] !== expectedGrant[field]) grantMatches = false;
+    }
+    if (!grantMatches || offer.recipientUsername !== recipientUsername
       || offer.recipientDeviceId !== recipientDeviceId) deny();
     return await openProtectedRecipientShareFile({
       redeemInput: input.redeemInput, envelope: offer.envelope,
