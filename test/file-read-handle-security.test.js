@@ -410,8 +410,17 @@ test("atomic quarantine verifies the moved inode before unlinking a raced replac
     fs.renameSync = originalRenameSync;
   }
   assert.equal(raced, true);
-  assert.equal(fs.readFileSync(cleanupPath, "utf8"), "unrelated replacement",
-    "a replacement moved into quarantine must be restored without being deleted");
+  // A pathname may be rebound by the exact race this test injects. Read the
+  // post-race replacement through an owned descriptor and independently pin
+  // its identity, rather than following it again after checking metadata.
+  const replacementFd = fs.openSync(cleanupPath, "r");
+  try {
+    const openedReplacement = fs.fstatSync(replacementFd, { bigint: true });
+    assert.notEqual(openedReplacement.ino, identity.ino,
+      "the restored foreign snapshot must not alias the authorized inode");
+    assert.equal(fs.readFileSync(replacementFd, { encoding: "utf8" }), "unrelated replacement",
+      "a replacement moved into quarantine must be restored without being deleted");
+  } finally { fs.closeSync(replacementFd); }
   assert.equal(fs.readFileSync(displacedPath, "utf8"), "authorized snapshot");
   assert.equal(budget.getState().active, 0,
     "the active request slot is released while bytes remain charged for the quarantined inode");
