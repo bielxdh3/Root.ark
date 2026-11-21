@@ -16,6 +16,27 @@ const cekTransfer = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
+// A fresh instance pins a controllable *native-release* clock before it loads.
+// Restore Date.now and the module cache immediately, so the real entry-time
+// approval, witness, signature and <=30-second skew checks still run against
+// real time. Only the final post-HPKE release boundary sees elapsed time.
+function releaseClockTransfer() {
+  const moduleId = require.resolve("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer");
+  const previousModule = require.cache[moduleId];
+  const actualNow = Date.now;
+  let nowMs = actualNow();
+  let transfer;
+  try {
+    Date.now = () => nowMs;
+    delete require.cache[moduleId];
+    transfer = require(moduleId);
+  } finally {
+    Date.now = actualNow;
+    if (previousModule) require.cache[moduleId] = previousModule;
+    else delete require.cache[moduleId];
+  }
+  return { transfer, advanceTo(ms) { nowMs = ms; } };
+}
 const cekBatch = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-versioned-cek-batch"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
@@ -664,12 +685,27 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     }
     assert.equal(ownerDecryptFinished, true,
       "test must reach genuine file AEAD before rebinding the global clock");
-    await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
-      ownerPrivateKey: owner.privateKey, ownerHeldCek,
+    const sealClock = releaseClockTransfer();
+    const validSealInput = { ownerPrivateKey: owner.privateKey, ownerHeldCek,
       metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
-      authority: { ...publicAuthority, nowSeconds: signedCommittedHead.expires_at + 2 },
-    }), /ZK_OWNER_FILE_CEK_DENIED/,
-    "an actual trusted time beyond the owner lease must still deny CEK rewrap");
+      authority: publicAuthority };
+    const baselineSeal = await sealClock.transfer.sealOwnerAuthorizedFileCek(validSealInput);
+    assert.equal(baselineSeal.core.expires_at, envelope.core.expires_at,
+      "the same signed authority must pass every entry-time gate before expiry");
+    const nativeSeal = z.hpkeSeal;
+    let realSealCompleted = false;
+    z.hpkeSeal = async (...args) => {
+      const value = await nativeSeal(...args);
+      realSealCompleted = true;
+      sealClock.advanceTo((envelope.core.expires_at + 1) * 1000);
+      return value;
+    };
+    try {
+      await assert.rejects(sealClock.transfer.sealOwnerAuthorizedFileCek(validSealInput),
+        /ZK_OWNER_FILE_CEK_DENIED/,
+        "an actually elapsed signed CEK lease must deny at the final post-HPKE seal fence");
+    } finally { z.hpkeSeal = nativeSeal; }
+    assert.equal(realSealCompleted, true, "real HPKE sealing must finish before the clock expires");
     for (const label of ["request", "metadata", "head", "opened envelope"]) {
       let accessed = 0;
       const accessor = { enumerable: true, configurable: true,
@@ -740,11 +776,33 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     }
     assert.equal(hpkeFinishedBeforeExpiry, true,
       "test must reach actual HPKE decrypt before the forged clock changes");
-    await assert.rejects(open({
-      authority: { ...linked, nowSeconds: envelope.core.expires_at + 2 },
-      nowSeconds: envelope.core.expires_at + 2,
-    }), /ZK_OWNER_FILE_CEK_DENIED/,
-    "trusted post-expiry request time still denies B's CEK release");
+    const openClock = releaseClockTransfer();
+    const validOpenInput = {
+      envelope, authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      metadata, objectRevision: 1, ciphertext: recoveredCiphertext,
+      ciphertextRoot: root, deviceHpkePrivateKey: bRecipient,
+      nowSeconds: now + 9,
+    };
+    const baselineOpen = await openClock.transfer.openOwnerAuthorizedFileCek(validOpenInput);
+    assert.equal(baselineOpen.verifiedReleaseExpiresAt,
+      Math.min(envelope.core.expires_at, issued.approval.expires_at,
+        signedCommittedHead.expires_at));
+    baselineOpen.cek.fill(0);
+    const originalHpkeOpen = z.hpkeOpen;
+    let realOpenCompleted = false;
+    z.hpkeOpen = async (...args) => {
+      const value = await originalHpkeOpen(...args);
+      realOpenCompleted = true;
+      openClock.advanceTo((baselineOpen.verifiedReleaseExpiresAt + 1) * 1000);
+      return value;
+    };
+    try {
+      await assert.rejects(openClock.transfer.openOwnerAuthorizedFileCek(validOpenInput),
+        /ZK_OWNER_FILE_CEK_DENIED/,
+        "an actually elapsed signed CEK lease must deny at the final post-HPKE open fence");
+    } finally { z.hpkeOpen = originalHpkeOpen; }
+    assert.equal(realOpenCompleted, true, "real HPKE opening must finish before the clock expires");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
     assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(
