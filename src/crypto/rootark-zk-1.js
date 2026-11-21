@@ -758,7 +758,10 @@ async function verifyAuthorizationCore(manifest, signature, publicKey, expected 
       }
     }
   };
-  if (normalized.envelope_version === 1) checkExpected(V1_EXPECTED_FIELDS, manifest);
+  // Use the normalized detached scope rather than reading the mutable caller
+  // manifest after async normalization. Number and bigint epochs represent
+  // the same signed unsigned integer when their values are equal.
+  if (normalized.envelope_version === 1) checkExpected(V1_EXPECTED_FIELDS, normalized, true);
   let valid;
   try {
     valid = crypto.verify(null, await buildAuthorizationSignatureInput(normalized), publicKey, sig);
