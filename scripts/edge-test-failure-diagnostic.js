@@ -6,6 +6,17 @@ const { createHash } = require("node:crypto");
 // for hosted logs. Browser exception messages, URLs, paths, key material, JS
 // sources, filenames and error stacks are never forwarded.
 const CASES = Object.freeze({
+  V2_ARCHIVE: {
+    file: "test/issue-65-versioned-keyring-ciphertext-archive.test.js",
+    title: "REAL Edge: authenticated signed CBOR v2 archive export/import and failure fencing",
+    stages: Object.freeze({
+      initial: "INITIAL", "launch-edge": "LAUNCH_EDGE",
+      "edge-ui": "EDGE_UI", "owner-provision": "OWNER_PROVISION",
+      "archive-export": "ARCHIVE_EXPORT", "archive-import": "ARCHIVE_IMPORT",
+      "negative-proofs": "NEGATIVE_PROOFS", "historical-recovery": "HISTORICAL_RECOVERY",
+      "session-revocation": "SESSION_REVOCATION",
+    }),
+  },
   V2_WITNESSED: {
     file: "test/issue-65-edge-v2-witnessed-positive.test.js",
     title: "REAL Edge owner-witnessed V2 PoP import survives fresh realm and restores only through signed-history strict mTLS-backed server",

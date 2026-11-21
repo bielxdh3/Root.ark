@@ -1,16 +1,38 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const {
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  verify: NATIVE_VERIFY,
+  createHash: NATIVE_CREATE_HASH,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  keyType: ATOMIC_NATIVE_TYPE,
+  keyAlgorithm: ATOMIC_NATIVE_ALGORITHM,
+  publicExport: ATOMIC_NATIVE_EXPORT,
+  keyEquals: ATOMIC_NATIVE_EQUALS,
+  randomBytes: NATIVE_RANDOM_BYTES,
+  randomUUID: NATIVE_RANDOM_UUID,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
+  canonicalSortedJson: NATIVE_CANONICAL_SORTED_JSON,
+  freeze: NATIVE_FREEZE,
+  hasOwn: NATIVE_HAS_OWN,
+  arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  jsonParse: NATIVE_JSON_PARSE,
+} = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const { types: { isProxy } } = require("node:util");
 
 const protocol = require("./rootark-sync-protocol");
 const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owner-provision");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
+
 
 const SNAPSHOT_VERSION = 1;
 const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
@@ -19,9 +41,13 @@ const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
+function sha256Hex(data, encoding) {
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, data, encoding);
+  return NATIVE_HASH_DIGEST.call(hash, "hex");
+}
 function signedEnvelopeDigest(operation) {
-  return crypto.createHash("sha256")
-    .update(protocol.canonicalJson(operation), "utf8").digest("hex");
+  return sha256Hex(NATIVE_CANONICAL_SORTED_JSON(operation), "utf8");
 }
 
 // v2 is intentionally incompatible with v1: a v1 receipt has no immutable
@@ -34,9 +60,9 @@ function pinnedAtomicOwnerIdentity(value) {
   // Detach option-owned getters just once. An apparent immutable identity
   // must not be replaced between constructor validation and signed readback.
   let identity;
-  try { identity = JSON.parse(protocol.canonicalJson(value)); }
+  try { identity = NATIVE_JSON_PARSE(NATIVE_CANONICAL_SORTED_JSON(value)); }
   catch { fail("Atomic batch owner identity is not canonical JSON", "authorization_required"); }
-  if (!identity || typeof identity !== "object" || Array.isArray(identity)
+  if (!identity || typeof identity !== "object" || NATIVE_ARRAY_IS_ARRAY(identity)
     || Object.keys(identity).sort().join(",")
       !== ["accountId", "storeId", "username", "compartmentId"].sort().join(",")
     || typeof identity.accountId !== "string" || !ATOMIC_UUID.test(identity.accountId)
@@ -47,31 +73,34 @@ function pinnedAtomicOwnerIdentity(value) {
     fail("Atomic batch requires immutable externally provisioned account/store identity",
       "authorization_required");
   }
-  return Object.freeze(identity);
+  return NATIVE_FREEZE(identity);
 }
 function pinnedAtomicWitnessKey(value) {
   if (value == null) return null;
-  let key;
-  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-    key = crypto.createPublicKey({ key: Buffer.from(value), format: "der", type: "spki" });
-  } else if (typeof value === "string" && /^[A-Za-z0-9_-]{40,512}$/.test(value)) {
-    const der = Buffer.from(value, "base64url");
-    if (der.toString("base64url") !== value) {
-      fail("Atomic batch witness key is not canonical", "authorization_required");
+  try {
+    if (isProxy(value)) throw new Error("Proxy pin");
+    let der;
+    if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+      der = NATIVE_BUFFER_FROM(value);
+    } else if (typeof value === "string" && /^[A-Za-z0-9_-]{40,512}$/.test(value)) {
+      der = NATIVE_BUFFER_FROM(value, "base64url");
+      if (NATIVE_BUFFER_TO_STRING.call(der, "base64url") !== value) {
+        fail("Atomic batch witness key is not canonical", "authorization_required");
+      }
+    } else {
+      const supplied = value instanceof crypto.KeyObject ? value : NATIVE_CREATE_PUBLIC_KEY(value);
+      if (ATOMIC_NATIVE_TYPE.call(supplied) !== "public"
+        || ATOMIC_NATIVE_ALGORITHM.call(supplied) !== "ed25519") throw new Error("Invalid key");
+      der = ATOMIC_NATIVE_EXPORT.call(supplied, { type: "spki", format: "der" });
     }
-    key = crypto.createPublicKey({ key: der, format: "der", type: "spki" });
-  } else if (value instanceof crypto.KeyObject && value.type === "public") {
-    // createPublicKey(publicKeyObject) throws ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE:
-    // an independently supplied public pin is already a parsed KeyObject.
-    key = value;
-  } else {
-    key = crypto.createPublicKey(value);
-  }
-  if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") {
+    const key = NATIVE_CREATE_PUBLIC_KEY({ key: der, format: "der", type: "spki" });
+    if (ATOMIC_NATIVE_TYPE.call(key) !== "public"
+      || ATOMIC_NATIVE_ALGORITHM.call(key) !== "ed25519") throw new Error("Invalid key");
+    return key;
+  } catch {
     fail("Atomic batch witness pin must be an Ed25519 public key",
       "authorization_required");
   }
-  return key;
 }
 function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, trustedScope, identity) {
   // Client-signed envelopes echoed by the server are NOT evidence that the
@@ -84,9 +113,9 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
   const required = ["version", "scope", "accountId", "storeId", "username",
     "compartmentId", "nonce", "operationIds", "envelopeDigests",
     "commitId", "storeHeadSha256", "fencingEpoch", "physicalDurable"];
-  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+  if (!receipt || typeof receipt !== "object" || NATIVE_ARRAY_IS_ARRAY(receipt)
     || Object.keys(receipt).sort().join(",") !== ["signature", "statement"].sort().join(",")
-    || !statement || typeof statement !== "object" || Array.isArray(statement)
+    || !statement || typeof statement !== "object" || NATIVE_ARRAY_IS_ARRAY(statement)
     || Object.keys(statement).sort().join(",") !== required.sort().join(",")
     || statement.version !== 2 || statement.scope !== trustedScope
     || !identity || statement.accountId !== identity.accountId
@@ -100,8 +129,8 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
     || typeof statement.commitId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(statement.commitId)
     || typeof statement.storeHeadSha256 !== "string"
     || !/^[a-f0-9]{64}$/.test(statement.storeHeadSha256)
-    || !Array.isArray(statement.operationIds) || statement.operationIds.length !== 2
-    || !Array.isArray(statement.envelopeDigests) || statement.envelopeDigests.length !== 2
+    || !NATIVE_ARRAY_IS_ARRAY(statement.operationIds) || statement.operationIds.length !== 2
+    || !NATIVE_ARRAY_IS_ARRAY(statement.envelopeDigests) || statement.envelopeDigests.length !== 2
     || operations.some((operation, index) =>
       operation.authorization?.username !== identity.username
       || operation.compartmentId !== identity.compartmentId
@@ -112,11 +141,11 @@ function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, tru
     fail("Atomic batch lacks an exact independent durable admission receipt",
       "sync_atomic_batch_indeterminate");
   }
-  const signature = Buffer.from(receipt.signature, "base64url");
+  const signature = NATIVE_BUFFER_FROM(receipt.signature, "base64url");
   if (signature.length !== 64
-    || signature.toString("base64url") !== receipt.signature
-    || !crypto.verify(null, Buffer.from(ATOMIC_ADMISSION_DOMAIN
-      + protocol.canonicalJson(statement), "utf8"), trustedWitnessKey, signature)) {
+    || NATIVE_BUFFER_TO_STRING.call(signature, "base64url") !== receipt.signature
+    || !NATIVE_VERIFY(null, NATIVE_BUFFER_FROM(ATOMIC_ADMISSION_DOMAIN
+      + NATIVE_CANONICAL_SORTED_JSON(statement), "utf8"), trustedWitnessKey, signature)) {
     fail("Independent atomic batch witness signature invalid",
       "sync_atomic_batch_indeterminate");
   }
@@ -130,14 +159,14 @@ function verifyAtomicBatchCasFloor(floor, witnessStatement, trustedCasKey,
   // verifying bytes; an accessor must not swap a value between comparison
   // against the physical witness and Ed25519 verification.
   let detached;
-  try { detached = JSON.parse(protocol.canonicalJson(floor)); }
+  try { detached = NATIVE_JSON_PARSE(NATIVE_CANONICAL_SORTED_JSON(floor)); }
   catch { fail("External CAS floor is not canonical JSON", "sync_atomic_batch_indeterminate"); }
   const statement = detached?.statement;
   const keys = ["version", "scope", "accountId", "storeId", "nonce",
     "commitId", "storeHeadSha256", "fencingEpoch", "sequence", "current"];
-  if (!trustedCasKey || !detached || typeof detached !== "object" || Array.isArray(detached)
+  if (!trustedCasKey || !detached || typeof detached !== "object" || NATIVE_ARRAY_IS_ARRAY(detached)
     || Object.keys(detached).sort().join(",") !== ["statement", "signature"].sort().join(",")
-    || !statement || typeof statement !== "object" || Array.isArray(statement)
+    || !statement || typeof statement !== "object" || NATIVE_ARRAY_IS_ARRAY(statement)
     || Object.keys(statement).sort().join(",") !== keys.sort().join(",")
     || statement.version !== 2 || statement.scope !== trustedScope
     || !identity || statement.accountId !== identity.accountId
@@ -155,10 +184,10 @@ function verifyAtomicBatchCasFloor(floor, witnessStatement, trustedCasKey,
     fail("External CAS floor does not attest the same current batch head",
       "sync_atomic_batch_indeterminate");
   }
-  const signature = Buffer.from(detached.signature, "base64url");
-  if (signature.length !== 64 || signature.toString("base64url") !== detached.signature
-    || !crypto.verify(null, Buffer.from(ATOMIC_CAS_FLOOR_DOMAIN
-      + protocol.canonicalJson(statement), "utf8"), trustedCasKey, signature)) {
+  const signature = NATIVE_BUFFER_FROM(detached.signature, "base64url");
+  if (signature.length !== 64 || NATIVE_BUFFER_TO_STRING.call(signature, "base64url") !== detached.signature
+    || !NATIVE_VERIFY(null, NATIVE_BUFFER_FROM(ATOMIC_CAS_FLOOR_DOMAIN
+      + NATIVE_CANONICAL_SORTED_JSON(statement), "utf8"), trustedCasKey, signature)) {
     fail("External CAS current floor signature invalid",
       "sync_atomic_batch_indeterminate");
   }
@@ -167,7 +196,7 @@ function envelopeCopy(operation) {
   // Detach incoming JSON from transport/callback-owned mutable references.
   // An async key resolver must never be able to swap an already-verified
   // signed envelope before the filesystem is changed.
-  return JSON.parse(protocol.canonicalJson(operation));
+  return NATIVE_JSON_PARSE(NATIVE_CANONICAL_SORTED_JSON(operation));
 }
 
 function signedWebDavEventId(operation) {
@@ -175,15 +204,13 @@ function signedWebDavEventId(operation) {
   // signed envelopes. Never infer batch ownership from adjacent array order
   // alone, an untrusted metadata field or a caller-selected operation ID.
   if (!operation || typeof operation !== "object"
-    || !Object.hasOwn(operation, "authorization")
+    || !NATIVE_HAS_OWN(operation, "authorization")
     || !["delete", "move"].includes(operation.operation)
     || typeof operation.operationId !== "string"
     || typeof operation.metadata?.path !== "string") return null;
   const parts = /^webdav-(.+)-([a-f0-9]{24})$/.exec(operation.operationId);
   if (!parts || parts[1].length > 100) return null;
-  const digest = crypto.createHash("sha256")
-    .update(`${operation.operation}:${operation.metadata.path}`)
-    .digest("hex").slice(0, 24);
+  const digest = sha256Hex(`${operation.operation}:${operation.metadata.path}`).slice(0, 24);
   return parts[2] === digest ? parts[1] : null;
 }
 
@@ -329,7 +356,7 @@ async function canonicalRelativePath(rootDir, relativePath) {
 function canonicalMapPath(relativePath, ...maps) {
   if (process.platform !== "win32") return relativePath;
   for (const map of maps) {
-    if (Object.prototype.hasOwnProperty.call(map, relativePath)) return relativePath;
+    if (NATIVE_HAS_OWN(map, relativePath)) return relativePath;
   }
   const matches = new Set();
   for (const map of maps) {
@@ -342,7 +369,7 @@ function canonicalMapPath(relativePath, ...maps) {
 }
 
 async function durableJson(filePath, value) {
-  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const temporary = `${filePath}.tmp-${process.pid}-${NATIVE_RANDOM_UUID()}`;
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
     | (fs.constants.O_SYNC || 0);
   let handle;
@@ -389,7 +416,7 @@ function evictionError(code, message, cause, rollbackCause) {
 
 function normalizeExcludedPaths(value) {
   if (value == null) return [];
-  if (!Array.isArray(value)) fail("Excluded paths must be an array", "invalid_excluded_paths");
+  if (!NATIVE_ARRAY_IS_ARRAY(value)) fail("Excluded paths must be an array", "invalid_excluded_paths");
   return [...new Set(value.map((item) => validatePortableRelativePath(item, "excludedPath")))].sort();
 }
 
@@ -447,8 +474,7 @@ class SyncEngine {
         "authorization_required");
     }
     if (witnessPublicKey && casFloorPublicKey
-      && witnessPublicKey.export({ type: "spki", format: "der" })
-        .equals(casFloorPublicKey.export({ type: "spki", format: "der" }))) {
+      && ATOMIC_NATIVE_EQUALS.call(witnessPublicKey, casFloorPublicKey)) {
       fail("External CAS floor and physical witness require distinct pinned keys",
         "authorization_required");
     }
@@ -474,8 +500,7 @@ class SyncEngine {
         witnessPublicKey, casPublicKey: casFloorPublicKey,
       }) : null;
     if (ownerProvision && [witnessPublicKey, casFloorPublicKey].some((key) =>
-      key && key.export({ type: "spki", format: "der" }).equals(
-        ownerProvision.publicKey.export({ type: "spki", format: "der" })))) {
+      key && ATOMIC_NATIVE_EQUALS.call(key, ownerProvision.publicKey))) {
       fail("Owner provisioner, witness and CAS must have distinct pinned keys",
         "authorization_required");
     }
@@ -502,7 +527,7 @@ class SyncEngine {
     this.requireAuthorization = options.requireAuthorization === true;
     this.translateWebDavOperation = options.translateWebDavOperation || null;
     this.maxRetries = Math.max(1, Math.min(5, Number(options.maxRetries || 3)));
-    if (options.selectedPaths != null && !Array.isArray(options.selectedPaths)) fail("Selected paths must be an array", "invalid_selected_paths");
+    if (options.selectedPaths != null && !NATIVE_ARRAY_IS_ARRAY(options.selectedPaths)) fail("Selected paths must be an array", "invalid_selected_paths");
     this.selectedPaths = options.selectedPaths == null ? null : [...new Set(options.selectedPaths.map((value) => protocol.safeRelativePath(value, "selectedPath")))].sort();
     this.excludedPaths = normalizeExcludedPaths(options.excludedPaths);
     this.snapshot = { version: SNAPSHOT_VERSION, files: {}, remoteOnly: {} };
@@ -584,18 +609,18 @@ class SyncEngine {
     if (!sameSnapshotRevision(this.snapshotDiskRevision, snapshotStats)) {
       let parsed;
       try {
-        parsed = JSON.parse(await fsp.readFile(this.snapshotPath, "utf8"));
+        parsed = NATIVE_JSON_PARSE(await fsp.readFile(this.snapshotPath, "utf8"));
       } catch {
         fail("Invalid sync snapshot", "invalid_snapshot");
       }
-      if (parsed.version !== SNAPSHOT_VERSION || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
+      if (parsed.version !== SNAPSHOT_VERSION || !parsed.files || typeof parsed.files !== "object" || NATIVE_ARRAY_IS_ARRAY(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
       if (parsed.remoteOnly === undefined) parsed.remoteOnly = {};
-      if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || Array.isArray(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
+      if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || NATIVE_ARRAY_IS_ARRAY(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
       if (parsed.excludedPaths !== undefined) {
         try { parsed.excludedPaths = normalizeExcludedPaths(parsed.excludedPaths); } catch { fail("Invalid excluded sync paths", "invalid_snapshot"); }
       }
       if (parsed.pendingEvictions !== undefined) {
-        if (!parsed.pendingEvictions || typeof parsed.pendingEvictions !== "object" || Array.isArray(parsed.pendingEvictions)) fail("Invalid pending evictions", "invalid_snapshot");
+        if (!parsed.pendingEvictions || typeof parsed.pendingEvictions !== "object" || NATIVE_ARRAY_IS_ARRAY(parsed.pendingEvictions)) fail("Invalid pending evictions", "invalid_snapshot");
         for (const entry of Object.values(parsed.pendingEvictions)) {
           if (!entry || typeof entry !== "object" || typeof entry.code !== "string" || !Number.isInteger(entry.attempts) || entry.attempts < 0) fail("Invalid pending eviction", "invalid_snapshot");
           try { protocol.safeRelativePath(entry.path, "path"); } catch { fail("Invalid pending eviction path", "invalid_snapshot"); }
@@ -634,7 +659,7 @@ class SyncEngine {
     // Historical expiry is allowed only for a structurally bound SIGNED
     // record; the trusted verifier below must still check key and revocation.
     if (this.requireAuthorization) {
-      if (!operation || !Object.hasOwn(operation, "authorization")) {
+      if (!operation || !NATIVE_HAS_OWN(operation, "authorization")) {
         fail("Remote sync device authorization is required", "remote_authorization_rejected");
       }
       try { protocol.validateStoredOperation(operation); }
@@ -813,7 +838,7 @@ class SyncEngine {
         }
       } else {
         const bytes = await readContainedFile(this.rootDir, sourcePath, stats);
-        changedLocally = crypto.createHash("sha256").update(bytes).digest("hex") !== prior.hash;
+        changedLocally = sha256Hex(bytes) !== prior.hash;
       }
     }
 
@@ -826,8 +851,8 @@ class SyncEngine {
         const conflictRoot = path.join(this.rootDir, ".rootark-conflicts");
         await fsp.mkdir(conflictRoot, { recursive: true });
         await containedAbsolute(this.rootDir, conflictRoot, false);
-        const operationKey = crypto.createHash("sha256").update(operation.operationId).digest("hex").slice(0, 16);
-        const conflictPath = path.join(conflictRoot, `${operationKey}-${crypto.randomUUID()}.local.conflict`);
+        const operationKey = sha256Hex(operation.operationId).slice(0, 16);
+        const conflictPath = path.join(conflictRoot, `${operationKey}-${NATIVE_RANDOM_UUID()}.local.conflict`);
         await containedAbsolute(this.rootDir, conflictPath, true);
         await fsp.rename(target, conflictPath);
       }
@@ -875,7 +900,7 @@ class SyncEngine {
       deviceId: input.deviceId || this.deviceId,
       keyEpoch: input.keyEpoch || this.keyEpoch,
       compartmentId: input.compartmentId || this.compartmentId,
-      operationId: input.operationId || crypto.randomUUID(),
+      operationId: input.operationId || NATIVE_RANDOM_UUID(),
       fileKey: key,
     });
     await this.assertOutgoingAuthorized(operation);
@@ -951,7 +976,7 @@ class SyncEngine {
     let hash;
     if (operation.operation === "move") {
       const plaintext = protocol.decodeMovePayload(protocol.decryptPayload(operation, key), key);
-      if (plaintext !== null) hash = crypto.createHash("sha256").update(plaintext).digest("hex");
+      if (plaintext !== null) hash = sha256Hex(plaintext);
     }
     this.rememberOperation(operation, hash);
     await this.persistSnapshot();
@@ -1010,13 +1035,12 @@ class SyncEngine {
       const soloDelete = kind === "delete" && verbAndPath.startsWith("delete:");
       const soloMove = kind === "move" && !event.previousDestinationIdentity
         && verbAndPath.startsWith("move:");
-      return `${soloDelete || soloMove ? "webdavsolo" : "webdav"}-${event.operationId}-${crypto.createHash("sha256")
-        .update(verbAndPath).digest("hex").slice(0, 24)}`;
+      return `${soloDelete || soloMove ? "webdavsolo" : "webdav"}-${event.operationId}-${sha256Hex(verbAndPath).slice(0, 24)}`;
     };
     const identityFor = (relativePath, prior) => {
       const deletedPrior = snapshotFiles[relativePath]?.deleted ? snapshotFiles[relativePath] : null;
-      const identitySeed = deletedPrior ? crypto.randomUUID().replace(/-/g, "")
-        : crypto.createHash("sha256").update(relativePath).digest("hex").slice(0, 32);
+      const identitySeed = deletedPrior ? NATIVE_RANDOM_UUID().replace(/-/g, "")
+        : sha256Hex(relativePath).slice(0, 32);
       return {
         objectId: prior?.objectId || `object-${identitySeed}`,
         fileId: prior?.fileId || `file-${identitySeed}`,
@@ -1038,7 +1062,7 @@ class SyncEngine {
         operation,
         objectId: identity.objectId,
         fileId: identity.fileId,
-        versionId: crypto.randomUUID(),
+        versionId: NATIVE_RANDOM_UUID(),
         operationId: stableOperationId(`${operation}:${relativePath}`),
         baseRevision,
         revision,
@@ -1323,7 +1347,7 @@ class SyncEngine {
       else fail("Atomic signed WebDAV remote batch outcome indeterminate",
         "sync_atomic_batch_indeterminate");
     }
-    if (!uncertainRequest && (!Array.isArray(response?.objects) || response.objects.length !== 2
+    if (!uncertainRequest && (!NATIVE_ARRAY_IS_ARRAY(response?.objects) || response.objects.length !== 2
       || response.objects.some((entry, index) => {
         try {
           return signedEnvelopeDigest(protocol.validateStoredOperation(entry)) !== digests[index];
@@ -1341,7 +1365,7 @@ class SyncEngine {
     // can be replayed after the server rolls its physical state backwards.
     // The readback transport must independently attest its current durable
     // head/floor, not fetch unsigned LIST or re-sign the server's JSON.
-    const witnessNonce = crypto.randomBytes(32).toString("base64url");
+    const witnessNonce = NATIVE_BUFFER_TO_STRING.call(NATIVE_RANDOM_BYTES(32), "base64url");
     let witnessed;
     try {
       witnessed = await this.atomicBatchWitnessReadback({
@@ -1361,7 +1385,7 @@ class SyncEngine {
         "sync_atomic_batch_indeterminate");
     }
     let detachedWitness;
-    try { detachedWitness = JSON.parse(protocol.canonicalJson(witnessed)); }
+    try { detachedWitness = NATIVE_JSON_PARSE(NATIVE_CANONICAL_SORTED_JSON(witnessed)); }
     catch { fail("Independent witness receipt is not canonical JSON",
       "sync_atomic_batch_indeterminate"); }
     if (detachedWitness?.statement?.nonce !== witnessNonce) {
@@ -1384,7 +1408,7 @@ class SyncEngine {
     // physical head can authorize a local ACK; never use a journal/PG row or
     // the original sync HTTP response as this readback.
     const verifiedWitnessStatement = detachedWitness.statement;
-    const floorNonce = crypto.randomBytes(32).toString("base64url");
+    const floorNonce = NATIVE_BUFFER_TO_STRING.call(NATIVE_RANDOM_BYTES(32), "base64url");
     let floor;
     try {
       floor = await this.atomicBatchCasFloorReadback({
@@ -1629,7 +1653,7 @@ class SyncEngine {
     const content = operation.operation === "move"
       ? protocol.decodeMovePayload(decrypted, key) || decrypted
       : decrypted;
-    return crypto.createHash("sha256").update(content).digest("hex");
+    return sha256Hex(content);
   }
 
   async stageExisting(target) {
@@ -1637,7 +1661,7 @@ class SyncEngine {
     const trashDir = path.join(this.rootDir, ".rootark-trash");
     await fsp.mkdir(trashDir, { recursive: true });
     await containedAbsolute(this.rootDir, trashDir, false);
-    const trashTarget = path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(target)}`);
+    const trashTarget = path.join(trashDir, `${Date.now()}-${NATIVE_RANDOM_UUID()}-${path.basename(target)}`);
     await containedAbsolute(this.rootDir, trashTarget, true);
     await fsp.rename(target, trashTarget);
     return trashTarget;
@@ -1725,15 +1749,15 @@ class SyncEngine {
           await fsp.rename(source, target);
         }
         const movedStats = await fsp.lstat(target, { bigint: true });
-        if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, metadata.path, movedStats)).digest("hex");
+        if (movedStats.isFile()) hash = sha256Hex(await readContainedFile(this.rootDir, metadata.path, movedStats));
       } else {
         if (await exists(target)) await this.stageExisting(target);
-        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        const temporary = `${target}.tmp-${process.pid}-${NATIVE_RANDOM_UUID()}`;
         try {
           await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
           await fsp.rename(temporary, target);
         } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
-        hash = crypto.createHash("sha256").update(movePayload).digest("hex");
+        hash = sha256Hex(movePayload);
       }
       this.rememberOperation(operation, hash, sourcePath);
     } else {
@@ -1765,14 +1789,14 @@ class SyncEngine {
           }
         }
       } else {
-        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        const temporary = `${target}.tmp-${process.pid}-${NATIVE_RANDOM_UUID()}`;
         await fsp.writeFile(temporary, plaintext, { mode: 0o600 });
         try {
           if (await exists(target)) await this.stageExisting(target);
           await fsp.rename(temporary, target);
         } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
       }
-      this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"));
+      this.rememberOperation(operation, sha256Hex(plaintext));
     }
     if (operation.operation === "move" && cleanupPath) {
       await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath, true)));
@@ -1786,7 +1810,7 @@ class SyncEngine {
 
   async scanFiles() {
     const result = {};
-    const emptyHash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
+    const emptyHash = sha256Hex(Buffer.alloc(0));
     const walk = async (directory, prefix = "") => {
       let hasSyncEntries = false;
       for (const entry of await fsp.readdir(directory, { withFileTypes: true })) {
@@ -1809,7 +1833,7 @@ class SyncEngine {
           if (childHasSyncEntries || this.isSelected(relative) || this.selectedPaths === null) hasSyncEntries = true;
         } else if (entry.isFile() && this.isSelected(relative)) {
           const data = await readContainedFile(this.rootDir, relative);
-          result[relative] = { hash: crypto.createHash("sha256").update(data).digest("hex"), size: data.length, directory: false };
+          result[relative] = { hash: sha256Hex(data), size: data.length, directory: false };
           hasSyncEntries = true;
         }
       }
@@ -1894,7 +1918,7 @@ class SyncEngine {
         continue;
       }
       const key = await this.fileKeyResolver(prior);
-      const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: crypto.randomUUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
+      const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: NATIVE_RANDOM_UUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
       await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
       this.rememberOperation(operation);
     }
@@ -1918,15 +1942,15 @@ class SyncEngine {
       if (prior && !prior.deleted && prior.hash === file.hash && Boolean(prior.directory) === isDirectory) continue;
       const isUpdate = prior && !prior.deleted;
       const identitySeed = prior?.deleted
-        ? crypto.randomUUID().replace(/-/g, "")
-        : crypto.createHash("sha256").update(relative).digest("hex").slice(0, 32);
+        ? NATIVE_RANDOM_UUID().replace(/-/g, "")
+        : sha256Hex(relative).slice(0, 32);
       const objectId = isUpdate ? prior.objectId : `object-${identitySeed}`;
       const fileId = isUpdate ? prior.fileId : `file-${identitySeed}`;
       const data = isDirectory ? Buffer.alloc(0) : await readContainedFile(this.rootDir, relative);
-      const contentHash = crypto.createHash("sha256").update(data).digest("hex");
+      const contentHash = sha256Hex(data);
       const key = await this.fileKeyResolver({ objectId, fileId, path: relative, keyEpoch: this.keyEpoch });
       const metadata = { path: relative, name: path.basename(relative), size: data.length, ...(isDirectory ? { contentType: "inode/directory" } : {}) };
-      const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: crypto.randomUUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
+      const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: NATIVE_RANDOM_UUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
       await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
       this.rememberOperation(operation, contentHash);
     }
@@ -1973,13 +1997,13 @@ class SyncEngine {
     const before = await fsp.lstat(target, { bigint: true });
     if (!before.isFile() || before.isSymbolicLink()) fail("Only regular files can be evicted", "unsafe_path");
     const bytes = await readContainedFile(this.rootDir, safePath, before);
-    const hash = crypto.createHash("sha256").update(bytes).digest("hex");
+    const hash = sha256Hex(bytes);
     const afterRead = await fsp.lstat(target, { bigint: true });
     if (hash !== prior.hash || !sameFileVersion(before, afterRead)) fail("Local file changed since its last sync", "local_changes_pending");
 
     const remoteResult = await this.adapter.list(prior.objectId);
-    const remoteRecords = Array.isArray(remoteResult) ? remoteResult
-      : Array.isArray(remoteResult?.objects) ? remoteResult.objects : remoteResult ? [remoteResult] : [];
+    const remoteRecords = NATIVE_ARRAY_IS_ARRAY(remoteResult) ? remoteResult
+      : NATIVE_ARRAY_IS_ARRAY(remoteResult?.objects) ? remoteResult.objects : remoteResult ? [remoteResult] : [];
     if (remoteRecords.length !== 1) fail("Current remote object is unavailable", "remote_object_missing");
     const remote = protocol.validateStoredOperation(remoteRecords[0]);
     if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId || !pathsEqual(remote.metadata.path, safePath)) {
@@ -1992,7 +2016,7 @@ class SyncEngine {
     const remoteContent = remote.operation === "move"
       ? protocol.decodeMovePayload(remotePlaintext, remoteKey) || remotePlaintext
       : remotePlaintext;
-    if (crypto.createHash("sha256").update(remoteContent).digest("hex") !== hash) {
+    if (sha256Hex(remoteContent) !== hash) {
       fail("Current remote content differs from the local cache", "remote_content_changed");
     }
 
@@ -2000,11 +2024,11 @@ class SyncEngine {
     if (!sameFileVersion(before, beforeStage)) fail("Local file changed during cache verification", "local_changes_pending");
     const confirmedBytes = await readContainedFile(this.rootDir, safePath, beforeStage);
     const afterConfirm = await fsp.lstat(target, { bigint: true });
-    if (crypto.createHash("sha256").update(confirmedBytes).digest("hex") !== hash || !sameFileVersion(beforeStage, afterConfirm)) {
+    if (sha256Hex(confirmedBytes) !== hash || !sameFileVersion(beforeStage, afterConfirm)) {
       fail("Local file changed during cache verification", "local_changes_pending");
     }
 
-    const hadPriorMarker = Object.prototype.hasOwnProperty.call(this.snapshot.remoteOnly, prior.objectId);
+    const hadPriorMarker = NATIVE_HAS_OWN(this.snapshot.remoteOnly, prior.objectId);
     const priorMarker = hadPriorMarker ? this.snapshot.remoteOnly[prior.objectId] : undefined;
     const restoreMemoryMarker = () => {
       if (hadPriorMarker) this.snapshot.remoteOnly[prior.objectId] = priorMarker;
@@ -2086,7 +2110,7 @@ class SyncEngine {
     const entry = activeMatches[0] || matches[0];
     if (!entry) fail("No remote-only object is recorded for this path", "remote_object_unavailable");
     const result = await this.adapter.list(entry.objectId);
-    const records = Array.isArray(result) ? result : Array.isArray(result?.objects) ? result.objects : result ? [result] : [];
+    const records = NATIVE_ARRAY_IS_ARRAY(result) ? result : NATIVE_ARRAY_IS_ARRAY(result?.objects) ? result.objects : result ? [result] : [];
     if (!records.length) fail("Remote object is no longer available", "remote_object_unavailable");
     const operation = envelopeCopy(protocol.validateStoredOperation(records[0]));
     if (operation.objectId !== entry.objectId || !this.operationDestinationIsSelected(operation)) {
@@ -2124,8 +2148,8 @@ class SyncEngine {
       if (transient(error)) { summary.offline = true; return; }
       throw error;
     }
-    const records = Array.isArray(result) ? result : result?.objects;
-    if (!Array.isArray(records)) fail("Sync pull returned an invalid record list", "invalid_pull");
+    const records = NATIVE_ARRAY_IS_ARRAY(result) ? result : result?.objects;
+    if (!NATIVE_ARRAY_IS_ARRAY(records)) fail("Sync pull returned an invalid record list", "invalid_pull");
     const rank = (operation) => {
       if (operation.tombstone || operation.operation === "delete") return 0;
       if (operation.metadata?.contentType === "inode/directory"

@@ -4,7 +4,28 @@
 // physical witness and a separate CAS floor are allowed to ACK an atomic pair.
 // The signing root MUST be pinned by the embedding process, never by sync JSON.
 const crypto = require("node:crypto");
-const protocol = require("./rootark-sync-protocol");
+const { types: { isProxy } } = require("node:util");
+const {
+  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
+  verify: NATIVE_VERIFY,
+  createHash: NATIVE_CREATE_HASH,
+  hashUpdate: NATIVE_HASH_UPDATE,
+  hashDigest: NATIVE_HASH_DIGEST,
+  keyType: NATIVE_TYPE,
+  keyAlgorithm: NATIVE_ALGORITHM,
+  publicExport: NATIVE_EXPORT,
+  keyEquals: NATIVE_EQUALS,
+  bufferFrom: NATIVE_BUFFER_FROM,
+  bufferToString: NATIVE_BUFFER_TO_STRING,
+  canonicalSortedJson: NATIVE_CANONICAL_SORTED_JSON,
+  freeze: NATIVE_FREEZE,
+  arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  ownKeys: NATIVE_OWN_KEYS,
+  jsonParse: NATIVE_JSON_PARSE,
+} = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
+
+// Verify native public-key identity, never caller-shadowable instance fields.
+// Reimport each pin so later instance method mutation cannot change readback.
 
 const DOMAIN = "Root.ark/sync-v2/atomic-owner-provisioning/v1\0";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -12,26 +33,30 @@ const SCOPE = /^[A-Za-z0-9._:-]{1,256}$/;
 const deny = () => Object.assign(new Error("Atomic batch owner provision is not independently authenticated"),
   { code: "authorization_required" });
 const exactKeys = (value, keys) => {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const actual = Reflect.ownKeys(value);
+  if (!value || typeof value !== "object" || NATIVE_ARRAY_IS_ARRAY(value)) return false;
+  const actual = NATIVE_OWN_KEYS(value);
   return actual.length === keys.length && actual.every((key) =>
     typeof key === "string" && keys.includes(key));
 };
 
 function pinnedProvisionerKey(input) {
   try {
-    let key;
+    if (isProxy(input)) throw deny();
+    let der;
     if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
-      key = crypto.createPublicKey({ key: Buffer.from(input), format: "der", type: "spki" });
+      der = NATIVE_BUFFER_FROM(input);
     } else if (typeof input === "string") {
       if (!/^[A-Za-z0-9_-]{40,512}$/.test(input)) throw deny();
-      const bytes = Buffer.from(input, "base64url");
-      if (bytes.toString("base64url") !== input) throw deny();
-      key = crypto.createPublicKey({ key: bytes, format: "der", type: "spki" });
-    } else if (input instanceof crypto.KeyObject && input.type === "public") {
-      key = input;
+      der = NATIVE_BUFFER_FROM(input, "base64url");
+      if (NATIVE_BUFFER_TO_STRING.call(der, "base64url") !== input) throw deny();
+    } else if (input instanceof crypto.KeyObject) {
+      if (NATIVE_TYPE.call(input) !== "public"
+        || NATIVE_ALGORITHM.call(input) !== "ed25519") throw deny();
+      der = NATIVE_EXPORT.call(input, { type: "spki", format: "der" });
     } else throw deny();
-    if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") throw deny();
+    const key = NATIVE_CREATE_PUBLIC_KEY({ key: der, format: "der", type: "spki" });
+    if (NATIVE_TYPE.call(key) !== "public"
+      || NATIVE_ALGORITHM.call(key) !== "ed25519") throw deny();
     return key;
   } catch { throw deny(); }
 }
@@ -41,7 +66,7 @@ function verifyPinnedAtomicOwnerProvision({ identity, scope, provisionerPublicKe
   // Detach all callback-owned certificate data exactly once; comparison and
   // Ed25519 verification must see identical canonical bytes, never getters.
   let detached;
-  try { detached = JSON.parse(protocol.canonicalJson(provisioning)); }
+  try { detached = NATIVE_JSON_PARSE(NATIVE_CANONICAL_SORTED_JSON(provisioning)); }
   catch { throw deny(); }
   if (!exactKeys(identity, ["accountId", "storeId", "username", "compartmentId"])
     || !exactKeys(detached, ["statement", "signature"])
@@ -69,26 +94,34 @@ function verifyPinnedAtomicOwnerProvision({ identity, scope, provisionerPublicKe
     witness = pinnedProvisionerKey(witnessPublicKey);
     cas = pinnedProvisionerKey(casPublicKey);
   } catch { throw deny(); }
-  if (statement.witnessSpki !== witness.export({ type: "spki", format: "der" }).toString("base64url")
-    || statement.casSpki !== cas.export({ type: "spki", format: "der" }).toString("base64url")) throw deny();
-  const signature = Buffer.from(detached.signature, "base64url");
-  if (signature.length !== 64 || signature.toString("base64url") !== detached.signature) throw deny();
+  if (statement.witnessSpki !== NATIVE_BUFFER_TO_STRING.call(
+    NATIVE_EXPORT.call(witness, { type: "spki", format: "der" }), "base64url")
+    || statement.casSpki !== NATIVE_BUFFER_TO_STRING.call(
+      NATIVE_EXPORT.call(cas, { type: "spki", format: "der" }), "base64url")) throw deny();
+  const signature = NATIVE_BUFFER_FROM(detached.signature, "base64url");
+  if (signature.length !== 64 || NATIVE_BUFFER_TO_STRING.call(signature, "base64url") !== detached.signature) throw deny();
   const pin = pinnedProvisionerKey(provisionerPublicKey);
-  if ([witness, cas].some((other) => other.export({ type: "spki", format: "der" }).equals(
-    pin.export({ type: "spki", format: "der" })))) throw deny();
-  if (!crypto.verify(null, Buffer.from(DOMAIN + protocol.canonicalJson(statement), "utf8"),
+  // All THREE separately administered principals must be physically distinct.
+  if (NATIVE_EQUALS.call(witness, cas) || NATIVE_EQUALS.call(witness, pin)
+    || NATIVE_EQUALS.call(cas, pin)) throw deny();
+  if (!NATIVE_VERIFY(null, NATIVE_BUFFER_FROM(DOMAIN + NATIVE_CANONICAL_SORTED_JSON(statement), "utf8"),
     pin, signature)) throw deny();
   // A signature by itself is REPLAYABLE. The trusted embedding must retain
   // the CURRENT certificate digest outside mutable sync config, server and
   // journal; an older but correctly signed certificate must fail closed.
-  const digest = crypto.createHash("sha256")
-    .update(DOMAIN + protocol.canonicalJson(detached), "utf8").digest("hex");
+  const hash = NATIVE_CREATE_HASH("sha256");
+  NATIVE_HASH_UPDATE.call(hash, DOMAIN + NATIVE_CANONICAL_SORTED_JSON(detached), "utf8");
+  const digest = NATIVE_HASH_DIGEST.call(hash, "hex");
   if (digest !== expectedDigest) throw deny();
-  return Object.freeze({ identity: Object.freeze({
+  // Expose the SAME newly-imported native signer identities used for the
+  // signed provisioning check. Consumers must never revisit a caller-owned
+  // KeyObject after this verification (its inherited kHandle can change).
+  return NATIVE_FREEZE({ identity: NATIVE_FREEZE({
     accountId: statement.accountId, storeId: statement.storeId,
     username: statement.username, compartmentId: statement.compartmentId,
-  }), publicKey: pin, provisioning: Object.freeze({
-    statement: Object.freeze(statement), signature: detached.signature,
+  }), publicKey: pin, witnessPublicKey: witness, casPublicKey: cas,
+  provisioning: NATIVE_FREEZE({
+    statement: NATIVE_FREEZE(statement), signature: detached.signature,
   }) });
 }
 
