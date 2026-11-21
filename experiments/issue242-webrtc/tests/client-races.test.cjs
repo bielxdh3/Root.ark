@@ -100,6 +100,52 @@ test('P2: delayed old-room close cannot revoke or tear down new-room peer', asyn
   assert.equal(f.peerConnections.at(-1).closed, false);
 });
 
+test('P2: leaving retires an old file-hash lock without clearing a newer room send', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'invite-A');
+  const oldSocket = f.sockets[0];
+  await f.incoming(oldSocket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(oldSocket, { type: 'peer-accepted', peerId: 'peer-A' });
+
+  let releaseOld;
+  const oldFile = { name: 'old.bin', size: 2,
+    arrayBuffer: () => new Promise(resolve => { releaseOld = resolve; }) };
+  const oldSend = f.sendFile(oldFile);
+  assert.equal(typeof releaseOld, 'function', 'old file hashing must be pending');
+
+  f.elements.get('leave').onclick();
+  assert.equal(f.snapshot().roomId, null);
+  assert.equal(f.snapshot().peers.length, 0);
+
+  f.joinRoom('room-B', 'invite-B');
+  const newSocket = f.sockets[1];
+  await f.incoming(newSocket, { type: 'joined', role: 'host', peerId: 'host-B' });
+  await f.incoming(newSocket, { type: 'peer-accepted', peerId: 'peer-B' });
+
+  let releaseNew;
+  const newFile = { name: 'new.bin', size: 2,
+    arrayBuffer: () => new Promise(resolve => { releaseNew = resolve; }) };
+  const newSend = f.sendFile(newFile);
+  assert.equal(typeof releaseNew, 'function', 'new room file hashing must be pending');
+
+  let thirdReadStarted = false;
+  const thirdFile = { name: 'third.bin', size: 2,
+    arrayBuffer: () => { thirdReadStarted = true; return Promise.resolve(new Uint8Array([7, 8]).buffer); } };
+  await f.sendFile(thirdFile);
+  assert.equal(thirdReadStarted, false, 'the new room must retain its own preparation lock');
+
+  releaseOld(new Uint8Array([1, 2]).buffer);
+  await oldSend;
+  await f.sendFile(thirdFile);
+  assert.equal(thirdReadStarted, false,
+    'a stale old-room finally block must not release the newer room preparation lock');
+
+  releaseNew(new Uint8Array([3, 4]).buffer);
+  await newSend;
+  assert.equal(f.snapshot().peers.some(peer => peer.outgoingPhase === 'offered'), true,
+    'the new room send must complete after its own hash resolves');
+});
+
 test('P2: empty offer IDs cannot create unbounded consent panels; valid offer still works', async () => {
   const f = clientFixture();
   f.joinRoom('room', 'invitation');
