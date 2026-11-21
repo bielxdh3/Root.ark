@@ -389,6 +389,9 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
   // BEFORE the engine linked its private staging file into the target.
   if (!staging) return;
   const target = await contained(rootDir, relativePath, false);
+  // Required after the held descriptor closes and the durable hardlink removal
+  // has been verified; keep this scope outside the descriptor's try block.
+  const directoryName = path.dirname(target);
   // Pin the original inode before consulting the mutable target pathname.
   // A swapped path cannot authorize recovery of unrelated signed bytes.
   const handle = await fsp.open(target, fs.constants.O_RDONLY
@@ -404,7 +407,6 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
     || current.ino.toString() !== staging.ino) {
     fail("Historical restore staging identity is not proven", "restore_local_materialization_missing");
   }
-  const directoryName = path.dirname(target);
   const staged = path.join(directoryName, staging.name);
   await containedAbsolute(rootDir, staged, false);
   const stagedStats = await fsp.lstat(staged, { bigint: true }).catch((error) => {
