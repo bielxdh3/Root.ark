@@ -1266,6 +1266,39 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "the originally authenticated reader must supply both HTTP reads and the post-AEAD read");
     assert.equal(substitutedRosterReads, 0,
       "a callback cannot replace the final independent roster reader after signed GET");
+    // The independent roster can also poison mutable Buffer/Object methods at
+    // the FINAL release boundary. Use the genuine HTTP, HPKE and AEAD path;
+    // after its third read there must be no mutable global crypto/byte path.
+    const originalBufferFrom = Buffer.from;
+    const originalObjectFreeze = Object.freeze;
+    let finalPoisonReads = 0;
+    let finalPoisonReached = false;
+    let poisonedShare;
+    try {
+      poisonedShare = await openProtectedRecipientShareFile({
+        ...bridgeArgs,
+        redeemInput: { ...recipientShareInput,
+          readIndependentAuthority: async () => {
+            const current = await readIndependentAuthority();
+            if (++finalPoisonReads === 3) {
+              finalPoisonReached = true;
+              Buffer.from = () => { throw Error("POISONED_BUFFER_FACTORY"); };
+              Object.freeze = () => { throw Error("POISONED_FREEZE"); };
+            }
+            return current;
+          },
+        },
+      });
+    } finally {
+      Buffer.from = originalBufferFrom;
+      Object.freeze = originalObjectFreeze;
+    }
+    assert.equal(finalPoisonReached, true,
+      "poisoning must happen only after both signed GET checks and real file AEAD");
+    assert.equal(finalPoisonReads, 3);
+    assert.deepEqual(Buffer.from(poisonedShare.data), bytes,
+      "final receipt must depend on captured native intrinsics, not late globals");
+    poisonedShare.data.fill(0);
     // P2: the independently verified owner HPKE CEK is still valid when B
     // starts file AEAD, but its owner approval/witness expires DURING the
     // final file decrypt. Share grant expires later, so checking only the

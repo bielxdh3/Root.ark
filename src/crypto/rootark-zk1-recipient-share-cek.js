@@ -3,7 +3,8 @@
 // DEV-OFF recipient-side bridge. Requires separately provisioned owner/V2
 // custody and a real owner-approved, recipient-specific HPKE file CEK.
 const crypto = require("node:crypto");
-const { isProxy: isNativeProxy } = require("node:util").types;
+const { isProxy: isNativeProxy, isSharedArrayBuffer: nativeIsSharedArrayBuffer,
+  isUint8Array: nativeIsUint8Array } = require("node:util").types;
 const z = require("./rootark-zk-1");
 const { redeemProtectedCiphertextShare } =
   require("../../public/client/rootark-zk1-recipient-share");
@@ -17,6 +18,28 @@ const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
 const nativeReleaseNow = Date.now;
 const nativeReleaseFloor = Math.floor;
 const nativeReflectApply = Reflect.apply.bind(Reflect);
+const nativeOwnDescriptor = Object.getOwnPropertyDescriptor.bind(Object);
+const nativeAllDescriptors = Object.getOwnPropertyDescriptors.bind(Object);
+const nativeGetPrototype = Object.getPrototypeOf.bind(Object);
+const nativeOwnKeys = Reflect.ownKeys.bind(Reflect);
+const nativeHasOwn = Object.hasOwn.bind(Object);
+const nativeIsArray = Array.isArray.bind(Array);
+const nativeIsSafeInteger = Number.isSafeInteger.bind(Number);
+const nativeUint8Array = Uint8Array;
+const nativeTypedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const nativeTypedLength = nativeOwnDescriptor(nativeTypedArrayPrototype, "length").get;
+const nativeTypedByteLength = nativeOwnDescriptor(nativeTypedArrayPrototype, "byteLength").get;
+const nativeTypedByteOffset = nativeOwnDescriptor(nativeTypedArrayPrototype, "byteOffset").get;
+const nativeTypedBuffer = nativeOwnDescriptor(nativeTypedArrayPrototype, "buffer").get;
+const nativeTypedSet = Uint8Array.prototype.set;
+const nativeTypedFill = Uint8Array.prototype.fill;
+const nativeBufferFrom = Buffer.from.bind(Buffer);
+const nativeBufferToString = Buffer.prototype.toString;
+const nativeBufferConcat = Buffer.concat.bind(Buffer);
+const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
+const nativeCreatePublicKey = crypto.createPublicKey.bind(crypto);
+const nativeVerify = crypto.verify.bind(crypto);
+const nativeFreeze = Object.freeze.bind(Object);
 
 const SHARE_DOMAIN = Buffer.from("Root.ark/zk-1/protected-ciphertext-share/v1\0");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
@@ -36,35 +59,77 @@ const OFFER = ["schema", "grant", "recipientUsername", "recipientDeviceId",
   "metadata", "envelope", "authorizesProductionIo", "externalCustodyProven"];
 function deny() { throw Error("ZK_SHARE_FILE_OPEN_DENIED"); }
 function denyOffer() { throw Error("ZK_SHARE_OFFER_DENIED"); }
-const b64 = (value) => Buffer.from(value).toString("base64url");
+// Independent roster readers may mutate typed-array prototype methods, own
+// `length` fields or Buffer.from between awaited signature checks. Verify the
+// actual view's native slots and copy its bytes without using its iterator.
+function copyNativeBytes(value, minLength, maxLength) {
+  if (isNativeProxy(value) || !nativeIsUint8Array(value)) deny();
+  const length = nativeReflectApply(nativeTypedLength, value, []);
+  const byteLength = nativeReflectApply(nativeTypedByteLength, value, []);
+  const byteOffset = nativeReflectApply(nativeTypedByteOffset, value, []);
+  const backing = nativeReflectApply(nativeTypedBuffer, value, []);
+  if (!nativeIsSafeInteger(length) || length < minLength || length > maxLength
+    || byteLength !== length || !nativeIsSafeInteger(byteOffset)
+    || byteOffset < 0 || nativeIsSharedArrayBuffer(backing)) deny();
+  const bytes = new nativeUint8Array(length);
+  nativeReflectApply(nativeTypedSet, bytes, [value]);
+  return nativeBufferFrom(nativeReflectApply(nativeTypedBuffer, bytes, []), 0, length);
+}
+const copyNativeBytes32 = (value) => copyNativeBytes(value, 32, 32);
+const BASE64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+function b64(value) {
+  const bytes = copyNativeBytes(value, 1, 128);
+  const length = nativeReflectApply(nativeTypedLength, bytes, []);
+  let encoded = "";
+  for (let index = 0; index < length; index += 3) {
+    const a = bytes[index];
+    const b = index + 1 < length ? bytes[index + 1] : 0;
+    const c = index + 2 < length ? bytes[index + 2] : 0;
+    encoded += BASE64URL[a >>> 2];
+    encoded += BASE64URL[((a & 3) << 4) | (b >>> 4)];
+    if (index + 1 < length) encoded += BASE64URL[((b & 15) << 2) | (c >>> 6)];
+    if (index + 2 < length) encoded += BASE64URL[c & 63];
+  }
+  return encoded;
+}
+function wipeNativeBytes(value) {
+  if (value != null && !isNativeProxy(value) && nativeIsUint8Array(value)) {
+    nativeReflectApply(nativeTypedFill, value, [0]);
+  }
+}
 function from64(value, length) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)
     || value.length > Math.ceil(length * 4 / 3) + 4) denyOffer();
-  const bytes = Buffer.from(value, "base64url");
+  const bytes = nativeBufferFrom(value, "base64url");
   if (bytes.length !== length || b64(bytes) !== value) denyOffer();
   return bytes;
 }
 function same(a, b) {
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  return a.length === b.length && nativeTimingSafeEqual(a, b);
 }
 function strict(value, names) {
-  if (!value || typeof value !== "object" || Array.isArray(value)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
-    || Reflect.ownKeys(value).length !== names.length
-    || names.some((name) => !Object.hasOwn(value, name))) deny();
+  if (!value || typeof value !== "object" || nativeIsArray(value)
+    || isNativeProxy(value)
+    || (nativeGetPrototype(value) !== Object.prototype
+      && nativeGetPrototype(value) !== null)
+    || nativeOwnKeys(value).length !== names.length) deny();
+  for (let index = 0; index < names.length; index++) {
+    const descriptor = nativeOwnDescriptor(value, names[index]);
+    if (!descriptor || !nativeHasOwn(descriptor, "value")) deny();
+  }
 }
 function snapshot(value, names) {
   strict(value, names);
-  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const descriptors = nativeAllDescriptors(value);
   const copy = Object.create(null);
   for (const name of names) {
     const descriptor = descriptors[name];
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+    if (!descriptor || !nativeHasOwn(descriptor, "value")) deny();
     const part = descriptor.value;
     if (part !== null && !["string", "number", "boolean"].includes(typeof part)) deny();
     copy[name] = part;
   }
-  return Object.freeze(copy);
+  return nativeFreeze(copy);
 }
 // Recipient contact pins come from the owner's separately authenticated
 // contact/device enrollment. Neither the server response nor its grant may
@@ -93,7 +158,7 @@ function snapshotAuthority(value) {
     || !(h.digest.value instanceof Uint8Array)
     || h.digest.value.length !== 32) denyOffer();
   const head = { revision: h.revision.value, epoch: h.epoch.value,
-    digest: Buffer.from(h.digest.value) };
+    digest: copyNativeBytes32(h.digest.value) };
   const sourceDevices = fields.devices.value;
   if (!Array.isArray(sourceDevices) || sourceDevices.length > 128) denyOffer();
   // Do not invoke an untrusted array's own map/iterator: it can substitute a
@@ -120,7 +185,7 @@ function snapshotAuthority(value) {
         || (Number.isSafeInteger(d.revokedAtEpoch.value)
           && d.revokedAtEpoch.value >= d.enrolledEpoch.value))) denyOffer();
     devices[index] = { deviceId: d.deviceId.value,
-      authorizationPublicKey: Buffer.from(d.authorizationPublicKey.value),
+      authorizationPublicKey: copyNativeBytes32(d.authorizationPublicKey.value),
       enrolledEpoch: d.enrolledEpoch.value, revokedAtEpoch: d.revokedAtEpoch.value };
   }
   return { scope, head, devices };
@@ -288,24 +353,24 @@ function currentAuthority(snapshotValue, statement, shareSignature, statementByt
   strict(snapshotValue.head, ["revision", "epoch", "digest"]);
   if (snapshotValue.head.revision !== statement.manifest_revision
     || snapshotValue.head.epoch !== statement.epoch
-    || !Buffer.from(snapshotValue.head.digest || []).equals(statement.manifest_digest)
-    || !Array.isArray(snapshotValue.devices) || snapshotValue.devices.length > 128) deny();
+    || !same(copyNativeBytes32(snapshotValue.head.digest),
+      copyNativeBytes32(statement.manifest_digest))
+    || !nativeIsArray(snapshotValue.devices) || snapshotValue.devices.length > 128) deny();
   for (const field of SCOPE) {
     if (snapshotValue.scope[field] !== b64(statement[field])) deny();
   }
   const active = (deviceId) => {
     const device = findUniqueDevice(snapshotValue.devices, deviceId);
     if (!device) deny();
-    if (device.revokedAtEpoch !== null || !Number.isSafeInteger(device.enrolledEpoch)
+    if (device.revokedAtEpoch !== null || !nativeIsSafeInteger(device.enrolledEpoch)
       || device.enrolledEpoch < 1 || device.enrolledEpoch > statement.epoch
-      || !(device.authorizationPublicKey instanceof Uint8Array)
-      || device.authorizationPublicKey.length !== 32) deny();
-    return Buffer.from(device.authorizationPublicKey);
+      || !nativeIsUint8Array(device.authorizationPublicKey)) deny();
+    return copyNativeBytes32(device.authorizationPublicKey);
   };
   active(statement.recipient_device_id);
   const issuer = active(statement.issuer_device_id);
-  if (!crypto.verify(null, Buffer.concat([SHARE_DOMAIN, statementBytes]),
-    crypto.createPublicKey({ key: Buffer.concat([ED25519_SPKI, issuer]),
+  if (!nativeVerify(null, nativeBufferConcat([SHARE_DOMAIN, statementBytes]),
+    nativeCreatePublicKey({ key: nativeBufferConcat([ED25519_SPKI, issuer]),
       format: "der", type: "spki" }), shareSignature)) deny();
 }
 async function openProtectedRecipientShareFile(input) {
@@ -390,7 +455,7 @@ async function openProtectedRecipientShareFile(input) {
     const releaseSeconds = nativeReleaseFloor(nativeReleaseNow() / 1000);
     if (releaseSeconds >= statement.expires_at || nowSeconds >= statement.expires_at
       || releaseSeconds >= verifiedReleaseExpiresAt || nowSeconds >= verifiedReleaseExpiresAt) deny();
-    const result = Object.freeze({
+    const result = nativeFreeze({
       schema: "rootark-zk1-recipient-share-file-dev/v1",
       grantId: receipt.grantId, objectId: receipt.objectId,
       revision: receipt.revision, epoch: receipt.epoch,
@@ -402,7 +467,7 @@ async function openProtectedRecipientShareFile(input) {
     plaintext = null;
     return result;
   } catch (_) { deny(); }
-  finally { opened?.cek?.fill(0); plaintext?.data?.fill(0); }
+  finally { wipeNativeBytes(opened?.cek); wipeNativeBytes(plaintext?.data); }
 }
 
 async function openPortableProtectedRecipientShareFile(input) {
