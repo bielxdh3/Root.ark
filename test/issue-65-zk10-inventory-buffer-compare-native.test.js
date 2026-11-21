@@ -233,14 +233,11 @@ test("P2 inventory: native key getter cannot replace signed member A with reques
   assert.equal((await inventory.verifySnapshot(input(signer.publicKey, memberB))).outcome,
     "ABSENT", "unsigned member B is absent");
 
-  const handle = Object.getOwnPropertySymbols(signer.publicKey)
-    .find((symbol) => symbol.description === "kHandle");
-  assert.ok(handle, "native Ed25519 handle must be reachable");
   const poisoned = Object.create(signer.publicKey);
   const originalIterator = Array.prototype[Symbol.iterator];
   let keyGetterReads = 0;
   let substituted = 0;
-  Object.defineProperty(poisoned, handle, { get() {
+  Object.defineProperty(poisoned, "type", { get() {
     keyGetterReads++;
     Array.prototype[Symbol.iterator] = function*() {
       // Only the post-signature membership loop can be substituted. CBOR
@@ -382,6 +379,27 @@ test("P2 inventory: signed object A must not make requested B PRESENT via post-k
     "PRESENT", "valid real Ed25519 owner remains accepted after the attack");
 });
 
+test("native Ed25519 handle lookup does not dispatch through a mutable Symbol.description getter", () => {
+  const { nativeEd25519Spki } = require("../src/crypto/rootark-zk1-native-ed25519-public-key");
+  const key = crypto.generateKeyPairSync("ed25519").publicKey;
+  const originalDescription = Object.getOwnPropertyDescriptor(Symbol.prototype, "description");
+  let descriptionReads = 0;
+  try {
+    Object.defineProperty(key, "type", { configurable: true, get() {
+      Object.defineProperty(Symbol.prototype, "description", { configurable: true,
+        get() { descriptionReads++; throw new Error("SYMBOL_DESCRIPTION_TRAP"); } });
+      return "public";
+    } });
+    const spki = nativeEd25519Spki(key);
+    assert.equal(spki.length, 44);
+    assert.equal(descriptionReads, 0,
+      "the captured native kHandle symbol must be compared by identity after caller getters");
+  } finally {
+    if (originalDescription) Object.defineProperty(Symbol.prototype, "description", originalDescription);
+    else delete Symbol.prototype.description;
+  }
+});
+
 test("P2 inventory: poisoned CBOR Object.keys cannot restore unsigned nonce B after encoding signed nonce A", async () => {
   const signer = crypto.generateKeyPairSync("ed25519");
   const signerKeyId = Buffer.alloc(16, 131);
@@ -516,4 +534,149 @@ test("P2 inventory: Set.prototype.has cannot turn signed nonce A into unsigned n
   assert.equal(replacements, 1, "independent positive canary demonstrates live hostile Set.has");
   assert.equal(restorations, replacements, "nonce B is restored after each transient replacement");
   assert.equal((await verify(signer.publicKey, signedA, signedNonceA)).outcome, "ABSENT");
+});
+
+test("P2 inventory: shadowed native handle export cannot pin A when B is configured", async () => {
+  const signerA = crypto.generateKeyPairSync("ed25519");
+  const signerB = crypto.generateKeyPairSync("ed25519");
+  const signerKeyId = Buffer.alloc(16, 251);
+  const scope = {
+    account_id: Buffer.alloc(16, 252),
+    compartment_id: Buffer.from("protected"),
+    keyring_id: Buffer.alloc(16, 253),
+  };
+  const entry = {
+    object_id: Buffer.alloc(16, 254),
+    revision: 1,
+    epoch: 1,
+    ciphertext_sha256: Buffer.alloc(32, 255),
+  };
+  const nonce = Buffer.alloc(32, 250);
+  const previousRoot = Buffer.alloc(32, 249);
+  const root = await inventory.computeRoot(scope, 1, previousRoot, [entry]);
+  const snapshotA = await inventory.createSignedSnapshot({
+    signerKeyId, privateKey: signerA.privateKey, scope, sequence: 1,
+    previousRoot, entries: [entry], nonce,
+  });
+  const snapshotB = await inventory.createSignedSnapshot({
+    signerKeyId, privateKey: signerB.privateKey, scope, sequence: 1,
+    previousRoot, entries: [entry], nonce,
+  });
+  const verify = (serialized, pinnedPublicKey) => inventory.verifySnapshot({
+    serialized,
+    pinnedPublicKey,
+    pinnedSignerKeyId: signerKeyId,
+    expectedScope: scope,
+    requested: entry,
+    minimumHead: { sequence: 1, root },
+    nonce,
+  });
+
+  assert.equal((await verify(snapshotA, signerA.publicKey)).outcome, "PRESENT",
+    "genuine signer A remains valid");
+  assert.equal((await verify(snapshotB, signerB.publicKey)).outcome, "PRESENT",
+    "genuine signer B remains valid");
+  let proxyKeyTraps = 0;
+  const proxyKey = new Proxy(signerB.publicKey, {
+    get(target, property, receiver) {
+      proxyKeyTraps++;
+      return Reflect.get(target, property, receiver);
+    },
+    getPrototypeOf(target) {
+      proxyKeyTraps++;
+      return Reflect.getPrototypeOf(target);
+    },
+  });
+  await assert.rejects(verify(snapshotA, proxyKey),
+    { code: "INVENTORY_SIGNER_KEY" }, "native KeyObject proxies are not trusted key pins");
+  assert.equal(proxyKeyTraps, 0, "native Proxy rejection must precede every KeyObject trap");
+
+  const handleSymbol = Object.getOwnPropertySymbols(signerB.publicKey)
+    .find((symbol) => symbol.description === "kHandle");
+  assert.ok(handleSymbol, "Node native KeyObject handle symbol must exist");
+  const handleDescriptor = Object.getOwnPropertyDescriptor(signerB.publicKey, handleSymbol);
+  assert.ok(handleDescriptor && Object.hasOwn(handleDescriptor, "value"),
+    "genuine public KeyObject must own a data handle");
+  const handle = handleDescriptor.value;
+  assert.equal(Object.getOwnPropertyDescriptor(handle, "export"), undefined,
+    "fresh native handle must not start with an own export override");
+
+  // The hostile handle exporter lies that configured key B is actually A.
+  // Only public SPKI bytes are used; no private material is exported or logged.
+  const spkiA = Buffer.from(signerA.publicKey.export({ type: "spki", format: "der" }));
+  let shadowedExportCalls = 0;
+  Object.defineProperty(handle, "export", {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value() {
+      shadowedExportCalls++;
+      return Buffer.from(spkiA);
+    },
+  });
+
+  let accepted;
+  let rejected;
+  try {
+    try {
+      accepted = await verify(snapshotA, signerB.publicKey);
+    } catch (error) {
+      rejected = error;
+    }
+  } finally {
+    delete handle.export;
+  }
+
+  assert.equal(accepted, undefined,
+    "snapshot A must not verify with configured B through a shadowed native exporter; observed outcome=" + (accepted?.outcome ?? "rejected"));
+  assert.equal(rejected?.code, "INVENTORY_SIGNER_KEY",
+    "a shadowed native-handle exporter must be rejected before signature verification");
+  assert.equal(shadowedExportCalls, 0,
+    "validation must reject the altered handle before invoking its own export method");
+  const originalHandlePrototype = Object.getPrototypeOf(handle);
+  const substitutedHandlePrototype = Object.create(originalHandlePrototype);
+  let inheritedShadowCalls = 0;
+  Object.defineProperty(substitutedHandlePrototype, "export", {
+    configurable: true,
+    value() { inheritedShadowCalls++; return Buffer.from(spkiA); },
+  });
+  Object.setPrototypeOf(handle, substitutedHandlePrototype);
+  try {
+    await assert.rejects(verify(snapshotA, signerB.publicKey),
+      { code: "INVENTORY_SIGNER_KEY" },
+      "a substituted native handle prototype must not redirect its inherited exporter");
+  } finally {
+    Object.setPrototypeOf(handle, originalHandlePrototype);
+  }
+  assert.equal(inheritedShadowCalls, 0,
+    "prototype substitution must be rejected before inherited export dispatch");
+  let exportOwner = originalHandlePrototype;
+  let exportOwnerDescriptor = null;
+  while (exportOwner && !exportOwnerDescriptor) {
+    exportOwnerDescriptor = Object.getOwnPropertyDescriptor(exportOwner, "export");
+    if (!exportOwnerDescriptor) exportOwner = Object.getPrototypeOf(exportOwner);
+  }
+  assert.ok(exportOwner && exportOwnerDescriptor
+    && Object.hasOwn(exportOwnerDescriptor, "value"),
+  "the captured native handle exporter must have a data-property owner");
+  assert.ok(exportOwnerDescriptor.configurable || exportOwnerDescriptor.writable,
+    "the Node native exporter can be adversarially replaced in this runtime");
+  let replacedNativeExportCalls = 0;
+  Object.defineProperty(exportOwner, "export", {
+    ...exportOwnerDescriptor,
+    value() { replacedNativeExportCalls++; return Buffer.from(spkiA); },
+  });
+  try {
+    await assert.rejects(verify(snapshotB, signerB.publicKey),
+      { code: "INVENTORY_SIGNER_KEY" },
+      "a later replacement of the native handle prototype exporter must be rejected");
+  } finally {
+    Object.defineProperty(exportOwner, "export", exportOwnerDescriptor);
+  }
+  assert.equal(replacedNativeExportCalls, 0,
+    "the pinned native exporter identity must be checked before dispatch");
+  assert.equal((await verify(snapshotA, signerA.publicKey)).outcome, "PRESENT",
+    "legitimate A verification remains available after the rejected attack");
+  assert.equal((await verify(snapshotB, signerB.publicKey)).outcome, "PRESENT",
+    "legitimate B verification remains available after the rejected attack");
 });

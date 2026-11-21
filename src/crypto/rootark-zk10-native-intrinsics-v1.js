@@ -7,7 +7,7 @@
 // It does not defend against an untrusted script running BEFORE initial load
 // or supply independent custody, a protected process, or production I/O.
 const crypto = require("node:crypto");
-const { types: { isProxy } } = require("node:util");
+const { types: { isProxy, isKeyObject } } = require("node:util");
 // Capture these before the first caller-owned KeyObject getter too. Even an
 // immutable JSON encoder can be retargeted via Array.join or Buffer.from.
 // Calling a captured function through .call is insufficient: the dispatch
@@ -30,6 +30,7 @@ const ARRAY_SOME = Array.prototype.some;
 const ARRAY_SORT = Array.prototype.sort;
 const ARRAY_IS_ARRAY = Array.isArray.bind(Array);
 const OWN_KEYS = Reflect.ownKeys.bind(Reflect);
+const OWN_SYMBOLS = Object.getOwnPropertySymbols.bind(Object);
 const OWN_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
 const GET_PROTOTYPE = Object.getPrototypeOf.bind(Object);
 const HAS_OWN = Object.hasOwn.bind(Object);
@@ -40,11 +41,37 @@ const OBJECT_FREEZE = Object.freeze.bind(Object);
 
 const createPublicKey = crypto.createPublicKey.bind(crypto);
 const createHash = crypto.createHash.bind(crypto);
-const prototype = Object.getPrototypeOf(createHash("sha256"));
-const publicPrototype = Object.getPrototypeOf(createPublicKey({
+const prototype = GET_PROTOTYPE(createHash("sha256"));
+const probePublicKey = createPublicKey({
   key: BUFFER_FROM("302a300506032b6570032100" + "00".repeat(32), "hex"),
   format: "der", type: "spki",
-}));
+});
+const publicPrototype = GET_PROTOTYPE(probePublicKey);
+const probeKeySymbols = OWN_SYMBOLS(probePublicKey);
+let probeHandleSymbol = null;
+for (let index = 0; index < probeKeySymbols.length; index += 1) {
+  if (probeKeySymbols[index].description === "kHandle") {
+    if (probeHandleSymbol) throw new TypeError("native KeyObject handle is ambiguous");
+    probeHandleSymbol = probeKeySymbols[index];
+  }
+}
+const probeHandleDescriptor = probeHandleSymbol
+  ? OWN_DESCRIPTOR(probePublicKey, probeHandleSymbol) : null;
+const probeHandle = probeHandleDescriptor && HAS_OWN(probeHandleDescriptor, "value")
+  ? probeHandleDescriptor.value : null;
+const nativeHandlePrototype = probeHandle ? GET_PROTOTYPE(probeHandle) : null;
+let nativeHandleExportOwner = nativeHandlePrototype;
+let nativeHandleExportDescriptor = null;
+for (let depth = 0; nativeHandleExportOwner && depth < 8; depth += 1) {
+  nativeHandleExportDescriptor = OWN_DESCRIPTOR(nativeHandleExportOwner, "export");
+  if (nativeHandleExportDescriptor) break;
+  nativeHandleExportOwner = GET_PROTOTYPE(nativeHandleExportOwner);
+}
+const nativeHandleExport = nativeHandleExportDescriptor
+  && HAS_OWN(nativeHandleExportDescriptor, "value") ? nativeHandleExportDescriptor.value : null;
+if (typeof nativeHandleExport !== "function") {
+  throw new TypeError("native KeyObject handle exporter unavailable");
+}
 const PRIMITIVE_STRINGIFY = JSON.stringify.bind(JSON);
 const JSON_PARSE = JSON.parse.bind(JSON);
 
@@ -166,6 +193,13 @@ module.exports = Object.freeze({
   arraySome: withSafeCall(ARRAY_SOME),
   arrayIsArray: ARRAY_IS_ARRAY,
   ownKeys: OWN_KEYS,
+  ownSymbols: OWN_SYMBOLS,
+  isProxy,
+  isKeyObject,
+  nativeHandlePrototype,
+  nativeHandleSymbol: probeHandleSymbol,
+  nativeHandleExportOwner,
+  nativeHandleExport,
   ownDescriptor: OWN_DESCRIPTOR,
   getPrototype: GET_PROTOTYPE,
   hasOwn: HAS_OWN,
