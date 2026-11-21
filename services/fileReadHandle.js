@@ -30,7 +30,11 @@ function openReadHandle(filePath) {
     const stableSnapshot = (stat) => stat.dev === opened.dev && stat.ino === opened.ino
       && stat.mode === opened.mode && stat.size === opened.size
       && stat.mtimeNs === opened.mtimeNs && stat.ctimeNs === opened.ctimeNs;
-    if (!opened.isFile() || !currentPath.isFile() || currentPath.isSymbolicLink()
+    // Do not authorize a share through an ambiguous hardlink alias, even if
+    // the caller has managed to bind the named pathname to a stable inode.
+    // This is the same single-link custody guard as the #265 parent branch.
+    if (!opened.isFile() || opened.nlink !== 1n
+      || !currentPath.isFile() || currentPath.isSymbolicLink()
       || !stableSnapshot(currentPath) || !stableSnapshot(afterPathCheck)) {
       throw fileReadError("FILE_HANDLE_CHANGED", "File changed while it was being opened");
     }
