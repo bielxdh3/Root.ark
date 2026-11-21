@@ -1140,6 +1140,9 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
   // BEFORE the engine linked its private staging file into the target.
   if (!staging) return;
   const target = await contained(rootDir, relativePath, false);
+  // Required after the held descriptor closes and the durable hardlink removal
+  // has been verified; keep this scope outside the descriptor's try block.
+  const directoryName = path.dirname(target);
   // Acquire and pin the target descriptor BEFORE using the pathname to
   // decide whether the old hardlink is eligible for recovery. A concurrent
   // writer may swap a name at any time; only fstat of this held descriptor
@@ -1158,7 +1161,6 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
     || bigIntToString(current.ino) !== staging.ino) {
     fail("Historical restore staging identity is not proven", "restore_local_materialization_missing");
   }
-  const directoryName = path.dirname(target);
   const staged = path.join(directoryName, staging.name);
   await containedAbsolute(rootDir, staged, false);
   const stagedStats = await nativeReflectApply(nativePromiseCatch,

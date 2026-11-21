@@ -2110,7 +2110,7 @@ test("#67 P2: failed POSIX directory fsync after link cannot authorize push on r
     await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
       (error) => error.code === "EIO");
     assert.equal(injectionsRemaining, 1, "first EIO must strike directory sync after physical link");
-    assert.equal((await readHeldRegularFile(target, current)).toString("utf8"),
+    assert.equal((await readHeldRegularFile(target)).toString("utf8"),
       "original authenticated bytes");
     const [signed] = await f.engine.journal.recover();
     assert.equal(await verifyAuthorizationProof(signed.authorization, signed, f.trusted), true);
