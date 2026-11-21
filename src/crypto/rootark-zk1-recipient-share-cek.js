@@ -16,6 +16,7 @@ const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
 // replacing the global Date.now function.
 const nativeReleaseNow = Date.now;
 const nativeReleaseFloor = Math.floor;
+const nativeReflectApply = Reflect.apply.bind(Reflect);
 
 const SHARE_DOMAIN = Buffer.from("Root.ark/zk-1/protected-ciphertext-share/v1\0");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
@@ -313,13 +314,30 @@ async function openProtectedRecipientShareFile(input) {
   try {
     strict(input, ["redeemInput", "envelope", "authority", "operatorMinimumSequence",
       "metadata", "deviceHpkePrivateKey", "nowSeconds"]);
-    const metadata = snapshot(input.metadata, METADATA);
-    const envelope = safeEnvelope(input.envelope);
-    const { redeemInput, authority, operatorMinimumSequence,
-      deviceHpkePrivateKey, nowSeconds } = input;
-    if (typeof redeemInput?.readIndependentAuthority !== "function"
+    const entry = Object.getOwnPropertyDescriptors(input);
+    if (Object.values(entry).some((field) => !Object.hasOwn(field, "value"))) deny();
+    const metadata = snapshot(entry.metadata.value, METADATA);
+    const envelope = safeEnvelope(entry.envelope.value);
+    const redeemInput = entry.redeemInput.value;
+    const authority = entry.authority.value;
+    const operatorMinimumSequence = entry.operatorMinimumSequence.value;
+    const deviceHpkePrivateKey = entry.deviceHpkePrivateKey.value;
+    const nowSeconds = entry.nowSeconds.value;
+    // Pin the same independently enrolled authority reader across signed GET,
+    // owner HPKE, file AEAD and final plaintext-release validation. A caller
+    // must not replace its function after the initial asynchronous GET with a
+    // stale but otherwise plausible roster reader.
+    const readerDescriptor = redeemInput && !isNativeProxy(redeemInput)
+      ? Object.getOwnPropertyDescriptor(redeemInput, "readIndependentAuthority") : null;
+    if (!readerDescriptor || !Object.hasOwn(readerDescriptor, "value")
+      || typeof readerDescriptor.value !== "function"
+      || isNativeProxy(readerDescriptor.value)
       || !Number.isSafeInteger(nowSeconds) || nowSeconds < 1) deny();
-    const receipt = await redeemProtectedCiphertextShare(redeemInput);
+    const readIndependentAuthority = () =>
+      nativeReflectApply(readerDescriptor.value, redeemInput, []);
+    const receipt = await redeemProtectedCiphertextShare({
+      ...redeemInput, readIndependentAuthority,
+    });
     if (receipt.ownerGrantSignatureVerified !== true
       || receipt.serverRevocationProofVerified !== false
       || receipt.authorizesPlaintextRelease !== false) deny();
@@ -362,7 +380,7 @@ async function openProtectedRecipientShareFile(input) {
     });
     // HPKE and file AEAD await. Check the independent head and both live devices
     // again immediately before releasing the decrypted file to this process.
-    currentAuthority(snapshotAuthority(await redeemInput.readIndependentAuthority()),
+    currentAuthority(snapshotAuthority(await readIndependentAuthority()),
       statement, shareSignature, statementBytes);
     // Only the owner CEK opener can attest which owner approval and witness
     // it ACTUALLY verified after the preceding asynchronous share redemption.

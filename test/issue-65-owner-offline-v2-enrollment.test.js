@@ -1244,6 +1244,28 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(Buffer.from(shared.data), bytes);
     assert.equal(shared.authorizesProductionIo, false);
     shared.data.fill(0);
+    let pinnedRosterReads = 0;
+    let substitutedRosterReads = 0;
+    const mutableRedemption = { ...recipientShareInput };
+    mutableRedemption.readIndependentAuthority = async () => {
+      pinnedRosterReads++;
+      if (pinnedRosterReads === 1) {
+        mutableRedemption.readIndependentAuthority = async () => {
+          substitutedRosterReads++;
+          return readIndependentAuthority();
+        };
+      }
+      return readIndependentAuthority();
+    };
+    const stableReaderShare = await openProtectedRecipientShareFile({
+      ...bridgeArgs, redeemInput: mutableRedemption,
+    });
+    assert.deepEqual(Buffer.from(stableReaderShare.data), bytes);
+    stableReaderShare.data.fill(0);
+    assert.equal(pinnedRosterReads, 3,
+      "the originally authenticated reader must supply both HTTP reads and the post-AEAD read");
+    assert.equal(substitutedRosterReads, 0,
+      "a callback cannot replace the final independent roster reader after signed GET");
     // P2: the independently verified owner HPKE CEK is still valid when B
     // starts file AEAD, but its owner approval/witness expires DURING the
     // final file decrypt. Share grant expires later, so checking only the
