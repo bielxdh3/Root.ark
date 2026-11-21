@@ -26,7 +26,10 @@ function makeChannel(overrides = {}) {
 function clientFixture() {
   const elements = new Map(), sockets = [], peerConnections = [];
   const makeNode = () => ({
-    children: [], dataset: {}, disabled: false, textContent: '',
+    children: [], dataset: {}, disabled: false, textContent: '', attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, String(value)); },
+    getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; },
+    removeAttribute(name) { this.attributes.delete(name); },
     append(...parts) { this.children.push(...parts); },
     replaceChildren(...parts) { this.children = [...parts]; },
     remove() { this.removed = true; },
@@ -66,8 +69,11 @@ function clientFixture() {
     TextDecoder,
     Uint8Array,
     ArrayBuffer,
+    AbortController,
+    DOMException,
     location: { origin: 'http://127.0.0.1:1234', pathname: '/' },
     setTimeout,
+    clearTimeout,
     console
   };
   vm.createContext(ctx);
