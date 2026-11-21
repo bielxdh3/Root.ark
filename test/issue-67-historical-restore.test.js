@@ -3396,3 +3396,57 @@ test("#67 P1: lost ACK retry uses the real HTTP route's 409 and the identical si
   const reopened = await new SyncObjectStore(storagePath, { atomicDeviceRegistry: true }).open();
   assert.equal(reopened.list("alice", "file-1")[0].operationId, restored.operationId);
 });
+
+test("#262 P1: ordinary markSeen cannot discharge a pending signed historical restore", async (t) => {
+  const f = await fixture(t);
+  const signed = await f.sign({ operation: "update",
+    operationId: `histrestore-${crypto.randomUUID()}`, versionId: "unadmitted-restore",
+    revision: { counter: 3, deviceId: "device-a" }, baseRevision: f.deleted.revision,
+    metadata: { path: "document.txt", name: "document.txt" },
+    plaintext: Buffer.from("signed but not physically admitted") });
+  await f.engine.journal.enqueue(signed);
+  await assert.rejects(f.engine.journal.markSeen(signed.operationId),
+    /independently verified markSeenExact/,
+    "even a direct ordinary journal ACK must preserve the original signed restore");
+  const [pending] = await f.engine.journal.recover();
+  assert.equal(pending.operationId, signed.operationId);
+  assert.equal(f.engine.journal.hasSeen(signed.operationId), false);
+});
+
+test("#262 P2: independent physical restore ACK promotes the durable observation", async (t) => {
+  const f = await fixture(t);
+  const outcome = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(outcome.pushed, true);
+  const digest = f.engine.journal.durableSignedReceiptDigest(outcome.operationId);
+  assert.match(digest, /^[a-f0-9]{64}$/);
+  assert.equal(f.engine.journal.state.admitted[outcome.operationId], digest,
+    "independently verified acknowledgement must promote the exact signed receipt");
+  assert.equal(Object.hasOwn(f.engine.journal.state.observed, outcome.operationId), false,
+    "the pre-observation must not consume a slot after physical admission");
+  assert.deepEqual(await f.engine.journal.recover(), []);
+});
+
+test("#262 P1: excluded signed restore LIST echo cannot consume pending physical admission", async (t) => {
+  const f = await fixture(t);
+  let echoed;
+  f.adapter.push = async (operation) => {
+    echoed = structuredClone(operation);
+    throw Object.assign(new Error("unproven server-side CAS conflict"),
+      { code: "sync_conflict", status: 409, current: structuredClone(operation) });
+  };
+  const queued = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(queued.pending, true);
+  assert.ok(echoed?.operationId.startsWith("histrestore-"));
+  f.engine.excludedPaths = ["document.txt"];
+  f.adapter.list = async () => [structuredClone(echoed)];
+  const summary = { pulled: 0, applied: 0, offline: false, conflicts: [] };
+  await f.engine.pullRemote(summary);
+  assert.equal(summary.pulled, 0);
+  assert.equal(f.engine.journal.hasSeen(echoed.operationId), false);
+  const [pending] = await f.engine.journal.recover();
+  assert.equal(pending.operationId, echoed.operationId,
+    "LIST cannot erase the signed outbox or its restore materialization record");
+  assert.equal(f.engine.journal.hasMaterializedRestore(pending), true);
+  assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"),
+    "original authenticated bytes");
+});

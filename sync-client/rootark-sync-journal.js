@@ -846,6 +846,10 @@ class SyncJournal {
       }
       const remainingPending = [];
       for (let cursor = 0; cursor < next.pending.length; cursor += 1) {
+        if (next.pending[cursor]?.operationId === operationId
+          && stringStartsWith(operationId, "histrestore-")) {
+          throw new Error("Historical restores require independently verified markSeenExact");
+        }
         if (next.pending[cursor]?.operationId !== operationId) {
           remainingPending[remainingPending.length] = next.pending[cursor];
         }
