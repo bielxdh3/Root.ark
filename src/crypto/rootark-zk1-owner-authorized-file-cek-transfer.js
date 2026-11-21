@@ -46,7 +46,13 @@ const nativeSign = crypto.sign.bind(crypto);
 const nativeVerify = crypto.verify.bind(crypto);
 const nativeRandomBytes = crypto.randomBytes.bind(crypto);
 const nativeKeyObject = crypto.KeyObject;
-const nativeKeyObjectExport = nativeKeyObject.prototype.export;
+// Node 22 defines export on PublicKeyObject's prototype, not on the generic
+// KeyObject base. Pin the real native method through a fixed public test key;
+// no caller-supplied owner key is inspected while capturing the intrinsic.
+const nativeKeyObjectExport = nativeGetPrototypeOf(nativeCreatePublicKey({
+  key: nativeBufferFrom("302a300506032b6570032100d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "hex"),
+  format: "der", type: "spki",
+})).export;
 const nativeSubtle = crypto.webcrypto.subtle;
 const nativeSubtleExportKey = nativeSubtle.exportKey;
 const nativeJsonStringify = JSON.stringify;
