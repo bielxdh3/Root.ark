@@ -7,6 +7,26 @@ authorize any positive `TRANSFER_DATA`.
 
 ## What the source actually implements
 
+### Follow-up: genuine held-HANDLE NTFS enumeration (partial, still NO-GO)
+
+`sync-client/rootark-sync-windows-cfapi-acl-preflight.cpp` now has an optional
+`--enumerate` operation that obtains a real Windows directory HANDLE only after
+the owner-only DACL, native file ID, NTFS volume and reparse checks have passed.
+`GetFileInformationByHandleEx(FileIdBothDirectoryRestartInfo / FileIdBothDirectoryInfo)`
+iterates the **same opened HANDLE**, validates bounded native record offsets,
+excludes dot records, and rechecks its volume/file ID after enumeration. It
+returns only the count; names and private bytes are neither printed nor sent.
+The disposable native Windows test creates **16,385** distinct empty entries,
+verifies the exact full count and rejects a broad-DACL root. This is a real
+read-only OS primitive rather than a simulated success.
+
+It does **not** prove a transactionally consistent directory view against a
+concurrent same-principal writer, authorize any listed child, or provide a
+native `openat`-equivalent child HANDLE, rollback protection, signed owner
+authority, CFAPI registration, Cloud Files callback, placeholder or hydration.
+It cannot satisfy `openNativeRootSession(true)` or lift any positive FOD skip.
+**The product remains NO-GO for native Files On-Demand and recovery.**
+
 - `sync-client/rootark-sync-windows-cfapi-deny-callback.cpp:22-46,76-95`
   registers a `FETCH_DATA` function in an **in-process self-test table**.
   The only `CfExecute` call uses `STATUS_CLOUD_FILE_UNSUCCESSFUL` and

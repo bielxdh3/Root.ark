@@ -113,11 +113,41 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     diagnostic.stage("OWNER_NO_TRANSFER");
     assert.equal(strong.output.cloudDataBytesTransferred, 0);
 
+    // A genuine native NTFS directory HANDLE must enumerate beyond 16,384
+    // entries without JS pathname reopens or truncation. All generated empty
+    // files are confined to the disposable owner-ACL fixture, not the user's
+    // sync root; the result is informational, NEVER proof of signed custody.
+    diagnostic.stage("OWNER_NATIVE_ENUMERATE_CREATE");
+    const entries = 16_385;
+    for (let start = 0; start < entries; start += 128) {
+      await Promise.all(Array.from({ length: Math.min(128, entries - start) }, (_, i) =>
+        fs.writeFile(path.join(strictRoot,
+          `native-entry-${String(start + i).padStart(5, "0")}.bin`), "", { flag: "wx" })));
+    }
+    diagnostic.stage("OWNER_NATIVE_ENUMERATE_VERIFY");
+    const enumerated = inspect(strictRoot); // ordinary ACL-only control remains unchanged
+    assert.equal(enumerated.status, 0);
+    const nativeEnumeration = runCompiledFixture(receipt, ["--enumerate", strictRoot], 25000);
+    assert.equal(nativeEnumeration.status, 0,
+      `native same-HANDLE enumeration failed: ${nativeEnumeration.stderr}`);
+    const listing = JSON.parse(nativeEnumeration.stdout.trim());
+    assert.equal(listing.aclPreflightPassed, true);
+    assert.equal(listing.nativeEnumerationInformational, true);
+    assert.equal(listing.directoryEntriesEnumerated, entries,
+      "native opened-HANDLE enumeration may not truncate a >16,384-entry root");
+    assert.equal(listing.cloudDataBytesTransferred, 0);
+    assert.equal(listing.syncRootRegistered, false,
+      "enumeration cannot activate or silently register a CFAPI sync root");
+
     diagnostic.stage("BROAD_INSPECT");
     const broad = inspect(exposedRoot);
     diagnostic.stage("BROAD_REJECT");
     assert.notEqual(broad.status, 0);
     assert.equal(broad.output.aclPreflightPassed, false);
+    const unauthorizedEnumeration = runCompiledFixture(receipt, ["--enumerate", exposedRoot]);
+    assert.notEqual(unauthorizedEnumeration.status, 0,
+      "a broad-access root may not become a native enumeration authority");
+    assert.equal(JSON.parse(unauthorizedEnumeration.stdout.trim()).directoryEntriesEnumerated, 0);
     diagnostic.stage("INHERITED_INSPECT");
     const inherited = inspect(inheritedRoot);
     diagnostic.stage("INHERITED_REJECT");

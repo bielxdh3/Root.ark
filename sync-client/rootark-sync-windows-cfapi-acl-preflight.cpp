@@ -9,8 +9,10 @@
 #include <Aclapi.h>
 #include <cfapi.h>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cwchar>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -105,7 +107,55 @@ bool trustedDacl(PSECURITY_DESCRIPTOR descriptor, PACL dacl,
   return ownerHasGrant;
 }
 
-bool inspect(const wchar_t* supplied, DWORD& platformBuild) {
+// First genuine handle-bound RootSession building block: stream the opened
+// directory's native NTFS entries, not a separate pathname enumeration. This
+// is strictly an informational preflight: without writer isolation, signed
+// object identities, cold-reopen proof and CFAPI callbacks, it can NEVER be
+// used to authorize file publication, removal or positive hydration.
+bool enumerateHeldDirectory(HANDLE directory, const FILE_ID_INFO& before,
+    std::uint64_t& total) {
+  constexpr DWORD kBufferSize = 64 * 1024;
+  constexpr std::uint64_t kMaxCount = 2'000'000;
+  constexpr std::size_t kMinimumEntry = offsetof(FILE_ID_BOTH_DIR_INFO, FileName);
+  std::vector<unsigned char> bytes(kBufferSize);
+  bool restart = true;
+  for (;;) {
+    const auto information = restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo;
+    restart = false;
+    if (!GetFileInformationByHandleEx(directory, information, bytes.data(), kBufferSize)) {
+      if (GetLastError() == ERROR_NO_MORE_FILES) break;
+      return false;
+    }
+    std::size_t offset = 0;
+    for (;;) {
+      if (offset > kBufferSize || kBufferSize - offset < kMinimumEntry) return false;
+      const auto* entry = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(bytes.data() + offset);
+      const DWORD next = entry->NextEntryOffset;
+      const std::size_t available = next ? static_cast<std::size_t>(next)
+        : static_cast<std::size_t>(kBufferSize - offset);
+      if (available < kMinimumEntry || available > kBufferSize - offset
+          || entry->FileNameLength == 0 || (entry->FileNameLength % sizeof(WCHAR)) != 0
+          || entry->FileNameLength > available - kMinimumEntry) return false;
+      const std::size_t characters = entry->FileNameLength / sizeof(WCHAR);
+      const bool dot = characters == 1 && entry->FileName[0] == L'.';
+      const bool dotdot = characters == 2 && entry->FileName[0] == L'.'
+        && entry->FileName[1] == L'.';
+      if (!dot && !dotdot && ++total > kMaxCount) return false;
+      if (!next) break;
+      if (next < kMinimumEntry + sizeof(WCHAR) || (next % sizeof(ULONG)) != 0) return false;
+      offset += next;
+    }
+  }
+  // One HANDLE is retained throughout; verify its real file ID and volume
+  // did not change. This DOES NOT prove a consistent snapshot against writes.
+  FILE_ID_INFO after{};
+  return GetFileInformationByHandleEx(directory, FileIdInfo, &after, sizeof(after))
+    && after.VolumeSerialNumber == before.VolumeSerialNumber
+    && std::memcmp(&after.FileId, &before.FileId, sizeof(before.FileId)) == 0;
+}
+
+bool inspect(const wchar_t* supplied, DWORD& platformBuild,
+    bool enumerate = false, std::uint64_t* enumerationCount = nullptr) {
   CF_PLATFORM_INFO platform{};
   if (FAILED(CfGetPlatformInfo(&platform)) || platform.BuildNumber < 16299)
     return false;
@@ -113,7 +163,8 @@ bool inspect(const wchar_t* supplied, DWORD& platformBuild) {
   if (!supplied || !*supplied) return false;
   // OPEN_REPARSE_POINT keeps the inspected handle on the exact final object;
   // ancestors and names are NOT securely pinned by this standalone probe.
-  ScopedHandle file(CreateFileW(supplied, FILE_READ_ATTRIBUTES | READ_CONTROL,
+  ScopedHandle file(CreateFileW(supplied, FILE_READ_ATTRIBUTES | READ_CONTROL
+      | (enumerate ? FILE_LIST_DIRECTORY : 0),
     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
     FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
   if (file.value == INVALID_HANDLE_VALUE) return false;
@@ -138,17 +189,28 @@ bool inspect(const wchar_t* supplied, DWORD& platformBuild) {
       OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
       &owner, nullptr, &dacl, nullptr, &descriptor.value) != ERROR_SUCCESS)
     return false;
-  return trustedDacl(descriptor.value, dacl, owner, user);
+  if (!trustedDacl(descriptor.value, dacl, owner, user)) return false;
+  if (enumerate) {
+    if (!enumerationCount) return false;
+    if (!enumerateHeldDirectory(file.value, id, *enumerationCount)) return false;
+  }
+  return true;
 }
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-  if (argc != 3 || std::wcscmp(argv[1], L"--inspect") != 0) return 2;
+  if (argc != 3 || (std::wcscmp(argv[1], L"--inspect") != 0
+      && std::wcscmp(argv[1], L"--enumerate") != 0)) return 2;
+  const bool enumerate = std::wcscmp(argv[1], L"--enumerate") == 0;
   DWORD platformBuild = 0;
-  const bool accepted = inspect(argv[2], platformBuild);
+  std::uint64_t count = 0;
+  const bool accepted = inspect(argv[2], platformBuild, enumerate, &count);
   std::printf("{\"aclPreflightPassed\":%s,\"handleIdentityCaptured\":%s,"
-    "\"platformBuild\":%lu,\"syncRootRegistered\":false,"
+    "\"platformBuild\":%lu,\"nativeEnumerationInformational\":%s,"
+    "\"directoryEntriesEnumerated\":%llu,\"syncRootRegistered\":false,"
     "\"cloudDataBytesTransferred\":0}\n",
-    accepted ? "true" : "false", accepted ? "true" : "false", platformBuild);
+    accepted ? "true" : "false", accepted ? "true" : "false", platformBuild,
+    enumerate && accepted ? "true" : "false",
+    static_cast<unsigned long long>(accepted ? count : 0));
   return accepted ? 0 : 4;
 }
