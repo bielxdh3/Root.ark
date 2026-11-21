@@ -271,8 +271,10 @@ function revokeCapability(token, username) {
     if (!row) return { status: "missing" };
     const metadata = safeJsonParse(row.metadata_json, {});
     if (metadata.shareKind !== "capability-v1") return { status: "missing" };
-    const owner = String(row.created_by || metadata.createdBy || "").trim().toLowerCase();
-    if (!owner || owner !== String(username || "").trim().toLowerCase()) {
+    // SQLite account identifiers are case-sensitive. Distinct case-colliding
+    // principals must never revoke one another's capability tokens.
+    const owner = row.created_by || metadata.createdBy;
+    if (typeof owner !== "string" || !owner || owner !== username) {
       return { status: "forbidden" };
     }
     const outcome = db.prepare(`UPDATE public_links SET revoked_at = ?

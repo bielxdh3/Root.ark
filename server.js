@@ -1452,7 +1452,7 @@ async function authenticateWebDavRequest(req, res) {
   let credentialVerified = false;
   if (!parseFailure) {
     credentialKey = webDavCredentialCache.keyFor(username, password);
-    cachedUser = loadUsers().find((entry) => sameUsername(entry.username, username));
+    cachedUser = loadUsers().find((entry) => entry.username === username);
     credentialVerified = webDavCredentialCache.isVerified(credentialKey, cachedUser);
   }
   const rejection = credentialVerified ? null : getLoginRejection(security);
@@ -1488,7 +1488,7 @@ async function authenticateWebDavRequest(req, res) {
     }
     // Re-validate against fresh data after every await: still exists, enabled, same password hash and sessionVersion.
     if (passwordOk) {
-      const current = loadUsers().find((entry) => sameUsername(entry.username, username));
+      const current = loadUsers().find((entry) => entry.username === username);
       const unchanged = Boolean(current) && !current.disabled && String(current.password || "") === snapshot.password && (current.sessionVersion || 0) === snapshot.sessionVersion;
       if (unchanged) {
         user = current;
@@ -4075,7 +4075,7 @@ function canAccessEncryptedFile(req, metadata) {
   }
 
   if (level === "user-key" || level === "dual") {
-    return Array.from(getEncryptedAuthorizedUsers(metadata)).some((username) => sameUsername(username, req.user?.username));
+    return Array.from(getEncryptedAuthorizedUsers(metadata)).some((username) => username === req.user?.username);
   }
 
   return false;
@@ -4463,7 +4463,7 @@ function hasFileAccess(req, folder, fileName, entries = loadFilePermissions(), e
 
   return (
     permissions.public ||
-    sameUsername(permissions.owner, req.user?.username) ||
+    permissions.owner === req.user?.username ||
     Boolean(userAccess?.read) ||
     Boolean(userAccess?.edit)
   );
@@ -4478,7 +4478,7 @@ function hasFileEditAccess(req, folder, fileName, entries = loadFilePermissions(
   if (!entry) return Boolean(req.user?.permissions?.delete);
 
   const permissions = normalizeFilePermissionEntry(entry);
-  if (sameUsername(permissions.owner, req.user?.username)) return true;
+  if (permissions.owner === req.user?.username) return true;
   if (permissions.public && Object.keys(permissions.users).length === 0) {
     return Boolean(req.user?.permissions?.delete);
   }
@@ -4491,7 +4491,8 @@ function hasPublicShareAccess(req, folder, fileName, entries = loadFilePermissio
   if (restoreProviderOrphans.isSuppressed(folder.id, fileName, "uploads", orphanSnapshot)) return canManageAccess(req);
   if (canManageAccess(req)) return true;
   const owner = getFilePermissionEntry(folder.id, fileName, entries)?.owner;
-  return typeof owner === "string" && owner.trim() !== "" && !sameUsername(owner, "sistema") && sameUsername(owner, req.user?.username);
+  return typeof owner === "string" && owner.trim() !== "" && !sameUsername(owner, "sistema")
+    && owner === req.user?.username;
 }
 
 function hasReadableFolderAccess(req, folder) {
@@ -5415,7 +5416,7 @@ async function findPendingApprovalTarget(req, requestedFolder, fileName, { allow
 function canAccessPendingFile(req, folderId, fileName) {
   if (req.user?.permissions?.listPending) return true;
   const owner = getPendingUploadOwner(folderId, fileName);
-  return Boolean(owner && sameUsername(owner, req.user?.username));
+  return Boolean(owner && owner === req.user?.username);
 }
 
 function resolveScopedFile(scope, rawName, rawFolderId = ROOT_FOLDER_ID) {
@@ -12594,7 +12595,7 @@ app.delete("/share/capabilities/revoke", shareRateLimit, authenticate, requirePe
   if (!link || link.shareKind !== "capability-v1") {
     return res.status(404).json({ error: "Capacidade indisponivel" });
   }
-  if (!sameUsername(link.createdBy, req.user.username)) {
+  if (link.createdBy !== req.user.username) {
     return res.status(403).json({ error: "Acesso negado" });
   }
   delete links[token];
