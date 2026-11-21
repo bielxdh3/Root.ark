@@ -50,6 +50,7 @@ const nativeArraySort = Array.prototype.sort;
 const nativeObjectHasOwn = Object.hasOwn;
 const nativeObjectAssign = Object.assign;
 const nativeObjectCreate = Object.create;
+const nativeObjectDefineProperty = Object.defineProperty;
 const nativeObjectSetPrototypeOf = Object.setPrototypeOf;
 const nativeObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const nativeObjectGetPrototypeOf = Object.getPrototypeOf;
@@ -383,7 +384,10 @@ function canonicalize(value) {
     const key = keys[index];
     const descriptor = nativeObjectGetOwnPropertyDescriptor(value, key);
     if (!descriptor || !nativeObjectHasOwn(descriptor, "value")) fail("Invalid JSON value");
-    result[key] = canonicalize(descriptor.value);
+    nativeObjectDefineProperty(result, key, {
+      value: canonicalize(descriptor.value), enumerable: true,
+      writable: true, configurable: true,
+    });
   }
   return result;
 }

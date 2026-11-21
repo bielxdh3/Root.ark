@@ -470,6 +470,10 @@ test("#262 P2: bounded canonical JSON preserves shared DAGs, rejects cycles and 
   const shared = { a: leaf, b: leaf };
   assert.equal(protocol.canonicalJson({ first: shared, second: shared }),
     '{"first":{"a":{"value":1},"b":{"value":1}},"second":{"a":{"value":1},"b":{"value":1}}}');
+  const reserved = JSON.parse('{"__proto__":{"polluted":true},"constructor":{"value":1}}');
+  assert.equal(protocol.canonicalJson(reserved),
+    '{"__proto__":{"polluted":true},"constructor":{"value":1}}');
+  assert.equal(Object.prototype.polluted, undefined);
 
   const originalSort = Array.prototype.sort;
   try {
