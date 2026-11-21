@@ -10,6 +10,13 @@ const test = require("node:test");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
+// Positive native pin/eviction/relocation suites are retained as executable
+// product oracles, but the RootSession contract deliberately rejects every
+// native mutation at present. An unavailable native provider is not a PASS
+// for these security properties; keep their status explicitly skipped until
+// the independently reviewed native implementation is introduced.
+const NATIVE_PIN_PENDING = "Requires native RootSession publication; currently fails closed";
+const nativeTest = (name, body) => test(name, { skip: NATIVE_PIN_PENDING }, body);
 
 async function fixture(t) {
   const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-device-pin-"));
@@ -71,7 +78,34 @@ async function fixture(t) {
   return { rootDir, open, adapter, state, remote, trusted };
 }
 
-test("issue 66: pin hydrates signed file, survives restart/offline and blocks explicit eviction; unpin retains bytes", async (t) => {
+test("issue 66: native-unavailable pin must fail closed without materializing or persisting a grant", async (t) => {
+  const { rootDir, open, state } = await fixture(t);
+  const engine = await open();
+  const localFile = path.join(rootDir, "docs", "a.txt");
+  const snapshotPath = path.join(rootDir, ".rootark-sync-index.json");
+  const journalPath = engine.journal.filePath;
+  const optionalBytes = async (file) => fsp.readFile(file).catch((error) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  const snapshotBefore = await optionalBytes(snapshotPath);
+  const journalBefore = await optionalBytes(journalPath);
+  assert.equal(await optionalBytes(localFile), null);
+  await assert.rejects(engine.pinLocal("docs/a.txt"),
+    { code: "root_session_native_unavailable" });
+  assert.deepEqual(await engine.pinStatus("docs/a.txt"), {
+    path: "docs/a.txt", pinned: false, localPresent: false, objectId: null,
+  });
+  assert.equal(await optionalBytes(localFile), null,
+    "denied native publication must not create a local plaintext cache");
+  assert.deepEqual(await optionalBytes(snapshotPath), snapshotBefore,
+    "denied pin must not publish a durable snapshot or pin record");
+  assert.deepEqual(await optionalBytes(journalPath), journalBefore,
+    "denied pin must not consume durable admission or journal state");
+  assert.equal(state.pushes, 0, "native denial never sends a signed write to the server");
+});
+
+nativeTest("issue 66: pin hydrates signed file, survives restart/offline and blocks explicit eviction; unpin retains bytes", async (t) => {
   const { rootDir, open, state } = await fixture(t);
   const engine = await open();
   assert.deepEqual(await engine.pinStatus("docs/a.txt"), {
@@ -97,7 +131,7 @@ test("issue 66: pin hydrates signed file, survives restart/offline and blocks ex
   assert.equal(state.pushes, 0);
 });
 
-test("issue 66: exclusion cannot evict a pinned file, and a missing pinned file cannot cause remote DELETE", async (t) => {
+nativeTest("issue 66: exclusion cannot evict a pinned file, and a missing pinned file cannot cause remote DELETE", async (t) => {
   const { rootDir, open, state } = await fixture(t);
   const pinned = await open();
   await pinned.pinLocal("docs/a.txt");
@@ -112,7 +146,7 @@ test("issue 66: exclusion cannot evict a pinned file, and a missing pinned file 
   assert.equal((await restarted.pinStatus("docs/a.txt")).pinned, true);
 });
 
-test("issue 66: excluded file is evicted after explicit unpin, without remote DELETE", async (t) => {
+nativeTest("issue 66: excluded file is evicted after explicit unpin, without remote DELETE", async (t) => {
   const { rootDir, open, state } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
   const excluded = await open(["docs"]);
@@ -125,7 +159,7 @@ test("issue 66: excluded file is evicted after explicit unpin, without remote DE
   assert.equal(state.records.get("object-a").tombstone, false);
 });
 
-test("issue 66: an independently signed remote DELETE cannot silently remove pinned local bytes", async (t) => {
+nativeTest("issue 66: an independently signed remote DELETE cannot silently remove pinned local bytes", async (t) => {
   const { rootDir, open, remote, state } = await fixture(t);
   const client = await open();
   await client.pinLocal("docs/a.txt");
@@ -136,7 +170,7 @@ test("issue 66: an independently signed remote DELETE cannot silently remove pin
   assert.equal(state.pushes, 0);
 });
 
-test("issue 66 P2: signed MOVE outside selected paths cannot evict a pinned origin across restart", async (t) => {
+nativeTest("issue 66 P2: signed MOVE outside selected paths cannot evict a pinned origin across restart", async (t) => {
   const { rootDir, open, remote, state, trusted } = await fixture(t);
   const client = await open();
   await client.pinLocal("docs/a.txt");
@@ -195,7 +229,7 @@ test("issue 66 P2: signed MOVE outside selected paths cannot evict a pinned orig
   assert.equal(state.pushes, 0);
 });
 
-test("issue 66 P2: signed out-of-scope directory relocation cannot drop a pinned descendant", async (t) => {
+nativeTest("issue 66 P2: signed out-of-scope directory relocation cannot drop a pinned descendant", async (t) => {
   const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
   const client = await open();
   await client.apply(await remote("create", "directory-object", "docs", "", 1,
@@ -223,7 +257,7 @@ test("issue 66 P2: signed out-of-scope directory relocation cannot drop a pinned
   assert.equal(state.pushes, 0);
 });
 
-test("issue 66 P2: explicit unpin permits a signed out-of-scope MOVE without remote DELETE", async (t) => {
+nativeTest("issue 66 P2: explicit unpin permits a signed out-of-scope MOVE without remote DELETE", async (t) => {
   const { rootDir, open, remote, adapter, state } = await fixture(t);
   const client = await open();
   await client.pinLocal("docs/a.txt");
@@ -272,7 +306,7 @@ test("issue 66: direct non-strict engine cannot pin without independently truste
   assert.equal((await nonStrict.pinStatus("docs/a.txt")).pinned, false);
 });
 
-test("issue 66 P2 POSIX: signed legacy case-alias files cannot create a second device pin or poison restart", async (t) => {
+nativeTest("issue 66 P2 POSIX: signed legacy case-alias files cannot create a second device pin or poison restart", async (t) => {
   if (process.platform === "win32") return t.skip("POSIX case-distinct filesystem regression; Windows coverage in shared tests");
   const { rootDir, open, state, remote } = await fixture(t);
   await remote("create", "object-b", "Docs/A.txt", "independent signed legacy bytes");
@@ -299,7 +333,7 @@ test("issue 66 P2 POSIX: signed legacy case-alias files cannot create a second d
   assert.equal(state.pushes, 0);
 });
 
-test("issue 66: aggregate pin status enumerates the persisted pin map only once", async (t) => {
+nativeTest("issue 66: aggregate pin status enumerates the persisted pin map only once", async (t) => {
   const { open, remote } = await fixture(t);
   const client = await open();
   await client.apply(await remote("create", "object-b", "docs/b.txt", "second authenticated bytes"));
@@ -340,7 +374,7 @@ function interceptSnapshotDirectoryFsync(t, directory, failures) {
   return { restore: () => { fsp.open = realOpen; }, count: () => injected };
 }
 
-test("issue 66 P2 POSIX: post-rename unpin fsync EIO compensates durable pin before allowing restart", async (t) => {
+nativeTest("issue 66 P2 POSIX: post-rename unpin fsync EIO compensates durable pin before allowing restart", async (t) => {
   if (process.platform === "win32") return t.skip("POSIX directory fsync failure boundary");
   const { rootDir, open, state } = await fixture(t);
   const client = await open();
@@ -358,7 +392,7 @@ test("issue 66 P2 POSIX: post-rename unpin fsync EIO compensates durable pin bef
   assert.equal(state.pushes, 0);
 });
 
-test("issue 66 P2 POSIX: indeterminate unpin plus failed compensation quarantines root on restart", async (t) => {
+nativeTest("issue 66 P2 POSIX: indeterminate unpin plus failed compensation quarantines root on restart", async (t) => {
   if (process.platform === "win32") return t.skip("POSIX directory fsync failure boundary");
   const { rootDir, open, state } = await fixture(t);
   const client = await open();
@@ -374,7 +408,7 @@ test("issue 66 P2 POSIX: indeterminate unpin plus failed compensation quarantine
   assert.equal(state.pushes, 0);
 });
 
-test("issue 66 P2: signed other-object MOVE/CREATE/UPDATE cannot overwrite a pinned destination", async (t) => {
+nativeTest("issue 66 P2: signed other-object MOVE/CREATE/UPDATE cannot overwrite a pinned destination", async (t) => {
   const { rootDir, open, remote, state } = await fixture(t);
   const pinned = await open();
   await pinned.pinLocal("docs/a.txt");
@@ -396,7 +430,7 @@ test("issue 66 P2: signed other-object MOVE/CREATE/UPDATE cannot overwrite a pin
   assert.equal(state.pushes, 0);
 });
 
-test("issue 66 P2: signed other-object ancestor mutations cannot stage a directory containing a pinned file", async (t) => {
+nativeTest("issue 66 P2: signed other-object ancestor mutations cannot stage a directory containing a pinned file", async (t) => {
   for (const action of ["delete", "create", "update", "move"]) {
     for (const ancestorPath of ["docs", "Docs"]) {
       await t.test(`${action} at ${ancestorPath} refuses before journal or filesystem mutation`, async (subtest) => {
@@ -437,7 +471,7 @@ test("issue 66 P2: signed other-object ancestor mutations cannot stage a directo
   }
 });
 
-test("issue 66 P2: signed relocation of a tracked ancestor cannot move a pinned subtree", async (t) => {
+nativeTest("issue 66 P2: signed relocation of a tracked ancestor cannot move a pinned subtree", async (t) => {
   for (const action of ["move", "update"]) {
     await t.test(`${action} of tracked docs refuses before any journal observation`, async (subtest) => {
       const { rootDir, open, remote } = await fixture(subtest);
@@ -461,7 +495,7 @@ test("issue 66 P2: signed relocation of a tracked ancestor cannot move a pinned 
   }
 });
 
-test("issue 66 P2: a sibling path must not be mistaken for an ancestor of a pinned file", async (t) => {
+nativeTest("issue 66 P2: a sibling path must not be mistaken for an ancestor of a pinned file", async (t) => {
   const { rootDir, open, remote } = await fixture(t);
   const client = await open();
   await client.pinLocal("docs/a.txt");
@@ -471,7 +505,7 @@ test("issue 66 P2: a sibling path must not be mistaken for an ancestor of a pinn
     "authenticated remote bytes");
 });
 
-test("issue 66: failed local pin journal commit never claims pin; a verified MOVE retains pinned identity", async (t) => {
+nativeTest("issue 66: failed local pin journal commit never claims pin; a verified MOVE retains pinned identity", async (t) => {
   const { rootDir, open, remote, state } = await fixture(t);
   const engine = await open();
   const originalPersist = engine.persistSnapshot.bind(engine);
