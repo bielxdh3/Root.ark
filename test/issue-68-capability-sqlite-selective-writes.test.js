@@ -444,3 +444,80 @@ test("issue 68 Windows trash skips a sibling removed during capability identity 
   if (result.includes("CASE_SENSITIVE_DIRECTORY")) return t.skip("NTFS directory is case-sensitive");
   assert.match(result, /TRASH_ALIAS_ENOENT_PASS/);
 });
+
+test("issue 68 Windows trash treats a source removed during identity pinning as missing", (t) => {
+  if (process.platform !== "win32") return t.skip("Windows capability alias enumeration");
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-source-enoent-"));
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
+  const script = `
+    "use strict";
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const root = ${JSON.stringify(path.resolve(__dirname, ".."))};
+    const trash = require(path.join(root, "services/trashService"));
+    const dir = path.join(process.cwd(), "uploads");
+    fs.mkdirSync(dir, { recursive: true });
+    const sourcePath = path.join(dir, "File.txt");
+    fs.writeFileSync(sourcePath, "source bytes");
+    const folder = { id: "root", name: "Root", uploadDir: dir };
+    const empty = () => ({});
+    const loaders = {
+      loadFilePermissions: empty, saveFilePermissions: () => {},
+      loadFileExpirations: empty, saveFileExpirations: () => {},
+      loadFileVersions: empty, saveFileVersions: () => {},
+      loadEncryptedFiles: empty, saveEncryptedFiles: () => {},
+      loadPublicLinks: empty, savePublicLinks: () => {},
+    };
+    const originalLstat = fs.lstatSync;
+    let injected = false;
+    fs.lstatSync = function (target, ...args) {
+      if (!injected && path.resolve(target) === path.resolve(sourcePath)) {
+        injected = true;
+        fs.unlinkSync(sourcePath);
+        const error = new Error("simulated concurrent source unlink");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return originalLstat.call(this, target, ...args);
+    };
+    let failure;
+    try {
+      try { trash.moveFileToTrash({ folder, fileName: "File.txt", deletedBy: "tester", loaders }); }
+      catch (error) { failure = error; }
+    } finally { fs.lstatSync = originalLstat; }
+    assert.equal(injected, true, "the source must disappear at the identity-pin boundary");
+    assert.equal(failure?.code, "TRASH_SOURCE_MISSING");
+    assert.equal(fs.existsSync(sourcePath), false);
+    assert.equal(fs.existsSync(path.join(process.cwd(), "data", "trash", "files")), false,
+      "a missing source must not create a trash item directory");
+    fs.writeFileSync(sourcePath, "source removed at rename");
+    const originalRename = fs.renameSync;
+    let renameInjected = false;
+    fs.renameSync = function (from, to) {
+      if (!renameInjected && path.resolve(from) === path.resolve(sourcePath)) {
+        renameInjected = true;
+        fs.unlinkSync(sourcePath);
+        const missing = new Error("source vanished before rename");
+        missing.code = "ENOENT";
+        throw missing;
+      }
+      return originalRename.call(this, from, to);
+    };
+    let renameFailure;
+    try {
+      try { trash.moveFileToTrash({ folder, fileName: "File.txt", deletedBy: "tester", loaders }); }
+      catch (error) { renameFailure = error; }
+    } finally { fs.renameSync = originalRename; }
+    assert.equal(renameInjected, true, "the late source race must reach the rename boundary");
+    assert.equal(renameFailure?.code, "TRASH_SOURCE_MISSING");
+    assert.equal(fs.existsSync(sourcePath), false);
+    console.log("TRASH_SOURCE_ENOENT_PASS");
+  `;
+  const result = execFileSync(process.execPath, ["-e", script], {
+    cwd: sandbox,
+    env: { ...process.env, DB_ENABLED: "false" },
+    timeout: 30_000, windowsHide: true, encoding: "utf8",
+  });
+  assert.match(result, /TRASH_SOURCE_ENOENT_PASS/);
+});
