@@ -70,7 +70,7 @@ for (const mode of ["json", "sqlite"]) {
       const cookies = login.headers["set-cookie"].map((entry) => entry.split(";", 1)[0]);
       const csrf = cookies.find((entry) => entry.startsWith("rootark_csrf=")).split("=", 2)[1];
       const revokeBody = JSON.stringify({ token });
-      const denied = await request(port, "/share/capabilities/revoke", {
+      const denied = await request(port, `/share/capabilities/${token}`, {
         method: "DELETE",
         headers: { origin, cookie: cookies.join("; "), "x-csrf-token": csrf,
           "content-type": "application/json",
@@ -79,7 +79,7 @@ for (const mode of ["json", "sqlite"]) {
       });
       assert.equal(denied.status, 403,
         "a distinct account with a case-colliding name cannot revoke an owner's capability");
-      const genuine = await authed("/share/capabilities/revoke", { token }, "DELETE");
+      const genuine = await authed(`/share/capabilities/${token}`, { token }, "DELETE");
       assert.equal(genuine.status, 204,
         "the authenticated issuer must retain their own revocation right");
     });
