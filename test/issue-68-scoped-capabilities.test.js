@@ -41,6 +41,50 @@ function request(port, requestPath, { method = "GET", headers = {}, body = "" } 
   });
 }
 
+for (const mode of ["json", "sqlite"]) {
+  test(`P2: distinct-case authenticated account cannot revoke issuer capability (${mode})`,
+    { timeout: 60_000 }, async (t) => {
+      const { authed, port, origin } = await startFixture(t, mode);
+      const issuer = mode === "sqlite" ? "admin" : "tester";
+      const impostor = issuer.toUpperCase();
+      const password = crypto.randomBytes(24).toString("base64url");
+      const account = await authed("/users", {
+        username: impostor, password, role: "user",
+        permissions: { listFiles: true },
+      });
+      assert.equal(account.status, 201, account.body);
+      const grant = await authed("/share/capabilities", {
+        name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+        permissions: ["download"], maxDownloads: 1,
+      });
+      assert.equal(grant.status, 201, grant.body);
+      const token = JSON.parse(grant.body).token;
+      const loginBody = JSON.stringify({ username: impostor, password });
+      const login = await request(port, "/auth/login", { method: "POST",
+        headers: { "content-type": "application/json",
+          "content-length": Buffer.byteLength(loginBody) },
+        body: loginBody,
+      });
+      assert.equal(login.status, 200, login.body);
+      assert.equal(JSON.parse(login.body).username, impostor);
+      const cookies = login.headers["set-cookie"].map((entry) => entry.split(";", 1)[0]);
+      const csrf = cookies.find((entry) => entry.startsWith("rootark_csrf=")).split("=", 2)[1];
+      const revokeBody = JSON.stringify({ token });
+      const denied = await request(port, "/share/capabilities/revoke", {
+        method: "DELETE",
+        headers: { origin, cookie: cookies.join("; "), "x-csrf-token": csrf,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(revokeBody) },
+        body: revokeBody,
+      });
+      assert.equal(denied.status, 403,
+        "a distinct account with a case-colliding name cannot revoke an owner's capability");
+      const genuine = await authed("/share/capabilities/revoke", { token }, "DELETE");
+      assert.equal(genuine.status, 204,
+        "the authenticated issuer must retain their own revocation right");
+    });
+}
+
 async function startFixture(t, mode, extraEnv = {}) {
   const sandbox = createPrivateAuthorityFixture(`rootark-share-permissions-${mode}-`);
   const dataDir = path.join(sandbox, "data");
