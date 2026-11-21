@@ -640,8 +640,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.equal(safe.core.owner_digest, committed.digest,
         `${label}: signed owner head pinned before await`);
     }
-    // The owner also must not create a fresh CEK grant after the signed
-    // approval expires while the real file AEAD open is pending.
+    // A hostile callback must not replace the module's wall clock after the
+    // real AEAD await. The signed owner lease remains authoritative.
     const originalWallClock = Date.now;
     let ownerDecryptFinished = false;
     subtle.decrypt = async function (...args) {
@@ -651,18 +651,25 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       return result;
     };
     try {
-      await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
+      const clockPinnedEnvelope = await cekTransfer.sealOwnerAuthorizedFileCek({
         ownerPrivateKey: owner.privateKey, ownerHeldCek,
         metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
         authority: publicAuthority,
-      }), /ZK_OWNER_FILE_CEK_DENIED/,
-      "A must refuse CEK rewrap after authorization expires during real file AEAD open");
+      });
+      assert.equal(clockPinnedEnvelope.core.expires_at, envelope.core.expires_at,
+        "an AEAD callback may not spoof a later wall clock or extend the signed owner lease");
     } finally {
       Date.now = originalWallClock;
       delete subtle.decrypt;
     }
     assert.equal(ownerDecryptFinished, true,
-      "test must reach the genuine file AEAD before expiring the grant");
+      "test must reach genuine file AEAD before rebinding the global clock");
+    await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
+      ownerPrivateKey: owner.privateKey, ownerHeldCek,
+      metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
+      authority: { ...publicAuthority, nowSeconds: signedCommittedHead.expires_at + 2 },
+    }), /ZK_OWNER_FILE_CEK_DENIED/,
+    "an actual trusted time beyond the owner lease must still deny CEK rewrap");
     for (const label of ["request", "metadata", "head", "opened envelope"]) {
       let accessed = 0;
       const accessor = { enumerable: true, configurable: true,
@@ -709,8 +716,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       ciphertextRoot: root, deviceHpkePrivateKey: bRecipient,
       nowSeconds: now + 9, ...overrides,
     });
-    // Expire the real signed authorization at the last awaited HPKE operation.
-    // A previously approved CEK must not escape after the time-bound grant dies.
+    // Rebind the mutable global clock after real HPKE; the pinned clock must
+    // not treat an attacker-supplied timestamp as wall-clock passage.
     const realHpkeOpen = z.hpkeOpen;
     const realDateNow = Date.now;
     let hpkeFinishedBeforeExpiry = false;
@@ -721,14 +728,23 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       return result;
     };
     try {
-      await assert.rejects(open(), /ZK_OWNER_FILE_CEK_DENIED/,
-        "B cannot release a CEK after expiry during real HPKE open");
+      const clockPinnedCek = await open();
+      assert.equal(clockPinnedCek.verifiedReleaseExpiresAt,
+        Math.min(envelope.core.expires_at, issued.approval.expires_at,
+          signedCommittedHead.expires_at),
+      "B returns exactly the original signed lease despite a forged Date.now callback");
+      clockPinnedCek.cek.fill(0);
     } finally {
       z.hpkeOpen = realHpkeOpen;
       Date.now = realDateNow;
     }
     assert.equal(hpkeFinishedBeforeExpiry, true,
-      "test must reach actual HPKE decrypt before the clock changes");
+      "test must reach actual HPKE decrypt before the forged clock changes");
+    await assert.rejects(open({
+      authority: { ...linked, nowSeconds: envelope.core.expires_at + 2 },
+      nowSeconds: envelope.core.expires_at + 2,
+    }), /ZK_OWNER_FILE_CEK_DENIED/,
+    "trusted post-expiry request time still denies B's CEK release");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
     assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(
