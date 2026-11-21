@@ -62,9 +62,23 @@ if (mutateAfterBeforeSend) {
   fs.createReadStream = function mutateAfterFinalAuthorization(file, options) {
     if (file === null && Number.isInteger(options?.fd)) descriptorStreams += 1;
     if (!mutated && descriptorStreams === 2 && file === null && Number.isInteger(options?.fd)) {
-      const before = fs.statSync(mutateFilePath);
-      fs.writeFileSync(mutateFilePath, Buffer.alloc(before.size, 0x46));
-      const after = fs.statSync(mutateFilePath);
+      // Mutate through one held descriptor: this fault oracle requires an
+      // in-place overwrite, not a pathname reopened after a stat race.
+      const mutationFd = fs.openSync(mutateFilePath, "r+");
+      let before;
+      let after;
+      try {
+        before = fs.fstatSync(mutationFd);
+        const replacement = Buffer.alloc(before.size, 0x46);
+        let written = 0;
+        while (written < replacement.length) {
+          const count = fs.writeSync(mutationFd, replacement, written,
+            replacement.length - written, written);
+          if (count <= 0) throw new Error("Test mutation did not overwrite the entire held inode");
+          written += count;
+        }
+        after = fs.fstatSync(mutationFd);
+      } finally { fs.closeSync(mutationFd); }
       if (before.ino !== after.ino) throw new Error("Test mutation replaced rather than modified the same inode");
       fs.writeFileSync(mutateMarkerPath, `${before.ino}:${after.ino}`);
       mutated = true;

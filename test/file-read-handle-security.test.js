@@ -304,8 +304,8 @@ test("ambiguous close errors retry only while fstat confirms the original inode"
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000004.tmp`);
   fs.writeFileSync(cleanupPath, "private snapshot");
-  const identity = fs.lstatSync(cleanupPath, { bigint: true });
   const descriptor = fs.openSync(cleanupPath, "r");
+  const identity = fs.fstatSync(descriptor, { bigint: true });
   const budget = createPrivateShareSnapshotBudget({ maxConcurrent: 1, maxBytes: 1024 });
   const release = budget.reserve(Buffer.byteLength("private snapshot"));
   const originalCloseSync = fs.closeSync;
@@ -345,8 +345,8 @@ test("ambiguous close remains charged until a later retry proves closure and rem
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000008.tmp`);
   fs.writeFileSync(cleanupPath, "private snapshot");
-  const identity = fs.lstatSync(cleanupPath, { bigint: true });
   const descriptor = fs.openSync(cleanupPath, "r");
+  const identity = fs.fstatSync(descriptor, { bigint: true });
   const budget = createPrivateShareSnapshotBudget({ maxConcurrent: 1, maxBytes: 1024 });
   const release = budget.reserve(Buffer.byteLength("private snapshot"));
   const originalCloseSync = fs.closeSync;
@@ -388,8 +388,8 @@ test("atomic quarantine verifies the moved inode before unlinking a raced replac
   const displacedPath = path.join(directory, "displaced-original.tmp");
   fs.writeFileSync(cleanupPath, "authorized snapshot");
   fs.writeFileSync(replacementPath, "unrelated replacement");
-  const identity = fs.lstatSync(cleanupPath, { bigint: true });
   const descriptor = fs.openSync(cleanupPath, "r");
+  const identity = fs.fstatSync(descriptor, { bigint: true });
   const budget = createPrivateShareSnapshotBudget({ maxConcurrent: 1, maxBytes: 1024 });
   const release = budget.reserve(Buffer.byteLength("authorized snapshot"));
   const originalRenameSync = fs.renameSync;
@@ -432,8 +432,8 @@ test("ambiguous close never closes a reused fd whose inode differs from the owne
   const replacementPath = path.join(directory, "replacement.txt");
   fs.writeFileSync(cleanupPath, "private snapshot");
   fs.writeFileSync(replacementPath, "unrelated descriptor owner");
-  const identity = fs.lstatSync(cleanupPath, { bigint: true });
   const descriptor = fs.openSync(cleanupPath, "r");
+  const identity = fs.fstatSync(descriptor, { bigint: true });
   const replacementIdentity = fs.statSync(replacementPath, { bigint: true });
   const budget = createPrivateShareSnapshotBudget({ maxConcurrent: 1, maxBytes: 1024 });
   const release = budget.reserve(Buffer.byteLength("private snapshot"));
@@ -482,8 +482,8 @@ test("cleanup preflight never closes a numeric fd already reused before cleanup 
   const replacementPath = path.join(directory, "replacement.txt");
   fs.writeFileSync(cleanupPath, "private snapshot");
   fs.writeFileSync(replacementPath, "unrelated descriptor owner");
-  const identity = fs.lstatSync(cleanupPath, { bigint: true });
   const descriptor = fs.openSync(cleanupPath, "r");
+  const identity = fs.fstatSync(descriptor, { bigint: true });
   const originalCloseSync = fs.closeSync;
   originalCloseSync(descriptor);
   const replacementFd = fs.openSync(replacementPath, "r");
@@ -980,10 +980,13 @@ test("a second owned descriptor for a pending inode must close independently", (
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000013.tmp`);
   fs.writeFileSync(cleanupPath, "native handle custody");
-  const stat = fs.lstatSync(cleanupPath, { bigint: true });
-  const identity = { dev: stat.dev, ino: stat.ino };
   const fdFirst = fs.openSync(cleanupPath, "r");
   const fdSecond = fs.openSync(cleanupPath, "r");
+  const stat = fs.fstatSync(fdFirst, { bigint: true });
+  const secondStat = fs.fstatSync(fdSecond, { bigint: true });
+  assert.equal(secondStat.dev, stat.dev);
+  assert.equal(secondStat.ino, stat.ino);
+  const identity = { dev: stat.dev, ino: stat.ino };
   const budget = createPrivateShareSnapshotBudget({ maxConcurrent: 2, maxBytes: 1024 });
   const bytes = stat.size;
   const releaseFirst = budget.reserve(Number(bytes));
