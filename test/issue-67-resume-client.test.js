@@ -1,0 +1,240 @@
+"use strict";
+
+const assert = require("node:assert/strict");
+const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const http = require("node:http");
+const path = require("node:path");
+const test = require("node:test");
+const { Readable } = require("node:stream");
+const express = require("express");
+const bcrypt = require("bcryptjs");
+
+const protocol = require("../sync-client/rootark-sync-protocol");
+const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
+const { createSyncBurstGuard } = require("../src/services/syncBurstGuard");
+const { createOpaqueSyncAdapter } = require("../public/client/rootark-sync-adapter");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
+const { writePrivateSyncConfig } = require("../sync-client/rootark-sync-private-config");
+const { readResumeCredentials, resume } = require("../sync-client/rootark-sync-v2");
+
+const CLI = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
+const PASSWORD = "secret-resume-password";
+
+function runResume(config, target, credentials, extraArgs = []) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CLI, "resume", "--config", config,
+      "--device-id", target, ...extraArgs, "--credentials-stdin"], {
+      windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => child.kill(), 12000);
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.stdin.on("error", (error) => {
+      // Invalid argv may exit before the test fixture completes its stdin write.
+      if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") reject(error);
+    });
+    child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+    child.once("close", (status) => {
+      clearTimeout(timeout);
+      resolve({ status, stdout, stderr });
+    });
+    child.stdin.end(credentials);
+  });
+}
+
+function operation(index, kind, parent, key) {
+  return protocol.createOperation({
+    operation: kind, objectId: `object-${index}`, fileId: `file-${index}`,
+    versionId: `version-${index}-${kind}`, operationId: `${kind}-${index}`,
+    deviceId: "device-a", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: kind === "create" ? 1 : 2, deviceId: "device-a" },
+    baseRevision: parent?.revision || null, metadata: { path: `file-${index}.txt` },
+    plaintext: kind === "create" ? Buffer.from("owner data") : undefined, fileKey: key,
+  });
+}
+
+test("#67: real burst pause can be reviewed and resumed by other device through CLI without leaking credentials", async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-67-resume-client-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const storagePath = path.join(root, "objects.json");
+  const app = express();
+  app.use("/sync/v1", express.json());
+  let resumeHttpRequests = 0;
+  app.use("/sync/v1/devices/:deviceId/resume", (_req, _res, next) => {
+    resumeHttpRequests += 1;
+    next();
+  });
+  const passwordHash = bcrypt.hashSync(PASSWORD, 4);
+  const user = { username: "alice", password: passwordHash, sessionVersion: 0 };
+  const authenticate = (req, res, next) => {
+    if (req.get("authorization") !== "Bearer test-resume-token") {
+      return res.status(401).json({ error: "Denied" });
+    }
+    req.user = { username: "alice", permissions: { upload: true, delete: true, listFiles: true } };
+    next();
+  };
+  const routes = registerSyncRoutes({ app, storagePath, authenticate,
+    requirePermission: () => (_req, _res, next) => next(), bcrypt,
+    loadUsers: () => [{ ...user }], saveUsers: () => {},
+    burstGuard: createSyncBurstGuard({ maxDestructive: 1, windowMs: 600000, env: {} }),
+  });
+  await routes.ready;
+  const server = await new Promise((resolve) => {
+    const listening = app.listen(0, "127.0.0.1", () => resolve(listening));
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const adapter = createOpaqueSyncAdapter({ baseUrl,
+    fetchImpl: (url, options) => fetch(url, { ...options,
+      headers: { ...options.headers, Authorization: "Bearer test-resume-token" } }),
+  });
+  const key = crypto.randomBytes(32);
+  for (const i of [1, 2]) {
+    const created = operation(i, "create", null, key);
+    assert.equal((await adapter.push(created)).protocolVersion, 2);
+    const deleted = operation(i, "delete", created, key);
+    if (i === 1) assert.equal((await adapter.push(deleted)).protocolVersion, 2);
+    else await assert.rejects(adapter.push(deleted), (error) => error.status === 423);
+  }
+  const config = path.join(root, "sync-config.json");
+  await writePrivateSyncConfig(config, JSON.stringify({ serverUrl: baseUrl,
+    username: "alice", token: "test-resume-token", deviceId: "device-b" }));
+  const credentials = JSON.stringify({ password: PASSWORD });
+  const denied = await runResume(config, "device-a", JSON.stringify({ password: "wrong-password" }));
+  assert.notEqual(denied.status, 0);
+  assert.doesNotMatch(denied.stderr + denied.stdout, /wrong-password|test-resume-token/);
+  assert.equal(routes.store.pauseFence("alice", "device-a") !== null, true);
+
+  // With duplicate --device-id, the previous parser silently selected the
+  // second target and lifted a real paused-device fence with valid stdin.
+  const beforeAmbiguousRequests = resumeHttpRequests;
+  const ambiguous = await runResume(config, "device-b", credentials, ["--device-id", "device-a"]);
+  assert.notEqual(routes.store.pauseFence("alice", "device-a"), null,
+    "ambiguous CLI arguments must not lift the pause on the unexpected device");
+  assert.equal(resumeHttpRequests, beforeAmbiguousRequests,
+    "ambiguous target must be rejected before HTTP");
+  assert.notEqual(ambiguous.status, 0);
+  assert.match(ambiguous.stderr, /Unsupported resume option/i);
+  assert.doesNotMatch(ambiguous.stdout + ambiguous.stderr, /secret-resume-password|test-resume-token/);
+
+  const resumed = await runResume(config, "device-a", credentials);
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.deepEqual(JSON.parse(resumed.stdout), {
+    protocolVersion: 2, deviceId: "device-a", paused: false, wasPaused: true,
+  });
+  assert.doesNotMatch(resumed.stdout + resumed.stderr, /secret-resume-password|test-resume-token/);
+  assert.equal(routes.store.pauseFence("alice", "device-a"), null);
+  const again = await runResume(config, "device-a", credentials);
+  assert.equal(JSON.parse(again.stdout).wasPaused, false);
+  const embedded = await resume({ config, "device-id": "device-a",
+    "credentials-stdin": true,
+    credentialsStream: Readable.from([JSON.stringify({ password: PASSWORD })]),
+  });
+  assert.equal(embedded.wasPaused, false,
+    "the exported programmatic stream contract must still work");
+});
+
+test("#67: resume CLI rejects secret flags and ambiguous arguments before stdin or HTTP", async (t) => {
+  const root = createPrivateAuthorityFixture("rootark-67-resume-argv-");
+  let requests = 0;
+  const server = http.createServer((_request, response) => {
+    requests += 1;
+    response.writeHead(500).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const config = path.join(root, "sync-config.json");
+  await writePrivateSyncConfig(config, JSON.stringify({
+    serverUrl: `http://127.0.0.1:${server.address().port}`,
+    username: "alice", token: "test-resume-token", deviceId: "device-b",
+  }));
+
+  const validArgs = ["--config", config, "--device-id", "device-a", "--credentials-stdin"];
+  for (const { argv, provideStdin = false } of [
+    { argv: [...validArgs, "--password=secret"] },
+    { argv: [...validArgs, "--code=123456"] },
+    { argv: [...validArgs, "--credentialsStream", "secret-json-on-argv"] },
+    { argv: ["unexpected-positional", ...validArgs], provideStdin: true },
+    { argv: ["--config", config, "--device-id", "device-a", "--device-id", "device-b", "--credentials-stdin"], provideStdin: true },
+  ]) {
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [CLI, "resume", ...argv], {
+        windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      const timeout = setTimeout(() => { timedOut = true; child.kill(); }, 8000);
+      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      child.stdin.on("error", (error) => {
+        // Immediate argv rejection may close the pipe before the fixture writes.
+        if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") reject(error);
+      });
+      child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+      child.once("close", (status) => {
+        clearTimeout(timeout);
+        resolve({ status, stdout, stderr, timedOut });
+      });
+      if (provideStdin) child.stdin.end(JSON.stringify({ password: "synthetic-test-only" }));
+      // For secret-bearing options, deliberately leave stdin open. Rejection
+      // must occur before stdin is read. Ambiguous targets also must not POST.
+    });
+    assert.equal(result.timedOut, false, "invalid argv must not wait for credentials on stdin");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Unsupported resume option/i);
+    assert.doesNotMatch(result.stdout + result.stderr, /secret|123456/i);
+    assert.equal(requests, 0, "invalid argv cannot contact the resume endpoint");
+  }
+});
+
+test("#67: resume adapter refuses self-resume, unsafe ids, missing password and forged success", async () => {
+  const requests = [];
+  const adapter = createOpaqueSyncAdapter({ baseUrl: "https://example.invalid",
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true, status: 200, json: async () => ({
+        protocolVersion: 2, deviceId: "other-device", paused: false, wasPaused: true,
+      }) };
+    },
+  });
+  await assert.rejects(adapter.resumeDevice("../device", { deviceId: "me", password: PASSWORD }), /id/i);
+  await assert.rejects(adapter.resumeDevice("me", { deviceId: "me", password: PASSWORD }), /device|self/i);
+  await assert.rejects(adapter.resumeDevice("other-device", { deviceId: "me" }), /password/i);
+  assert.equal(requests.length, 0);
+  assert.deepEqual(await adapter.resumeDevice("other-device", { deviceId: "me", password: PASSWORD }), {
+    protocolVersion: 2, deviceId: "other-device", paused: false, wasPaused: true,
+  });
+  assert.equal(requests[0].options.redirect, "error");
+  assert.equal(requests[0].options.method, "POST");
+  const body = JSON.parse(requests[0].options.body);
+  assert.deepEqual(body, { deviceId: "me", password: PASSWORD });
+  await adapter.resumeDevice("other-device", { deviceId: "me", password: PASSWORD, code: "123456" });
+  assert.deepEqual(JSON.parse(requests[1].options.body), {
+    deviceId: "me", password: PASSWORD, code: "123456",
+  });
+  const forged = createOpaqueSyncAdapter({ baseUrl: "https://example.invalid",
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({
+      protocolVersion: 2, deviceId: "different-device", paused: false, wasPaused: true,
+    }) }),
+  });
+  await assert.rejects(forged.resumeDevice("other-device", {
+    deviceId: "me", password: PASSWORD,
+  }), /resume response/i);
+});
+
+test("#67: private credential stdin rejects oversize, unexpected keys and malformed JSON", async () => {
+  await assert.rejects(readResumeCredentials(Readable.from([Buffer.alloc(2049, 32)])), /credentials/i);
+  await assert.rejects(readResumeCredentials(Readable.from(['{"password":"ok","key":"leak"}'])), /credentials/i);
+  await assert.rejects(readResumeCredentials(Readable.from(['{"password":42}'])), /credentials/i);
+  await assert.rejects(readResumeCredentials(Readable.from(['broken-json'])), /credentials/i);
+  assert.deepEqual(await readResumeCredentials(Readable.from(['{"password":"ok","code":"123456"}'])),
+    { password: "ok", code: "123456" });
+});
