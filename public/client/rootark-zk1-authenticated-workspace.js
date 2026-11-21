@@ -32,6 +32,8 @@
   let checking = false;
   let loadingScripts = null;
   let busy = false;
+  let protectedLocalSearchGeneration = 0;
+  let protectedLocalSearchTerm = "";
   let dialog = null;
   // A logout invalidates the operation even if an awaited crypto/file/network
   // promise later resolves. The CSRF cookie also fences session switches in
@@ -1010,6 +1012,16 @@
     const invalidateInput = (event) => {
       clearLocalPreview();
       const changed = event.target?.getAttribute?.("data-zk1-field");
+      if (changed === "catalog-delta-query") {
+        // Editing the query revokes both an in-flight result and previously
+        // rendered private names immediately, even while the Search button is
+        // disabled by the single-operation busy gate.
+        protectedLocalSearchGeneration += 1;
+        protectedLocalSearchTerm = event.target.value || "";
+        field("catalog-delta-private-list")?.replaceChildren();
+        const previousSummary = field("catalog-delta-summary");
+        if (previousSummary) previousSummary.textContent = "";
+      }
       if (changed && !["catalog-batch-confirm", "catalog-batch-persist",
         "catalog-batch-replace"].includes(changed)) resetRevisionBatchConsent();
     };
@@ -1035,6 +1047,14 @@
       return;
     }
     if (busy) return;
+    if (action === "catalog-delta-list") {
+      // Invalidate the previously displayed local result before any script,
+      // capability, key-import, or listing await can yield to the event loop.
+      const previousSummary = field("catalog-delta-summary");
+      if (previousSummary) previousSummary.textContent = "";
+      const previousPrivateList = field("catalog-delta-private-list");
+      if (previousPrivateList) previousPrivateList.replaceChildren();
+    }
     if (action === "close") {
       resetRevisionBatchConsent();
       clearLocalPreview();
@@ -1065,6 +1085,8 @@
       "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
       "catalog-delta-restore"].includes(action)) return;
     if (action === "catalog-delta-list") {
+      protectedLocalSearchGeneration += 1;
+      protectedLocalSearchTerm = field("catalog-delta-query")?.value || "";
       // A failed refresh must never leave the previous query's local names or
       // count visible while scripts, trust, or key material are being loaded.
       field("catalog-delta-private-list")?.replaceChildren();
@@ -1416,22 +1438,39 @@
             await loadScript("rootark-zk1-protected-local-search");
           assertLive();
           if (!window.RootarkZk1ProtectedLocalSearch?.search) fail();
+          const searchGeneration = protectedLocalSearchGeneration;
+          const term = protectedLocalSearchTerm;
+          const assertSearchLive = () => {
+            assertLive();
+            if (searchGeneration !== protectedLocalSearchGeneration
+              || field("catalog-delta-query")?.value !== term) {
+              const error = new Error("Consulta local substituída");
+              error.code = "SEARCH_SUPERSEDED";
+              throw error;
+            }
+          };
           const raw = await fileBytes("catalog-write-key", 32, 32);
           const list = field("catalog-delta-private-list");
-          const term = field("catalog-delta-query")?.value || "";
           let opened;
           try {
-            opened = await window.RootarkZk1ProtectedLocalSearch.search({
-              client: held.client, baseline: held.baseline,
-              grant: trust.signedDeviceGrant,
-              ownerRevision: trust.pinnedCurrentHead.revision,
-              ownerEpoch: trust.pinnedCurrentHead.epoch,
-              ownerDigest: to64(trust.pinnedCurrentHead.digest),
-              metadataRaw: raw, term, indexedDBImpl:
-                typeof indexedDB === "object" ? indexedDB : null, assertLive,
-            });
+            try {
+              assertSearchLive();
+              opened = await window.RootarkZk1ProtectedLocalSearch.search({
+                client: held.client, baseline: held.baseline,
+                grant: trust.signedDeviceGrant,
+                ownerRevision: trust.pinnedCurrentHead.revision,
+                ownerEpoch: trust.pinnedCurrentHead.epoch,
+                ownerDigest: to64(trust.pinnedCurrentHead.digest),
+                metadataRaw: raw, term, indexedDBImpl:
+                  typeof indexedDB === "object" ? indexedDB : null,
+                assertLive: assertSearchLive,
+              });
+              assertSearchLive();
+            } catch (error) {
+              if (error?.code === "SEARCH_SUPERSEDED") return;
+              throw error;
+            }
           } finally { raw.fill(0); }
-          assertLive();
           if (opened.independentlySignedCatalog !== true
             || opened.plaintextSentToServer !== false
             || opened.authorizesMutation !== false
@@ -1441,9 +1480,12 @@
             || !Number.isSafeInteger(opened.totalMatches)
             || opened.totalMatches < opened.entries.length) fail();
           const listLive = () => {
-            assertLive();
-            return !busy && verifiedOpaqueDelta === held
-              && field("catalog-delta-query")?.value === term;
+            try { assertSearchLive(); }
+            catch (error) {
+              if (error?.code === "SEARCH_SUPERSEDED") return false;
+              throw error;
+            }
+            return !busy && verifiedOpaqueDelta === held;
           };
           const updateListSummary = (page) => {
             const first = page.entries.length ? page.offset + 1 : 0;

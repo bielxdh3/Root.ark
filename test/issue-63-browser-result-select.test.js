@@ -53,6 +53,8 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       const list=dialog.querySelector('[data-zk1-field="catalog-delta-private-list"]');
       const target=dialog.querySelector('[data-zk1-field="catalog-write-id"]');
       const revision=dialog.querySelector('[data-zk1-field="catalog-delta-read-revision"]');
+      const listButton=dialog.querySelector('[data-zk1-action="catalog-delta-list"]');
+      const summary=dialog.querySelector('[data-zk1-field="catalog-delta-summary"]');
       const getButton=dialog.querySelector('[data-zk1-action="catalog-delta-get"]');
       const batchButton=dialog.querySelector('[data-zk1-action="catalog-delta-text-search"]');
       const allTermsToggle=dialog.querySelector('[data-zk1-field="catalog-batch-all-terms"]');
@@ -60,7 +62,8 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       const replaceToggle=dialog.querySelector('[data-zk1-field="catalog-batch-replace"]');
       const storedIndexButton=dialog.querySelector('[data-zk1-action="catalog-delta-index-search"]');
       const indexPages=dialog.querySelector('[data-zk1-field="catalog-index-pages"]');
-      if(!list||!target||!revision||!getButton||getButton.type!=="button"
+      if(!list||!target||!revision||!listButton||listButton.type!=="button"
+        ||!summary||!getButton||getButton.type!=="button"
         ||!batchButton||batchButton.type!=="button"
         ||!allTermsToggle||allTermsToggle.type!=="checkbox"||allTermsToggle.checked
         ||!persistToggle||persistToggle.type!=="checkbox"||persistToggle.checked
@@ -351,6 +354,126 @@ test("real Edge CSP: verified local results select an opaque object without HTML
         throw Error("PREVIEW_NOT_ZEROED_ON_CHANGE");
       pane.textContent=opened.text;
       batchPane.textContent=found.matches[0].excerpt;
+      // Produce a real authenticated local-search result and let the real
+      // renderer create its selectable row and summary. Only the independent
+      // signed-catalog boundary is a fixture; do not seed DOM nodes manually.
+      const scope={account_id:b64(crypto.getRandomValues(new Uint8Array(16))),
+        compartment_id:b64(new TextEncoder().encode("fixture-compartment")),
+        keyring_id:b64(crypto.getRandomValues(new Uint8Array(16)))};
+      const ownerDigest=b64(crypto.getRandomValues(new Uint8Array(32)));
+      const head={sequence:12,digest:b64(crypto.getRandomValues(new Uint8Array(32)))};
+      const objectId=b64(crypto.getRandomValues(new Uint8Array(16)));
+      const baseline={head,entries:[{objectId,revision:7,epoch:2}]};
+      const grant={...scope,device_id:"fixture-device",current_epoch:2,
+        manifest_revision:8,manifest_digest:ownerDigest,revoked_at_epoch:null};
+      const localMetadataRaw=crypto.getRandomValues(new Uint8Array(32));
+      let openedLocal;
+      try {
+        openedLocal=await window.RootarkZk1ProtectedLocalSearch.search({
+          client:{
+            verifyPrivateListingHead:async()=>({scope,head}),
+            readPrivateListing:async()=>({scope,head,totalMatches:1,
+              entries:[{objectId,revision:7,epoch:2,name:"stale-private-name.txt",
+                logicalTrashCandidate:false}],plaintextSentToServer:false,
+              independentlySignedCatalog:true,authorizesMutation:false}),
+          },
+          baseline,grant,ownerRevision:8,ownerEpoch:2,ownerDigest,
+          metadataRaw:localMetadataRaw,term:"",indexedDBImpl:null,assertLive:()=>{},
+        });
+      } finally { localMetadataRaw.fill(0); }
+      if(openedLocal.entries.length!==1||openedLocal.entries[0].name!=="stale-private-name.txt")
+        throw Error("REAL_LOCAL_SEARCH_FIXTURE_FAILED");
+      const updateSummary=page=>{summary.textContent="Listagem local: "+page.entries.length
+        +" de "+page.totalMatches+" versão(ões) · CAS #"+page.head.sequence;};
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,openedLocal.entries,target,()=>true,revision,{...openedLocal,onPage:updateSummary});
+      updateSummary(openedLocal);
+      // A genuine older local search may still be waiting on its signed-head
+      // response when a newer query finishes. Its response must not replace
+      // the newer result set or summary.
+      const queryField=document.querySelector('[data-zk1-field="catalog-delta-query"]');
+      if(!queryField)throw Error("REAL_LOCAL_QUERY_FIELD_MISSING");
+      let searchGeneration=1;
+      queryField.value="old";
+      let releaseOldHead;
+      let oldReadCalled=false;
+      const oldMetadataRaw=crypto.getRandomValues(new Uint8Array(32));
+      const assertOldLive=()=>{
+        if(searchGeneration!==1||queryField.value!=="old"){
+          const error=new Error("SEARCH_SUPERSEDED");error.code="SEARCH_SUPERSEDED";throw error;
+        }
+      };
+      const oldSearch=window.RootarkZk1ProtectedLocalSearch.search({
+        client:{
+          verifyPrivateListingHead:()=>new Promise(resolve=>{releaseOldHead=resolve;}),
+          readPrivateListing:async()=>{oldReadCalled=true;return {scope,head,totalMatches:1,
+            entries:[{objectId,revision:7,epoch:2,name:"old-private-name.txt",
+              logicalTrashCandidate:false}],plaintextSentToServer:false,
+            independentlySignedCatalog:true,authorizesMutation:false};},
+        },
+        baseline,grant,ownerRevision:8,ownerEpoch:2,ownerDigest,
+        metadataRaw:oldMetadataRaw,term:"old",indexedDBImpl:null,assertLive:assertOldLive,
+      });
+      let newMetadataRaw=null;
+      let freshSearch;
+      try {
+        for(let i=0;i<100&&!releaseOldHead;i++)await sleep(0);
+        if(!releaseOldHead)throw Error("OLD_LOCAL_SEARCH_DID_NOT_REACH_HEAD_READ");
+        queryField.value="new";
+        searchGeneration=2;
+        newMetadataRaw=crypto.getRandomValues(new Uint8Array(32));
+        freshSearch=await window.RootarkZk1ProtectedLocalSearch.search({
+          client:{
+            verifyPrivateListingHead:async()=>({scope,head}),
+            readPrivateListing:async()=>({scope,head,totalMatches:1,
+              entries:[{objectId,revision:7,epoch:2,name:"new-private-name.txt",
+                logicalTrashCandidate:false}],plaintextSentToServer:false,
+              independentlySignedCatalog:true,authorizesMutation:false}),
+          },
+          baseline,grant,ownerRevision:8,ownerEpoch:2,ownerDigest,
+          metadataRaw:newMetadataRaw,term:"new",indexedDBImpl:null,
+          assertLive:()=>{
+            if(searchGeneration!==2||queryField.value!=="new"){
+              const error=new Error("SEARCH_SUPERSEDED");error.code="SEARCH_SUPERSEDED";throw error;
+            }
+          },
+        });
+        window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+          list,freshSearch.entries,target,()=>searchGeneration===2&&queryField.value==="new",
+          revision,{...freshSearch,onPage:updateSummary});
+        updateSummary(freshSearch);
+        releaseOldHead({scope,head});
+        let oldFailure;
+        try { await oldSearch; } catch(error) { oldFailure=error; }
+        if(oldFailure?.code!=="SEARCH_SUPERSEDED"||oldReadCalled)
+          throw Error("OLD_LOCAL_SEARCH_WAS_NOT_SUPERSEDED");
+        if(!list.textContent.includes("new-private-name.txt")
+          ||list.textContent.includes("old-private-name.txt"))
+          throw Error("OLD_LOCAL_SEARCH_OVERWROTE_NEW_RESULTS");
+      } finally {
+        searchGeneration=2;
+        queryField.value="new";
+        if(releaseOldHead)releaseOldHead({scope,head});
+        oldMetadataRaw.fill(0);
+        newMetadataRaw?.fill(0);
+      }
+      if(!summary.textContent.includes("CAS #12")
+        ||!list.textContent.includes("new-private-name.txt"))
+        throw Error("REAL_LOCAL_RESULT_NOT_RENDERED");
+      // Exercise the *workspace's actual input listener*, not a local test
+      // generation counter: editing a query must erase authenticated names
+      // and count before another button click or asynchronous response.
+      queryField.value="newer";
+      queryField.dispatchEvent(new Event("input",{bubbles:true}));
+      if(summary.textContent!==""||list.childNodes.length!==0)
+        throw Error("QUERY_INPUT_FAILED_TO_INVALIDATE_RENDERED_PRIVATE_NAMES");
+      // A new local query must clear the real previous result and its count
+      // synchronously, before any trust/key/network await can reject.
+      listButton.click();
+      if(summary.textContent!==""||list.childNodes.length!==0)
+        throw Error("NEW_QUERY_LEFT_STALE_SUMMARY_OR_RESULTS_VISIBLE");
+      for(let i=0;i<100&&listButton.disabled;i++)await sleep(20);
+      if(listButton.disabled)throw Error("NEW_QUERY_DID_NOT_SETTLE");
       window.dispatchEvent(new Event("rootark:logout"));
       if(pane.textContent!==""||batchPane.textContent!=="")
         throw Error("PREVIEW_NOT_ZEROED_ON_LOGOUT");
