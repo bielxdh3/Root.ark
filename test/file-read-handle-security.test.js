@@ -18,6 +18,15 @@ function testTempDirectoryRoot() {
     ? process.env.LOCALAPPDATA : os.tmpdir();
 }
 
+test("default private share snapshots stay outside repository runtime artifact roots", () => {
+  if (process.env.ROOTARK_PRIVATE_SHARE_SNAPSHOT_DIRECTORY) return;
+  const actual = getPrivateShareSnapshotDirectory();
+  const repo = path.resolve(__dirname, "..");
+  const relative = path.relative(repo, actual);
+  assert.ok(relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative),
+    "private share snapshots must not create permanent temp content in a source checkout");
+});
+
 test("opened file descriptor keeps the authorized bytes after path replacement", async () => {
   const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-open-file-handle-"));
   const filePath = path.join(directory, "file.txt");

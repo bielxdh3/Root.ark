@@ -2,6 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const os = require("node:os");
 const crypto = require("node:crypto");
 const { execFileSync } = require("node:child_process");
 const { pipeline } = require("node:stream/promises");
@@ -15,7 +16,7 @@ const PRIVATE_SHARE_SNAPSHOT_OVERRIDE = process.env.ROOTARK_PRIVATE_SHARE_SNAPSH
 const PRIVATE_SHARE_SNAPSHOT_DIRECTORY = path.resolve(PRIVATE_SHARE_SNAPSHOT_OVERRIDE
   || (process.platform === "win32" && process.env.LOCALAPPDATA
     ? path.join(process.env.LOCALAPPDATA, "Rootark", "share-snapshots")
-    : "./temp/share-snapshots"));
+    : path.join(os.homedir(), ".rootark", "share-snapshots")));
 const PRIVATE_SHARE_SNAPSHOT_PROCESS_INSTANCE = crypto.randomUUID();
 const WINDOWS_SYSTEM_SID = "S-1-5-18";
 const WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544";
