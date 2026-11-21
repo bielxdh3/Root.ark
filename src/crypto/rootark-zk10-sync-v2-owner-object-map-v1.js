@@ -438,7 +438,11 @@ function createOwnerObjectMapVerifier(config, headReadOptions) {
       // Reserve capacity BEFORE invoking an untrusted async adapter. A late
       // result never re-enters verification and never frees its slot early.
       const pending = NATIVE_PROMISE_READ(() => {
-        if (nativeAborted(controllerSignal)) deny();
+        // Cancellation before the deferred adapter callback proves no external
+        // read started. Settle this reservation instead of throwing into the
+        // fail-closed "possibly started I/O" path, which intentionally retains
+        // capacity for callbacks that may have launched noncooperative work.
+        if (nativeAborted(controllerSignal)) return null;
         return a.readCurrentHead(challenge, { signal: controllerSignal });
       });
       NATIVE_SET_ADD.call(pendingHeadReads, pending);

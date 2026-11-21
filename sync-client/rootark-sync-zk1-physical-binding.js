@@ -139,7 +139,7 @@ function snapshotLocalDevicePolicy(input) {
   const revoked = [];
   const seen = NATIVE_OBJECT_CREATE(null);
   for (let index = 0; index < raw.revokedDeviceIds.length; index += 1) {
-    const descriptor = NATIVE_OWN_DESCRIPTOR(raw.revokedDeviceIds, String(index));
+    const descriptor = NATIVE_OWN_DESCRIPTOR(raw.revokedDeviceIds, index);
     if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
     const deviceId = descriptor.value;
     if (typeof deviceId !== "string"
@@ -148,7 +148,7 @@ function snapshotLocalDevicePolicy(input) {
     NATIVE_DEFINE_PROPERTY(seen, deviceId, { value: true });
     // Defining own DATA slots avoids a hostile Array.push and inherited numeric
     // setters installed by a signed native KeyObject's kHandle callback.
-    NATIVE_DEFINE_PROPERTY(revoked, String(index), {
+    NATIVE_DEFINE_PROPERTY(revoked, index, {
       value: deviceId, enumerable: true, writable: true, configurable: true,
     });
   }

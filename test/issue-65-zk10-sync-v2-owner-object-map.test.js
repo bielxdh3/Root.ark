@@ -8,6 +8,7 @@ const protocol = require("../sync-client/rootark-sync-protocol");
 const { DOMAIN: SOURCE_DOMAIN, verifyPinnedAtomicOwnerProvision } =
   require("../sync-client/rootark-sync-atomic-owner-provision");
 const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { invokeNativeRead } = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const { snapshotLocalDevicePolicy } =
   require("../sync-client/rootark-sync-zk1-physical-binding");
 const { signOwnerCutover, digestOwnerCutover, signOwnerRotation, spkiHash,
@@ -243,6 +244,23 @@ test("P2: proxy-backed revocation policy cannot hide a real revoked source devic
   const ordinary = snapshotLocalDevicePolicy({ ...policy, revokedDeviceIds: ["source-device-4"] });
   assert.deepEqual(ordinary.revokedDeviceIds, ["source-device-4"],
     "a real ordinary revocation list must retain its entries");
+});
+
+test("P2: revocation snapshots use native numeric property keys under String poisoning", () => {
+  const originalString = global.String;
+  let snapshot;
+  global.String = () => "not-an-array-index";
+  try {
+    snapshot = snapshotLocalDevicePolicy({
+      username: identity.username,
+      trustedDevicePublicKeys: { "source-device-4": b64(keys.device) },
+      revokedDeviceIds: ["source-device-4"],
+    });
+  } finally {
+    global.String = originalString;
+  }
+  assert.deepEqual(snapshot.revokedDeviceIds, ["source-device-4"]);
+  assert.deepEqual(Object.keys(snapshot.revokedDeviceIds), ["0"]);
 });
 
 test("P2: source KeyObject getter cannot replace the operation validator after construction", async () => {
@@ -1666,6 +1684,69 @@ async function withinHeadDeadline(promise, milliseconds = 400) {
     })]);
   } finally { clearTimeout(timeout); }
 }
+
+test("P2: cancellation before the deferred native read callback settles without starting I/O", async () => {
+  const controller = new AbortController();
+  let reads = 0;
+  const pending = invokeNativeRead(() => {
+    // Mirrors boundedCurrentHead's pre-invocation cancellation fence.
+    if (controller.signal.aborted) return null;
+    reads++;
+    return Promise.resolve("unexpected read");
+  });
+  controller.abort();
+  const settled = await withinHeadDeadline(pending);
+  assert.equal(settled.settled, true);
+  assert.equal(settled.value, null);
+  assert.equal(reads, 0);
+});
+
+test("P2: cancellation after reservation but before the deferred read releases the one-slot budget", async () => {
+  const f = await fixture();
+  const authorization = require("../sync-client/rootark-sync-authorization");
+  const modulePath = require.resolve("../src/crypto/rootark-zk10-sync-v2-owner-object-map-v1");
+  const originalModule = require.cache[modulePath];
+  const originalVerify = authorization.verifyHistoricalAuthorizationProof;
+  let releaseAuthorization;
+  let holdAuthorization = true;
+  authorization.verifyHistoricalAuthorizationProof = () => holdAuthorization
+    ? new Promise((resolve) => { releaseAuthorization = resolve; })
+    : Promise.resolve();
+  delete require.cache[modulePath];
+  let freshModule;
+  try { freshModule = require(modulePath); }
+  finally {
+    authorization.verifyHistoricalAuthorizationProof = originalVerify;
+    if (originalModule) require.cache[modulePath] = originalModule;
+    else delete require.cache[modulePath];
+  }
+
+  const controller = new AbortController();
+  let reads = 0;
+  const authority = { ...f.authority, readCurrentHead: (challenge) => {
+    reads++;
+    return Promise.resolve(signedHead(f, challenge));
+  } };
+  const verify = freshModule.createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority, mappingAuthority: authority,
+  }, { headTimeoutMs: 400, maxPendingHeadReads: 1 });
+
+  const cancelled = verify(f.input, { signal: controller.signal });
+  for (let i = 0; i < 100 && !releaseAuthorization; i++) await Promise.resolve();
+  assert.equal(typeof releaseAuthorization, "function", "authorization fence must be reached");
+  releaseAuthorization();
+  // The verification continuation reserves its slot and schedules the native
+  // read callback before this microtask; abort wins before that callback runs.
+  queueMicrotask(() => controller.abort());
+  await withinHeadDeadline(assert.rejects(cancelled, deny));
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  assert.equal(reads, 0, "the cancelled deferred callback must not start external I/O");
+
+  holdAuthorization = false;
+  const recovered = await withinHeadDeadline(verify(f.input));
+  assert.equal(reads, 1, "the pre-I/O cancellation must release its reservation");
+  assert.equal(recovered.authorizesIo, false);
+});
 
 test("W26: never-settling external head is aborted and retains its occupied slot", async () => {
   const f = await fixture();
