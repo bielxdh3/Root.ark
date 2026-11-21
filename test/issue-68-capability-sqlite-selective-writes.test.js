@@ -37,12 +37,34 @@ test("issue 68: stale legacy snapshots never revoke newer capability or erase ad
 
   repository.savePublicLinks({ [a]: entry() });
   const staleSnapshot = repository.loadPublicLinks();
+  // The public-share alias index is initialized before the first exchange;
+  // admitting a session must update it without a full public_links scan.
+  repository.initializeCapabilitySessionIndex();
   const alias = "1".repeat(32);
   const session = { alias, hash: "f".repeat(64), expiresAt: new Date(Date.now() + 2 * 60_000).toISOString(),
     expectedResourceBinding: binding, expectedFileName: "safe.txt", expectedFolderId: "root" };
   assert.equal(repository.addCapabilitySession(a, session).status, "ok",
     "genuinely committed session exists before stale writer replays its old snapshot");
   assert.ok(repository.loadPublicLinks()[a].capabilitySessions[alias]);
+  const db = require("../db").getDb();
+  const originalPrepare = db.prepare.bind(db);
+  let fullPublicLinkScans = 0;
+  db.prepare = (sql, ...args) => {
+    if (/FROM\s+public_links\s+WHERE\s+revoked_at\s+IS\s+NULL/i.test(String(sql))) fullPublicLinkScans++;
+    return originalPrepare(sql, ...args);
+  };
+  try {
+    for (let index = 0; index < 20; index++) {
+      const indexed = repository.findCapabilitySessionByAlias(alias);
+      assert.equal(indexed?.token, a, "alias lookup must resolve its unique capability token");
+      assert.equal(indexed?.session?.hash, session.hash);
+      assert.equal(repository.getPublicLinkByToken(a)?.shareKind, "capability-v1");
+    }
+  } finally {
+    db.prepare = originalPrepare;
+  }
+  assert.equal(fullPublicLinkScans, 0,
+    "repeated alias and token lookups must use the in-memory alias index and SQLite token primary key");
   repository.savePublicLinks({ ...staleSnapshot, [b]: entry() });
   repository.savePublicLinks(staleSnapshot);
 
@@ -51,18 +73,88 @@ test("issue 68: stale legacy snapshots never revoke newer capability or erase ad
     "legacy whole-map write must not roll back the independently committed session");
   assert.ok(afterLegacyWrite[b],
     "stale whole-map write must not silently revoke newly inserted capability B");
+  assert.equal(repository.findCapabilitySessionByAlias(alias)?.token, a,
+    "bulk reconciliation invalidates and rebuilds the alias index without losing the committed session");
+  assert.equal(repository.addCapabilitySession(b, { ...session, expectedResourceBinding: binding }).status, "collision",
+    "one alias cannot resolve to two capability tokens");
   assert.equal(repository.createCapability(c, entry()).status, "ok");
   assert.ok(repository.loadPublicLinks()[c]);
+  const expiredSessionAlias = "3".repeat(32);
+  assert.equal(repository.addCapabilitySession(b, { ...session, alias: expiredSessionAlias }).status, "ok");
+  const expiredSessionRow = db.prepare("SELECT metadata_json FROM public_links WHERE token = ?").get(b);
+  const expiredSessionMetadata = JSON.parse(expiredSessionRow.metadata_json);
+  expiredSessionMetadata.capabilitySessions[expiredSessionAlias].expiresAt = new Date(Date.now() - 1000).toISOString();
+  db.prepare("UPDATE public_links SET metadata_json = ? WHERE token = ?")
+    .run(JSON.stringify(expiredSessionMetadata), b);
+  assert.equal(repository.findCapabilitySessionByAlias(expiredSessionAlias), null,
+    "an alias indexed before expiry must stop resolving as soon as its durable session expires");
+
+  const expiredLinkAlias = "4".repeat(32);
+  assert.equal(repository.addCapabilitySession(b, { ...session, alias: expiredLinkAlias }).status, "ok");
+  db.prepare("UPDATE public_links SET expires_at = ? WHERE token = ?")
+    .run(new Date(Date.now() - 1000).toISOString(), b);
+  assert.equal(repository.findCapabilitySessionByAlias(expiredLinkAlias), null,
+    "a live session alias must stop resolving when its parent capability expires");
   assert.equal(repository.revokeCapability(a, "outsider").status, "forbidden");
   assert.ok(repository.loadPublicLinks()[a]);
   assert.equal(repository.revokeCapability(a, "tester").status, "ok");
   assert.equal(repository.loadPublicLinks()[a], undefined, "revoke must persist as tombstone");
+  assert.equal(repository.findCapabilitySessionByAlias(alias), null,
+    "revoking the token must remove its aliases from the process-local index");
   assert.ok(repository.loadPublicLinks()[b], "revoking A may not revoke unrelated B");
   assert.ok(repository.loadPublicLinks()[c], "revoking A may not revoke independently created C");
   assert.equal(repository.addCapabilitySession(a, session).status, "missing",
     "revoked capability cannot acquire another session");
   assert.equal(repository.createCapability(a, entry()).status, "collision",
     "revoked token cannot be reissued by stale database insert");
+});
+
+test("issue 68: expired duplicate legacy alias is pruned without hiding its unique live session", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-capability-alias-prune-"));
+  const previous = { DB_ENABLED: process.env.DB_ENABLED, DATABASE_URL: process.env.DATABASE_URL };
+  process.env.DB_ENABLED = "true";
+  process.env.DATABASE_URL = path.join(dir, "aliases.sqlite");
+  const { closeDb, getDb } = require("../db");
+  const { runMigrations } = require("../db/migrations");
+  const repository = require("../repositories/publicLinksRepository");
+  t.after(() => {
+    closeDb();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  runMigrations({ backup: false });
+  const binding = { version: 2, folderId: "root", fileName: "safe.txt", identity: "e".repeat(64) };
+  const entry = () => ({ fileName: "safe.txt", folderId: "root", shareKind: "capability-v1",
+    resourceBinding: binding, createdBy: "tester", createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    permissions: ["download"], maxViews: 0, maxDownloads: 3, views: 0, downloads: 0,
+    capabilitySessions: {}, activeViewers: {} });
+  const liveToken = `C${"a".repeat(47)}`;
+  const staleToken = `C${"b".repeat(47)}`;
+  assert.equal(repository.createCapability(liveToken, entry()).status, "ok");
+  assert.equal(repository.createCapability(staleToken, entry()).status, "ok");
+  const db = getDb();
+  const alias = "9".repeat(32);
+  for (const [token, hash] of [[liveToken, "a".repeat(64)], [staleToken, "b".repeat(64)]]) {
+    const row = db.prepare("SELECT metadata_json FROM public_links WHERE token = ?").get(token);
+    const metadata = JSON.parse(row.metadata_json);
+    metadata.capabilitySessions[alias] = {
+      hash, expiresAt: new Date(Date.now() + 2 * 60_000).toISOString(),
+    };
+    db.prepare("UPDATE public_links SET metadata_json = ? WHERE token = ?")
+      .run(JSON.stringify(metadata), token);
+  }
+  repository.initializeCapabilitySessionIndex();
+  const staleRow = db.prepare("SELECT metadata_json FROM public_links WHERE token = ?").get(staleToken);
+  const staleMetadata = JSON.parse(staleRow.metadata_json);
+  staleMetadata.capabilitySessions[alias].expiresAt = new Date(Date.now() - 1000).toISOString();
+  db.prepare("UPDATE public_links SET metadata_json = ? WHERE token = ?")
+    .run(JSON.stringify(staleMetadata), staleToken);
+  assert.equal(repository.findCapabilitySessionByAlias(alias)?.token, liveToken,
+    "a stale duplicate candidate must be revalidated and pruned before resolving the sole live session");
 });
 
 test("issue 68 P1: explicit file and folder trash revokes only affected SQLite capabilities", (t) => {

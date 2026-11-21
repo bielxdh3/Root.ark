@@ -13,6 +13,9 @@ const savedPath = process.env.ROOTARK_TEST_SHARE_SWAP_SAVED_FILE;
 const markerPath = process.env.ROOTARK_TEST_SHARE_SWAP_MARKER;
 const foreignFdOnly = process.env.ROOTARK_TEST_SHARE_FOREIGN_FD_ONLY === "1";
 const foreignFdPath = process.env.ROOTARK_TEST_SHARE_FOREIGN_FD_PATH;
+const mutateAfterBeforeSend = process.env.ROOTARK_TEST_SHARE_MUTATE_AFTER_BEFORE_SEND === "1";
+const mutateFilePath = process.env.ROOTARK_TEST_SHARE_MUTATE_FILE;
+const mutateMarkerPath = process.env.ROOTARK_TEST_SHARE_MUTATE_MARKER;
 // Node's full test discovery also loads support/*.js as standalone tests.
 // Stay inert without a configured attack; reject partially configured hooks.
 if (filePath || savedPath || markerPath) {
@@ -47,5 +50,25 @@ if (filePath || savedPath || markerPath) {
       throw error;
     }
     return readHandle;
+  };
+}
+
+if (mutateAfterBeforeSend) {
+  if (process.env.NODE_ENV !== "test") throw new Error("Test-only in-place mutation hook");
+  if (!mutateFilePath || !mutateMarkerPath) throw new Error("Incomplete test mutation paths");
+  const originalCreateReadStream = fs.createReadStream;
+  let mutated = false;
+  let descriptorStreams = 0;
+  fs.createReadStream = function mutateAfterFinalAuthorization(file, options) {
+    if (file === null && Number.isInteger(options?.fd)) descriptorStreams += 1;
+    if (!mutated && descriptorStreams === 2 && file === null && Number.isInteger(options?.fd)) {
+      const before = fs.statSync(mutateFilePath);
+      fs.writeFileSync(mutateFilePath, Buffer.alloc(before.size, 0x46));
+      const after = fs.statSync(mutateFilePath);
+      if (before.ino !== after.ino) throw new Error("Test mutation replaced rather than modified the same inode");
+      fs.writeFileSync(mutateMarkerPath, `${before.ino}:${after.ino}`);
+      mutated = true;
+    }
+    return originalCreateReadStream.call(this, file, options);
   };
 }
