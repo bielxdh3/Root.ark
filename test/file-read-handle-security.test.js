@@ -419,17 +419,17 @@ test("atomic quarantine verifies the moved inode before unlinking a raced replac
     fs.renameSync = originalRenameSync;
   }
   assert.equal(raced, true);
-  // A pathname may be rebound by the exact race this test injects. Read the
-  // post-race replacement through an owned descriptor and independently pin
-  // its identity, rather than following it again after checking metadata.
-  const replacementFd = fs.openSync(cleanupPath, "r");
+  // The race deliberately replaces the pathname. Re-open only through the
+  // product's descriptor-first, multi-stat identity verifier; the test must
+  // not perform its own check-then-open against a mutable pathname.
+  const replacementHandle = openReadHandle(cleanupPath);
   try {
-    const openedReplacement = fs.fstatSync(replacementFd, { bigint: true });
+    const openedReplacement = fs.fstatSync(replacementHandle.fd, { bigint: true });
     assert.notEqual(openedReplacement.ino, identity.ino,
       "the restored foreign snapshot must not alias the authorized inode");
-    assert.equal(fs.readFileSync(replacementFd, { encoding: "utf8" }), "unrelated replacement",
+    assert.equal(fs.readFileSync(replacementHandle.fd, { encoding: "utf8" }), "unrelated replacement",
       "a replacement moved into quarantine must be restored without being deleted");
-  } finally { fs.closeSync(replacementFd); }
+  } finally { fs.closeSync(replacementHandle.fd); }
   assert.equal(fs.readFileSync(displacedPath, "utf8"), "authorized snapshot");
   assert.equal(budget.getState().active, 0,
     "the active request slot is released while bytes remain charged for the quarantined inode");
@@ -998,10 +998,14 @@ test("a second owned descriptor for a pending inode must close independently", (
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000013.tmp`);
   fs.writeFileSync(cleanupPath, "native handle custody");
-  const fdFirst = fs.openSync(cleanupPath, "r");
-  const fdSecond = fs.openSync(cleanupPath, "r");
-  const stat = fs.fstatSync(fdFirst, { bigint: true });
-  const secondStat = fs.fstatSync(fdSecond, { bigint: true });
+  // Two independently owned descriptors must both be authenticated by the
+  // same descriptor-first product opener before quota/cleanup registration.
+  const firstHandle = openReadHandle(cleanupPath);
+  const secondHandle = openReadHandle(cleanupPath);
+  const fdFirst = firstHandle.fd;
+  const fdSecond = secondHandle.fd;
+  const stat = firstHandle.snapshot;
+  const secondStat = secondHandle.snapshot;
   assert.equal(secondStat.dev, stat.dev);
   assert.equal(secondStat.ino, stat.ino);
   const identity = { dev: stat.dev, ino: stat.ino };
