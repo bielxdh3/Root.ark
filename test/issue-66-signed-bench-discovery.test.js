@@ -16,7 +16,9 @@ function run(args, env = cliEnv) {
 }
 
 test("#66 signed eviction benchmark is inert under canonical Node test discovery", () => {
-  const discovery = run(["--test", benchmark]);
+  // Node 22/24 may choose a human-friendly spec reporter by default; TAP
+  // preserves the explicit SKIP marker this discovery assertion verifies.
+  const discovery = run(["--test", "--test-reporter=tap", benchmark]);
   assert.equal(discovery.error, undefined);
   assert.equal(discovery.status, 0, `${discovery.stdout}\n${discovery.stderr}`);
   assert.match(discovery.stdout, /benchmark is CLI-only.*SKIP/);
