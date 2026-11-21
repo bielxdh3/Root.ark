@@ -27,7 +27,18 @@ test("native protected text view requires provisioned trust, authenticated fetch
   assert.match(activity, /isForeground = true/, "onStart must set isForeground = true");
   assert.match(activity, /isForeground = false/, "onStop must set isForeground = false");
   assert.match(activity, /stillActive = \{ isForeground && generation == startedGeneration/, "stillActive must verify isForeground and atomic startedGeneration");
-  assert.match(activity, /setText\(characters,\s*0,\s*characters\.size\)/, "must use CharArray setText without immutable String heap copy");
+  // SecurePreviewBuffer intentionally retains the caller-owned mutable
+  // CharArray under the lambda name `retained` until the view is cleared.
+  // Require that exact buffer (not a String copy or a new CharArray) to reach
+  // TextView.setText and that the lifecycle still wipes/clears its owner.
+  assert.match(activity, /securePreviewText\.show\(characters,\s*\{\s*retained\s*->/,
+    "the secured view must retain the verified CharArray through SecurePreviewBuffer");
+  assert.match(activity, /previewText\.setText\(retained,\s*0,\s*retained\.size\)/,
+    "must use retained CharArray setText without an immutable String heap copy");
+  assert.match(activity, /securePreviewText\.clear\(\)/, "protected preview must clear on close and lifecycle");
+  const buffer = read("android/app/src/main/java/dev/rootark/android/SecurePreviewBuffer.kt");
+  assert.match(buffer, /previous\?\.fill\('\\u0000'\)/,
+    "clear must wipe the actual retained CharArray before the TextView is replaced");
   assert.doesNotMatch(activity, /text\(view,\s*String\(characters\)\)/, "must not wrap characters in String");
   assert.doesNotMatch(activity, /\.ciphertext|\.nonce|\.tag|\.aad|\.authorization|SharedPreferences|ClipboardManager|WebView/);
 });
