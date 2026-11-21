@@ -15,6 +15,7 @@ const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
 // arbitrary JavaScript. An authority callback cannot extend a signed lease by
 // replacing the global Date.now function.
 const nativeReleaseNow = Date.now;
+const nativeReleaseFloor = Math.floor;
 
 const SHARE_DOMAIN = Buffer.from("Root.ark/zk-1/protected-ciphertext-share/v1\0");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
@@ -252,7 +253,7 @@ async function createProtectedRecipientShareOffer(input) {
     // The independently verified second authority read can outlast the
     // owner-approved HPKE envelope even while the share grant remains valid.
     // Neither lease may expire before releasing the portable CEK offer.
-    const releaseSeconds = Math.floor(nativeReleaseNow() / 1000);
+    const releaseSeconds = nativeReleaseFloor(nativeReleaseNow() / 1000);
     if (!Number.isSafeInteger(envelope.core.expires_at)
       || releaseSeconds >= envelope.core.expires_at
       || releaseSeconds >= statement.expires_at) denyOffer();
@@ -368,7 +369,7 @@ async function openProtectedRecipientShareFile(input) {
     const verifiedReleaseExpiresAt = opened.verifiedReleaseExpiresAt;
     if (!Number.isSafeInteger(verifiedReleaseExpiresAt)
       || verifiedReleaseExpiresAt < 1) deny();
-    const releaseSeconds = Math.floor(nativeReleaseNow() / 1000);
+    const releaseSeconds = nativeReleaseFloor(nativeReleaseNow() / 1000);
     if (releaseSeconds >= statement.expires_at || nowSeconds >= statement.expires_at
       || releaseSeconds >= verifiedReleaseExpiresAt || nowSeconds >= verifiedReleaseExpiresAt) deny();
     const result = Object.freeze({

@@ -1022,6 +1022,31 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(regressionReads, 2,
       "owner AEAD/HPKE sealing must complete before the rollback oracle runs");
 
+    // A hostile independent authority callback can rebind Math.floor after
+    // cryptographic work. A zero-valued rounded clock would incorrectly make
+    // an already-expired envelope appear live at the release boundary.
+    const originalFloor = Math.floor;
+    let poisonedReleaseFloorCalls = 0;
+    let floorAuthorityReads = 0;
+    try {
+      const safeOffer = await createProtectedRecipientShareOffer(freshOfferArgs({
+        readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          floorAuthorityReads++;
+          if (floorAuthorityReads === 2) Math.floor = () => {
+            poisonedReleaseFloorCalls++;
+            return 0;
+          };
+          return current;
+        },
+      }));
+      assert.equal(safeOffer.schema, "rootark-zk1-recipient-share-offer-dev/v1");
+      assert.equal(floorAuthorityReads, 2,
+        "the callback must poison Math.floor after the authenticated second read");
+      assert.equal(poisonedReleaseFloorCalls, 0,
+        "post-authentication release must use the clock intrinsics pinned before callbacks");
+    } finally { Math.floor = originalFloor; }
+
     // Feed a valid, successfully opened portable offer to this negative case.
     // An own getter in the recipient login must be rejected WITHOUT firing.
     const hostileRedeem = { ...recipientShareInput };
@@ -1122,9 +1147,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     }), /ZK_SHARE_OFFER_DENIED/,
     "owner-pinned issuer revoked after genuine HPKE sealing fails before export");
     assert.equal(issuerReads, 2);
-    // The authentic owner-approved HPKE envelope has a shorter lifetime than
-    // this independently owner-signed grant. Advance only the wall clock in
-    // the SECOND authority read, after the real AEAD + HPKE sealing awaits.
+    // The genuine owner envelope has a shorter lifetime than this signed
+    // grant. A callback MUST NOT impersonate an expired real-world clock by
+    // replacing Date.now after the authentic AEAD/HPKE sealing awaits.
     const longGrantInput = { ...grantInput,
       expiresAt: envelope.core.expires_at + 120 };
     const longGrantBytes = await shareGrantMessageV1(longGrantInput);
@@ -1138,7 +1163,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     const expiryOriginalWallClock = Date.now;
     let expiryReads = 0;
     try {
-      await assert.rejects(createProtectedRecipientShareOffer({
+      const clockPinnedOffer = await createProtectedRecipientShareOffer({
         ...ownerOfferArgs, grant: longGrant,
         readIndependentAuthority: async () => {
           const current = await readIndependentAuthority();
@@ -1147,8 +1172,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
           }
           return current;
         },
-      }), /ZK_SHARE_OFFER_DENIED/,
-      "a valid grant cannot export a newly expired, owner-signed HPKE envelope");
+      });
+      assert.equal(clockPinnedOffer.schema, "rootark-zk1-recipient-share-offer-dev/v1",
+        "a callback's replacement of Date.now must not change the pinned clock");
     } finally { Date.now = expiryOriginalWallClock; }
     assert.equal(expiryReads, 2,
       "the test must expire the envelope only at the second independent authority read");
