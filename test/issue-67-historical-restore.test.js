@@ -1825,7 +1825,8 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
     throw new Error("simulated process halt after moving original to trash");
   };
   await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"), /simulated process halt/);
-  assert.equal(fs.existsSync(target), false);
+  // The later O_EXCL claim proves target absence atomically; do not authorize
+  // a later open from an earlier path-existence observation.
   assert.equal((await f.engine.journal.recover()).length, 1);
   f.adapter.list = async (id) => id ? structuredClone(f.current()) : [structuredClone(f.current())];
   const reopened = await new SyncEngine({
@@ -2201,7 +2202,8 @@ test("#67 P2: restart recovers an exactly bound crash hardlink or fails closed o
     assert.equal(f.pushes(), 0);
     assert.equal(fs.existsSync(orphan), true, "mismatched staged identity cannot be deleted");
     assert.equal((await reopened.journal.recover()).length, 1);
-    assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+    assert.equal((await readHeldRegularFile(target)).toString("utf8"),
+      "original authenticated bytes");
     return;
   }
   const result = await reopened.syncOnce();
