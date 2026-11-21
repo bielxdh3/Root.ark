@@ -68,7 +68,9 @@ async function setup(t, files) {
   }).open();
   const openCached = (...relativePaths) =>
     openPreexistingCachedFodFixture({ root, source, writer, open, adapter, key }, relativePaths);
-  return { root, source, writer, open, openCached, adapter, state, store, key };
+  const seedCached = (...relativePaths) =>
+    openPreexistingCachedFodFixture({ root, source, writer, open, adapter, key }, relativePaths, false);
+  return { root, source, writer, open, openCached, seedCached, adapter, state, store, key };
 }
 
 async function exists(filePath) {
@@ -78,7 +80,7 @@ async function exists(filePath) {
 // Seed an explicitly preexisting cache without invoking the native-disabled
 // inbound publisher. Authenticate every remote ciphertext before writing any
 // local fixture bytes; a tampered remote record must not create a cache.
-async function openPreexistingCachedFodFixture({ root, source, writer, open, adapter, key }, relativePaths) {
+async function openPreexistingCachedFodFixture({ root, source, writer, open, adapter, key }, relativePaths, openFod = true) {
   const verified = [];
   for (const relative of relativePaths) {
     const tracked = writer.snapshot.files[relative];
@@ -101,6 +103,7 @@ async function openPreexistingCachedFodFixture({ root, source, writer, open, ada
     await fsp.writeFile(target, bytes, { flag: "wx" });
   }
   await fsp.writeFile(path.join(root, ".rootark-sync-index.json"), JSON.stringify(snapshot), { flag: "wx" });
+  if (!openFod) return snapshot;
   const reopened = await open();
   for (const relative of relativePaths) {
     assert.deepEqual(reopened.snapshot.files[relative], snapshot.files[relative],
@@ -514,15 +517,15 @@ test("issue 66: direct Files On-Demand outbox cannot enqueue a signed DELETE", a
 });
 
 test("issue 66: a previous non-FOD signed DELETE in a durable journal cannot be pushed by FOD", async (t) => {
-  const { root, open, store, adapter, key, state } = await setup(t,
+  const { root, open, seedCached, store, adapter, key, state } = await setup(t,
     { "docs/retained.txt": "retain remote and local" });
+  await seedCached("docs/retained.txt");
   // A genuine pre-FOD outbox must precede the first FOD open. Opening a
   // non-FOD writer after FOD activation is now deliberately forbidden.
   const legacy = await new SyncEngine({ rootDir: root, adapter,
     deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
     fileKeyResolver: () => key,
   }).open();
-  await legacy.syncOnce();
   const remote = store.list("alice")[0];
   await legacy.enqueueChange({
     operation: "delete", objectId: remote.objectId, fileId: remote.fileId,
@@ -799,15 +802,15 @@ test("issue 66: a FOD root retains its mode across non-FOD restart and custom sn
 });
 
 test("issue 66: an already-open non-FOD engine cannot evict after another instance marks FOD", async (t) => {
-  const { root, open, adapter, store, key, state } = await setup(t,
+  const { root, open, seedCached, adapter, store, key, state } = await setup(t,
     { "docs/retained.txt": "bytes of owner must never be evicted" });
+  await seedCached("docs/retained.txt");
   const legacy = await new SyncEngine({ rootDir: root, adapter,
     deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
     selectedPaths: ["docs"], fileKeyResolver: () => key,
   }).open();
   assert.equal(await exists(path.join(root, ".rootark-sync-ever-fod")), false,
     "ordinary non-FOD operations must not set the marker");
-  await legacy.syncOnce();
   assert.equal(await fsp.readFile(path.join(root, "docs", "retained.txt"), "utf8"),
     "bytes of owner must never be evicted");
   const fod = await open();
@@ -834,13 +837,13 @@ test("issue 66: an already-open non-FOD engine cannot evict after another instan
 });
 
 test("issue 66: direct recoverConflict cannot write after another engine marks FOD", async (t) => {
-  const { root, open, adapter, store, key } = await setup(t,
+  const { root, open, seedCached, adapter, store, key } = await setup(t,
     { "docs/retained.txt": "protected content" });
+  await seedCached("docs/retained.txt");
   const legacy = await new SyncEngine({ rootDir: root, adapter,
     deviceId: "device-b", keyEpoch: "epoch-1", compartmentId: "private",
     fileKeyResolver: () => key,
   }).open();
-  await legacy.syncOnce();
   assert.equal(await fsp.readFile(path.join(root, "docs", "retained.txt"), "utf8"),
     "protected content");
   const fod = await open();
