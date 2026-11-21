@@ -67,7 +67,7 @@ async function setup(t, files) {
     filesOnDemand,
   }).open();
   const openCached = (...relativePaths) =>
-    openPreexistingCachedFodFixture({ root, source, writer, open, store }, relativePaths);
+    openPreexistingCachedFodFixture({ root, source, writer, open, adapter, key }, relativePaths);
   return { root, source, writer, open, openCached, adapter, state, store, key };
 }
 
@@ -75,32 +75,36 @@ async function exists(filePath) {
   return fsp.stat(filePath).then(() => true, () => false);
 }
 
-// Hydrate through a real legacy sync before the FOD mode marker exists. This
-// exercises AES-GCM authentication and the on-disk snapshot service boundary;
-// current FOD publication must remain denied after the marker is created.
-async function openPreexistingCachedFodFixture({ root, source, writer, open, store }, relativePaths) {
-  const legacy = await open(["docs"], false);
-  assert.equal(legacy.filesOnDemand, false);
-  await legacy.syncOnce();
+// Seed an explicitly preexisting cache without invoking the native-disabled
+// inbound publisher. Authenticate every remote ciphertext before writing any
+// local fixture bytes; a tampered remote record must not create a cache.
+async function openPreexistingCachedFodFixture({ root, source, writer, open, adapter, key }, relativePaths) {
+  const verified = [];
   for (const relative of relativePaths) {
     const tracked = writer.snapshot.files[relative];
     assert.ok(tracked && !tracked.deleted, `writer must track ${relative}`);
-    const received = legacy.snapshot.files[relative];
-    assert.ok(received && !received.deleted, `real pre-FOD sync must hydrate ${relative}`);
-    for (const field of ["objectId", "fileId", "versionId", "hash"]) {
-      assert.equal(received[field], tracked[field], `pre-FOD ${field} must match the remote source`);
-    }
-    assert.ok(store.list("alice").some((record) => record.objectId === received.objectId
-      && record.fileId === received.fileId && record.versionId === received.versionId),
-    `the hydrated cache must match an actual remote record for ${relative}`);
-    const bytes = await fsp.readFile(path.join(root, relative));
+    const records = await adapter.list(tracked.objectId);
+    const record = records.find((item) => item.objectId === tracked.objectId
+      && item.fileId === tracked.fileId && item.versionId === tracked.versionId);
+    assert.ok(record, `remote cache source must exist for ${relative}`);
+    const bytes = protocol.decryptPayload(record, key);
     assert.deepEqual(bytes, await fsp.readFile(path.join(source, relative)));
-    assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"), received.hash);
+    assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"), tracked.hash);
+    verified.push({ relative, bytes, tracked });
   }
+  const snapshot = { ...writer.snapshot, files: Object.fromEntries(
+    verified.map(({ relative, tracked }) => [relative, tracked])) };
+  await fsp.mkdir(root, { recursive: true });
+  for (const { relative, bytes } of verified) {
+    const target = path.join(root, relative);
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await fsp.writeFile(target, bytes, { flag: "wx" });
+  }
+  await fsp.writeFile(path.join(root, ".rootark-sync-index.json"), JSON.stringify(snapshot), { flag: "wx" });
   const reopened = await open();
   for (const relative of relativePaths) {
-    assert.deepEqual(reopened.snapshot.files[relative], legacy.snapshot.files[relative],
-      "reopened FOD cache must retain the actual legacy-synced record");
+    assert.deepEqual(reopened.snapshot.files[relative], snapshot.files[relative],
+      "reopened FOD cache must retain the authenticated preexisting record");
     assert.deepEqual(await fsp.readFile(path.join(root, relative)),
       await fsp.readFile(path.join(source, relative)),
       "reopened FOD cache must retain the verified source bytes");
