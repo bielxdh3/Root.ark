@@ -92,6 +92,15 @@ test("real historical HTTP responses emit pinned Last-Modified for full and rang
       const fd = fs.openSync(name, fs.constants.O_RDONLY);
       return { fd, stats: fs.fstatSync(fd) };
     },
+    // This isolated VM test exercises HTTP headers, not the snapshot custody
+    // implementation. Close a still-owned descriptor and leave stream-owned
+    // descriptors to ReadStream's autoClose, mirroring the actual handoff.
+    cleanupReadHandle(handle) {
+      if (handle && handle.fdOwned !== false && Number.isInteger(handle.fd)) {
+        try { fs.closeSync(handle.fd); }
+        catch (error) { if (error.code !== "EBADF") throw error; }
+      }
+    },
     getMimeType() { return "application/octet-stream"; },
     getFileContentDisposition() { return 'attachment; filename="archive.ct"'; },
     isActiveContentFile() { return false; }, console,
