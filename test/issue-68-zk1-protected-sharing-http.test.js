@@ -304,6 +304,32 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   const genuineAgainstUntrustedServer = await redeem({ fetchImpl: forgedServer });
   assert.deepEqual(genuineAgainstUntrustedServer, redeemed,
     "positive control: the same authenticated bytes with the pinned device signer remain valid");
+  // Exercise the same client under a browser cookie session: a genuine owner
+  // grant must include the double-submit CSRF header without trusting the
+  // server response to furnish the recipient's authorization history.
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  try {
+    globalThis.document = { cookie: "session=opaque; rootark_csrf=browser%2Dfixture%2Dtoken" };
+    let observedHeader = false;
+    const browserReceipt = await redeem({ fetchImpl: async (_url, options) => {
+      assert.equal(options.headers["x-csrf-token"], "browser-fixture-token");
+      observedHeader = true;
+      return forgedServer();
+    } });
+    assert.equal(observedHeader, true, "browser redemption must reach the CSRF-bound request");
+    assert.deepEqual(browserReceipt, redeemed);
+    globalThis.document.cookie = "rootark_csrf=first; rootark_csrf=second";
+    let attemptedFetch = false;
+    await assert.rejects(redeem({ fetchImpl: async () => {
+      attemptedFetch = true;
+      return forgedServer();
+    } }), /ZK_SHARE_REDEMPTION_DENIED/,
+    "an ambiguous duplicate CSRF cookie must be rejected before request dispatch");
+    assert.equal(attemptedFetch, false);
+  } finally {
+    if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument);
+    else delete globalThis.document;
+  }
   await assert.rejects(redeem({ fetchImpl: fetch }), /ZK_SHARE_REDEMPTION_DENIED/,
     "grant possession without recipient account session must not download ciphertext");
   await assert.rejects(redeem({ readIndependentAuthority: null }),
