@@ -3422,16 +3422,16 @@ class SyncEngine {
           if (result.status !== 409) fail("Sync push rejected", "push_rejected");
           throw new SyncConflictError(result);
         }
-        // Persist the exact pre-expiry observation BEFORE snapshot writes. A
-        // later journal fsync failure must not make this verified ciphertext
-        // impossible to authenticate after authorization expires.
-        // A historical restore has already passed both the independent
-        // physical witness and CURRENT CAS floor above. Promote precisely
-        // that signed digest; the remote HTTP echo is not its authority.
+        // Ordinary exact echoed operations need a pre-observation before
+        // snapshot writes. Historical restores instead have an independently
+        // signed physical witness and CURRENT CAS proof, and are durably
+        // admitted in markSeenExact's single journal transaction below.
+        // Do not consume a bounded observation slot for a proven restore:
+        // the other 10,000 slots may legitimately contain pending evidence.
         const acknowledgedDigest = historicalRestore ? historicalRestoreEnvelope.digest
           : outboundFreshDigest && result?.operationId === operation.operationId
             && signedEnvelopeDigest(result) === outboundFreshDigest ? outboundFreshDigest : null;
-        if (acknowledgedDigest) await nativeReflectApply(journalMethods.observeAdmission, journal,
+        if (!historicalRestore && acknowledgedDigest) await nativeReflectApply(journalMethods.observeAdmission, journal,
           [operation.operationId, acknowledgedDigest]);
         if (operation.operation === "move" || operation.operation === "delete") {
           const hash = operation.operation === "move"
@@ -3671,10 +3671,17 @@ class SyncEngine {
     };
     operation = { ...operation, metadata };
     const target = await contained(this.rootDir, metadata.path, true);
-    // Credential/key/AEAD/path preflight is complete. Fsync the exact verified
-    // envelope before the first filesystem or snapshot mutation; failure here
-    // must not leave an applied object with no restart-safe observation.
-    if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+    // Incoming remote operations require a durable pre-observation before
+    // local mutation. A locally staged historical restore instead has its
+    // exact signed outbox journaled BEFORE this call, and its materialization
+    // is recorded separately. No remote admission has happened yet: only the
+    // later independent physical witness + CURRENT CAS may atomically admit
+    // it. Do not allocate an observation slot for that local materialization.
+    const locallyStagedRestore = historicalRestoreHash !== undefined
+      && stringStartsWith(operation.operationId, "histrestore-");
+    if (verifiedFreshDigest && !locallyStagedRestore) {
+      await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+    }
     let cleanupPath = null;
     if (operation.operation === "delete" || operation.tombstone) {
       const priorAtTarget = this.snapshot.files[metadata.path];

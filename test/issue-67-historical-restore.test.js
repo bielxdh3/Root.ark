@@ -3426,6 +3426,36 @@ test("#262 P2: independent physical restore ACK promotes the durable observation
   assert.deepEqual(await f.engine.journal.recover(), []);
 });
 
+test("#271 P2: physical historical restore ACK is atomic with 10,000 occupied observation slots", async (t) => {
+  const f = await fixture(t);
+  const otherDigest = "a".repeat(64);
+  // Reach the actual durable capacity boundary, rather than mocking a
+  // capacity error. These unrelated observations must remain untouched.
+  await f.engine.journal.commit((next) => {
+    for (let index = 0; index < 10_000; index += 1) {
+      next.observed[`capacity-${String(index).padStart(5, "0")}`] = otherDigest;
+    }
+  });
+  assert.equal(Object.keys(f.engine.journal.state.observed).length, 10_000);
+
+  const outcome = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(outcome.pushed, true,
+    "signed physical witness + CURRENT CAS must not require a free pre-observation slot");
+  const digest = f.engine.journal.durableSignedReceiptDigest(outcome.operationId);
+  assert.match(digest, /^[a-f0-9]{64}$/);
+  assert.equal(f.engine.journal.state.admitted[outcome.operationId], digest);
+  assert.equal(f.engine.journal.hasSeen(outcome.operationId), true);
+  assert.equal(Object.hasOwn(f.engine.journal.state.observed, outcome.operationId), false);
+  assert.equal(Object.keys(f.engine.journal.state.observed).length, 10_000,
+    "physical admission must not evict unrelated pending observations");
+  assert.equal(f.engine.journal.state.observed["capacity-00000"], otherDigest);
+  assert.equal(f.engine.journal.state.observed["capacity-09999"], otherDigest);
+  assert.deepEqual(await f.engine.journal.recover(), [],
+    "exact signed restore must leave pending state only with a durable ACK");
+  assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"),
+    "original authenticated bytes");
+});
+
 test("#262 P1: excluded signed restore LIST echo cannot consume pending physical admission", async (t) => {
   const f = await fixture(t);
   let echoed;
