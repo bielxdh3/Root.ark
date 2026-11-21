@@ -4,16 +4,84 @@
 // explicitly rewraps an already-held FILE CEK; a device epoch key alone never
 // grants access to historical file CEKs. No off-host or production claim.
 const crypto = require("node:crypto");
-const { types: nativeTypes } = require("node:util");
+const nativeTypes = require("node:util").types;
+const nativeIsProxy = nativeTypes.isProxy;
+const nativeIsCryptoKey = nativeTypes.isCryptoKey;
+const nativeIsKeyObject = nativeTypes.isKeyObject;
+const nativeNumberIsFinite = Number.isFinite;
+const nativeNumberIsSafeInteger = Number.isSafeInteger;
+const nativeMathFloor = Math.floor;
+const nativeMathAbs = Math.abs;
+const nativeMathMin = Math.min;
+const nativeMathCeil = Math.ceil;
 const z = require("./rootark-zk-1");
 const commitment = require("./rootark-zk1-offline-commitment-receipt");
 const committedApproval = require("../../public/client/rootark-zk1-v2-committed-approval");
 const browserPop = require("../../public/client/rootark-zk1-v2-browser-pop");
 const fileContent = require("../../public/client/rootark-zk1-file-content");
 const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
-const DOMAIN = Buffer.from("Root.ark/zk-1/owner-authorized-file-cek-transfer/v1\0");
-const INFO = Buffer.from("Root.ark/zk-1/owner-authorized-file-cek-info/v1\0");
-const AAD = Buffer.from("Root.ark/zk-1/owner-authorized-file-cek-aad/v1\0");
+const nativeApply = Reflect.apply;
+const nativeObjectPrototype = Object.prototype;
+const nativeGetPrototypeOf = Object.getPrototypeOf;
+const nativeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const nativeGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+const nativeHasOwn = Object.hasOwn;
+const nativeCreate = Object.create;
+const nativeFreeze = Object.freeze;
+const nativeDefineProperty = Object.defineProperty;
+const nativeOwnKeys = Reflect.ownKeys;
+const nativeArrayIsArray = Array.isArray;
+const nativeArrayBufferIsView = ArrayBuffer.isView;
+const nativeArrayBuffer = ArrayBuffer;
+const nativeUint8Array = Uint8Array;
+const nativeUint8ArrayFrom = Uint8Array.from;
+const nativeBufferFrom = Buffer.from.bind(Buffer);
+const nativeBufferConcat = Buffer.concat.bind(Buffer);
+const nativeBufferIsBuffer = Buffer.isBuffer.bind(Buffer);
+const nativeBufferToString = Buffer.prototype.toString;
+const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
+const nativeCreateHash = crypto.createHash.bind(crypto);
+const nativeCreatePublicKey = crypto.createPublicKey.bind(crypto);
+const nativeSign = crypto.sign.bind(crypto);
+const nativeVerify = crypto.verify.bind(crypto);
+const nativeRandomBytes = crypto.randomBytes.bind(crypto);
+const nativeKeyObject = crypto.KeyObject;
+const nativeKeyObjectExport = nativeKeyObject.prototype.export;
+const nativeSubtle = crypto.webcrypto.subtle;
+const nativeSubtleExportKey = nativeSubtle.exportKey;
+const nativeJsonStringify = JSON.stringify;
+const nativeDecodeDeterministic = z.decodeDeterministic.bind(z);
+const nativeEncodeDeterministic = z.encodeDeterministic.bind(z);
+const nativeHpkeSuite = z.hpkeSuite.bind(z);
+const nativeHpkeSeal = z.hpkeSeal.bind(z);
+const nativeHpkeOpen = z.hpkeOpen.bind(z);
+const nativeDecryptFile = fileContent.decryptFile.bind(fileContent);
+const nativeImportFileCek = fileContent.importFileCek.bind(fileContent);
+const nativeComputeCiphertextRoot = roots.computeCiphertextRoot.bind(roots);
+const nativeVerifySignedReceipt = commitment.verifySignedReceipt.bind(commitment);
+const nativeCommitmentSigningBytes = commitment.commitmentSigningBytes.bind(commitment);
+const nativeVerifyCommittedApproval = committedApproval.verifyCommittedApproval.bind(committedApproval);
+const nativeTargetDigest = browserPop.targetDigest.bind(browserPop);
+const nativeHashPrototype = nativeGetPrototypeOf(nativeCreateHash("sha256"));
+const nativeHashUpdate = nativeHashPrototype.update;
+const nativeHashDigest = nativeHashPrototype.digest;
+function nativeSha256(value) {
+  const hash = nativeCreateHash("sha256");
+  nativeApply(nativeHashUpdate, hash, [value]);
+  return nativeApply(nativeHashDigest, hash, []);
+}
+function nativeBase64Url(value) {
+  return nativeApply(nativeBufferToString, nativeBufferFrom(value), ["base64url"]);
+}
+function fieldsObject(keys, source) {
+  const output = nativeCreate(null);
+  for (const key of keys) nativeDefineProperty(output, key, {
+    value: source[key], enumerable: true, writable: false, configurable: false });
+  return output;
+}
+const DOMAIN = nativeBufferFrom("Root.ark/zk-1/owner-authorized-file-cek-transfer/v1\0");
+const INFO = nativeBufferFrom("Root.ark/zk-1/owner-authorized-file-cek-info/v1\0");
+const AAD = nativeBufferFrom("Root.ark/zk-1/owner-authorized-file-cek-aad/v1\0");
 const FORMAT = "rootark-zk1-owner-device-file-cek-hpke/v1";
 const GRANT = ["schema", "account_id", "compartment_id", "keyring_id", "device_id",
   "authorization_key_id", "authorization_public_key", "manifest_revision",
@@ -37,97 +105,104 @@ function deny() { throw Error("ZK_OWNER_FILE_CEK_DENIED"); }
 // Native private/public keys are opaque handles, not caller-owned dictionaries.
 function snapshotFields(value, depth = 0, budget = { count: 0, bytes: 0 }) {
   if (depth > 12 || ++budget.count > 512) deny();
+  if (value !== null && (typeof value === "object" || typeof value === "function")
+    && nativeIsProxy(value)) deny();
   if (value === null || typeof value === "boolean" || typeof value === "number"
     || typeof value === "string") {
     if (typeof value === "string" && value.length > 524288) deny();
     return value;
   }
-  if (Buffer.isBuffer(value) || value instanceof Uint8Array
-    || value instanceof ArrayBuffer) {
+  if (nativeBufferIsBuffer(value) || value instanceof nativeUint8Array
+    || value instanceof nativeArrayBuffer) {
     const length = value.byteLength;
     budget.bytes += length;
-    if (!Number.isSafeInteger(length) || length > 4 * 1024 * 1024
+    if (!nativeNumberIsSafeInteger(length) || length > 4 * 1024 * 1024
       || budget.bytes > 8 * 1024 * 1024) deny();
-    if (Buffer.isBuffer(value)) return Buffer.from(value);
-    if (value instanceof Uint8Array) return Uint8Array.from(value);
+    if (nativeBufferIsBuffer(value)) return nativeBufferFrom(value);
+    if (value instanceof nativeUint8Array) return nativeApply(nativeUint8ArrayFrom,
+      nativeUint8Array, [value]);
     return value.slice(0);
   }
-  if (value instanceof crypto.KeyObject
-    || nativeTypes.isCryptoKey(value)) return value;
+  if (value instanceof nativeKeyObject
+    || nativeIsCryptoKey(value)) return value;
   // @hpke uses XCryptoKey wrapping mutable 32-byte private raw material.
   // Copy that material synchronously; reconstruct a fresh HPKE handle only
   // after all other authorization checks. Never keep the caller's raw array.
   const prototype = value && typeof value === "object"
-    ? Object.getPrototypeOf(value) : null;
-  const ctor = prototype && Object.getOwnPropertyDescriptor(prototype, "constructor");
-  if (ctor && Object.hasOwn(ctor, "value")
+    ? nativeGetPrototypeOf(value) : null;
+  const ctor = prototype && nativeGetOwnPropertyDescriptor(prototype, "constructor");
+  if (ctor && nativeHasOwn(ctor, "value")
     && ctor.value?.name === "XCryptoKey") {
-    const d = Object.getOwnPropertyDescriptors(value);
+    const d = nativeGetOwnPropertyDescriptors(value);
     const expected = ["key", "type", "extractable", "algorithm", "usages"];
-    if (Reflect.ownKeys(d).length !== expected.length
-      || expected.some((name) => !d[name] || !Object.hasOwn(d[name], "value"))
-      || d.type.value !== "private" || !(d.key.value instanceof Uint8Array)
-      || d.key.value.byteLength !== 32 || !Array.isArray(d.usages.value)
+    const keys = nativeOwnKeys(d);
+    if (keys.length !== expected.length
+      || d.type.value !== "private" || !(d.key.value instanceof nativeUint8Array)
+      || d.key.value.byteLength !== 32 || !nativeArrayIsArray(d.usages.value)
       || d.usages.value.length > 8) deny();
     const algorithm = snapshotFields(d.algorithm.value, depth + 1, budget);
     if (algorithm.name !== "X25519") deny();
-    const usages = Object.getOwnPropertyDescriptors(d.usages.value);
+    const usages = nativeGetOwnPropertyDescriptors(d.usages.value);
     for (let i = 0; i < d.usages.value.length; i++) {
-      if (!Object.hasOwn(usages[i] ?? {}, "value")
+      if (!nativeHasOwn(usages[i] ?? {}, "value")
         || typeof usages[i].value !== "string") deny();
     }
-    return Object.freeze({ hpkePrivateRaw: Uint8Array.from(d.key.value) });
+    return nativeFreeze({ hpkePrivateRaw: nativeApply(nativeUint8ArrayFrom,
+      nativeUint8Array, [d.key.value]) });
   }
-  if (typeof value !== "object" || Array.isArray(value)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) deny();
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const entries = Reflect.ownKeys(descriptors);
-  const out = Object.create(Object.getPrototypeOf(value));
+  const plainPrototype = nativeGetPrototypeOf(value);
+  if (typeof value !== "object" || nativeArrayIsArray(value)
+    || (plainPrototype !== nativeObjectPrototype && plainPrototype !== null)) deny();
+  const descriptors = nativeGetOwnPropertyDescriptors(value);
+  const entries = nativeOwnKeys(descriptors);
+  const out = nativeCreate(prototype);
   for (const name of entries) {
-    if (typeof name !== "string" || !Object.hasOwn(descriptors[name], "value")) deny();
-    Object.defineProperty(out, name, { value: snapshotFields(
+    if (typeof name !== "string" || !nativeHasOwn(descriptors[name], "value")) deny();
+    nativeDefineProperty(out, name, { value: snapshotFields(
       descriptors[name].value, depth + 1, budget),
     enumerable: true, writable: false, configurable: false });
   }
-  return Object.freeze(out);
+  return nativeFreeze(out);
 }
 function exact(v, keys) {
-  if (!v || typeof v !== "object" || Array.isArray(v)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(v))
-    || Reflect.ownKeys(v).length !== keys.length
-    || keys.some((k) => !Object.hasOwn(v, k))) deny();
+  if (!v || nativeIsProxy(v) || typeof v !== "object" || nativeArrayIsArray(v)) deny();
+  const prototype = nativeGetPrototypeOf(v);
+  if (prototype !== nativeObjectPrototype && prototype !== null) deny();
+  if (nativeOwnKeys(v).length !== keys.length) deny();
+  for (const key of keys) if (!nativeHasOwn(v, key)) deny();
   return v;
 }
 function raw(v, length) {
-  if (!ArrayBuffer.isView(v) || v.byteLength !== length) deny();
-  return Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+  if (!nativeArrayBufferIsView(v) || v.byteLength !== length) deny();
+  return nativeBufferFrom(v.buffer, v.byteOffset, v.byteLength);
 }
 function from64(v, n) {
   if (typeof v !== "string" || !/^[A-Za-z0-9_-]+$/.test(v)
-    || v.length > Math.ceil(n * 4 / 3) + 3) deny();
-  const b = Buffer.from(v, "base64url");
-  if (b.length !== n || b.toString("base64url") !== v) deny();
+    || v.length > nativeMathCeil(n * 4 / 3) + 3) deny();
+  const b = nativeBufferFrom(v, "base64url");
+  if (b.length !== n || nativeBase64Url(b) !== v) deny();
   return b;
 }
-const b64 = (v) => Buffer.from(v).toString("base64url");
-const sha = (v) => crypto.createHash("sha256").update(v).digest();
-function compare(a, b) { return a.length === b.length && crypto.timingSafeEqual(a, b); }
-function positive(v) { if (!Number.isSafeInteger(v) || v < 1) deny(); return v; }
-function requireUnexpiredAtRelease(expiresAt) {
-  if (!Number.isSafeInteger(expiresAt)
-    || Math.floor(Date.now() / 1000) > expiresAt) deny();
+const b64 = nativeBase64Url;
+const sha = nativeSha256;
+function compare(a, b) { return a.length === b.length && nativeTimingSafeEqual(a, b); }
+function positive(v) { if (!nativeNumberIsSafeInteger(v) || v < 1) deny(); return v; }
+function requireUnexpiredAtRelease(expiresAt, wallClock) {
+  if (!nativeNumberIsSafeInteger(expiresAt)
+    || Date.now !== wallClock || !nativeNumberIsFinite(wallClock())
+    || nativeMathFloor(wallClock() / 1000) > expiresAt) deny();
 }
 function metadataCopy(meta) {
   exact(meta, META);
   for (const n of ["account_id", "keyring_id", "object_id", "version_id"])
     from64(meta[n], 16);
-  const compartment = Buffer.from(meta.compartment_id, "base64url");
+  const compartment = nativeBufferFrom(meta.compartment_id, "base64url");
   if (!compartment.length || compartment.length > 128
     || b64(compartment) !== meta.compartment_id) deny();
   if (meta.parent_version_id !== null) from64(meta.parent_version_id, 16);
   positive(meta.epoch);
   if (meta.kind !== "file") deny();
-  return Object.fromEntries(META.map((n) => [n, meta[n]]));
+  return fieldsObject(META, meta);
 }
 function headFrom(a) {
   const h = a.currentHead || a.pinnedCurrentHead;
@@ -136,8 +211,9 @@ function headFrom(a) {
     digest: raw(h.digest, 32) };
 }
 function toNodePub(publicKey) {
-  if (publicKey?.type === "public" && typeof publicKey.export === "function")
-    return publicKey;
+  if (publicKey && !nativeIsProxy(publicKey) && nativeIsKeyObject(publicKey)
+    && nativeApply(nativeGetOwnPropertyDescriptor(nativeKeyObject.prototype, "type").get,
+      publicKey, []) === "public") return publicKey;
   deny();
 }
 async function verifyOwnerApprovedHpkeRecipient(a, trusted, owner, nowSeconds) {
@@ -149,8 +225,8 @@ async function verifyOwnerApprovedHpkeRecipient(a, trusted, owner, nowSeconds) {
   if (request.schema !== "rootark-zk1-device-enrollment-request/v1"
     || request.approval !== "OWNER_MUST_VERIFY_IDENTITY_AND_FINISH_V2_POP_AND_SIGN_CURRENT_GRANT"
     || approval.schema !== "rootark-zk1-offline-v2-device-approval/v1"
-    || !Number.isSafeInteger(approval.issued_at)
-    || !Number.isSafeInteger(approval.expires_at)
+    || !nativeNumberIsSafeInteger(approval.issued_at)
+    || !nativeNumberIsSafeInteger(approval.expires_at)
     || approval.expires_at <= approval.issued_at
     || approval.expires_at - approval.issued_at > 300
     || approval.issued_at > nowSeconds + 30
@@ -159,56 +235,61 @@ async function verifyOwnerApprovedHpkeRecipient(a, trusted, owner, nowSeconds) {
   for (const field of ["request_sha256", "target_device_key_digest",
     "manifest_digest", "grant_sha256"]) from64(approval[field], 32);
   for (const field of ["operation_id", "pop_challenge_id"]) from64(approval[field], 16);
-  if (approval.request_sha256 !== b64(sha(Buffer.from(JSON.stringify(request))))
-    || approval.grant_sha256 !== b64(sha(Buffer.from(JSON.stringify(
-      Object.fromEntries(GRANT.map((field) => [field, trusted.grant[field]]))))))
-    || approval.target_device_key_digest !== await browserPop.targetDigest(request)
+  if (approval.request_sha256 !== b64(sha(nativeBufferFrom(nativeJsonStringify(request))))
+    || approval.grant_sha256 !== b64(sha(nativeBufferFrom(nativeJsonStringify(
+      fieldsObject(GRANT, trusted.grant)))))
+    || approval.target_device_key_digest !== await nativeTargetDigest(request)
     || approval.manifest_revision !== trusted.head.revision
     || approval.manifest_digest !== b64(trusted.head.digest)
     || approval.epoch !== trusted.head.epoch
     || approval.operation_id !== a.committedReceipt.operation_id
     || approval.pop_challenge_id !== a.committedReceipt.pop_challenge_id
     || request.challenge !== a.committedReceipt.request_nonce) deny();
-  const approvedMessage = Buffer.concat([
-    Buffer.from("Root.ark/zk-1/v2-offline-device-approval/v1\0"),
-    Buffer.from(JSON.stringify(Object.fromEntries(
-      APPROVAL.map((field) => [field, approval[field]]))))]);
-  if (!crypto.verify(null, approvedMessage, owner, from64(approval.signature, 64))) deny();
+  const approvedMessage = nativeBufferConcat([
+    nativeBufferFrom("Root.ark/zk-1/v2-offline-device-approval/v1\0"),
+    nativeBufferFrom(nativeJsonStringify(fieldsObject(APPROVAL, approval)))]);
+  if (!nativeVerify(null, approvedMessage, owner, from64(approval.signature, 64))) deny();
 
   // The witness-pinned head identifies the exact signed V2 manifest, not a
   // JSON self-assertion. Ensure its committed target public keys match B.
-  const manifestBytes = Buffer.from(a.signedV2Manifest, "base64url");
+  const manifestBytes = nativeBufferFrom(a.signedV2Manifest, "base64url");
   if (manifestBytes.length < 128 || manifestBytes.length > 262144
     || b64(manifestBytes) !== a.signedV2Manifest
-    || !compare(sha(Buffer.concat([
-      Buffer.from("Root.ark/zk-1/recovery-manifest-digest/v1\0"), manifestBytes])),
+    || !compare(sha(nativeBufferConcat([
+      nativeBufferFrom("Root.ark/zk-1/recovery-manifest-digest/v1\0"), manifestBytes])),
     trusted.head.digest)) deny();
-  const v2 = await z.decodeDeterministic(manifestBytes);
-  const device = v2.devices?.find((d) => d.device_id === request.device_id);
+  const v2 = await nativeDecodeDeterministic(manifestBytes);
+  let device = null;
+  if (nativeArrayIsArray(v2.devices)) {
+    for (const candidate of v2.devices)
+      if (candidate?.device_id === request.device_id) { device = candidate; break; }
+  }
   if (!device
-    || !compare(Buffer.from(device.hpke_public_key), from64(request.hpke_public_key, 32))
-    || !compare(Buffer.from(device.hpke_key_id), from64(request.hpke_key_id, 16))
-    || !compare(Buffer.from(device.authorization_public_key),
+    || !compare(nativeBufferFrom(device.hpke_public_key), from64(request.hpke_public_key, 32))
+    || !compare(nativeBufferFrom(device.hpke_key_id), from64(request.hpke_key_id, 16))
+    || !compare(nativeBufferFrom(device.authorization_public_key),
       from64(request.authorization_public_key, 32))
-    || !compare(Buffer.from(device.authorization_key_id),
+    || !compare(nativeBufferFrom(device.authorization_key_id),
       from64(request.authorization_key_id, 16))
-    || !compare(Buffer.from(v2.operation?.target_device_key_digest),
+    || !compare(nativeBufferFrom(v2.operation?.target_device_key_digest),
       from64(approval.target_device_key_digest, 32))) deny();
-  return Buffer.from(device.hpke_public_key);
+  return nativeBufferFrom(device.hpke_public_key);
 }
-async function normalizedAuthority(a, minimumSequence, nowSeconds, nodeKeys) {
+async function normalizedAuthority(a, minimumSequence, nowSeconds, nodeKeys, wallClock) {
   positive(minimumSequence); positive(nowSeconds);
   // A caller-supplied old time cannot resurrect an expired signed grant.
-  if (Math.abs(Math.floor(Date.now() / 1000) - nowSeconds) > 30) deny();
+  if (Date.now !== wallClock
+    || nativeMathAbs(nativeMathFloor(wallClock() / 1000) - nowSeconds) > 30) deny();
   const grant = exact(snapshotFields(a.signedDeviceGrant), [...GRANT, "signature"]);
   const request = snapshotFields(a.request);
   if (!request || typeof request !== "object") deny();
   const owner = nodeKeys.owner, witness = nodeKeys.witness;
-  const ownerHash = sha(owner.export({ type: "spki", format: "der" }));
+  const ownerHash = sha(nativeApply(nativeKeyObjectExport, owner,
+    [{ type: "spki", format: "der" }]));
   if (!compare(ownerHash, raw(a.independentOwnerSpkiSha256, 32))) deny();
   const head = headFrom(a);
   for (const k of SCOPE) {
-    const value = Buffer.from(grant[k], "base64url");
+    const value = nativeBufferFrom(grant[k], "base64url");
     if (!value.length || value.length > (k === "compartment_id" ? 128 : 16)
       || (k !== "compartment_id" && value.length !== 16)
       || b64(value) !== grant[k]) deny();
@@ -225,32 +306,36 @@ async function normalizedAuthority(a, minimumSequence, nowSeconds, nodeKeys) {
   from64(request.hpke_public_key, 32);
   from64(request.authorization_public_key, 32);
   if (grant.enrolled_epoch > head.epoch) deny();
-  const signatureInput = Buffer.concat([Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
-    Buffer.from(JSON.stringify(Object.fromEntries(GRANT.map((k) => [k, grant[k]]))))]);
-  if (!crypto.verify(null, signatureInput, owner, from64(grant.signature, 64))) deny();
-  const expectedScope = Object.fromEntries(SCOPE.map((k) => [k, Buffer.from(grant[k], "base64url")]));
-  const receipt = commitment.verifySignedReceipt({
+  const signatureInput = nativeBufferConcat([
+    nativeBufferFrom("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
+    nativeBufferFrom(nativeJsonStringify(fieldsObject(GRANT, grant)))]);
+  if (!nativeVerify(null, signatureInput, owner, from64(grant.signature, 64))) deny();
+  const expectedScope = nativeCreate(null);
+  for (const key of SCOPE) nativeDefineProperty(expectedScope, key, {
+    value: nativeBufferFrom(grant[key], "base64url"), enumerable: true,
+    writable: false, configurable: false });
+  const receipt = nativeVerifySignedReceipt({
     receipt: a.committedReceipt, signerPublicKey: witness,
     independentSignerSpkiSha256: b64(raw(a.independentWitnessSpkiSha256, 32)),
     expectedScope, expectedHead: head,
     nowSeconds, previousReceipt: a.previousReceipt,
   });
   if (receipt.sequence < minimumSequence) deny();
-  const signedReceiptBytes = Buffer.concat([
-    commitment.commitmentSigningBytes(Object.fromEntries(commitment.FIELDS.map(
-      (k) => [k, a.committedReceipt[k]]))), from64(a.committedReceipt.signature, 64)]);
+  const signedReceiptBytes = nativeBufferConcat([
+    nativeCommitmentSigningBytes(fieldsObject(commitment.FIELDS, a.committedReceipt)),
+    from64(a.committedReceipt.signature, 64)]);
   return { grant, request, head, scope: expectedScope, sequence: receipt.sequence,
     receiptDigest: sha(signedReceiptBytes), grantDigest: sha(signatureInput),
-    expiresAt: Math.min(a.committedReceipt.expires_at, nowSeconds + 300) };
+    expiresAt: nativeMathMin(a.committedReceipt.expires_at, nowSeconds + 300) };
 }
 async function binding({ metadata, revision, ciphertext, ciphertextRoot, authority }) {
   const meta = metadataCopy(metadata);
   positive(revision);
-  const data = Buffer.from(ciphertext);
+  const data = nativeBufferFrom(ciphertext);
   if (!data.length || data.length > 4 * 1024 * 1024) deny();
   const pin = raw(ciphertextRoot, 32);
-  if (!compare(Buffer.from(await roots.computeCiphertextRoot([data])), pin)) deny();
-  for (const name of SCOPE) if (!compare(Buffer.from(meta[name], "base64url"),
+  if (!compare(nativeBufferFrom(await nativeComputeCiphertextRoot([data])), pin)) deny();
+  for (const name of SCOPE) if (!compare(nativeBufferFrom(meta[name], "base64url"),
     authority.scope[name])) deny();
   if (meta.epoch > authority.head.epoch) deny();
   return { ...meta, object_revision: revision,
@@ -268,50 +353,52 @@ async function binding({ metadata, revision, ciphertext, ciphertextRoot, authori
     ciphertext_sha256: b64(sha(data)) };
 }
 async function sealOwnerAuthorizedFileCek(input) {
+  const wallClock = Date.now;
   let cek, checked, stable;
   try {
     stable = snapshotFields(input);
     exact(stable, ["ownerPrivateKey", "ownerHeldCek", "metadata",
       "objectRevision", "ciphertext", "ciphertextRoot", "authority"]);
     const a = stable.authority;
-    const owner = crypto.createPublicKey(stable.ownerPrivateKey);
+    const owner = nativeCreatePublicKey(stable.ownerPrivateKey);
     const witness = toNodePub(a.witnessPublicKey);
     const trusted = await normalizedAuthority(a, a.operatorMinimumSequence,
-      a.nowSeconds, { owner, witness });
+      a.nowSeconds, { owner, witness }, wallClock);
     const ownerApprovedHpkePublicKey = await verifyOwnerApprovedHpkeRecipient(
       a, trusted, owner, a.nowSeconds);
-    cek = Buffer.from(raw(stable.ownerHeldCek, 32));
+    cek = nativeBufferFrom(raw(stable.ownerHeldCek, 32));
     // Possession of arbitrary 32 bytes is not proof of owning this particular
     // file's CEK. The authorizing owner must demonstrate an AEAD open of the
     // exact pinned ciphertext before exporting a recipient-specific envelope.
-    checked = await fileContent.decryptFile({
-      cek: await fileContent.importFileCek(cek),
+    checked = await nativeDecryptFile({
+      cek: await nativeImportFileCek(cek),
       metadata: stable.metadata, envelopeBytes: stable.ciphertext });
     const core = { schema: FORMAT, ...await binding({
       metadata: stable.metadata, revision: stable.objectRevision,
       ciphertext: stable.ciphertext, ciphertextRoot: stable.ciphertextRoot, authority: trusted }),
-      nonce: b64(crypto.randomBytes(16)),
-      expires_at: Math.min(trusted.expiresAt, a.approval.expires_at) };
+      nonce: b64(nativeRandomBytes(16)),
+      expires_at: nativeMathMin(trusted.expiresAt, a.approval.expires_at) };
     exact(core, CORE);
     if (!compare(from64(core.hpke_public_key, 32), ownerApprovedHpkePublicKey)) deny();
-    const context = Buffer.from(await z.encodeDeterministic(core));
-    const recipient = await z.hpkeSuite().kem.deserializePublicKey(
+    const context = nativeBufferFrom(await nativeEncodeDeterministic(core));
+    const recipient = await nativeHpkeSuite().kem.deserializePublicKey(
       ownerApprovedHpkePublicKey);
-    const sealed = await z.hpkeSeal({ recipientPublicKey: recipient, plaintext: cek,
-      info: Buffer.concat([INFO, context]), aad: Buffer.concat([AAD, context]) });
-    const message = Buffer.concat([DOMAIN, await z.encodeDeterministic({
+    const sealed = await nativeHpkeSeal({ recipientPublicKey: recipient, plaintext: cek,
+      info: nativeBufferConcat([INFO, context]), aad: nativeBufferConcat([AAD, context]) });
+    const message = nativeBufferConcat([DOMAIN, await nativeEncodeDeterministic({
       core, enc: sealed.enc, ciphertext: sealed.ciphertext })]);
     // AEAD and HPKE are asynchronous. The signed approval can expire while
     // the owner holds the CEK; gate its final export using the real wall clock.
-    requireUnexpiredAtRelease(core.expires_at);
-    return Object.freeze({ schema: FORMAT, core, enc: b64(sealed.enc),
+    requireUnexpiredAtRelease(core.expires_at, wallClock);
+    return nativeFreeze({ schema: FORMAT, core, enc: b64(sealed.enc),
       ciphertext: b64(sealed.ciphertext),
-      owner_signature: b64(crypto.sign(null, message, stable.ownerPrivateKey)),
+      owner_signature: b64(nativeSign(null, message, stable.ownerPrivateKey)),
       authorizesProductionRestore: false, externalCustodyProven: false });
   } catch (_) { deny(); }
   finally { checked?.data?.fill(0); cek?.fill(0); stable?.ownerHeldCek?.fill(0); }
 }
 async function openOwnerAuthorizedFileCek(input) {
+  const wallClock = Date.now;
   let cek, stable;
   try {
     stable = snapshotFields(input);
@@ -323,50 +410,52 @@ async function openOwnerAuthorizedFileCek(input) {
       "authorizesProductionRestore", "externalCustodyProven"]);
     if (wire.schema !== FORMAT || wire.authorizesProductionRestore !== false
       || wire.externalCustodyProven !== false) deny();
-    const approved = await committedApproval.verifyCommittedApproval({
+    const approved = await nativeVerifyCommittedApproval({
       ...a, nowSeconds: stable.nowSeconds });
     if (approved.committedOwnerApprovalVerified !== true
       || approved.authorizesProductionIo !== false) deny();
-    const owner = crypto.createPublicKey({ key: Buffer.from(
-      await crypto.webcrypto.subtle.exportKey("spki", a.ownerPublicKey)),
+    const ownerSpki = await nativeApply(nativeSubtleExportKey, nativeSubtle,
+      ["spki", a.ownerPublicKey]);
+    const witnessSpki = await nativeApply(nativeSubtleExportKey, nativeSubtle,
+      ["spki", a.witnessPublicKey]);
+    const owner = nativeCreatePublicKey({ key: nativeBufferFrom(ownerSpki),
       format: "der", type: "spki" });
-    const witness = crypto.createPublicKey({ key: Buffer.from(
-      await crypto.webcrypto.subtle.exportKey("spki", a.witnessPublicKey)),
+    const witness = nativeCreatePublicKey({ key: nativeBufferFrom(witnessSpki),
       format: "der", type: "spki" });
     const trusted = await normalizedAuthority(a, stable.operatorMinimumSequence,
-      stable.nowSeconds, { owner, witness });
+      stable.nowSeconds, { owner, witness }, wallClock);
     const core = wire.core;
     exact(core, CORE);
-    if (core.schema !== FORMAT || !Number.isSafeInteger(core.expires_at)
+    if (core.schema !== FORMAT || !nativeNumberIsSafeInteger(core.expires_at)
       || core.expires_at < stable.nowSeconds) deny();
     const expected = await binding({
       metadata: stable.metadata, revision: stable.objectRevision,
       ciphertext: stable.ciphertext, ciphertextRoot: stable.ciphertextRoot, authority: trusted });
-    for (const [key, value] of Object.entries(expected))
-      if (core[key] !== value) deny();
+    for (const key of BINDING) if (core[key] !== expected[key]) deny();
     from64(core.nonce, 16);
-    const context = Buffer.from(await z.encodeDeterministic(core));
+    const context = nativeBufferFrom(await nativeEncodeDeterministic(core));
     const enc = from64(wire.enc, 32);
     const ciphertext = from64(wire.ciphertext, 48);
-    const signed = Buffer.concat([DOMAIN, await z.encodeDeterministic({ core, enc, ciphertext })]);
-    if (!crypto.verify(null, signed, owner, from64(wire.owner_signature, 64))) deny();
-    if (!(stable.deviceHpkePrivateKey?.hpkePrivateRaw instanceof Uint8Array)
+    const signed = nativeBufferConcat([DOMAIN,
+      await nativeEncodeDeterministic({ core, enc, ciphertext })]);
+    if (!nativeVerify(null, signed, owner, from64(wire.owner_signature, 64))) deny();
+    if (!(stable.deviceHpkePrivateKey?.hpkePrivateRaw instanceof nativeUint8Array)
       || stable.deviceHpkePrivateKey.hpkePrivateRaw.length !== 32) deny();
-    const deviceHpkeKey = await z.hpkeSuite().kem.deserializePrivateKey(
+    const deviceHpkeKey = await nativeHpkeSuite().kem.deserializePrivateKey(
       stable.deviceHpkePrivateKey.hpkePrivateRaw);
-    cek = Buffer.from(await z.hpkeOpen({ recipientKey: deviceHpkeKey,
-      enc, ciphertext, info: Buffer.concat([INFO, context]),
-      aad: Buffer.concat([AAD, context]) }));
+    cek = nativeBufferFrom(await nativeHpkeOpen({ recipientKey: deviceHpkeKey,
+      enc, ciphertext, info: nativeBufferConcat([INFO, context]),
+      aad: nativeBufferConcat([AAD, context]) }));
     if (cek.length !== 32) deny();
     // Last use: reject a now-expired owner approval/receipt before returning
     // plaintext-equivalent CEK bytes to B, even if HPKE was valid at entry.
     // Release the minimum expiration from the exact owner-approved envelope,
     // committed approval and independently verified witness snapshot, rather
     // than forcing a later caller to reread mutable untrusted authority.
-    const verifiedReleaseExpiresAt = Math.min(core.expires_at,
+    const verifiedReleaseExpiresAt = nativeMathMin(core.expires_at,
       a.approval.expires_at, a.committedReceipt.expires_at);
-    requireUnexpiredAtRelease(verifiedReleaseExpiresAt);
-    return Object.freeze({ cek: Buffer.from(cek), verifiedReleaseExpiresAt,
+    requireUnexpiredAtRelease(verifiedReleaseExpiresAt, wallClock);
+    return nativeFreeze({ cek: nativeBufferFrom(cek), verifiedReleaseExpiresAt,
       authorizesProductionRestore: false,
       externalCustodyProven: false });
   } catch (_) { deny(); }

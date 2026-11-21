@@ -694,6 +694,43 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     }
     assert.equal(ownerDecryptFinished, true,
       "test must reach the genuine file AEAD before expiring the grant");
+    // Keep the entry-time Date.now function identity stable while the real
+    // wall-clock value crosses expiry. A hostile callback also poisons the
+    // mutable Math.floor global; release must use its module-entry intrinsic.
+    const originalStableClock = Date.now;
+    const originalMathFloor = Math.floor;
+    const originalMathMin = Math.min;
+    const simulatedOwnerExpiry = Math.min(issued.approval.expires_at,
+      signedCommittedHead.expires_at);
+    let simulatedOwnerMilliseconds = (simulatedOwnerExpiry - 1) * 1000;
+    const stableOwnerClock = () => simulatedOwnerMilliseconds;
+    const ownerClockAuthority = { ...publicAuthority,
+      nowSeconds: simulatedOwnerExpiry - 1 };
+    let ownerFloorPoisonReached = false;
+    Date.now = stableOwnerClock;
+    subtle.decrypt = async function (...args) {
+      const result = await realDecrypt.apply(this, args);
+      simulatedOwnerMilliseconds = (simulatedOwnerExpiry + 2) * 1000;
+      Math.floor = () => 0;
+      Math.min = () => Number.MAX_SAFE_INTEGER;
+      ownerFloorPoisonReached = true;
+      return result;
+    };
+    try {
+      await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
+        ownerPrivateKey: owner.privateKey, ownerHeldCek, metadata,
+        objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
+        authority: ownerClockAuthority,
+      }), /ZK_OWNER_FILE_CEK_DENIED/,
+      "mutating Math.floor after real AEAD cannot make an expired CEK release look current");
+    } finally {
+      Date.now = originalStableClock;
+      Math.floor = originalMathFloor;
+      Math.min = originalMathMin;
+      delete subtle.decrypt;
+    }
+    assert.equal(ownerFloorPoisonReached, true,
+      "test must poison Math.floor only after the genuine AEAD await");
     for (const label of ["request", "metadata", "head", "opened envelope"]) {
       let accessed = 0;
       const accessor = { enumerable: true, configurable: true,
@@ -744,11 +781,18 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     // A previously approved CEK must not escape after the time-bound grant dies.
     const realHpkeOpen = z.hpkeOpen;
     const realDateNow = Date.now;
+    const realMathFloor = Math.floor;
+    const realMathMin = Math.min;
     let hpkeFinishedBeforeExpiry = false;
+    let simulatedOpenMilliseconds = (now + 9) * 1000;
+    const stableOpenClock = () => simulatedOpenMilliseconds;
+    Date.now = stableOpenClock;
     z.hpkeOpen = async (...args) => {
       const result = await realHpkeOpen(...args);
       hpkeFinishedBeforeExpiry = true;
-      Date.now = () => (envelope.core.expires_at + 2) * 1000;
+      simulatedOpenMilliseconds = (envelope.core.expires_at + 2) * 1000;
+      Math.floor = () => 0;
+      Math.min = () => Number.MAX_SAFE_INTEGER;
       return result;
     };
     try {
@@ -757,6 +801,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     } finally {
       z.hpkeOpen = realHpkeOpen;
       Date.now = realDateNow;
+      Math.floor = realMathFloor;
+      Math.min = realMathMin;
     }
     assert.equal(hpkeFinishedBeforeExpiry, true,
       "test must reach actual HPKE decrypt before the clock changes");
@@ -858,7 +904,64 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       metadata, objectRevision: 1, ciphertext: Buffer.from(sealed),
       ciphertextRoot: Buffer.from(root), authority: publicAuthority,
       nowSeconds: now + 9 };
-    const offer = await createProtectedRecipientShareOffer(ownerOfferArgs);
+    const originalShareDecode = z.decodeDeterministic;
+    const originalShareMathCeil = Math.ceil;
+    const originalShareMathMax = Math.max;
+    const originalShareAuthorityRead = ownerOfferArgs.readIndependentAuthority;
+    const originalGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+    const originalGetPrototypeOf = Object.getPrototypeOf;
+    const originalHasOwn = Object.hasOwn;
+    const originalReflectOwnKeys = Reflect.ownKeys;
+    const originalArraySome = Array.prototype.some;
+    const originalBufferFrom = Buffer.from;
+    const originalCryptoVerify = crypto.verify;
+    const originalObjectFreeze = Object.freeze;
+    let shareAuthorityReads = 0;
+    let shareNativeMathPoisonReached = false;
+    let shareNativeReflectionPoisonReached = false;
+    ownerOfferArgs.readIndependentAuthority = async (...args) => {
+      const current = await originalShareAuthorityRead(...args);
+      if (++shareAuthorityReads === 2) {
+        Object.getOwnPropertyDescriptors = () => { throw new Error("OBJECT_DESCRIPTORS_POISONED"); };
+        Object.getPrototypeOf = () => { throw new Error("GET_PROTOTYPE_POISONED"); };
+        Object.hasOwn = () => false;
+        Reflect.ownKeys = () => { throw new Error("REFLECT_KEYS_POISONED"); };
+        Array.prototype.some = () => false;
+        Buffer.from = () => { throw new Error("BUFFER_FROM_POISONED"); };
+        crypto.verify = () => { throw new Error("CRYPTO_VERIFY_POISONED"); };
+        Object.freeze = () => { throw new Error("OBJECT_FREEZE_POISONED"); };
+        shareNativeReflectionPoisonReached = true;
+      }
+      return current;
+    };
+    z.decodeDeterministic = async (...args) => {
+      const decoded = await originalShareDecode(...args);
+      Math.ceil = () => 0;
+      Math.max = () => Number.MIN_SAFE_INTEGER;
+      shareNativeMathPoisonReached = true;
+      return decoded;
+    };
+    let offer;
+    try { offer = await createProtectedRecipientShareOffer(ownerOfferArgs); }
+    finally {
+      z.decodeDeterministic = originalShareDecode;
+      Math.ceil = originalShareMathCeil;
+      Math.max = originalShareMathMax;
+      ownerOfferArgs.readIndependentAuthority = originalShareAuthorityRead;
+      Object.getOwnPropertyDescriptors = originalGetOwnPropertyDescriptors;
+      Object.getPrototypeOf = originalGetPrototypeOf;
+      Object.hasOwn = originalHasOwn;
+      Reflect.ownKeys = originalReflectOwnKeys;
+      Array.prototype.some = originalArraySome;
+      Buffer.from = originalBufferFrom;
+      crypto.verify = originalCryptoVerify;
+      Object.freeze = originalObjectFreeze;
+    }
+    assert.equal(shareNativeMathPoisonReached, true,
+      "real deterministic share decode must poison Math.max before expiry validation");
+    assert.equal(shareAuthorityReads, 2, "the offer must complete both independent authority reads");
+    assert.equal(shareNativeReflectionPoisonReached, true,
+      "the final independent authority callback must poison mutable reflection, Buffer and crypto globals");
     // Each later export is a new owner action: the independently trusted
     // adapter supplies a fresh clock, not a timestamp from fixture setup.
     const testWallSeconds = () => Math.floor(Date.now() / 1000);
@@ -1279,12 +1382,57 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     await assert.rejects(createProtectedRecipientShareOffer(maliciousOffer),
       /ZK_SHARE_OFFER_DENIED/);
     assert.equal(getterRuns, 0, "owner input getters must not run");
+    let proxyTrapCalls = 0;
+    const proxiedOfferInput = new Proxy(ownerOfferArgs, {
+      ownKeys() { proxyTrapCalls++; throw Error("PROXY_OWN_KEYS"); },
+      getPrototypeOf() { proxyTrapCalls++; throw Error("PROXY_GET_PROTOTYPE"); },
+    });
+    await assert.rejects(createProtectedRecipientShareOffer(proxiedOfferInput),
+      /ZK_SHARE_OFFER_DENIED/);
+    assert.equal(proxyTrapCalls, 0,
+      "native Proxy inputs must be rejected before ownKeys/getPrototypeOf traps execute");
+    let envelopeCoreProxyTraps = 0;
+    const proxiedEnvelope = { ...bridgeArgs.envelope,
+      core: new Proxy(bridgeArgs.envelope.core, {
+        ownKeys() { envelopeCoreProxyTraps++; throw Error("ENVELOPE_CORE_PROXY_OWN_KEYS"); },
+        getPrototypeOf() { envelopeCoreProxyTraps++; throw Error("ENVELOPE_CORE_PROXY_PROTO"); },
+      }) };
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs, envelope: proxiedEnvelope }),
+      /ZK_SHARE_FILE_OPEN_DENIED/,
+      "a proxied nested HPKE envelope core must be rejected before reflective traps execute");
+    assert.equal(envelopeCoreProxyTraps, 0,
+      "nested envelope Proxy must be detected before Reflect.ownKeys/getPrototypeOf");
     await assert.rejects(openPortableProtectedRecipientShareFile({
       offer: { ...offer, grant: { ...offer.grant, grantId: b64(crypto.randomBytes(32)) } },
       redeemInput: recipientShareInput, authority: { ...linked, nowSeconds: testWallSeconds() },
       operatorMinimumSequence: signedCommittedHead.sequence,
       deviceHpkePrivateKey: bRecipient, nowSeconds: testWallSeconds(),
     }), /ZK_SHARE_FILE_OPEN_DENIED/, "tampered portable grant must fail before ciphertext release");
+    const portableProxyArgs = {
+      offer: { ...offer, grant: { ...offer.grant, grantId: b64(crypto.randomBytes(32)) } },
+      redeemInput: recipientShareInput,
+      authority: { ...linked, nowSeconds: testWallSeconds() },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: testWallSeconds(),
+    };
+    let portableProxyTraps = 0;
+    const trapProxy = (value) => new Proxy(value, {
+      ownKeys() { portableProxyTraps++; throw Error("PORTABLE_PROXY_OWN_KEYS"); },
+      getPrototypeOf() { portableProxyTraps++; throw Error("PORTABLE_PROXY_PROTO"); },
+      getOwnPropertyDescriptor() { portableProxyTraps++; throw Error("PORTABLE_PROXY_DESCRIPTOR"); },
+      get() { portableProxyTraps++; throw Error("PORTABLE_PROXY_GET"); },
+    });
+    await assert.rejects(openPortableProtectedRecipientShareFile(trapProxy(portableProxyArgs)),
+      /ZK_SHARE_FILE_OPEN_DENIED/, "portable outer input Proxy must be rejected before traps");
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      ...portableProxyArgs, offer: trapProxy(portableProxyArgs.offer),
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "portable offer Proxy must be rejected before traps");
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      ...portableProxyArgs, offer: JSON.parse(JSON.stringify(offer)),
+      redeemInput: trapProxy(portableProxyArgs.redeemInput),
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "portable redeemInput Proxy must be rejected before traps");
+    assert.equal(portableProxyTraps, 0,
+      "outer input, offer and redeemInput Proxies must fail before reflective property access");
     await assert.rejects(openPortableProtectedRecipientShareFile({
       offer, redeemInput: { ...recipientShareInput, recipientUsername: "attacker" },
       authority: { ...linked, nowSeconds: testWallSeconds() },
@@ -1334,13 +1482,24 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.notEqual(fileAeadCipherLength, 48, "genuine file AEAD differs from HPKE CEK");
     const originalFinalDecrypt = subtle.decrypt;
     const originalFinalNow = Date.now;
+    const originalFinalFloor = Math.floor;
+    const originalFinalMin = Math.min;
+    const originalFinalSome = Array.prototype.some;
+    let simulatedFinalMilliseconds = (now + 9) * 1000;
+    const pinnedFinalClock = () => simulatedFinalMilliseconds;
+    Date.now = pinnedFinalClock;
     let finalAeadCompleted = false;
     subtle.decrypt = async function (...args) {
       const openedFile = await originalFinalDecrypt.apply(this, args);
       if (args[0]?.name === "AES-GCM"
         && args[2]?.byteLength === fileAeadCipherLength) {
         finalAeadCompleted = true;
-        Date.now = () => (firstExpiry + 2) * 1000;
+        simulatedFinalMilliseconds = (firstExpiry + 2) * 1000;
+        // A caller callback runs after real file AEAD. Poisoning Math.floor
+        // must not make the captured wall clock appear pre-expiry.
+        Math.floor = () => 0;
+        Math.min = () => Number.MAX_SAFE_INTEGER;
+        Array.prototype.some = () => false;
       }
       return openedFile;
     };
@@ -1351,6 +1510,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     } finally {
       delete subtle.decrypt;
       Date.now = originalFinalNow;
+      Math.floor = originalFinalFloor;
+      Math.min = originalFinalMin;
+      Array.prototype.some = originalFinalSome;
     }
     assert.equal(finalAeadCompleted, true,
       "oracle must complete genuine file AEAD before expiring owner authority");
@@ -1419,6 +1581,44 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "attack must be installed at the genuine post-HPKE/file-AEAD authority read");
     assert.equal(forgedFilterCalls, 0,
       "authority arrays must never dispatch caller-owned filter methods");
+    let proxiedAuthorityReads = 0;
+    let authorityProxyTraps = 0;
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++proxiedAuthorityReads === 3) {
+          return new Proxy(current, {
+            ownKeys() { authorityProxyTraps++; throw Error("AUTHORITY_PROXY_OWN_KEYS"); },
+            getPrototypeOf() { authorityProxyTraps++; throw Error("AUTHORITY_PROXY_PROTO"); },
+          });
+        }
+        return current;
+      } },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "a proxied final independent authority snapshot must fail closed without executing traps");
+    assert.equal(proxiedAuthorityReads, 3);
+    assert.equal(authorityProxyTraps, 0,
+      "native Proxy authority must be detected before reflective inspection");
+    let proxiedDeviceReads = 0;
+    let deviceArrayProxyTraps = 0;
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++proxiedDeviceReads === 3) {
+          return { ...current, devices: new Proxy(current.devices, {
+            getOwnPropertyDescriptor() {
+              deviceArrayProxyTraps++;
+              throw Error("DEVICE_ARRAY_PROXY_DESCRIPTOR");
+            },
+          }) };
+        }
+        return current;
+      } },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "a proxied roster array must fail closed before array reflection");
+    assert.equal(proxiedDeviceReads, 3);
+    assert.equal(deviceArrayProxyTraps, 0,
+      "native Proxy roster arrays must be rejected without invoking traps");
     // This proof covers the three explicitly owner-selected versions, never
     // unknown historical versions or externally held backup copies.
     assert.equal(typeof cekBatch.sealOwnerAuthorizedVersionedCeks, "function",
