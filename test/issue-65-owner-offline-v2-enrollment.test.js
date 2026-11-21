@@ -605,6 +605,40 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "genuine approved B still unwraps the owner CEK after caller mutation");
     bOpenedRaced.fill(0);
 
+    // The owner CEK primitive may also be called directly, without the
+    // recipient-share bridge. The authenticated file AEAD awaits an external
+    // callback; a spoofed global clock or Math.min must never extend the
+    // owner-approved HPKE lease on that direct release path.
+    const trustedClock = Date.now;
+    const trustedFloor = Math.floor;
+    const trustedMin = Math.min;
+    let releaseClockPoisoned = false;
+    subtle.decrypt = async function (...args) {
+      const decrypted = await realDecrypt.apply(this, args);
+      releaseClockPoisoned = true;
+      Date.now = () => 0;
+      Math.floor = () => 0;
+      Math.min = () => Number.MAX_SAFE_INTEGER;
+      return decrypted;
+    };
+    let sealedWithPoisonedGlobals;
+    try {
+      sealedWithPoisonedGlobals = await cekTransfer.sealOwnerAuthorizedFileCek({
+        ownerPrivateKey: owner.privateKey, ownerHeldCek,
+        metadata, objectRevision: 1, ciphertext: sealed,
+        ciphertextRoot: root, authority: publicAuthority,
+      });
+    } finally {
+      delete subtle.decrypt;
+      Date.now = trustedClock;
+      Math.floor = trustedFloor;
+      Math.min = trustedMin;
+    }
+    assert.equal(releaseClockPoisoned, true,
+      "the direct CEK path must cross a real asynchronous authenticated-file boundary");
+    assert.equal(sealedWithPoisonedGlobals.core.expires_at, envelope.core.expires_at,
+      "callback-poisoned intrinsics cannot extend the signed owner's CEK expiry");
+
     for (const label of ["metadata", "ciphertext", "head", "root"]) {
       const otherMeta = { ...metadata };
       const otherCipher = Buffer.from(sealed);
