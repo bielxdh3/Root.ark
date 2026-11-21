@@ -250,7 +250,10 @@ test("P2 inventory: native key getter cannot replace signed member A with reques
       }
       yield* Reflect.apply(originalIterator, this, []);
     };
-    return signer.publicKey[handle];
+    // This is the `type` getter, not the kHandle getter. Returning a native
+    // handle here makes the verifier reject INVENTORY_SIGNER_KEY *before*
+    // reaching the signed membership attack under test.
+    return "public";
   } });
   try {
     assert.equal((await inventory.verifySnapshot(input(poisoned, memberB))).outcome,
@@ -357,7 +360,11 @@ test("P2 inventory: signed object A must not make requested B PRESENT via post-k
   const originalCompare = Buffer.compare;
   let getterReads = 0;
   let substitutions = 0;
-  Object.defineProperty(poisonedPin, handle, { get() {
+  // An accessor replacing kHandle itself must be rejected during native key
+  // custody (before inventory comparison). Install the late comparator attack
+  // at the genuine public-key `type` callback instead, while the native
+  // Ed25519 handle remains valid so membership verification is actually run.
+  Object.defineProperty(poisonedPin, "type", { get() {
     getterReads += 1;
     Buffer.compare = function(left, right) {
       if (Buffer.isBuffer(left) && Buffer.isBuffer(right)
@@ -367,13 +374,13 @@ test("P2 inventory: signed object A must not make requested B PRESENT via post-k
       }
       return Reflect.apply(originalCompare, Buffer, [left, right]);
     };
-    return signer.publicKey[handle];
+    return "public";
   } });
   try {
     assert.equal((await inventory.verifySnapshot(args(poisonedPin, requestedB))).outcome,
       "ABSENT", "valid signature for A must not authorize unlisted object B");
   } finally { Buffer.compare = originalCompare; }
-  assert.ok(getterReads > 0, "product verification must invoke hostile inherited kHandle");
+  assert.ok(getterReads > 0, "product verification must reach the hostile native-key type getter");
   assert.equal(substitutions, 0, "lookup must retain early native buffer comparator");
   assert.equal((await inventory.verifySnapshot(args(signer.publicKey, requestedA))).outcome,
     "PRESENT", "valid real Ed25519 owner remains accepted after the attack");
