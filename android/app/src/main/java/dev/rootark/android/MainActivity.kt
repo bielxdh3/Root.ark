@@ -51,7 +51,8 @@ internal data class InventoryPagingTracker(
     }
 
     fun isValid(): Boolean {
-        if (pageNumber !in 1..100_000 || previousCursors.size != pageNumber - 1) return false
+        if (pageNumber !in 1..PagedInventoryPolicy.MAX_PAGES
+            || previousCursors.size != pageNumber - 1) return false
         if (pageNumber == 1) return cursor == null && usedCursors.isEmpty()
         if (previousCursors.firstOrNull() != null) return false
         val priorCursors = previousCursors.filterNotNull()
@@ -265,9 +266,10 @@ class MainActivity : Activity() {
             if (page != null) {
                 val nextTracker = tracker.advance(page.nextCursor)
                 val next = page.nextCursor
-                if (next != null && runCatching {
+                if (next != null && PagedInventoryPolicy.hasNextPage(tracker.pageNumber, next)
+                    && (!nextTracker.isValid() || runCatching {
                     PagedInventoryPolicy.checkCursor(next, nextTracker.usedCursors)
-                }.isFailure) {
+                }.isFailure)) {
                     showSession("Inventário retornou cursor repetido. Reinicie a listagem.")
                 } else {
                     val binding = offlineSession
@@ -311,7 +313,9 @@ class MainActivity : Activity() {
         val previous = tracker.previous()
         if (previous != null) button(layout, "Página anterior") { loadInventoryPage(previous) }
         val next = nextTracker.cursor
-        if (next != null) button(layout, "Próxima página") { loadInventoryPage(nextTracker) }
+        if (PagedInventoryPolicy.hasNextPage(tracker.pageNumber, next) && nextTracker.isValid()) {
+            button(layout, "Próxima página") { loadInventoryPage(nextTracker) }
+        }
         val binding = offlineSession
         val cache = offlineInventory
         if (binding != null && cache != null && cache.pages(binding).isNotEmpty()) {
