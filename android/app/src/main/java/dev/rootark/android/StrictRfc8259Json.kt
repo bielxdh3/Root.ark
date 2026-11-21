@@ -12,6 +12,8 @@ import java.io.IOException
  * field/type validation and signed Sync v2 verification remain authoritative.
  */
 internal object StrictRfc8259Json {
+    internal class LimitExceededException(message: String) : IOException(message)
+
     fun validate(text: String) {
         Parser(text).parse()
     }
@@ -27,7 +29,7 @@ internal object StrictRfc8259Json {
         }
 
         private fun value(depth: Int) {
-            if (depth > 16) invalid()
+            if (depth > 16) throw LimitExceededException("JSON nesting limit exceeded")
             whitespace()
             when (peek()) {
                 '{' -> objectValue(depth + 1)
@@ -50,7 +52,8 @@ internal object StrictRfc8259Json {
                 if (peek() != '"') invalid()
                 val key = stringValue()
                 count++
-                if (count > 64 || !keys.add(key)) invalid()
+                if (count > 64) throw LimitExceededException("JSON object member limit exceeded")
+                if (!keys.add(key)) invalid()
                 whitespace()
                 expect(':')
                 value(depth)
@@ -68,7 +71,7 @@ internal object StrictRfc8259Json {
             var count = 0
             while (true) {
                 count++
-                if (count > 256) invalid()
+                if (count > 256) throw LimitExceededException("JSON array item limit exceeded")
                 value(depth)
                 whitespace()
                 if (take(']')) return

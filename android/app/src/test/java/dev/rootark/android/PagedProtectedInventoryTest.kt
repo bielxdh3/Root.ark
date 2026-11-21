@@ -6,6 +6,7 @@ import dev.rootark.core.sync.ProtectedSyncException
 import dev.rootark.core.sync.RootArkApiException
 import dev.rootark.core.sync.OfflineSession
 import dev.rootark.core.sync.SessionOfflineInventory
+import dev.rootark.core.sync.PagedInventoryPolicy
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.net.URL
@@ -181,5 +182,137 @@ class PagedProtectedInventoryTest {
             }
             assertTrue(response.disconnected)
         }
+    }
+
+    @Test fun listingByteAndEntryBudgetsUseTheSpecificLimitException() {
+        val baseBody = fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body")
+            .toString().toByteArray(Charsets.UTF_8)
+        val exactBoundaryPayload = baseBody + ByteArray(PagedInventoryPolicy.MAX_RESPONSE_BYTES - baseBody.size) {
+            ' '.code.toByte()
+        }
+        val exactBoundary = SecureResponse(
+            origin.syncInventoryUrl(), payload = exactBoundaryPayload,
+            declaredSize = PagedInventoryPolicy.MAX_RESPONSE_BYTES.toLong(),
+        )
+        assertEquals(64, AuthHttpTransport { exactBoundary }.listInventoryPage(origin, "fixture-token").rows.size)
+        assertTrue(exactBoundary.disconnected)
+
+        val declaredTooLarge = SecureResponse(
+            origin.syncInventoryUrl(), declaredSize = PagedInventoryPolicy.MAX_RESPONSE_BYTES.toLong() + 1L,
+        )
+        assertThrows(SyncListingLimitException::class.java) {
+            AuthHttpTransport { declaredTooLarge }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(declaredTooLarge.disconnected)
+
+        val streamedTooLarge = SecureResponse(
+            origin.syncInventoryUrl(), payload = ByteArray(PagedInventoryPolicy.MAX_RESPONSE_BYTES + 1),
+        )
+        assertThrows(SyncListingLimitException::class.java) {
+            AuthHttpTransport { streamedTooLarge }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(streamedTooLarge.disconnected)
+
+        val oversizedPage = JSONObject(
+            fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body").toString()
+        ).apply {
+            val objects = getJSONArray("objects")
+            objects.put(objects.getJSONObject(0))
+        }
+        val tooManyEntries = SecureResponse(
+            origin.syncInventoryUrl(), payload = oversizedPage.toString().toByteArray(Charsets.UTF_8),
+        )
+        assertThrows(SyncListingLimitException::class.java) {
+            AuthHttpTransport { tooManyEntries }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(tooManyEntries.disconnected)
+
+        val structurallyTooLarge = SecureResponse(
+            origin.syncInventoryUrl(),
+            payload = ("{\"protocolVersion\":2,\"view\":\"metadata\",\"objects\":[" +
+                List(257) { "null" }.joinToString(",") + "],\"nextCursor\":null}")
+                .toByteArray(Charsets.UTF_8),
+        )
+        assertThrows(SyncListingLimitException::class.java) {
+            AuthHttpTransport { structurallyTooLarge }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(structurallyTooLarge.disconnected)
+    }
+
+    @Test fun malformedUtf8JsonAndInventoryEnvelopeUseTheSpecificValidationException() {
+        val malformedUtf8 = SecureResponse(
+            origin.syncInventoryUrl(), payload = byteArrayOf(0xC3.toByte(), 0x28),
+        )
+        assertThrows(SyncListingValidationException::class.java) {
+            AuthHttpTransport { malformedUtf8 }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(malformedUtf8.disconnected)
+
+        val malformedJson = SecureResponse(
+            origin.syncInventoryUrl(), payload = "not-json".toByteArray(Charsets.UTF_8),
+        )
+        assertThrows(SyncListingValidationException::class.java) {
+            AuthHttpTransport { malformedJson }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(malformedJson.disconnected)
+
+        val invalidEnvelope = JSONObject(
+            fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body").toString()
+        ).put("view", "full")
+        val invalidView = SecureResponse(
+            origin.syncInventoryUrl(), payload = invalidEnvelope.toString().toByteArray(Charsets.UTF_8),
+        )
+        assertThrows(SyncListingValidationException::class.java) {
+            AuthHttpTransport { invalidView }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(invalidView.disconnected)
+
+        val invalidRecord = JSONObject(
+            fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body").toString()
+        ).apply {
+            getJSONArray("objects").getJSONObject(0).put("objectId", "")
+        }
+        val invalidObjectId = SecureResponse(
+            origin.syncInventoryUrl(), payload = invalidRecord.toString().toByteArray(Charsets.UTF_8),
+        )
+        assertThrows(SyncListingValidationException::class.java) {
+            AuthHttpTransport { invalidObjectId }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(invalidObjectId.disconnected)
+
+        val invalidOperation = JSONObject(
+            fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body").toString()
+        ).apply {
+            getJSONArray("objects").getJSONObject(0).put("operation", "")
+        }
+        val invalidOperationResponse = SecureResponse(
+            origin.syncInventoryUrl(), payload = invalidOperation.toString().toByteArray(Charsets.UTF_8),
+        )
+        assertThrows(SyncListingValidationException::class.java) {
+            AuthHttpTransport { invalidOperationResponse }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(invalidOperationResponse.disconnected)
+
+        val invalidMime = SecureResponse(
+            origin.syncInventoryUrl(),
+            payload = fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body")
+                .toString().toByteArray(Charsets.UTF_8),
+            mime = "text/html",
+        )
+        assertThrows(SyncListingValidationException::class.java) {
+            AuthHttpTransport { invalidMime }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(invalidMime.disconnected)
+
+        val invalidEncoding = SecureResponse(
+            origin.syncInventoryUrl(),
+            payload = fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body")
+                .toString().toByteArray(Charsets.UTF_8),
+            encoding = "gzip",
+        )
+        assertThrows(SyncListingValidationException::class.java) {
+            AuthHttpTransport { invalidEncoding }.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(invalidEncoding.disconnected)
     }
 }

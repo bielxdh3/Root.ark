@@ -17,6 +17,13 @@ import java.nio.charset.StandardCharsets
 import javax.net.ssl.HttpsURLConnection
 import org.json.JSONObject
 
+/** Listing-only failures; they do not change the HTTP or core API contract. */
+internal open class SyncListingException(message: String, cause: Throwable? = null) : IOException(message, cause)
+internal class SyncListingLimitException(message: String, cause: Throwable? = null) :
+    SyncListingException(message, cause)
+internal class SyncListingValidationException(message: String, cause: Throwable? = null) :
+    SyncListingException(message, cause)
+
 /** HTTP adapter for canonical login/TOTP and the bounded, read-only sync listing. */
 internal class AuthHttpTransport(
     private val openInventoryConnection: (URL) -> URLConnection = { it.openConnection() },
@@ -61,11 +68,13 @@ internal class AuthHttpTransport(
             val status = connection.responseCode
             if (status != 200) throw RootArkApiException(status)
             val mime = connection.contentType?.substringBefore(';')?.trim()
+            if (connection.contentLengthLong > PagedInventoryPolicy.MAX_RESPONSE_BYTES) {
+                throw SyncListingLimitException("Sync listing exceeds limit")
+            }
             if (!"application/json".equals(mime, ignoreCase = true) ||
                 (connection.contentEncoding != null &&
-                    !"identity".equals(connection.contentEncoding, ignoreCase = true)) ||
-                connection.contentLengthLong > PagedInventoryPolicy.MAX_RESPONSE_BYTES) {
-                throw IOException("Invalid inventory response encoding or size")
+                    !"identity".equals(connection.contentEncoding, ignoreCase = true))) {
+                throw SyncListingValidationException("Invalid inventory response encoding")
             }
             val json = connection.inputStream.use { stream ->
                 val out = ByteArrayOutputStream()
@@ -75,19 +84,29 @@ internal class AuthHttpTransport(
                     val count = stream.read(buffer)
                     if (count < 0) break
                     if (count > PagedInventoryPolicy.MAX_RESPONSE_BYTES - total) {
-                        throw IOException("Inventory page exceeds limit")
+                        throw SyncListingLimitException("Sync listing exceeds limit")
                     }
                     out.write(buffer, 0, count)
                     total += count
                 }
-                val chars = StandardCharsets.UTF_8.newDecoder()
-                    .onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT)
-                    .decode(ByteBuffer.wrap(out.toByteArray())).toString()
+                val chars = try {
+                    StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .decode(ByteBuffer.wrap(out.toByteArray())).toString()
+                } catch (error: Exception) {
+                    throw SyncListingValidationException("Malformed UTF-8 in sync listing", error)
+                }
                 // Prevent AOSP org.json from normalizing duplicate keys or
                 // nonstandard syntax before the metadata-only projection.
-                StrictRfc8259Json.validate(chars)
-                JSONObject(chars)
+                try {
+                    StrictRfc8259Json.validate(chars)
+                    JSONObject(chars)
+                } catch (error: StrictRfc8259Json.LimitExceededException) {
+                    throw SyncListingLimitException("Sync listing exceeds structural limit", error)
+                } catch (error: Exception) {
+                    throw SyncListingValidationException("Malformed JSON in sync listing", error)
+                }
             }
             return projectInventoryPage(json)
         } finally {
@@ -96,31 +115,42 @@ internal class AuthHttpTransport(
     }
 
     private fun projectInventoryPage(response: JSONObject): InventoryPage {
-        val objects = response.optJSONArray("objects") ?: throw IOException("Invalid inventory page")
-        val version = response.opt("protocolVersion") as? Int ?: throw IOException("Invalid inventory page")
-        val view = response.opt("view") as? String ?: throw IOException("Invalid inventory page")
-        if (!response.has("nextCursor")) throw IOException("Invalid inventory page")
+        val objects = response.optJSONArray("objects") ?: throw SyncListingValidationException("Invalid inventory page")
+        if (objects.length() > PagedInventoryPolicy.MAX_ENTRIES) {
+            throw SyncListingLimitException("Sync listing exceeds maximum entry limit")
+        }
+        val version = response.opt("protocolVersion") as? Int
+            ?: throw SyncListingValidationException("Invalid inventory page")
+        val view = response.opt("view") as? String ?: throw SyncListingValidationException("Invalid inventory page")
+        if (!response.has("nextCursor")) throw SyncListingValidationException("Invalid inventory page")
         val nextCursor = when (val value = response.opt("nextCursor")) {
             JSONObject.NULL -> null
             is String -> value
-            else -> throw IOException("Invalid inventory cursor")
+            else -> throw SyncListingValidationException("Invalid inventory cursor")
         }
         try {
             PagedInventoryPolicy.checkEnvelope(version, view, objects.length(), nextCursor)
             val rows = (0 until objects.length()).map { index ->
-                val record = objects.optJSONObject(index) ?: throw IOException("Invalid sync listing")
-                val metadata = record.optJSONObject("metadata") ?: throw IOException("Invalid sync listing")
-                val deleted = record.opt("tombstone") as? Boolean ?: throw IOException("Invalid sync listing")
-                val recordVersion = record.opt("protocolVersion") as? Int ?: throw IOException("Invalid sync listing")
-                val revision = record.optJSONObject("revision") ?: throw IOException("Invalid sync listing")
+                val record = objects.optJSONObject(index)
+                    ?: throw SyncListingValidationException("Invalid sync listing")
+                val metadata = record.optJSONObject("metadata")
+                    ?: throw SyncListingValidationException("Invalid sync listing")
+                val deleted = record.opt("tombstone") as? Boolean
+                    ?: throw SyncListingValidationException("Invalid sync listing")
+                val recordVersion = record.opt("protocolVersion") as? Int
+                    ?: throw SyncListingValidationException("Invalid sync listing")
+                val revision = record.optJSONObject("revision")
+                    ?: throw SyncListingValidationException("Invalid sync listing")
                 val counter = revision.opt("counter")
                 if ((counter !is Int && counter !is Long) || (counter as Number).toLong() < 0L ||
-                    requiredString(revision, "deviceId").length > 256) throw IOException("Invalid sync listing")
+                    requiredListingString(revision, "deviceId").length > 256) {
+                    throw SyncListingValidationException("Invalid sync listing")
+                }
 
                 ReadOnlyFileListPolicy.project(
                     protocolVersion = recordVersion,
-                    objectId = requiredString(record, "objectId"),
-                    operation = requiredString(record, "operation"),
+                    objectId = requiredListingString(record, "objectId"),
+                    operation = requiredListingString(record, "operation"),
                     tombstone = deleted,
                     name = optionalString(metadata, "name"),
                     path = optionalString(metadata, "path"),
@@ -129,15 +159,19 @@ internal class AuthHttpTransport(
                 )
             }
             return InventoryPage(rows, nextCursor)
-        } catch (_: IllegalArgumentException) {
-            throw IOException("Invalid or oversized inventory page")
+        } catch (error: IllegalArgumentException) {
+            throw SyncListingValidationException("Invalid inventory page", error)
         }
     }
+
+    private fun requiredListingString(json: JSONObject, name: String): String =
+        (json.opt(name) as? String)?.takeIf { it.isNotBlank() }
+            ?: throw SyncListingValidationException("Invalid sync listing")
 
     private fun optionalString(json: JSONObject, key: String): String? {
         val value = json.opt(key)
         if (value == null || value == JSONObject.NULL) return null
-        return value as? String ?: throw IOException("Invalid sync listing")
+        return value as? String ?: throw SyncListingValidationException("Invalid sync listing")
     }
 
     private fun optionalLong(json: JSONObject, key: String): Long? {
@@ -146,7 +180,7 @@ internal class AuthHttpTransport(
         return when (value) {
             is Int -> value.toLong()
             is Long -> value
-            else -> throw IOException("Invalid sync listing")
+            else -> throw SyncListingValidationException("Invalid sync listing")
         }
     }
 
