@@ -13283,8 +13283,6 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
     if (!physicalNameIsStable(currentFolder.uploadDir)) {
       return res.status(409).json({ error: "Arquivo mudou durante a exclusao" });
     }
-    const fileSize = isExistingFile(filePath) ? fs.statSync(filePath).size : 0;
-
     try {
     const trashItem = trashService.moveFileToTrash({
       folder: currentFolder,
@@ -13293,6 +13291,7 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
       deletedBy: req.user.username,
       loaders: getTrashLoaders(),
     });
+    const fileSize = trashItem.sizeBytes;
     logAnalyticsEvent("deletion", {
       filename: name,
       deletedBy: req.user.username,
@@ -13311,6 +13310,9 @@ app.post("/delete/:name", deleteRateLimit, authenticate, async (req, res) => {
     broadcastDataChanged("trash", { folderId: folder.id, fileName: name, itemType: "file" });
     res.json({ message: "Movido para lixeira", trashItem: serializeTrashItemForUser(trashItem) });
     } catch (error) {
+      if (error.code === "TRASH_SOURCE_MISSING") {
+        return res.status(404).json({ error: "Arquivo nao encontrado" });
+      }
       auditLog("trash.delete.failed", getAuditActor(req), { type: "file", id: name }, "move_to_trash", "failure", {
         folderId: folder.id,
         error: error.message,
