@@ -17,6 +17,37 @@ const cekTransfer = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
+// Capture an adjustable wall clock only in a fresh copy of the release module.
+// Restore the global Date.now and cache before invoking any crypto: real
+// signed approval, witness, and skew checks must remain unmodified at entry.
+function releaseClockTransfer({ hpkeOpen } = {}) {
+  const moduleId = require.resolve("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer");
+  const previousModule = require.cache[moduleId];
+  const actualNow = Date.now;
+  const actualHpkeOpen = z.hpkeOpen;
+  let nowMs = actualNow();
+  const stableClock = () => nowMs;
+  let transfer;
+  try {
+    Date.now = stableClock;
+    if (hpkeOpen) z.hpkeOpen = hpkeOpen;
+    delete require.cache[moduleId];
+    transfer = require(moduleId);
+  } finally {
+    Date.now = actualNow;
+    z.hpkeOpen = actualHpkeOpen;
+    if (previousModule) require.cache[moduleId] = previousModule;
+    else delete require.cache[moduleId];
+  }
+  return { transfer, advanceTo(ms) { nowMs = ms; },
+    async withClock(action) {
+      const saved = Date.now;
+      Date.now = stableClock;
+      try { return await action(); }
+      finally { Date.now = saved; }
+    },
+  };
+}
 const cekBatch = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-versioned-cek-batch"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
@@ -777,35 +808,44 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       ciphertextRoot: root, deviceHpkePrivateKey: bRecipient,
       nowSeconds: now + 9, ...overrides,
     });
-    // Expire the real signed authorization at the last awaited HPKE operation.
-    // A previously approved CEK must not escape after the time-bound grant dies.
+    // Exercise the real post-HPKE release fence, not a forged Date.now (which
+    // the release module correctly pins). The valid signed witness and owner
+    // approval must pass before we advance only its captured release clock.
+    // This branch pins the native HPKE function when the CEK module loads.
+    // Intercept that exact intrinsic BEFORE loading the isolated test copy;
+    // rebinding z.hpkeOpen afterwards would never exercise the final fence.
+    const exactExpiry = Math.min(envelope.core.expires_at,
+      issued.approval.expires_at, signedCommittedHead.expires_at);
     const realHpkeOpen = z.hpkeOpen;
-    const realDateNow = Date.now;
-    const realMathFloor = Math.floor;
-    const realMathMin = Math.min;
     let hpkeFinishedBeforeExpiry = false;
-    let simulatedOpenMilliseconds = (now + 9) * 1000;
-    const stableOpenClock = () => simulatedOpenMilliseconds;
-    Date.now = stableOpenClock;
-    z.hpkeOpen = async (...args) => {
+    let expireOnOpen = false;
+    let openClock;
+    openClock = releaseClockTransfer({ hpkeOpen: async (...args) => {
       const result = await realHpkeOpen(...args);
-      hpkeFinishedBeforeExpiry = true;
-      simulatedOpenMilliseconds = (envelope.core.expires_at + 2) * 1000;
-      Math.floor = () => 0;
-      Math.min = () => Number.MAX_SAFE_INTEGER;
+      if (expireOnOpen) {
+        hpkeFinishedBeforeExpiry = true;
+        openClock.advanceTo((exactExpiry + 1) * 1000);
+      }
       return result;
+    } });
+    const validOpenInput = {
+      envelope, authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      metadata, objectRevision: 1, ciphertext: recoveredCiphertext,
+      ciphertextRoot: root, deviceHpkePrivateKey: bRecipient,
+      nowSeconds: now + 9,
     };
-    try {
-      await assert.rejects(open(), /ZK_OWNER_FILE_CEK_DENIED/,
-        "B cannot release a CEK after expiry during real HPKE open");
-    } finally {
-      z.hpkeOpen = realHpkeOpen;
-      Date.now = realDateNow;
-      Math.floor = realMathFloor;
-      Math.min = realMathMin;
-    }
+    const beforeExpiry = await openClock.withClock(
+      () => openClock.transfer.openOwnerAuthorizedFileCek(validOpenInput));
+    assert.equal(beforeExpiry.verifiedReleaseExpiresAt, exactExpiry);
+    beforeExpiry.cek.fill(0);
+    expireOnOpen = true;
+    await assert.rejects(openClock.withClock(
+      () => openClock.transfer.openOwnerAuthorizedFileCek(validOpenInput)),
+    /ZK_OWNER_FILE_CEK_DENIED/,
+    "B must reject at the final release fence after genuine HPKE decrypt and lease expiry");
     assert.equal(hpkeFinishedBeforeExpiry, true,
-      "test must reach actual HPKE decrypt before the clock changes");
+      "test must complete actual HPKE decrypt before the protected clock expires");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
     assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(
@@ -904,7 +944,6 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       metadata, objectRevision: 1, ciphertext: Buffer.from(sealed),
       ciphertextRoot: Buffer.from(root), authority: publicAuthority,
       nowSeconds: now + 9 };
-    const originalShareDecode = z.decodeDeterministic;
     const originalShareMathCeil = Math.ceil;
     const originalShareMathMax = Math.max;
     const originalShareAuthorityRead = ownerOfferArgs.readIndependentAuthority;
@@ -922,6 +961,12 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     ownerOfferArgs.readIndependentAuthority = async (...args) => {
       const current = await originalShareAuthorityRead(...args);
       if (++shareAuthorityReads === 2) {
+        // The owner offer captures its native CBOR decoder at module load.
+        // Poison the actual final independent-authority callback instead of
+        // replacing an unused z.decodeDeterministic export.
+        Math.ceil = () => 0;
+        Math.max = () => Number.MIN_SAFE_INTEGER;
+        shareNativeMathPoisonReached = true;
         Object.getOwnPropertyDescriptors = () => { throw new Error("OBJECT_DESCRIPTORS_POISONED"); };
         Object.getPrototypeOf = () => { throw new Error("GET_PROTOTYPE_POISONED"); };
         Object.hasOwn = () => false;
@@ -934,17 +979,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       }
       return current;
     };
-    z.decodeDeterministic = async (...args) => {
-      const decoded = await originalShareDecode(...args);
-      Math.ceil = () => 0;
-      Math.max = () => Number.MIN_SAFE_INTEGER;
-      shareNativeMathPoisonReached = true;
-      return decoded;
-    };
     let offer;
     try { offer = await createProtectedRecipientShareOffer(ownerOfferArgs); }
     finally {
-      z.decodeDeterministic = originalShareDecode;
       Math.ceil = originalShareMathCeil;
       Math.max = originalShareMathMax;
       ownerOfferArgs.readIndependentAuthority = originalShareAuthorityRead;
@@ -958,7 +995,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       Object.freeze = originalObjectFreeze;
     }
     assert.equal(shareNativeMathPoisonReached, true,
-      "real deterministic share decode must poison Math.max before expiry validation");
+      "the actual second independent authority callback must poison Math.max before release");
     assert.equal(shareAuthorityReads, 2, "the offer must complete both independent authority reads");
     assert.equal(shareNativeReflectionPoisonReached, true,
       "the final independent authority callback must poison mutable reflection, Buffer and crypto globals");
@@ -1654,25 +1691,21 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(bundle.entries.length, 3);
     assert.equal(bundle.globalAccountCompletenessProven, false);
     assert.equal(bundle.authorizesProductionRestore, false);
-    // Logout during the final real per-file owner HPKE seal must also fence
-    // the signed release; every selected CEK was independently AEAD checked.
-    const trueHpkeSeal = z.hpkeSeal;
-    let ownerSessionLive = true, realSeals = 0;
-    z.hpkeSeal = async (...args) => {
-      const sealedCek = await trueHpkeSeal(...args);
-      if (++realSeals === versionRows.length) ownerSessionLive = false;
-      return sealedCek;
-    };
-    try {
-      await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
-        ownerPrivateKey: owner.privateKey, authority: publicAuthority,
-        versions: versionRows,
-        assertLive: () => { if (!ownerSessionLive) throw Error("OWNER_LOGGED_OUT"); },
-      }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
-      "owner logout after last genuine CEK seal must refuse the signed batch");
-    } finally { z.hpkeSeal = trueHpkeSeal; }
-    assert.equal(realSeals, versionRows.length,
-      "owner-side revocation must occur after all genuine CEK seals");
+    // The owner CEK transfer pins native HPKE at module load; rebinding its
+    // exported function afterwards does not intercept genuine encryption.
+    // Seven assertLive checks reach the point immediately AFTER the third
+    // awaited real per-file HPKE seal and before any batch signature escapes.
+    let ownerSessionChecks = 0;
+    await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
+      ownerPrivateKey: owner.privateKey, authority: publicAuthority,
+      versions: versionRows,
+      assertLive: () => {
+        if (++ownerSessionChecks === 7) throw Error("OWNER_LOGGED_OUT");
+      },
+    }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+    "owner logout after all three genuine CEK seals must refuse the signed batch");
+    assert.equal(ownerSessionChecks, 7,
+      "the final post-HPKE owner session checkpoint must be reached");
     const openBatch = (overrides = {}) => cekBatch.openOwnerAuthorizedVersionedCeks({
       bundle, authority: { ...linked, nowSeconds: testWallSeconds() },
       operatorMinimumSequence: signedCommittedHead.sequence,
@@ -1691,42 +1724,30 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.deepEqual(entry.cek, original.ownerHeldCek);
       entry.cek.fill(0);
     }
-    // A local session revoked while the LAST genuine X25519 HPKE open is
-    // awaiting must never receive even the first validated historical CEK.
-    // This exercises real crypto; the wrapper only schedules a local logout.
-    const trueHpkeOpen = z.hpkeOpen;
-    let localSessionLive = true, realOpens = 0;
-    z.hpkeOpen = async (...args) => {
-      const opened = await trueHpkeOpen(...args);
-      if (++realOpens === versionRows.length) localSessionLive = false;
-      return opened;
-    };
-    try {
-      await assert.rejects(cekBatch.openOwnerAuthorizedVersionedCeks({
-        bundle, authority: { ...linked, nowSeconds: testWallSeconds() },
-        operatorMinimumSequence: signedCommittedHead.sequence,
-        recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: testWallSeconds(),
-        assertLive: () => { if (!localSessionLive) throw Error("SESSION_REVOKED"); },
-      }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
-      "revocation after last real HPKE open must fence all CEKs at final release");
-    } finally { z.hpkeOpen = trueHpkeOpen; }
-    assert.equal(realOpens, versionRows.length,
-      "the test must exercise every real HPKE version before local revocation");
+    // Eleven assertLive checks reach the point immediately AFTER all three
+    // genuine native HPKE opens, before any historical CEK is released.
+    let localSessionChecks = 0;
+    await assert.rejects(cekBatch.openOwnerAuthorizedVersionedCeks({
+      bundle, authority: { ...linked, nowSeconds: testWallSeconds() },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      recipientHpkePrivateRaw: fresh.hpkePrivateRaw, nowSeconds: testWallSeconds(),
+      assertLive: () => {
+        if (++localSessionChecks === 11) throw Error("SESSION_REVOKED");
+      },
+    }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
+    "revocation after last real HPKE open must fence all CEKs at final release");
+    assert.equal(localSessionChecks, 11,
+      "the final post-HPKE recipient session checkpoint must be reached");
     // A revoked session must stop immediately, not perform unrelated file
     // decryptions or leak a successful partial result.
-    localSessionLive = true; realOpens = 0;
-    z.hpkeOpen = async (...args) => {
-      const opened = await trueHpkeOpen(...args);
-      if (++realOpens === 1) localSessionLive = false;
-      return opened;
-    };
-    try {
-      await assert.rejects(openBatch({
-        assertLive: () => { if (!localSessionLive) throw Error("SESSION_REVOKED"); },
-      }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/);
-    } finally { z.hpkeOpen = trueHpkeOpen; }
-    assert.equal(realOpens, 1,
-      "first revoked CEK must stop later HPKE operations");
+    let firstOpenChecks = 0;
+    await assert.rejects(openBatch({
+      assertLive: () => {
+        if (++firstOpenChecks === 5) throw Error("SESSION_REVOKED");
+      },
+    }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/);
+    assert.equal(firstOpenChecks, 5,
+      "first revoked CEK must stop later genuine HPKE decryptions");
     await assert.rejects(openBatch({ assertLive: async () => undefined }),
       /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/,
     "an asynchronous local fence cannot masquerade as a final sync check");
