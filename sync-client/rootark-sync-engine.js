@@ -3420,8 +3420,13 @@ class SyncEngine {
         // Persist the exact pre-expiry observation BEFORE snapshot writes. A
         // later journal fsync failure must not make this verified ciphertext
         // impossible to authenticate after authorization expires.
-        const acknowledgedDigest = outboundFreshDigest && result?.operationId === operation.operationId
-          && signedEnvelopeDigest(result) === outboundFreshDigest ? outboundFreshDigest : null;
+        // The restore branch reached this line only AFTER the independent
+        // physical witness and CURRENT CAS floor both proved exact admission.
+        // Promote its earlier durable pre-observation to an admitted receipt;
+        // otherwise thousands of successful restores strand `observed` slots.
+        const acknowledgedDigest = historicalRestore ? historicalRestoreEnvelope.digest
+          : outboundFreshDigest && result?.operationId === operation.operationId
+            && signedEnvelopeDigest(result) === outboundFreshDigest ? outboundFreshDigest : null;
         if (acknowledgedDigest) await nativeReflectApply(journalMethods.observeAdmission, journal,
           [operation.operationId, acknowledgedDigest]);
         if (operation.operation === "move" || operation.operation === "delete") {
@@ -4332,6 +4337,24 @@ class SyncEngine {
       fail("Remote pull blocked by pending atomic signed WebDAV batch",
         "sync_atomic_batch_indeterminate");
     }
+    // LIST is not a physical admission receipt. If an excluded/offline
+    // historical restore is still queued, an exact echo must never reach an
+    // ordinary markSeen(), which would discard the durable signed outbox and
+    // its local materialization without consulting the independent witness.
+    const pendingRestoreDigests = nativeObjectCreate(null);
+    const pendingRestores = await this.journal.recover();
+    for (let index = 0; index < pendingRestores.length; index += 1) {
+      const pending = pendingRestores[index];
+      if (typeof pending?.operationId !== "string"
+        || !stringStartsWith(pending.operationId, "histrestore-")) continue;
+      const restore = protocol.validateStoredOperation(pending);
+      const digest = signedEnvelopeDigest(restore);
+      if (nativeObjectHasOwn(pendingRestoreDigests, restore.operationId)
+        && pendingRestoreDigests[restore.operationId] !== digest) {
+        fail("Conflicting pending historical restore identity", "remote_authorization_rejected");
+      }
+      pendingRestoreDigests[restore.operationId] = digest;
+    }
     let result;
     try {
       result = await this.adapter.list();
@@ -4374,6 +4397,10 @@ class SyncEngine {
       const operation = inspected[index];
       const digest = signedEnvelopeDigest(operation);
       this.journal.assertCompatibleAdmission(operation.operationId, digest);
+      if (nativeObjectHasOwn(pendingRestoreDigests, operation.operationId)
+        && pendingRestoreDigests[operation.operationId] !== digest) {
+        fail("Remote LIST conflicts with pending historical restore", "remote_authorization_rejected");
+      }
       const previous = nativeObjectHasOwn(batchDigests, operation.operationId)
         ? batchDigests[operation.operationId] : undefined;
       if (previous !== undefined && previous !== digest) {
@@ -4397,6 +4424,11 @@ class SyncEngine {
     };
     for (let index = 0; index < inspected.length; index += 1) {
       const operation = inspected[index];
+      if (nativeObjectHasOwn(pendingRestoreDigests, operation.operationId)) {
+        // Only the outbound independent admission flow may consume this ID.
+        // It remains queued even if its destination is currently excluded.
+        continue;
+      }
       if (!this.operationDestinationIsSelected(operation)) {
         const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
         await this.reconcileOutOfScopeMove(operation, summary);

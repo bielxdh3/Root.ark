@@ -1127,7 +1127,10 @@ async function verifyAuthorizationCore(manifest, signature, publicKey, expected 
       }
     }
   };
-  if (normalized.envelope_version === 1) checkExpected(V1_EXPECTED_FIELDS, normalized);
+  // v1 accepted numeric epoch scopes before buildManifestMap normalized the
+  // detached epoch to bigint; keep that API contract without rereading the
+  // caller's mutable manifest.
+  if (normalized.envelope_version === 1) checkExpected(V1_EXPECTED_FIELDS, manifestSnapshot);
   if (normalized.envelope_version === 2) {
     for (let index = 0; index < V2_EXPECTED_SCOPE.length; index += 1) {
       if (!nativeObjectHasOwn(expectedMap, V2_EXPECTED_SCOPE[index])) {
