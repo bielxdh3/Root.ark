@@ -64,6 +64,16 @@ class MainActivity : Activity() {
         showLogin()
     }
 
+    override fun onDestroy() {
+        // Also invalidate callbacks and wipe retained preview arrays when the
+        // activity is destroyed without a normal foreground/background cycle.
+        // clearSensitiveState is idempotent after onStop.
+        isForeground = false
+        generation++
+        clearSensitiveState()
+        super.onDestroy()
+    }
+
     private fun clearSensitiveState() {
         securePreviewText.clear()
         sessionToken = null
@@ -169,19 +179,38 @@ class MainActivity : Activity() {
         val cursor: String? = null,
         val pageNumber: Int = 1,
         val usedCursors: Set<String> = emptySet(),
+        val previousCursors: List<String?> = emptyList(),
     ) {
         fun advance(nextCursor: String?): InventoryPagingTracker {
-            val updatedUsed = if (cursor != null) usedCursors + cursor else usedCursors
+            val history = previousCursors + cursor
             return InventoryPagingTracker(
                 cursor = nextCursor,
                 pageNumber = pageNumber + 1,
-                usedCursors = updatedUsed,
+                usedCursors = history.filterNotNull().toSet(),
+                previousCursors = history,
             )
         }
 
+        fun previous(): InventoryPagingTracker? {
+            if (pageNumber <= 1 || !isValid()) return null
+            val history = previousCursors.dropLast(1)
+            return InventoryPagingTracker(
+                cursor = previousCursors.last(),
+                pageNumber = pageNumber - 1,
+                usedCursors = history.filterNotNull().toSet(),
+                previousCursors = history,
+            ).takeIf { it.isValid() }
+        }
+
         fun isValid(): Boolean {
-            val currentCursor = cursor ?: return pageNumber == 1
-            if (pageNumber <= 1 || pageNumber > 100_000) return false
+            if (pageNumber !in 1..100_000 || previousCursors.size != pageNumber - 1) return false
+            if (pageNumber == 1) return cursor == null && usedCursors.isEmpty()
+            if (previousCursors.firstOrNull() != null) return false
+            val priorCursors = previousCursors.filterNotNull()
+            if (priorCursors.size != previousCursors.size - 1 ||
+                priorCursors.toSet().size != priorCursors.size || usedCursors != priorCursors.toSet()
+            ) return false
+            val currentCursor = cursor ?: return false
             return runCatching { PagedInventoryPolicy.checkCursor(currentCursor, usedCursors) }.isSuccess
         }
     }
@@ -205,7 +234,7 @@ class MainActivity : Activity() {
                 }.isFailure) {
                     showSession("Inventário retornou cursor repetido. Reinicie a listagem.")
                 } else {
-                    showInventoryPage(page, tracker.pageNumber, nextTracker)
+                    showInventoryPage(page, tracker, nextTracker)
                 }
             } else when ((failure as? RootArkApiException)?.statusCode) {
                 401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
@@ -216,8 +245,8 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showInventoryPage(page: InventoryPage, pageNumber: Int, nextTracker: InventoryPagingTracker) {
-        val layout = screen("Inventário · página $pageNumber", "${page.rows.size} metadados de sincronização. Nenhum conteúdo descriptografado.")
+    private fun showInventoryPage(page: InventoryPage, tracker: InventoryPagingTracker, nextTracker: InventoryPagingTracker) {
+        val layout = screen("Inventário · página ${tracker.pageNumber}", "${page.rows.size} metadados de sincronização. Nenhum conteúdo descriptografado.")
         if (page.rows.isEmpty()) text(layout, "Nenhum registro disponível.")
         for (row in page.rows) {
             text(layout, row.name + if (row.deleted) " (excluído)" else "")
@@ -228,9 +257,11 @@ class MainActivity : Activity() {
             ).joinToString(" · ")
             if (details.isNotEmpty()) text(layout, details)
             if (!row.deleted) button(layout, "Conteúdo protegido", accessibilityLabel = protectedContentAccessibilityLabel(row)) {
-                showProtectedObject(row.objectId) { showInventoryPage(page, pageNumber, nextTracker) }
+                showProtectedObject(row.objectId) { showInventoryPage(page, tracker, nextTracker) }
             }
         }
+        val previous = tracker.previous()
+        if (previous != null) button(layout, "Página anterior") { loadInventoryPage(previous) }
         val next = nextTracker.cursor
         if (next != null) button(layout, "Próxima página") { loadInventoryPage(nextTracker) }
         button(layout, "Atualizar desde o início") { loadInventoryPage() }
