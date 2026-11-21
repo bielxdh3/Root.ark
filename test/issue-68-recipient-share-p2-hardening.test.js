@@ -273,6 +273,37 @@ test("issue 68 P2: snapshotAuthority validates non-negative safe integers for re
 // AEAD/HPKE sealing, and regressionReads === 2 in the owner ceremony suite.
 // This reduced fixture cannot reach that boundary and must not claim it does.
 
+test("issue 68: revoked owner roster does not consult poisoned Array.filter after authority await", async () => {
+  const f = await createMinimalOfferFixture();
+  const revoked = {
+    ...f.baseAuthority,
+    devices: f.baseAuthority.devices.map((device, index) =>
+      index === 0 ? { ...device, revokedAtEpoch: f.epoch } : device),
+  };
+  const originalFilter = Array.prototype.filter;
+  let filterCalls = 0;
+  let authorityReads = 0;
+  try {
+    await assert.rejects(createProtectedRecipientShareOffer({
+      grant: f.grant, recipientPin: f.recipientPin, issuerPin: f.issuerPin,
+      readIndependentAuthority: async () => {
+        authorityReads++;
+        Array.prototype.filter = function (...args) {
+          filterCalls++;
+          return originalFilter.apply(this, args);
+        };
+        return revoked;
+      },
+      ownerPrivateKey: f.owner.privateKey, ownerHeldCek: f.ownerHeldCek,
+      metadata: f.metadata, objectRevision: 1, ciphertext: f.ciphertext,
+      ciphertextRoot: f.ciphertextRoot, authority: f.baseAuthority, nowSeconds: f.now,
+    }), /ZK_SHARE_OFFER_DENIED/);
+  } finally { Array.prototype.filter = originalFilter; }
+  assert.equal(authorityReads, 1, "a valid grant reaches one independent authority read");
+  assert.equal(filterCalls, 0,
+    "revoked authority must fail before any callback-poisonable array filter is invoked");
+});
+
 test("issue 68 P2: openPortableProtectedRecipientShareFile rejects getter reentrancy on redeemInput", async () => {
   const f = await createMinimalOfferFixture();
   let getterRan = false;

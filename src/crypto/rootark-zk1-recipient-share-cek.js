@@ -11,6 +11,10 @@ const { openOwnerAuthorizedFileCek, sealOwnerAuthorizedFileCek } =
   require("./rootark-zk1-owner-authorized-file-cek-transfer");
 const fileContent = require("../../public/client/rootark-zk1-file-content");
 const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
+// Capture the real clock before an independent roster reader gets to execute
+// arbitrary JavaScript. An authority callback cannot extend a signed lease by
+// replacing the global Date.now function.
+const nativeReleaseNow = Date.now;
 
 const SHARE_DOMAIN = Buffer.from("Root.ark/zk-1/protected-ciphertext-share/v1\0");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
@@ -125,17 +129,27 @@ async function verifyOfferAuthority(authority, statement, bytes, signature, pin,
   currentAuthority(current, statement, signature, bytes);
   // Independent roster membership does NOT grant issuer/owner authority:
   // a recipient may have a legitimate active Ed25519 signing device.
-  const issuer = current.devices.filter((device) =>
-    device.deviceId === issuerPin.deviceId);
-  if (issuer.length !== 1
-    || !same(issuer[0].authorizationPublicKey,
+  const issuer = findUniqueDevice(current.devices, issuerPin.deviceId);
+  if (!issuer
+    || !same(issuer.authorizationPublicKey,
       from64(issuerPin.authorizationPublicKey, 32))) denyOffer();
-  const recipient = current.devices.filter((device) =>
-    device.deviceId === pin.deviceId);
-  if (recipient.length !== 1
-    || !same(recipient[0].authorizationPublicKey,
+  const recipient = findUniqueDevice(current.devices, pin.deviceId);
+  if (!recipient
+    || !same(recipient.authorizationPublicKey,
       from64(pin.authorizationPublicKey, 32))) denyOffer();
   return current;
+}
+function findUniqueDevice(devices, deviceId) {
+  // snapshotAuthority creates a dense private array from checked own data
+  // descriptors. Do not run Array#filter or species constructors after the
+  // independent authority read: callbacks can poison those mutable methods.
+  let found = null;
+  for (let index = 0; index < devices.length; index++) {
+    if (devices[index].deviceId !== deviceId) continue;
+    if (found) deny();
+    found = devices[index];
+  }
+  return found;
 }
 // Owner-side DEV-OFF portable offer. The owner MUST independently pin the
 // authorized issuer's device ID and Ed25519 key; a candidate server ACK has no
@@ -238,7 +252,7 @@ async function createProtectedRecipientShareOffer(input) {
     // The independently verified second authority read can outlast the
     // owner-approved HPKE envelope even while the share grant remains valid.
     // Neither lease may expire before releasing the portable CEK offer.
-    const releaseSeconds = Math.floor(Date.now() / 1000);
+    const releaseSeconds = Math.floor(nativeReleaseNow() / 1000);
     if (!Number.isSafeInteger(envelope.core.expires_at)
       || releaseSeconds >= envelope.core.expires_at
       || releaseSeconds >= statement.expires_at) denyOffer();
@@ -278,9 +292,8 @@ function currentAuthority(snapshotValue, statement, shareSignature, statementByt
     if (snapshotValue.scope[field] !== b64(statement[field])) deny();
   }
   const active = (deviceId) => {
-    const hits = snapshotValue.devices.filter((device) => device?.deviceId === deviceId);
-    if (hits.length !== 1) deny();
-    const device = hits[0];
+    const device = findUniqueDevice(snapshotValue.devices, deviceId);
+    if (!device) deny();
     if (device.revokedAtEpoch !== null || !Number.isSafeInteger(device.enrolledEpoch)
       || device.enrolledEpoch < 1 || device.enrolledEpoch > statement.epoch
       || !(device.authorizationPublicKey instanceof Uint8Array)
@@ -355,9 +368,9 @@ async function openProtectedRecipientShareFile(input) {
     const verifiedReleaseExpiresAt = opened.verifiedReleaseExpiresAt;
     if (!Number.isSafeInteger(verifiedReleaseExpiresAt)
       || verifiedReleaseExpiresAt < 1) deny();
-    const releaseSeconds = Math.floor(Date.now() / 1000);
-    if ([statement.expires_at, verifiedReleaseExpiresAt]
-      .some((expiresAt) => releaseSeconds >= expiresAt || nowSeconds >= expiresAt)) deny();
+    const releaseSeconds = Math.floor(nativeReleaseNow() / 1000);
+    if (releaseSeconds >= statement.expires_at || nowSeconds >= statement.expires_at
+      || releaseSeconds >= verifiedReleaseExpiresAt || nowSeconds >= verifiedReleaseExpiresAt) deny();
     const result = Object.freeze({
       schema: "rootark-zk1-recipient-share-file-dev/v1",
       grantId: receipt.grantId, objectId: receipt.objectId,
