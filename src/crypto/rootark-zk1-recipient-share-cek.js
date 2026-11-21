@@ -89,19 +89,28 @@ function from64(value, length) {
 function same(a, b) {
   return a.length === b.length && nativeTimingSafeEqual(a, b);
 }
+function hasOwnDataFields(descriptors, names) {
+  for (let index = 0; index < names.length; index++) {
+    const descriptor = descriptors[names[index]];
+    if (!descriptor || !nativeHasOwn(descriptor, "value")) return false;
+  }
+  return true;
+}
 function strict(value, names) {
   if (!value || isProxy(value) || typeof value !== "object" || nativeArrayIsArray(value)) deny();
   const prototype = nativeGetPrototypeOf(value);
   if (prototype !== nativeObjectPrototype && prototype !== null) deny();
   const keys = nativeOwnKeys(value);
   if (keys.length !== names.length) deny();
-  for (const name of names) if (!nativeHasOwn(value, name)) deny();
+  for (let index = 0; index < names.length; index++)
+    if (!nativeHasOwn(value, names[index])) deny();
 }
 function snapshot(value, names) {
   strict(value, names);
   const descriptors = nativeGetOwnPropertyDescriptors(value);
   const copy = nativeCreate(null);
-  for (const name of names) {
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
     const descriptor = descriptors[name];
     if (!descriptor || !nativeHasOwn(descriptor, "value")) deny();
     const part = descriptor.value;
@@ -118,12 +127,14 @@ function ownDataDescriptors(value, required, optional = []) {
   const descriptors = nativeGetOwnPropertyDescriptors(value);
   const keys = nativeOwnKeys(descriptors);
   if (keys.length < required.length || keys.length > required.length + optional.length) deny();
-  for (const key of required) if (!nativeHasOwn(descriptors, key)) deny();
-  for (const key of keys) {
+  for (let index = 0; index < required.length; index++)
+    if (!nativeHasOwn(descriptors, required[index])) deny();
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index];
     if (typeof key !== "string") deny();
     let allowed = false;
-    for (const candidate of required) if (candidate === key) allowed = true;
-    for (const candidate of optional) if (candidate === key) allowed = true;
+    for (let i = 0; i < required.length; i++) if (required[i] === key) allowed = true;
+    for (let i = 0; i < optional.length; i++) if (optional[i] === key) allowed = true;
     if (!allowed || !nativeHasOwn(descriptors[key], "value")) deny();
   }
   return descriptors;
@@ -166,14 +177,12 @@ function snapshotRedeemInput(value) {
 function snapshotAuthority(value) {
   strict(value, ["scope", "head", "devices"]);
   const fields = nativeGetOwnPropertyDescriptors(value);
-  for (const key of ["scope", "head", "devices"])
-    if (!nativeHasOwn(fields[key] ?? {}, "value")) denyOffer();
+  if (!hasOwnDataFields(fields, ["scope", "head", "devices"])) denyOffer();
   const scope = snapshot(fields.scope.value, SCOPE);
   const headValue = fields.head.value;
   strict(headValue, ["revision", "epoch", "digest"]);
   const h = nativeGetOwnPropertyDescriptors(headValue);
-  for (const key of ["revision", "epoch", "digest"])
-    if (!nativeHasOwn(h[key] ?? {}, "value")) denyOffer();
+  if (!hasOwnDataFields(h, ["revision", "epoch", "digest"])) denyOffer();
   if (isProxy(h.digest.value) || !(h.digest.value instanceof Uint8Array)
     || h.digest.value.length !== 32) denyOffer();
   const head = { revision: h.revision.value, epoch: h.epoch.value,
@@ -192,9 +201,9 @@ function snapshotAuthority(value) {
     strict(device, ["deviceId", "authorizationPublicKey",
       "enrolledEpoch", "revokedAtEpoch"]);
     const d = nativeGetOwnPropertyDescriptors(device);
-    for (const key of ["deviceId", "authorizationPublicKey", "enrolledEpoch", "revokedAtEpoch"])
-      if (!nativeHasOwn(d[key] ?? {}, "value")) denyOffer();
-    if (isProxy(d.authorizationPublicKey.value)
+    if (!hasOwnDataFields(d, ["deviceId", "authorizationPublicKey",
+      "enrolledEpoch", "revokedAtEpoch"])
+      || isProxy(d.authorizationPublicKey.value)
       || !(d.authorizationPublicKey.value instanceof Uint8Array)
       || d.authorizationPublicKey.value.length !== 32) denyOffer();
     devices[index] = { deviceId: d.deviceId.value,
@@ -239,8 +248,10 @@ async function createProtectedRecipientShareOffer(input) {
       "ownerPrivateKey", "ownerHeldCek", "metadata", "objectRevision",
       "ciphertext", "ciphertextRoot", "authority", "nowSeconds"]);
     const d = nativeGetOwnPropertyDescriptors(input);
-    for (const key of nativeOwnKeys(d))
-      if (!nativeHasOwn(d[key] ?? {}, "value")) denyOffer();
+    if (!hasOwnDataFields(d, ["grant", "recipientPin", "issuerPin",
+      "readIndependentAuthority", "ownerPrivateKey", "ownerHeldCek",
+      "metadata", "objectRevision", "ciphertext", "ciphertextRoot",
+      "authority", "nowSeconds"])) denyOffer();
     const grant = snapshot(d.grant.value, GRANT);
     const pin = snapshot(d.recipientPin.value, RECIPIENT_PIN);
     const issuerPin = snapshot(d.issuerPin.value, ISSUER_PIN);
@@ -299,7 +310,8 @@ async function createProtectedRecipientShareOffer(input) {
       || statement.object_revision !== d.objectRevision.value
       || statement.epoch !== metadata.epoch
       || !same(nativeBufferFrom(statement.ciphertext_digest || []), nativeSha256(ciphertext))) denyOffer();
-    for (const field of SCOPE) {
+    for (let index = 0; index < SCOPE.length; index++) {
+      const field = SCOPE[index];
       if (metadata[field] !== b64(statement[field])) denyOffer();
     }
     const signature = from64(grant.shareSignatureBase64, 64);
@@ -344,11 +356,12 @@ async function createProtectedRecipientShareOffer(input) {
 function safeEnvelope(value) {
   strict(value, ENVELOPE);
   const d = nativeGetOwnPropertyDescriptors(value);
-  for (const name of ENVELOPE) if (!nativeHasOwn(d[name] ?? {}, "value")) deny();
+  if (!hasOwnDataFields(d, ENVELOPE)) deny();
   if (isProxy(d.core.value)) deny();
   const keys = nativeOwnKeys(d.core.value);
   if (keys.length > 40) deny();
-  for (const key of keys) if (typeof key !== "string") deny();
+  for (let index = 0; index < keys.length; index++)
+    if (typeof keys[index] !== "string") deny();
   const core = snapshot(d.core.value, keys);
   const other = snapshot({ schema: d.schema.value, enc: d.enc.value,
     ciphertext: d.ciphertext.value, owner_signature: d.owner_signature.value,
@@ -363,7 +376,8 @@ function currentAuthority(snapshotValue, statement, shareSignature, statementByt
   if (current.head.revision !== statement.manifest_revision
     || current.head.epoch !== statement.epoch
     || !same(current.head.digest, statement.manifest_digest)) deny();
-  for (const field of SCOPE) {
+  for (let index = 0; index < SCOPE.length; index++) {
+    const field = SCOPE[index];
     if (current.scope[field] !== b64(statement[field])) deny();
   }
   const active = (deviceId) => {
@@ -429,7 +443,8 @@ async function openProtectedRecipientShareFile(input) {
       || core.owner_revision !== statement.manifest_revision
       || core.owner_digest !== b64(statement.manifest_digest)
       || core.owner_epoch !== statement.epoch) deny();
-    for (const field of SCOPE) {
+    for (let index = 0; index < SCOPE.length; index++) {
+      const field = SCOPE[index];
       if (core[field] !== b64(statement[field])
         || metadata[field] !== core[field]) deny();
     }
@@ -496,8 +511,10 @@ async function openPortableProtectedRecipientShareFile(input) {
       || typeof offerSnapshot.recipientUsername !== "string"
       || typeof offerSnapshot.recipientDeviceId !== "string") deny();
     const redeemInput = snapshotRedeemInput(inputDescriptors.redeemInput.value);
-    for (const key of GRANT)
+    for (let index = 0; index < GRANT.length; index++) {
+      const key = GRANT[index];
       if (offerSnapshot.grant[key] !== redeemInput.grant[key]) deny();
+    }
     if (offerSnapshot.recipientUsername !== redeemInput.recipientUsername
       || offerSnapshot.recipientDeviceId !== redeemInput.recipientDeviceId) deny();
     const openInput = nativeFreeze(nativeAssign(nativeCreate(null), {

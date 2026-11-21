@@ -3,8 +3,10 @@
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const test = require("node:test");
+const z = require("../src/crypto/rootark-zk-1");
 const { shareGrantMessageV1 } = require("../src/services/zk1ProtectedCiphertextSharing");
 const {
+  createProtectedRecipientShareOffer,
   openPortableProtectedRecipientShareFile,
 } = require("../src/crypto/rootark-zk1-recipient-share-cek");
 
@@ -232,4 +234,184 @@ test("issue 68 P2: data callback can mutate only the original, not the frozen re
   assert.equal(hostileRedeemTarget.recipientUsername, "mallory");
   assert.equal(hostileRedeemTarget.recipientDeviceId, "device-attacker");
   assert.equal(fetchCalls, 0, "invalid authority must be rejected before fetch");
+});
+
+async function createMinimalOfferFixture() {
+  const owner = crypto.generateKeyPairSync("ed25519");
+  const issuer = crypto.generateKeyPairSync("ed25519");
+  const recipient = crypto.generateKeyPairSync("ed25519");
+  const recipientHpke = await z.hpkeSuite().kem.generateKeyPair();
+  const recipientHpkePub = b64(await z.hpkeSuite().kem.serializePublicKey(recipientHpke.publicKey));
+
+  const accountIdRaw = crypto.randomBytes(16);
+  const compartmentIdRaw = crypto.randomBytes(16);
+  const keyringIdRaw = crypto.randomBytes(16);
+
+  const scope = {
+    account_id: b64(accountIdRaw),
+    compartment_id: b64(compartmentIdRaw),
+    keyring_id: b64(keyringIdRaw),
+  };
+  const now = Math.floor(Date.now() / 1000);
+  const epoch = 1;
+  const revision = 1;
+  const digest = crypto.randomBytes(32);
+
+  const issuerId = "device-issuer";
+  const recipientId = "device-recipient";
+
+  const issuerPubBytes = Uint8Array.from(issuer.publicKey.export({ format: "der", type: "spki" }).subarray(12));
+  const recipientPubBytes = Uint8Array.from(recipient.publicKey.export({ format: "der", type: "spki" }).subarray(12));
+
+  const objectId = b64(crypto.randomBytes(16));
+  const metadata = {
+    ...scope,
+    object_id: objectId,
+    version_id: b64(crypto.randomBytes(16)),
+    parent_version_id: null,
+    epoch,
+    kind: "file",
+  };
+
+  const plaintext = Buffer.from("test plaintext bytes");
+  const ownerHeldCek = crypto.randomBytes(32);
+  const cekKey = await crypto.webcrypto.subtle.importKey("raw", ownerHeldCek, "AES-GCM", false, ["encrypt", "decrypt"]);
+  const iv = crypto.randomBytes(12);
+  const ciphertextBuf = Buffer.from(await crypto.webcrypto.subtle.encrypt({ name: "AES-GCM", iv }, cekKey, plaintext));
+  const ciphertext = Buffer.concat([iv, ciphertextBuf]);
+  const ciphertextDigest = crypto.createHash("sha256").update(ciphertext).digest();
+  const ciphertextRoot = crypto.createHash("sha256").update(ciphertext).digest();
+
+  const grantId = b64(crypto.randomBytes(32));
+
+  const shareAuthorization = {
+    account_id: accountIdRaw,
+    compartment_id: compartmentIdRaw,
+    keyring_id: keyringIdRaw,
+    device_id: issuerId,
+    operation: "get",
+    object_id: metadata.object_id,
+    expected_object_revision: 1,
+    manifest_revision: revision,
+    manifest_digest: digest,
+    epoch,
+    nonce: crypto.randomBytes(32),
+    issued_at: now,
+    ciphertext_digest: ciphertextDigest,
+  };
+
+  const grantInput = {
+    authorization: shareAuthorization,
+    grantId,
+    recipientUsername: "alice",
+    recipientDeviceId: recipientId,
+    expiresAt: now + 60,
+  };
+
+  const message = await shareGrantMessageV1(grantInput);
+  const grant = {
+    grantId: grantInput.grantId,
+    expiresAt: grantInput.expiresAt,
+    shareStatementBase64: b64(message.subarray(Buffer.byteLength("Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
+    shareSignatureBase64: b64(crypto.sign(null, message, issuer.privateKey)),
+  };
+
+  const recipientPin = {
+    recipientUsername: "alice",
+    deviceId: recipientId,
+    authorizationPublicKey: b64(recipientPubBytes),
+    hpkePublicKey: recipientHpkePub,
+  };
+
+  const issuerPin = {
+    deviceId: issuerId,
+    authorizationPublicKey: b64(issuerPubBytes),
+  };
+
+  const baseAuthority = {
+    scope,
+    head: { revision, epoch, digest: Uint8Array.from(digest) },
+    devices: [
+      {
+        deviceId: issuerId,
+        authorizationPublicKey: issuerPubBytes,
+        enrolledEpoch: epoch,
+        revokedAtEpoch: null,
+      },
+      {
+        deviceId: recipientId,
+        authorizationPublicKey: recipientPubBytes,
+        enrolledEpoch: epoch,
+        revokedAtEpoch: null,
+      },
+    ],
+  };
+
+  return {
+    owner,
+    issuer,
+    recipient,
+    scope,
+    now,
+    epoch,
+    revision,
+    digest,
+    metadata,
+    ownerHeldCek,
+    ciphertext,
+    ciphertextRoot,
+    grant,
+    recipientPin,
+    issuerPin,
+    baseAuthority,
+  };
+}
+
+
+test("issue 68: poisoned scope iterator and Array.some cannot suppress an independent owner scope mismatch", async () => {
+  const f = await createMinimalOfferFixture();
+  const originalIterator = Array.prototype[Symbol.iterator];
+  const originalSome = Array.prototype.some;
+  let iteratedSignedScope = 0;
+  let poisonedScopeChecks = 0;
+  let authorityReads = 0;
+  const mismatched = { ...f.baseAuthority,
+    scope: { ...f.baseAuthority.scope, account_id: b64(crypto.randomBytes(16)) },
+  };
+  try {
+    await assert.rejects(createProtectedRecipientShareOffer({
+      grant: f.grant, recipientPin: f.recipientPin, issuerPin: f.issuerPin,
+      readIndependentAuthority: async () => {
+        authorityReads++;
+        Array.prototype[Symbol.iterator] = function* () {
+          if (this.length === 3 && this[0] === "account_id") {
+            iteratedSignedScope++;
+            // Legacy for-of scope checking could silently skip all fields.
+            return;
+          }
+          yield* Reflect.apply(originalIterator, this, []);
+        };
+        Array.prototype.some = function (...args) {
+          if (this.length === 3 && this[0] === "scope") {
+            poisonedScopeChecks++;
+            return false;
+          }
+          return Reflect.apply(originalSome, this, args);
+        };
+        return mismatched;
+      },
+      ownerPrivateKey: f.owner.privateKey, ownerHeldCek: f.ownerHeldCek,
+      metadata: f.metadata, objectRevision: 1, ciphertext: f.ciphertext,
+      ciphertextRoot: f.ciphertextRoot, authority: f.baseAuthority,
+      nowSeconds: f.now,
+    }), /ZK_SHARE_OFFER_DENIED/);
+  } finally {
+    Array.prototype[Symbol.iterator] = originalIterator;
+    Array.prototype.some = originalSome;
+  }
+  assert.equal(authorityReads, 1, "the independently read mismatched scope must be checked");
+  assert.equal(iteratedSignedScope, 0,
+    "the authority-scope guard must use indexed checks, not a replaceable iterator");
+  assert.equal(poisonedScopeChecks, 0,
+    "the authority-scope guard must not dispatch a replaceable Array.some");
 });
