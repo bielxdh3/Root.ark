@@ -1127,10 +1127,9 @@ async function verifyAuthorizationCore(manifest, signature, publicKey, expected 
       }
     }
   };
-  // v1 accepted numeric epoch scopes before buildManifestMap normalized the
-  // detached epoch to bigint; keep that API contract without rereading the
-  // caller's mutable manifest.
-  if (normalized.envelope_version === 1) checkExpected(V1_EXPECTED_FIELDS, manifestSnapshot);
+  // Compare the detached original v1 scope, but preserve integer equivalence
+  // between number and bigint epochs. Never reread the mutable caller input.
+  if (normalized.envelope_version === 1) checkExpected(V1_EXPECTED_FIELDS, manifestSnapshot, true);
   if (normalized.envelope_version === 2) {
     for (let index = 0; index < V2_EXPECTED_SCOPE.length; index += 1) {
       if (!nativeObjectHasOwn(expectedMap, V2_EXPECTED_SCOPE[index])) {
