@@ -1019,6 +1019,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     let poisonRecipientOutputLength = false;
     let recipientFinalAuthorityReads = 0;
     let poisonedActualRecipientAuthority = false;
+    let genuineRecipientDecrypts = 0;
+    const trustedTypedLength = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(Uint8Array.prototype), "byteLength").get;
     globalThis[testContextId] = async (role, input) => {
       if (role === "export") {
         const { grant: unusedGrant, ...trusted } = ownerOfferArgs;
@@ -1041,11 +1044,19 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
             return snapshot;
           } : poisonRecipientOutputLength ? async (...args) => {
             const current = await readIndependentAuthority(...args);
-            if (++recipientFinalAuthorityReads === 2) {
-              // Poison a real final post-HPKE/AEAD independent authority
-              // read, not Object.freeze (pinned by the CEK module at load).
+            if (++recipientFinalAuthorityReads === 3) {
+              assert.ok(genuineRecipientDecrypts > 0,
+                "the final authority read must follow real successful HPKE/AEAD, not an earlier denial");
+              // Only the THIRD independent authority read is after the real
+              // HPKE and file AEAD, immediately before the bytes leave the
+              // verified recipient flow. Target the private output byte view,
+              // not the 32-byte public Ed25519 and digest inputs of the
+              // independent authorization recheck.
               Object.defineProperty(Uint8Array.prototype, "byteLength", {
-                configurable: true, get() { return 0; },
+                configurable: true, get() {
+                  return this.length === bytes.length && bytes.length > 32
+                    ? 0 : Reflect.apply(trustedTypedLength, this, []);
+                },
               });
               poisonedActualRecipientAuthority = true;
             }
@@ -1101,16 +1112,34 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       ownerHeldCek.fill(0);
       return;
     }
-    // P2: a genuine final authority read can replace a typed-array byteLength
-    // getter after real HPKE/AEAD but before the CLI writes private plaintext.
-    // Intercept the actual fs.writeSync boundary to prove the private copy is
-    // byte-accurate and zeroized, without replacing cryptographic output.
+    // P2: the THIRD authority read happens AFTER real HPKE/AEAD. Observe
+    // the native AES-GCM successful decrypt, not the frozen fileContent
+    // export; the final authority callback can only run after file content
+    // has also been parsed and authenticated. An early generic denial is NOT
+    // evidence of the final output fence.
+    const realAeadDecrypt = subtle.decrypt;
+    const originalOpenSync = fs.openSync;
     const originalWriteSync = fs.writeSync;
     const savedTypedByteLength = Object.getOwnPropertyDescriptor(
       Uint8Array.prototype, "byteLength");
     let sawActualFile = false, capturedFinalPlaintext;
+    let reachedExclusivePrivateOutput = false;
     poisonRecipientOutputLength = true;
     recipientFinalAuthorityReads = 0;
+    genuineRecipientDecrypts = 0;
+    subtle.decrypt = async function (...args) {
+      const result = await realAeadDecrypt.apply(this, args);
+      if (poisonRecipientOutputLength && args[0]?.name === "AES-GCM") {
+        genuineRecipientDecrypts += 1;
+      }
+      return result;
+    };
+    fs.openSync = function (...args) {
+      if (String(args[0]).endsWith("recipient-native-byte-length.bin")) {
+        reachedExclusivePrivateOutput = true;
+      }
+      return originalOpenSync.apply(this, args);
+    };
     fs.writeSync = function (fd, buffer, ...args) {
       if (poisonedActualRecipientAuthority && buffer instanceof Uint8Array) {
         capturedFinalPlaintext = buffer;
@@ -1118,17 +1147,15 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       }
       return originalWriteSync(fd, buffer, ...args);
     };
-    let poisonedOutputAccepted = false;
+    let outputResult, outputError;
     try {
       try {
-        assert.equal(await runRecipientRedeem("portable-offer.json",
-          "recipient-native-byte-length.bin"), "ZK_RECIPIENT_FILE_REDEEMED");
-        poisonedOutputAccepted = true;
-      } catch (error) {
-        assert.match(String(error), /ZK_RECIPIENT_OFFER_CLI_DENIED/,
-          "the poisoned internal view may only fail closed without a success claim");
-      }
+        outputResult = await runRecipientRedeem("portable-offer.json",
+          "recipient-native-byte-length.bin");
+      } catch (error) { outputError = error; }
     } finally {
+      delete subtle.decrypt;
+      fs.openSync = originalOpenSync;
       fs.writeSync = originalWriteSync;
       poisonRecipientOutputLength = false;
       if (savedTypedByteLength) {
@@ -1136,23 +1163,71 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       } else delete Uint8Array.prototype.byteLength;
     }
     assert.equal(poisonedActualRecipientAuthority, true,
-      "the post-HPKE independent authority callback must poison the actual plaintext output path");
-    if (poisonedOutputAccepted) {
-      assert.equal(sawActualFile, true,
-        "a successful redeem must reach the real private output writer");
-      assert.ok(capturedFinalPlaintext instanceof Uint8Array
-        && capturedFinalPlaintext.length === bytes.length && bytes.length > 0);
-      assert.deepEqual(fs.readFileSync(path.join(dir,
-        "recipient-native-byte-length.bin")), bytes,
+      "only the final post-AEAD authority callback may poison the plaintext output path");
+    assert.equal(recipientFinalAuthorityReads, 3,
+      "exactly three independent reads, not an early pre-HPKE rejection");
+    assert.ok(genuineRecipientDecrypts > 0,
+      "actual authenticated file decryption must complete before private output");
+    assert.equal(outputError, undefined,
+      `final output unexpectedly denied: authority=${recipientFinalAuthorityReads}, AEAD=${genuineRecipientDecrypts}, exclusiveOpen=${reachedExclusivePrivateOutput}, write=${sawActualFile}`);
+    assert.equal(outputResult, "ZK_RECIPIENT_FILE_REDEEMED");
+    assert.equal(reachedExclusivePrivateOutput, true,
+      "the third authority callback must allow the verified bytes to reach private output");
+    assert.equal(sawActualFile, true,
+      "successful redeem must reach the native private output writer");
+    assert.ok(capturedFinalPlaintext instanceof Uint8Array
+      && capturedFinalPlaintext.length === bytes.length && bytes.length > 0);
+    assert.deepEqual(fs.readFileSync(path.join(dir,
+      "recipient-native-byte-length.bin")), bytes,
       "callback-poisoned typed-array byteLength must not truncate verified plaintext");
-      assert.ok(capturedFinalPlaintext.every((value) => value === 0),
-        "recipient CLI must wipe the private output buffer");
-    } else {
-      assert.equal(fs.existsSync(path.join(dir, "recipient-native-byte-length.bin")), false,
-        "a denied poisoned authority read must not publish a partial plaintext file");
-      assert.equal(sawActualFile, false,
-        "a failed closed redeem must not make any private output write");
+    assert.ok(capturedFinalPlaintext.every((value) => value === 0),
+      "recipient CLI must wipe the private output buffer");
+    // Separate negative oracle: deny the exclusive private-output open ONLY
+    // after the third authority read and genuine AES-GCM authentication.
+    // The CLI's public error is generic by design, so insist on the concrete
+    // output-fence event and no published destination, not just rejection.
+    let deniedOutputBoundary = null;
+    recipientFinalAuthorityReads = 0;
+    genuineRecipientDecrypts = 0;
+    poisonedActualRecipientAuthority = false;
+    poisonRecipientOutputLength = true;
+    subtle.decrypt = async function (...args) {
+      const result = await realAeadDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM") genuineRecipientDecrypts += 1;
+      return result;
+    };
+    fs.openSync = function (...args) {
+      if (String(args[0]).endsWith("recipient-denied-at-output.bin")) {
+        deniedOutputBoundary = {
+          authorityReads: recipientFinalAuthorityReads,
+          aesGcmDecrypts: genuineRecipientDecrypts,
+          getterPoisoned: poisonedActualRecipientAuthority,
+        };
+        const error = Error("DISPOSABLE_PRIVATE_OUTPUT_FENCE");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalOpenSync.apply(this, args);
+    };
+    try {
+      await assert.rejects(runRecipientRedeem("portable-offer.json",
+        "recipient-denied-at-output.bin"), /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "a real private-output rejection must never report successful redemption");
+    } finally {
+      delete subtle.decrypt;
+      fs.openSync = originalOpenSync;
+      poisonRecipientOutputLength = false;
+      if (savedTypedByteLength) {
+        Object.defineProperty(Uint8Array.prototype, "byteLength", savedTypedByteLength);
+      } else delete Uint8Array.prototype.byteLength;
     }
+    assert.deepEqual(deniedOutputBoundary, {
+      authorityReads: 3, aesGcmDecrypts: genuineRecipientDecrypts,
+      getterPoisoned: true,
+    }, "the denied open must occur only AFTER third authority and real AES-GCM");
+    assert.ok(genuineRecipientDecrypts > 0, "signed HPKE/AEAD must finish before output denial");
+    assert.equal(fs.existsSync(path.join(dir, "recipient-denied-at-output.bin")), false,
+      "an exclusive-output failure cannot leave a partial or truncated plaintext file");
     withoutTrustedAuthority = true;
     await assert.rejects(runOwnerExport("grant-ack.json", "no-authority-offer.json"),
       /ZK_RECIPIENT_OFFER_CLI_DENIED/,
