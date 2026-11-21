@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE_NAME = "rootark-public-shell-v26";
+const CACHE_NAME = "rootark-public-shell-v27";
 const SHELL_ASSETS = [
   "/",
   "/index.html",
