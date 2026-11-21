@@ -1299,10 +1299,10 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(Buffer.from(poisonedShare.data), bytes,
       "final receipt must depend on captured native intrinsics, not late globals");
     poisonedShare.data.fill(0);
-    // P2: the independently verified owner HPKE CEK is still valid when B
-    // starts file AEAD, but its owner approval/witness expires DURING the
-    // final file decrypt. Share grant expires later, so checking only the
-    // share expiry at return is a false-green authorization boundary.
+    // The longer owner-signed share grant cannot extend the shorter owner
+    // approval/witness. Global Date.now rebinding after real file AEAD is
+    // *not* genuine wall-clock passage; a pinned native clock must ignore
+    // the forged future reading rather than claim expiry occurred.
     const postDecryptGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
       expiresAt: Math.max(envelope.core.expires_at,
         issued.approval.expires_at, signedCommittedHead.expires_at) + 120 };
@@ -1339,16 +1339,23 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       }
       return openedFile;
     };
+    let spoofedClockResult;
     try {
-      await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
-        redeemInput: longShareInput }), /ZK_SHARE_FILE_OPEN_DENIED/,
-      "B must not return decrypted file after signed owner approval or witness expiry");
+      spoofedClockResult = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: longShareInput });
     } finally {
       delete subtle.decrypt;
       Date.now = originalFinalNow;
     }
     assert.equal(finalAeadCompleted, true,
-      "oracle must complete genuine file AEAD before expiring owner authority");
+      "oracle must complete genuine file AEAD before forging the global clock");
+    assert.deepEqual(Buffer.from(spoofedClockResult.data), bytes,
+      "forging a later Date.now callback must not replace the module's verified wall clock");
+    spoofedClockResult.data.fill(0);
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      redeemInput: longShareInput, nowSeconds: firstExpiry + 2,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "an actual caller-declared time after the shorter signed CEK lease denies release");
     await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
       redeemInput: { ...recipientShareInput, grant: { ...grant,
         shareSignatureBase64: b64(crypto.randomBytes(64)) } },
