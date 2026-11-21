@@ -17,6 +17,7 @@ const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
 // replacing the global Date.now function.
 const nativeReleaseNow = Date.now;
 const nativeReleaseFloor = Math.floor;
+const nativeMathCeil = Math.ceil.bind(Math);
 const nativeReflectApply = Reflect.apply.bind(Reflect);
 const nativeOwnDescriptor = Object.getOwnPropertyDescriptor.bind(Object);
 const nativeAllDescriptors = Object.getOwnPropertyDescriptors.bind(Object);
@@ -99,9 +100,13 @@ function wipeNativeBytes(value) {
 }
 function from64(value, length) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)
-    || value.length > Math.ceil(length * 4 / 3) + 4) denyOffer();
+    || value.length > nativeMathCeil(length * 4 / 3) + 4) denyOffer();
   const bytes = nativeBufferFrom(value, "base64url");
-  if (bytes.length !== length || b64(bytes) !== value) denyOffer();
+  // A signed CBOR statement is up to 4096 bytes, unlike 16/32-byte scope
+  // fields. Re-encode through the captured native Buffer method, not the
+  // deliberately 128-byte-bounded scope encoder.
+  if (bytes.length !== length
+    || nativeReflectApply(nativeBufferToString, bytes, ["base64url"]) !== value) denyOffer();
   return bytes;
 }
 function same(a, b) {
@@ -140,7 +145,7 @@ function snapshotAuthority(value) {
   // using the Node intrinsic before any user-controlled reflective access.
   if (isNativeProxy(value)) denyOffer();
   strict(value, ["scope", "head", "devices"]);
-  const fields = Object.getOwnPropertyDescriptors(value);
+  const fields = nativeAllDescriptors(value);
   if (["scope", "head", "devices"].some((key) =>
     !Object.hasOwn(fields[key], "value"))) denyOffer();
   if (isNativeProxy(fields.scope.value)
@@ -149,7 +154,7 @@ function snapshotAuthority(value) {
   const scope = snapshot(fields.scope.value, SCOPE);
   const headValue = fields.head.value;
   strict(headValue, ["revision", "epoch", "digest"]);
-  const h = Object.getOwnPropertyDescriptors(headValue);
+  const h = nativeAllDescriptors(headValue);
   if (["revision", "epoch", "digest"].some((key) =>
     !Object.hasOwn(h[key], "value"))
     || !Number.isSafeInteger(h.revision.value) || h.revision.value < 0
@@ -163,7 +168,7 @@ function snapshotAuthority(value) {
   if (!Array.isArray(sourceDevices) || sourceDevices.length > 128) denyOffer();
   // Do not invoke an untrusted array's own map/iterator: it can substitute a
   // healthy roster while the actual authority entries are revoked.
-  const entries = Object.getOwnPropertyDescriptors(sourceDevices);
+  const entries = nativeAllDescriptors(sourceDevices);
   const length = entries.length?.value;
   if (!Number.isSafeInteger(length) || length > 128
     || Reflect.ownKeys(entries).length !== length + 1) denyOffer();
@@ -175,7 +180,7 @@ function snapshotAuthority(value) {
     if (isNativeProxy(device)) denyOffer();
     strict(device, ["deviceId", "authorizationPublicKey",
       "enrolledEpoch", "revokedAtEpoch"]);
-    const d = Object.getOwnPropertyDescriptors(device);
+    const d = nativeAllDescriptors(device);
     if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))
       || isNativeProxy(d.authorizationPublicKey.value)
       || !(d.authorizationPublicKey.value instanceof Uint8Array)
@@ -228,7 +233,7 @@ async function createProtectedRecipientShareOffer(input) {
     strict(input, ["grant", "recipientPin", "issuerPin", "readIndependentAuthority",
       "ownerPrivateKey", "ownerHeldCek", "metadata", "objectRevision",
       "ciphertext", "ciphertextRoot", "authority", "nowSeconds"]);
-    const d = Object.getOwnPropertyDescriptors(input);
+    const d = nativeAllDescriptors(input);
     if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))) denyOffer();
     const grant = snapshot(d.grant.value, GRANT);
     const pin = snapshot(d.recipientPin.value, RECIPIENT_PIN);
@@ -268,7 +273,7 @@ async function createProtectedRecipientShareOffer(input) {
     if (typeof grant.shareStatementBase64 !== "string"
       || grant.shareStatementBase64.length > 5470) denyOffer();
     const statementBytes = from64(grant.shareStatementBase64,
-      Buffer.from(grant.shareStatementBase64, "base64url").length);
+      nativeBufferFrom(grant.shareStatementBase64, "base64url").length);
     if (statementBytes.length < 1 || statementBytes.length > 4096) denyOffer();
     const statement = await z.decodeDeterministic(statementBytes);
     strict(statement, SHARE);
@@ -335,7 +340,7 @@ async function createProtectedRecipientShareOffer(input) {
 }
 function safeEnvelope(value) {
   strict(value, ENVELOPE);
-  const d = Object.getOwnPropertyDescriptors(value);
+  const d = nativeAllDescriptors(value);
   if (ENVELOPE.some((name) => !Object.hasOwn(d[name], "value"))) deny();
   const keys = Reflect.ownKeys(d.core.value);
   if (keys.length > 40 || keys.some((key) => typeof key !== "string")) deny();
@@ -379,7 +384,7 @@ async function openProtectedRecipientShareFile(input) {
   try {
     strict(input, ["redeemInput", "envelope", "authority", "operatorMinimumSequence",
       "metadata", "deviceHpkePrivateKey", "nowSeconds"]);
-    const entry = Object.getOwnPropertyDescriptors(input);
+    const entry = nativeAllDescriptors(input);
     if (Object.values(entry).some((field) => !Object.hasOwn(field, "value"))) deny();
     const metadata = snapshot(entry.metadata.value, METADATA);
     const envelope = safeEnvelope(entry.envelope.value);
@@ -474,12 +479,12 @@ async function openPortableProtectedRecipientShareFile(input) {
   try {
     strict(input, ["offer", "redeemInput", "authority", "operatorMinimumSequence",
       "deviceHpkePrivateKey", "nowSeconds"]);
-    const inputDescriptors = Object.getOwnPropertyDescriptors(input);
+    const inputDescriptors = nativeAllDescriptors(input);
     if (Object.values(inputDescriptors).some((entry) =>
       !Object.hasOwn(entry, "value"))) deny();
     const offer = inputDescriptors.offer.value;
     strict(offer, OFFER);
-    const offerDescriptors = Object.getOwnPropertyDescriptors(offer);
+    const offerDescriptors = nativeAllDescriptors(offer);
     if (Object.values(offerDescriptors).some((entry) =>
       !Object.hasOwn(entry, "value"))) deny();
     if (offer.schema !== "rootark-zk1-recipient-share-offer-dev/v1"
@@ -488,7 +493,7 @@ async function openPortableProtectedRecipientShareFile(input) {
     const grant = snapshot(offer.grant, GRANT);
     const redeemInput = inputDescriptors.redeemInput.value;
     if (!redeemInput || typeof redeemInput !== "object") deny();
-    const redeemDescriptors = Object.getOwnPropertyDescriptors(redeemInput);
+    const redeemDescriptors = nativeAllDescriptors(redeemInput);
     if (!["grant", "recipientUsername", "recipientDeviceId"].every((key) =>
       Object.hasOwn(redeemDescriptors, key) && Object.hasOwn(redeemDescriptors[key], "value"))) deny();
     const expectedGrant = snapshot(redeemDescriptors.grant.value, GRANT);

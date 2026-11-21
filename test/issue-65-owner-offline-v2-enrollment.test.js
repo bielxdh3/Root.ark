@@ -795,6 +795,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       shareStatementBase64: b64(message.subarray(Buffer.byteLength(
         "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
       shareSignatureBase64: b64(crypto.sign(null, message, originalActor)) };
+    assert.ok(Buffer.from(grant.shareStatementBase64, "base64url").length > 128,
+      "real owner-signed CBOR grants are larger than the 128-byte scope encoder");
     const readIndependentAuthority = async () => ({ scope,
       head: { revision: currentManifest.revision, epoch: currentManifest.current_epoch,
         digest: Uint8Array.from(currentDigest) },
@@ -1299,6 +1301,41 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(Buffer.from(poisonedShare.data), bytes,
       "final receipt must depend on captured native intrinsics, not late globals");
     poisonedShare.data.fill(0);
+    // A revoked PHYSICAL device can be hidden by swapping the mutable global
+    // descriptor helper after real file AEAD. The bridge must use the
+    // module-captured descriptor intrinsic and reject the real revocation.
+    const originalDescriptors = Object.getOwnPropertyDescriptors;
+    let changedRosterReads = 0;
+    let descriptorSpoofCalls = 0;
+    try {
+      await assert.rejects(openProtectedRecipientShareFile({
+        ...bridgeArgs,
+        redeemInput: { ...recipientShareInput,
+          readIndependentAuthority: async () => {
+            const current = await readIndependentAuthority();
+            if (++changedRosterReads === 3) {
+              const revoked = current.devices.find((device) =>
+                device.deviceId === fresh.request.device_id);
+              assert.ok(revoked);
+              revoked.revokedAtEpoch = metadata.epoch;
+              Object.getOwnPropertyDescriptors = (value) => {
+                const descriptors = originalDescriptors(value);
+                if (value !== revoked) return descriptors;
+                descriptorSpoofCalls++;
+                return { ...descriptors, revokedAtEpoch: {
+                  ...descriptors.revokedAtEpoch, value: null } };
+              };
+            }
+            return current;
+          },
+        },
+      }), /ZK_SHARE_FILE_OPEN_DENIED/,
+      "late forged property descriptors must not conceal a truly revoked recipient");
+    } finally { Object.getOwnPropertyDescriptors = originalDescriptors; }
+    assert.equal(changedRosterReads, 3,
+      "the real physical revocation must occur only after signed GET and file AEAD");
+    assert.equal(descriptorSpoofCalls, 0,
+      "the release boundary must never call the callback-replaced descriptor factory");
     // The longer owner-signed share grant cannot extend the shorter owner
     // approval/witness. Global Date.now rebinding after real file AEAD is
     // *not* genuine wall-clock passage; a pinned native clock must ignore
