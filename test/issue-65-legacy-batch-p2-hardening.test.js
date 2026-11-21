@@ -84,8 +84,8 @@ test("real historical HTTP responses emit pinned Last-Modified for full and rang
   fs.utimesSync(localPath, new Date("2026-10-26T12:01:00.000Z"), new Date("2026-10-26T12:01:00.000Z"));
   const pinned = "Thu, 22 Oct 2026 01:00:00 GMT";
   const parseRangeHeader = vm.runInNewContext("(" + section("function parseRangeHeader(",
-    "\nfunction sendOptimizedFile(") + ")");
-  const sendOptimizedFile = vm.runInNewContext("(" + section("function sendOptimizedFile(",
+    "\nasync function sendOptimizedFile(") + ")");
+  const sendOptimizedFile = vm.runInNewContext("(" + section("async function sendOptimizedFile(",
     "\nfunction removeFileExpiration(") + ")", {
     fs, path, parseRangeHeader,
     openReadHandle(name) {
