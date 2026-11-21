@@ -25,6 +25,10 @@ const WINDOWS_OWNER_RIGHTS_SID = "S-1-3-4";
 const WINDOWS_FULL_CONTROL = 0x1f01ff;
 const WINDOWS_DIRECTORY_WRITE_RIGHTS = 0x0002 | 0x0004 | 0x0010 | 0x0040
   | 0x0100 | 0x10000 | 0x40000 | 0x80000 | 0x10000000 | 0x40000000;
+// Directory write access is represented by concrete FileSystemRights bits.
+// GENERIC_WRITE/GENERIC_ALL are alternative masks, not additional mandatory
+// rights; requiring every mask above rejects even an explicit FullControl ACE.
+const WINDOWS_PARENT_REQUIRED_RIGHTS = 0x0002 | 0x0004 | 0x0040;
 
 function isPathWithin(parentPath, childPath) {
   const relative = path.relative(path.resolve(parentPath), path.resolve(childPath));
@@ -144,7 +148,7 @@ function validateDirectorySecurity(directoryPath, privateDirectory) {
       || (currentDeniedRights & (WINDOWS_FULL_CONTROL | 0x10000000 | 0x40000000)) !== 0)) {
       throw fileReadError("PRIVATE_SNAPSHOT_DIRECTORY_INVALID", "Private snapshot directory ACL is not restricted to its owner");
     }
-    if (!privateDirectory && ((currentRights & WINDOWS_DIRECTORY_WRITE_RIGHTS) !== WINDOWS_DIRECTORY_WRITE_RIGHTS
+    if (!privateDirectory && ((currentRights & WINDOWS_PARENT_REQUIRED_RIGHTS) !== WINDOWS_PARENT_REQUIRED_RIGHTS
       || (currentDeniedRights & WINDOWS_DIRECTORY_WRITE_RIGHTS) !== 0)) {
       throw fileReadError("PRIVATE_SNAPSHOT_DIRECTORY_INVALID", "Snapshot parent is not writable by its owner");
     }
