@@ -354,6 +354,7 @@ test("real Edge CSP: verified local results select an opaque object without HTML
         throw Error("PREVIEW_NOT_ZEROED_ON_CHANGE");
       pane.textContent=opened.text;
       batchPane.textContent=found.matches[0].excerpt;
+      {
       // Produce a real authenticated local-search result and let the real
       // renderer create its selectable row and summary. Only the independent
       // signed-catalog boundary is a fixture; do not seed DOM nodes manually.
@@ -395,21 +396,31 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       if(!queryField)throw Error("REAL_LOCAL_QUERY_FIELD_MISSING");
       let searchGeneration=1;
       queryField.value="old";
-      let releaseOldHead;
-      let oldReadCalled=false;
+      let releaseOldListing;
+      let oldReadStarted=false,oldReadReleased=false,oldLiveRejected=false;
       const oldMetadataRaw=crypto.getRandomValues(new Uint8Array(32));
       const assertOldLive=()=>{
         if(searchGeneration!==1||queryField.value!=="old"){
+          oldLiveRejected=true;
           const error=new Error("SEARCH_SUPERSEDED");error.code="SEARCH_SUPERSEDED";throw error;
         }
       };
       const oldSearch=window.RootarkZk1ProtectedLocalSearch.search({
         client:{
-          verifyPrivateListingHead:()=>new Promise(resolve=>{releaseOldHead=resolve;}),
-          readPrivateListing:async()=>{oldReadCalled=true;return {scope,head,totalMatches:1,
-            entries:[{objectId,revision:7,epoch:2,name:"old-private-name.txt",
-              logicalTrashCandidate:false}],plaintextSentToServer:false,
-            independentlySignedCatalog:true,authorizesMutation:false};},
+          verifyPrivateListingHead:async()=>({scope,head}),
+          // With indexedDB disabled, a fresh search first awaits the REAL
+          // verified listing. verifyPrivateListingHead is only called for a
+          // reused index or a subsequent page, never for this initial read.
+          readPrivateListing:()=>new Promise(resolve=>{
+            oldReadStarted=true;
+            releaseOldListing=()=>{
+              oldReadReleased=true;
+              resolve({scope,head,totalMatches:1,
+                entries:[{objectId,revision:7,epoch:2,name:"old-private-name.txt",
+                  logicalTrashCandidate:false}],plaintextSentToServer:false,
+                independentlySignedCatalog:true,authorizesMutation:false});
+            };
+          }),
         },
         baseline,grant,ownerRevision:8,ownerEpoch:2,ownerDigest,
         metadataRaw:oldMetadataRaw,term:"old",indexedDBImpl:null,assertLive:assertOldLive,
@@ -417,8 +428,9 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       let newMetadataRaw=null;
       let freshSearch;
       try {
-        for(let i=0;i<100&&!releaseOldHead;i++)await sleep(0);
-        if(!releaseOldHead)throw Error("OLD_LOCAL_SEARCH_DID_NOT_REACH_HEAD_READ");
+        for(let i=0;i<100&&!releaseOldListing;i++)await sleep(0);
+        if(!releaseOldListing||!oldReadStarted)
+          throw Error("OLD_LOCAL_SEARCH_DID_NOT_REACH_SIGNED_LISTING_READ");
         queryField.value="new";
         searchGeneration=2;
         newMetadataRaw=crypto.getRandomValues(new Uint8Array(32));
@@ -442,10 +454,14 @@ test("real Edge CSP: verified local results select an opaque object without HTML
           list,freshSearch.entries,target,()=>searchGeneration===2&&queryField.value==="new",
           revision,{...freshSearch,onPage:updateSummary});
         updateSummary(freshSearch);
-        releaseOldHead({scope,head});
+        releaseOldListing();
         let oldFailure;
         try { await oldSearch; } catch(error) { oldFailure=error; }
-        if(oldFailure?.code!=="SEARCH_SUPERSEDED"||oldReadCalled)
+        // Public search deliberately normalizes a local session exception to
+        // ZK_LOCAL_SEARCH_DENIED; prove the actual assertLive callback ran,
+        // rather than requiring it to expose the private failure code.
+        if(oldFailure?.message!=="ZK_LOCAL_SEARCH_DENIED"
+          ||!oldLiveRejected||!oldReadReleased)
           throw Error("OLD_LOCAL_SEARCH_WAS_NOT_SUPERSEDED");
         if(!list.textContent.includes("new-private-name.txt")
           ||list.textContent.includes("old-private-name.txt"))
@@ -453,7 +469,7 @@ test("real Edge CSP: verified local results select an opaque object without HTML
       } finally {
         searchGeneration=2;
         queryField.value="new";
-        if(releaseOldHead)releaseOldHead({scope,head});
+        if(releaseOldListing)releaseOldListing();
         oldMetadataRaw.fill(0);
         newMetadataRaw?.fill(0);
       }
@@ -474,6 +490,7 @@ test("real Edge CSP: verified local results select an opaque object without HTML
         throw Error("NEW_QUERY_LEFT_STALE_SUMMARY_OR_RESULTS_VISIBLE");
       for(let i=0;i<100&&listButton.disabled;i++)await sleep(20);
       if(listButton.disabled)throw Error("NEW_QUERY_DID_NOT_SETTLE");
+      }
       window.dispatchEvent(new Event("rootark:logout"));
       if(pane.textContent!==""||batchPane.textContent!=="")
         throw Error("PREVIEW_NOT_ZEROED_ON_LOGOUT");
