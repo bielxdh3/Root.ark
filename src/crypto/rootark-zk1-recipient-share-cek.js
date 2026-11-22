@@ -11,6 +11,9 @@ const nativeMathAbs = Math.abs;
 const nativeMathCeil = Math.ceil;
 const nativeMathMax = Math.max;
 const z = require("./rootark-zk-1");
+// The independent-authority callback is caller-controlled and may run after
+// several awaits. Capture the reflection, Buffer and crypto intrinsics used
+// by the post-callback validation before that callback can poison globals.
 const nativeApply = Reflect.apply;
 const nativeObjectPrototype = Object.prototype;
 const nativeGetPrototypeOf = Object.getPrototypeOf;
@@ -470,8 +473,9 @@ async function openProtectedRecipientShareFile(input) {
     // again immediately before releasing the decrypted file to this process.
     currentAuthority(await redeemInput.readIndependentAuthority(),
       statement, shareSignature, statementBytes);
-    // Preserve #296's verified release-expiry fence while applying #294's
-    // immutable redeem snapshot fix directly, without ancestry integration.
+    // The owner approval, witness receipt and HPKE envelope are independent
+    // authorization leases. Their verified minimum must still be live after
+    // the final authority await, as must the recipient-specific share grant.
     const verifiedReleaseExpiresAt = opened.verifiedReleaseExpiresAt;
     if (!nativeNumberIsSafeInteger(verifiedReleaseExpiresAt)
       || verifiedReleaseExpiresAt < 1) deny();

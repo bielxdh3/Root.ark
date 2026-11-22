@@ -871,7 +871,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       issued_at: now + 9, expires_at: now + 39, ciphertext_digest: digest };
     const grantInput = { authorization: shareAuthorization, grantId: b64(crypto.randomBytes(32)),
       recipientUsername: "recipient", recipientDeviceId: fresh.request.device_id,
-      expiresAt: now + 129 };
+      expiresAt: now + 420 };
     const message = await shareGrantMessageV1(grantInput);
     const shareSignatureBase64 = b64(crypto.sign(null, message, originalActor));
     const shareAuthorizationWire = Object.fromEntries(
@@ -1033,6 +1033,12 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     let withoutTrustedAuthority = false;
     let withoutIssuerPin = false;
     let withoutRecipientSession = false;
+    let poisonRecipientOutputLength = false;
+    let recipientFinalAuthorityReads = 0;
+    let poisonedActualRecipientAuthority = false;
+    let genuineRecipientDecrypts = 0;
+    const trustedTypedLength = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(Uint8Array.prototype), "byteLength").get;
     globalThis[testContextId] = async (role, input) => {
       if (role === "export") {
         const { grant: unusedGrant, ...trusted } = ownerOfferArgs;
@@ -1053,6 +1059,25 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
             snapshot.devices.find((entry) =>
               entry.deviceId === issuerPin.deviceId).revokedAtEpoch = metadata.epoch;
             return snapshot;
+          } : poisonRecipientOutputLength ? async (...args) => {
+            const current = await readIndependentAuthority(...args);
+            if (++recipientFinalAuthorityReads === 3) {
+              assert.ok(genuineRecipientDecrypts > 0,
+                "the final authority read must follow real successful HPKE/AEAD, not an earlier denial");
+              // Only the THIRD independent authority read is after the real
+              // HPKE and file AEAD, immediately before the bytes leave the
+              // verified recipient flow. Target the private output byte view,
+              // not the 32-byte public Ed25519 and digest inputs of the
+              // independent authorization recheck.
+              Object.defineProperty(Uint8Array.prototype, "byteLength", {
+                configurable: true, get() {
+                  return this.length === bytes.length && bytes.length > 32
+                    ? 0 : Reflect.apply(trustedTypedLength, this, []);
+                },
+              });
+              poisonedActualRecipientAuthority = true;
+            }
+            return current;
           } : readIndependentAuthority,
           fetchImpl: withoutRecipientSession ? fetch
             : swapHttpObject ? async (url, options) => {
@@ -1223,6 +1248,122 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       { offer: "forged-second-offer.json", output: "forged-second.bin" },
     ]), /ZK_RECIPIENT_BATCH_INCOMPLETE_1_OF_2_INSPECT_PRIVATE_OUTPUTS/);
     assert.equal(fs.existsSync(path.join(dir, "forged-second.bin")), false);
+    // P2: the THIRD authority read happens AFTER real HPKE/AEAD. Observe
+    // the native AES-GCM successful decrypt, not the frozen fileContent
+    // export; the final authority callback can only run after file content
+    // has also been parsed and authenticated. An early generic denial is NOT
+    // evidence of the final output fence.
+    const realAeadDecrypt = subtle.decrypt;
+    const originalOpenSync = fs.openSync;
+    const originalWriteSync = fs.writeSync;
+    const savedTypedByteLength = Object.getOwnPropertyDescriptor(
+      Uint8Array.prototype, "byteLength");
+    let sawActualFile = false, capturedFinalPlaintext;
+    let reachedExclusivePrivateOutput = false;
+    poisonRecipientOutputLength = true;
+    recipientFinalAuthorityReads = 0;
+    genuineRecipientDecrypts = 0;
+    subtle.decrypt = async function (...args) {
+      const result = await realAeadDecrypt.apply(this, args);
+      if (poisonRecipientOutputLength && args[0]?.name === "AES-GCM") {
+        genuineRecipientDecrypts += 1;
+      }
+      return result;
+    };
+    fs.openSync = function (...args) {
+      if (String(args[0]).endsWith("recipient-native-byte-length.bin")) {
+        reachedExclusivePrivateOutput = true;
+      }
+      return originalOpenSync.apply(this, args);
+    };
+    fs.writeSync = function (fd, buffer, ...args) {
+      if (poisonedActualRecipientAuthority && buffer instanceof Uint8Array) {
+        capturedFinalPlaintext = buffer;
+        sawActualFile = true;
+      }
+      return originalWriteSync(fd, buffer, ...args);
+    };
+    let outputResult, outputError;
+    try {
+      try {
+        outputResult = await runRecipientRedeem("portable-offer.json",
+          "recipient-native-byte-length.bin");
+      } catch (error) { outputError = error; }
+    } finally {
+      delete subtle.decrypt;
+      fs.openSync = originalOpenSync;
+      fs.writeSync = originalWriteSync;
+      poisonRecipientOutputLength = false;
+      if (savedTypedByteLength) {
+        Object.defineProperty(Uint8Array.prototype, "byteLength", savedTypedByteLength);
+      } else delete Uint8Array.prototype.byteLength;
+    }
+    assert.equal(poisonedActualRecipientAuthority, true,
+      "only the final post-AEAD authority callback may poison the plaintext output path");
+    assert.equal(recipientFinalAuthorityReads, 3,
+      "exactly three independent reads, not an early pre-HPKE rejection");
+    assert.ok(genuineRecipientDecrypts > 0,
+      "actual authenticated file decryption must complete before private output");
+    assert.equal(outputError, undefined,
+      `final output unexpectedly denied: authority=${recipientFinalAuthorityReads}, AEAD=${genuineRecipientDecrypts}, exclusiveOpen=${reachedExclusivePrivateOutput}, write=${sawActualFile}`);
+    assert.equal(outputResult, "ZK_RECIPIENT_FILE_REDEEMED");
+    assert.equal(reachedExclusivePrivateOutput, true,
+      "the third authority callback must allow the verified bytes to reach private output");
+    assert.equal(sawActualFile, true,
+      "successful redeem must reach the native private output writer");
+    assert.ok(capturedFinalPlaintext instanceof Uint8Array
+      && capturedFinalPlaintext.length === bytes.length && bytes.length > 0);
+    assert.deepEqual(fs.readFileSync(path.join(dir,
+      "recipient-native-byte-length.bin")), bytes,
+      "callback-poisoned typed-array byteLength must not truncate verified plaintext");
+    assert.ok(capturedFinalPlaintext.every((value) => value === 0),
+      "recipient CLI must wipe the private output buffer");
+    // Separate negative oracle: deny the exclusive private-output open ONLY
+    // after the third authority read and genuine AES-GCM authentication.
+    // The CLI's public error is generic by design, so insist on the concrete
+    // output-fence event and no published destination, not just rejection.
+    let deniedOutputBoundary = null;
+    recipientFinalAuthorityReads = 0;
+    genuineRecipientDecrypts = 0;
+    poisonedActualRecipientAuthority = false;
+    poisonRecipientOutputLength = true;
+    subtle.decrypt = async function (...args) {
+      const result = await realAeadDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM") genuineRecipientDecrypts += 1;
+      return result;
+    };
+    fs.openSync = function (...args) {
+      if (String(args[0]).endsWith("recipient-denied-at-output.bin")) {
+        deniedOutputBoundary = {
+          authorityReads: recipientFinalAuthorityReads,
+          aesGcmDecrypts: genuineRecipientDecrypts,
+          getterPoisoned: poisonedActualRecipientAuthority,
+        };
+        const error = Error("DISPOSABLE_PRIVATE_OUTPUT_FENCE");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalOpenSync.apply(this, args);
+    };
+    try {
+      await assert.rejects(runRecipientRedeem("portable-offer.json",
+        "recipient-denied-at-output.bin"), /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+      "a real private-output rejection must never report successful redemption");
+    } finally {
+      delete subtle.decrypt;
+      fs.openSync = originalOpenSync;
+      poisonRecipientOutputLength = false;
+      if (savedTypedByteLength) {
+        Object.defineProperty(Uint8Array.prototype, "byteLength", savedTypedByteLength);
+      } else delete Uint8Array.prototype.byteLength;
+    }
+    assert.deepEqual(deniedOutputBoundary, {
+      authorityReads: 3, aesGcmDecrypts: genuineRecipientDecrypts,
+      getterPoisoned: true,
+    }, "the denied open must occur only AFTER third authority and real AES-GCM");
+    assert.ok(genuineRecipientDecrypts > 0, "signed HPKE/AEAD must finish before output denial");
+    assert.equal(fs.existsSync(path.join(dir, "recipient-denied-at-output.bin")), false,
+      "an exclusive-output failure cannot leave a partial or truncated plaintext file");
     withoutTrustedAuthority = true;
     await assert.rejects(runOwnerExport("grant-ack.json", "no-authority-offer.json"),
       /ZK_RECIPIENT_OFFER_CLI_DENIED/,
@@ -1614,6 +1755,131 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       } },
     }), /ZK_SHARE_FILE_OPEN_DENIED/,
     "a late revoked signer cannot be made active by an own array filter method");
+    assert.equal(poisonedReads, 3);
+    assert.equal(forgedFilterCalls, 0,
+      "authority arrays must not dispatch caller-owned filter methods");
+    // Parent branch's additional trap/expiry regressions intentionally run
+    // in a separate lexical scope: the child already exercises some of the
+    // same adversarial inputs earlier with independently pinned fixtures.
+    {
+    let envelopeCoreProxyTraps = 0;
+    const proxiedEnvelope = { ...bridgeArgs.envelope,
+      core: new Proxy(bridgeArgs.envelope.core, {
+        ownKeys() { envelopeCoreProxyTraps++; throw Error("ENVELOPE_CORE_PROXY_OWN_KEYS"); },
+        getPrototypeOf() { envelopeCoreProxyTraps++; throw Error("ENVELOPE_CORE_PROXY_PROTO"); },
+      }) };
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs, envelope: proxiedEnvelope }),
+      /ZK_SHARE_FILE_OPEN_DENIED/,
+      "a proxied nested HPKE envelope core must fail before reflective traps execute");
+    assert.equal(envelopeCoreProxyTraps, 0);
+    let outerProxyTraps = 0;
+    const proxiedBridgeInput = new Proxy(bridgeArgs, {
+      ownKeys() { outerProxyTraps++; throw Error("BRIDGE_PROXY_OWN_KEYS"); },
+      getPrototypeOf() { outerProxyTraps++; throw Error("BRIDGE_PROXY_PROTO"); },
+    });
+    await assert.rejects(openProtectedRecipientShareFile(proxiedBridgeInput),
+      /ZK_SHARE_FILE_OPEN_DENIED/);
+    assert.equal(outerProxyTraps, 0,
+      "native Proxy bridge inputs must be rejected before reflection");
+    let transferProxyTraps = 0;
+    const proxiedTransferAuthority = new Proxy(bridgeArgs.authority, {
+      ownKeys() { transferProxyTraps++; throw Error("TRANSFER_AUTHORITY_PROXY_OWN_KEYS"); },
+      getPrototypeOf() { transferProxyTraps++; throw Error("TRANSFER_AUTHORITY_PROXY_PROTO"); },
+    });
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      authority: proxiedTransferAuthority,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/);
+    assert.equal(transferProxyTraps, 0,
+      "owner-authorized CEK transfer must reject nested Proxy trust material before reflection");
+    let portableProxyTraps = 0;
+    const proxiedPortableOffer = new Proxy(offer, {
+      ownKeys() { portableProxyTraps++; throw Error("PORTABLE_OFFER_PROXY_OWN_KEYS"); },
+      getPrototypeOf() { portableProxyTraps++; throw Error("PORTABLE_OFFER_PROXY_PROTO"); },
+    });
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      offer: proxiedPortableOffer, redeemInput: recipientShareInput,
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    }), /ZK_SHARE_FILE_OPEN_DENIED/);
+    assert.equal(portableProxyTraps, 0,
+      "portable offer Proxy must be rejected before descriptor enumeration");
+    const portableProxyArgs = {
+      offer: { ...offer, grant: { ...offer.grant, grantId: b64(crypto.randomBytes(32)) } },
+      redeemInput: recipientShareInput,
+      authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9,
+    };
+    const trapPortableValue = (value) => new Proxy(value, {
+      ownKeys() { portableProxyTraps++; throw Error("PORTABLE_PROXY_OWN_KEYS"); },
+      getPrototypeOf() { portableProxyTraps++; throw Error("PORTABLE_PROXY_PROTO"); },
+      getOwnPropertyDescriptor() { portableProxyTraps++; throw Error("PORTABLE_PROXY_DESCRIPTOR"); },
+      get() { portableProxyTraps++; throw Error("PORTABLE_PROXY_GET"); },
+    });
+    await assert.rejects(openPortableProtectedRecipientShareFile(trapPortableValue(portableProxyArgs)),
+      /ZK_SHARE_FILE_OPEN_DENIED/, "portable outer input Proxy must be rejected before traps");
+    await assert.rejects(openPortableProtectedRecipientShareFile({
+      ...portableProxyArgs, offer: JSON.parse(JSON.stringify(offer)),
+      redeemInput: trapPortableValue(portableProxyArgs.redeemInput),
+    }), /ZK_SHARE_FILE_OPEN_DENIED/, "portable redeemInput Proxy must be rejected before traps");
+    assert.equal(portableProxyTraps, 0,
+      "portable outer input, offer and redeemInput Proxies must fail before reflection");
+    let proxiedRosterReads = 0;
+    let rosterProxyTraps = 0;
+    await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++proxiedRosterReads === 3) {
+          current.devices = new Proxy(current.devices, {
+            getOwnPropertyDescriptor() {
+              rosterProxyTraps++;
+              throw Error("ROSTER_ARRAY_PROXY_DESCRIPTOR");
+            },
+          });
+        }
+        return current;
+      } },
+    }), /ZK_SHARE_FILE_OPEN_DENIED/,
+    "a native Proxy roster array must fail closed before array reflection");
+    assert.equal(proxiedRosterReads, 3);
+    assert.equal(rosterProxyTraps, 0,
+      "native Proxy roster arrays must be rejected without invoking descriptor traps");
+    // The authenticated share grant remains live after the shorter, genuinely
+    // owner-signed HPKE CEK envelope. Advance the wall clock only during the
+    // third independent authority read, after the real HTTP, HPKE and AEAD work.
+    assert.ok(grant.expiresAt > envelope.core.expires_at + 1,
+      "fixture requires the owner HPKE envelope to expire before the signed grant");
+    const recipientExpiryClock = Date.now;
+    const recipientExpiryFloor = Math.floor;
+    const recipientExpiryMin = Math.min;
+    let recipientExpiryMilliseconds = (now + 9) * 1000;
+    const stableRecipientClock = () => recipientExpiryMilliseconds;
+    Date.now = stableRecipientClock;
+    let recipientExpiryReads = 0;
+    try {
+      await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++recipientExpiryReads === 3) {
+            recipientExpiryMilliseconds = (envelope.core.expires_at + 1) * 1000;
+            Math.floor = () => 0;
+            Math.min = () => Number.MAX_SAFE_INTEGER;
+          }
+          return current;
+        } },
+      }), /ZK_SHARE_FILE_OPEN_DENIED/,
+      "the final authority await cannot release plaintext after signed HPKE expiry");
+    } finally {
+      Date.now = recipientExpiryClock;
+      Math.floor = recipientExpiryFloor;
+      Math.min = recipientExpiryMin;
+    }
+    assert.equal(recipientExpiryReads, 3,
+      "expiry race must reach the final independent read after real HPKE and AEAD");
+    }
+
+    // Preserve #296 adversarial final-authority and roster Proxy regressions.
     assert.equal(poisonedReads, 3,
       "attack must be installed at the genuine post-HPKE/file-AEAD authority read");
     assert.equal(forgedFilterCalls, 0,

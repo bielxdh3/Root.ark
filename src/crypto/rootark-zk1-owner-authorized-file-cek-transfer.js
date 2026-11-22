@@ -146,6 +146,8 @@ function snapshotFields(value, depth = 0, budget = { count: 0, bytes: 0 }) {
       || d.type.value !== "private" || !(d.key.value instanceof nativeUint8Array)
       || d.key.value.byteLength !== 32 || !nativeArrayIsArray(d.usages.value)
       || d.usages.value.length > 8) deny();
+    for (const name of expected)
+      if (!d[name] || !nativeHasOwn(d[name], "value")) deny();
     const algorithm = snapshotFields(d.algorithm.value, depth + 1, budget);
     if (algorithm.name !== "X25519") deny();
     const usages = nativeGetOwnPropertyDescriptors(d.usages.value);
