@@ -12,6 +12,7 @@ const { cleanupOrphanPrivateShareSnapshots, cleanupReadHandle, openReadHandle, r
   getPrivateShareSnapshotProcessInstance,
   retryPendingPrivateShareSnapshotCleanup, snapshotReadHandle } = require("../services/fileReadHandle");
 const { createPrivateShareSnapshotBudget } = require("../services/privateShareSnapshotBudget");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 function testTempDirectoryRoot() {
   return process.platform === "win32" && process.env.LOCALAPPDATA
@@ -134,7 +135,7 @@ test("opening rejects a path replaced after its descriptor is pinned", () => {
 });
 
 test("share snapshot preserves authorized bytes after same-inode mutation and cleans up without double-closing the stream fd", async (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const filePath = path.join(directory, "file.txt");
   fs.writeFileSync(filePath, "authorized bytes");
@@ -161,7 +162,7 @@ test("share snapshot preserves authorized bytes after same-inode mutation and cl
 });
 
 test("share snapshot abort signal cancels the pipeline and removes its temporary file", async (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-abort-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-abort-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const filePath = path.join(directory, "file.txt");
   fs.writeFileSync(filePath, Buffer.alloc(32 * 1024 * 1024, 0x61));
@@ -220,7 +221,7 @@ test("private share snapshot budget bounds active copies separately from retaine
 });
 
 test("private share snapshot budget remains reserved when TEMP cleanup fails and releases after retry", async (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-cleanup-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-cleanup-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const filePath = path.join(directory, "file.txt");
   fs.writeFileSync(filePath, Buffer.from("authorized snapshot bytes"));
@@ -263,7 +264,7 @@ test("private share snapshot budget remains reserved when TEMP cleanup fails and
 });
 
 test("identity-null cleanup recovers only from its still-owned descriptor, never from pathname metadata", (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-identity-retry-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-identity-retry-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000003.tmp`);
@@ -308,7 +309,7 @@ test("identity-null cleanup recovers only from its still-owned descriptor, never
 });
 
 test("ambiguous close errors retry only while fstat confirms the original inode", (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-close-ambiguous-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-close-ambiguous-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000004.tmp`);
@@ -349,7 +350,7 @@ test("ambiguous close errors retry only while fstat confirms the original inode"
 });
 
 test("ambiguous close remains charged until a later retry proves closure and removes the quarantine", (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-close-pending-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-close-pending-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000008.tmp`);
@@ -389,7 +390,7 @@ test("ambiguous close remains charged until a later retry proves closure and rem
 });
 
 test("atomic quarantine verifies the moved inode before unlinking a raced replacement", (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-quarantine-race-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-quarantine-race-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000009.tmp`);
@@ -443,7 +444,7 @@ test("atomic quarantine verifies the moved inode before unlinking a raced replac
 });
 
 test("ambiguous close never closes a reused fd whose inode differs from the owned snapshot", (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-fd-reuse-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-fd-reuse-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000007.tmp`);
@@ -493,7 +494,7 @@ test("ambiguous close never closes a reused fd whose inode differs from the owne
 });
 
 test("cleanup preflight never closes a numeric fd already reused before cleanup begins", (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-fd-preflight-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-fd-preflight-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000010.tmp`);
@@ -532,7 +533,7 @@ test("cleanup preflight never closes a numeric fd already reused before cleanup 
 });
 
 test("partial snapshot copy retries the same inode after an ambiguous close", async (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-partial-close-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-partial-close-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const filePath = path.join(directory, "file.txt");
   fs.writeFileSync(filePath, Buffer.alloc(512 * 1024, 0x61));
@@ -602,7 +603,7 @@ test("partial snapshot copy retries the same inode after an ambiguous close", as
 });
 
 test("private share snapshot copies no bytes appended after its initial fstat size", async (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-growth-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-growth-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const filePath = path.join(directory, "file.txt");
   const initial = Buffer.alloc(1024 * 1024, 0x61);
@@ -627,7 +628,7 @@ test("private share snapshot copies no bytes appended after its initial fstat si
 });
 
 test("startup cleanup removes only orphaned private share snapshots from dead PIDs", (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-orphans-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-orphans-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const orphan = path.join(directory,
     "rootark-share-egress-2147483647-00000000-0000-4000-8000-000000000001.tmp");
@@ -661,7 +662,7 @@ test("startup cleanup removes only orphaned private share snapshots from dead PI
 
 test("private snapshot directory validates owner and restrictive permissions on both directory levels", (t) => {
   if (process.platform === "win32") {
-    const root = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-acl-"));
+    const root = createPrivateAuthorityFixture("rootark-share-snapshot-acl-");
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     const parent = path.join(root, "temp");
     const child = path.join(parent, "share-snapshots");
@@ -866,7 +867,7 @@ test("bounded reader returns the stat from the validated read snapshot", (t) => 
 });
 
 test("identity-null cleanup without the original descriptor preserves the file and reservation", (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-identity-unavailable-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-identity-unavailable-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000010.tmp`);
@@ -895,7 +896,7 @@ test("identity-null cleanup without the original descriptor preserves the file a
 
 test("identity-null pending cleanup never adopts identity from a different handle for the same path", (t) => {
   const earlierCleanup = getPrivateShareSnapshotCleanupState();
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-identity-cross-handle-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-identity-cross-handle-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000011.tmp`);
@@ -953,7 +954,7 @@ test("identity-null pending cleanup never adopts identity from a different handl
 });
 
 test("multiple reservations for a proven inode survive a failed rename and release once on retry", (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-same-inode-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-same-inode-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000012.tmp`);
@@ -993,7 +994,7 @@ test("multiple reservations for a proven inode survive a failed rename and relea
 });
 
 test("a second owned descriptor for a pending inode must close independently", (t) => {
-  const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-share-snapshot-two-fds-"));
+  const directory = createPrivateAuthorityFixture("rootark-share-snapshot-two-fds-");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const cleanupPath = path.join(directory,
     `rootark-share-egress-${process.pid}-00000000-0000-4000-8000-000000000013.tmp`);
