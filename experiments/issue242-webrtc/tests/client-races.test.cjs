@@ -26,7 +26,10 @@ function makeChannel(overrides = {}) {
 function clientFixture() {
   const elements = new Map(), sockets = [], peerConnections = [];
   const makeNode = () => ({
-    children: [], dataset: {}, disabled: false, textContent: '',
+    children: [], dataset: {}, disabled: false, textContent: '', attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, String(value)); },
+    getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; },
+    removeAttribute(name) { this.attributes.delete(name); },
     append(...parts) { this.children.push(...parts); },
     replaceChildren(...parts) { this.children = [...parts]; },
     remove() { this.removed = true; },
@@ -66,8 +69,11 @@ function clientFixture() {
     TextDecoder,
     Uint8Array,
     ArrayBuffer,
+    AbortController,
+    DOMException,
     location: { origin: 'http://127.0.0.1:1234', pathname: '/' },
     setTimeout,
+    clearTimeout,
     console
   };
   vm.createContext(ctx);
@@ -98,6 +104,173 @@ test('P2: delayed old-room close cannot revoke or tear down new-room peer', asyn
   assert.equal(f.elements.get('invite').disabled, false,
     'old close must not disable new room controls');
   assert.equal(f.peerConnections.at(-1).closed, false);
+});
+
+test('P2: a signaling connection can be canceled before joined without stale reconnection', async () => {
+  const f = clientFixture();
+  f.joinRoom('pending', 'invite-old');
+  const pendingSocket = f.sockets[0];
+  assert.equal(f.elements.get('leave').disabled, false,
+    'the user must be able to cancel a stalled signaling connection');
+  assert.equal(f.elements.get('leave').textContent, 'Cancelar conexão');
+  f.elements.get('leave').onclick();
+  assert.equal(pendingSocket.closeRequested, true);
+  assert.equal(f.snapshot().roomId, null);
+  assert.equal(f.elements.get('leave').disabled, true);
+
+  f.joinRoom('fresh', 'invite-new');
+  const newSocket = f.sockets[1];
+  pendingSocket.onopen();
+  await f.incoming(pendingSocket, { type: 'joined', role: 'host', peerId: 'stale' });
+  pendingSocket.onclose();
+  assert.equal(f.snapshot().roomId, 'fresh');
+  assert.equal(f.snapshot().role, null);
+  assert.equal(newSocket.closeRequested, undefined);
+
+  await f.incoming(newSocket, { type: 'joined', role: 'guest', peerId: 'fresh-peer' });
+  assert.equal(f.snapshot().role, 'guest');
+  assert.equal(f.elements.get('leave').textContent, 'Sair da sala');
+  assert.equal(f.elements.get('leave').disabled, false);
+});
+
+test('P2: leaving retires an old file-hash lock without clearing a newer room send', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'invite-A');
+  const oldSocket = f.sockets[0];
+  await f.incoming(oldSocket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(oldSocket, { type: 'peer-accepted', peerId: 'peer-A' });
+
+  let releaseOld;
+  const oldFile = { name: 'old.bin', size: 2,
+    arrayBuffer: () => new Promise(resolve => { releaseOld = resolve; }) };
+  const oldSend = f.sendFile(oldFile);
+  assert.equal(typeof releaseOld, 'function', 'old file hashing must be pending');
+
+  f.elements.get('leave').onclick();
+  assert.equal(f.snapshot().roomId, null);
+  assert.equal(f.snapshot().peers.length, 0);
+
+  f.joinRoom('room-B', 'invite-B');
+  const newSocket = f.sockets[1];
+  await f.incoming(newSocket, { type: 'joined', role: 'host', peerId: 'host-B' });
+  await f.incoming(newSocket, { type: 'peer-accepted', peerId: 'peer-B' });
+
+  let releaseNew;
+  const newFile = { name: 'new.bin', size: 2,
+    arrayBuffer: () => new Promise(resolve => { releaseNew = resolve; }) };
+  const newSend = f.sendFile(newFile);
+  assert.equal(typeof releaseNew, 'function', 'new room file hashing must be pending');
+
+  let thirdReadStarted = false;
+  const thirdFile = { name: 'third.bin', size: 2,
+    arrayBuffer: () => { thirdReadStarted = true; return Promise.resolve(new Uint8Array([7, 8]).buffer); } };
+  await f.sendFile(thirdFile);
+  assert.equal(thirdReadStarted, false, 'the new room must retain its own preparation lock');
+
+  releaseOld(new Uint8Array([1, 2]).buffer);
+  await oldSend;
+  await f.sendFile(thirdFile);
+  assert.equal(thirdReadStarted, false,
+    'a stale old-room finally block must not release the newer room preparation lock');
+
+  releaseNew(new Uint8Array([3, 4]).buffer);
+  await newSend;
+  assert.equal(f.snapshot().peers.some(peer => peer.outgoingPhase === 'offered'), true,
+    'the new room send must complete after its own hash resolves');
+});
+
+test('P2: a retired outgoing cancel callback cannot abort a later transfer to the same peer', async () => {
+  const f = clientFixture();
+  f.joinRoom('room', 'invitation');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'host', peerId: 'host' });
+  await f.incoming(f.sockets[0], { type: 'peer-accepted', peerId: 'peer-A' });
+  const channel = f.testChannel(0);
+  const sent = [];
+  channel.send = data => sent.push(JSON.parse(data));
+  const file = name => ({ name, size: 2,
+    arrayBuffer: async () => new Uint8Array([1, 2]).buffer });
+
+  await f.sendFile(file('old.bin'));
+  const retiredCancel = f.elements.get('transfers').children[0].children[1].onclick;
+  const firstOffer = sent.find(message => message.type === 'offer-file');
+  assert.ok(firstOffer);
+  await channel.onmessage({ data: JSON.stringify({ type: 'decline-file', id: firstOffer.id }) });
+  assert.equal(f.snapshot().peers[0].outgoingPhase, null);
+
+  await f.sendFile(file('current.bin'));
+  const currentOffer = sent.filter(message => message.type === 'offer-file').at(-1);
+  assert.notEqual(currentOffer.id, firstOffer.id);
+  assert.equal(f.snapshot().peers[0].outgoingPhase, 'offered');
+  retiredCancel(); // A previously queued click from a now-removed control.
+  assert.equal(f.snapshot().peers[0].outgoingPhase, 'offered',
+    'an obsolete cancel callback must not release the new transfer');
+  assert.equal(sent.some(message => message.type === 'cancel-file' && message.id === currentOffer.id), false);
+
+  f.elements.get('transfers').children[1].children[1].onclick();
+  assert.equal(f.snapshot().peers[0].outgoingPhase, null);
+  assert.equal(sent.some(message => message.type === 'cancel-file' && message.id === currentOffer.id), true,
+    'the current transfer must still be cancellable');
+});
+
+test('P2: a retired offer consent callback cannot accept or decline a replacement with a reused ID', async () => {
+  const f = clientFixture();
+  f.joinRoom('room', 'invitation');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+  await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+  const channel = makeChannel();
+  const sent = [];
+  channel.send = data => sent.push(JSON.parse(data));
+  f.peerConnections[0].ondatachannel({ channel });
+  const offer = { type: 'offer-file', id: 'a'.repeat(32), name: 'old.bin',
+    size: 2, digest: 'b'.repeat(64) };
+  await channel.onmessage({ data: JSON.stringify(offer) });
+  const oldUi = f.elements.get('incoming').children[0];
+  const oldAccept = oldUi.children[0].onclick;
+  const oldDecline = oldUi.children[1].onclick;
+  oldDecline();
+  assert.equal(f.snapshot().peers[0].pendingOffer, false);
+
+  await channel.onmessage({ data: JSON.stringify({ ...offer, name: 'new.bin' }) });
+  assert.equal(f.snapshot().peers[0].pendingOffer, true);
+  const sentBeforeStale = sent.length;
+  oldAccept();
+  oldDecline();
+  assert.equal(sent.length, sentBeforeStale,
+    'stale consent must neither accept nor decline a different offer with the same ID');
+  assert.equal(f.snapshot().peers[0].pendingOffer, true,
+    'replacement offer must retain its own consent');
+
+  const currentAccept = f.elements.get('incoming').children[1].children[0].onclick;
+  currentAccept();
+  assert.equal(f.snapshot().peers[0].pendingOffer, false);
+  assert.equal(sent.filter(message => message.type === 'accept-file' && message.id === offer.id).length, 1,
+    'the current consent button must still accept the replacement');
+});
+
+test('P2: an old incoming cancel callback cannot cancel a replacement receiving the same ID', async () => {
+  const f = clientFixture();
+  f.joinRoom('room', 'invitation');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+  await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+  const channel = makeChannel();
+  const sent = [];
+  channel.send = data => sent.push(JSON.parse(data));
+  f.peerConnections[0].ondatachannel({ channel });
+  const offer = { type: 'offer-file', id: 'c'.repeat(32), name: 'old.bin',
+    size: 2, digest: 'd'.repeat(64) };
+  await channel.onmessage({ data: JSON.stringify(offer) });
+  f.elements.get('incoming').children[0].children[0].onclick();
+  const oldCancel = f.elements.get('transfers').children[0].children[1].onclick;
+  await channel.onmessage({ data: JSON.stringify({ type: 'cancel-file', id: offer.id }) });
+
+  await channel.onmessage({ data: JSON.stringify({ ...offer, name: 'current.bin' }) });
+  f.elements.get('incoming').children[1].children[0].onclick();
+  oldCancel();
+  assert.equal(sent.filter(message => message.type === 'cancel-file').length, 0,
+    'the obsolete cancel handler must not clear the new transfer');
+  f.elements.get('transfers').children[1].children[1].onclick();
+  assert.equal(sent.filter(message => message.type === 'cancel-file').length, 1,
+    'the current incoming cancellation must still notify the peer');
 });
 
 test('P2: empty offer IDs cannot create unbounded consent panels; valid offer still works', async () => {

@@ -38,6 +38,14 @@ async function run() {
       pages.push(page);
       await page.call('Page.enable');
       await page.call('Network.enable');
+      if (username !== 'eve') {
+        // Capture real Edge sockets before the protected page loads, then
+        // deterministically deliver a delayed event from the prior room.
+        await page.call('Page.addScriptToEvaluateOnNewDocument', { source:
+          'window.__testSockets=[]; const NativeSocket=WebSocket; ' +
+          'window.WebSocket=class extends NativeSocket { constructor(...args) { super(...args); window.__testSockets.push(this); } };'
+        });
+      }
       for (const cookie of session.cookie.split('; ')) {
         const [name, value] = cookie.split('=');
         await page.call('Network.setCookie', { name, value, url: f.origin,
@@ -57,6 +65,8 @@ async function run() {
     assert.equal(await eve.evaluate('Boolean(window.__poc)'), false, 'non ACL user loaded transfer UI');
     assert.equal(await alice.evaluate('document.querySelector("#sendFile")!==null'), true);
     assert.equal(await alice.evaluate('document.getElementById("rootarkReturn").hidden'), false);
+    assert.equal(await alice.evaluate('document.getElementById("leave").disabled'), true);
+    assert.equal(await alice.evaluate('document.getElementById("leave").getAttribute("aria-describedby")'), 'leaveHint');
     await alice.evaluate('window.__poc.createRoom()');
     const roomId = await until(() => alice.evaluate('window.__poc.snapshot().role==="host" && window.__poc.snapshot().roomId'),
       'real server host not joined');
@@ -83,6 +93,49 @@ async function run() {
     }
     await joinAs(bob, await invite('bob'), 1);
     await joinAs(carol, await invite('carol'), 2);
+    // A WebRTC offer may reject after the signaling peer was accepted. The
+    // async message handler must consume that rejection and retire only the
+    // still-current synthetic peer, never leak an unhandled rejection.
+    await alice.evaluate(`(async () => {
+      const NativePeer = window.RTCPeerConnection;
+      window.__restorePeerConstructor = () => { window.RTCPeerConnection = NativePeer; };
+      window.__unhandledPeerOffer = false;
+      window.addEventListener('unhandledrejection', event => {
+        window.__unhandledPeerOffer = true;
+        event.preventDefault();
+      });
+      window.RTCPeerConnection = class extends NativePeer {
+        createDataChannel(...args) {
+          window.__syntheticDataChannel = super.createDataChannel(...args);
+          return window.__syntheticDataChannel;
+        }
+        async createOffer() { throw new Error('synthetic createOffer rejection'); }
+      };
+      const socket = window.__testSockets.at(-1);
+      await socket.onmessage({ data: JSON.stringify({
+        type: 'peer-accepted', peerId: 'synthetic-offer-failure',
+      }) });
+    })()`);
+    await until(() => alice.evaluate('!window.__poc.snapshot().peers.some(' +
+      'peer=>peer.id==="synthetic-offer-failure") && ' +
+      'document.getElementById("state").textContent==="Negociação falhou: Error"'),
+    'rejected WebRTC offer left a synthetic peer registered');
+    await alice.evaluate('new Promise(resolve => setTimeout(resolve, 0))');
+    assert.equal(await alice.evaluate('window.__unhandledPeerOffer'), false,
+      'rejected WebRTC offer escaped as an unhandled promise rejection');
+    await alice.evaluate(`(() => {
+      window.__syntheticDataChannel.onopen();
+      window.__syntheticDataChannel.onclose();
+    })()`);
+    assert.equal(await alice.evaluate('window.__poc.snapshot().diagnostics.channels.includes("synthetic-offer-failure")'), false,
+      'stale DataChannel callback published diagnostics for a retired peer');
+    await alice.evaluate('window.__restorePeerConstructor()');
+    assert.equal(await alice.evaluate('document.getElementById("leave").textContent'), 'Encerrar sala');
+    assert.equal(await bob.evaluate('document.getElementById("leave").textContent'), 'Sair da sala');
+    assert.equal(await alice.evaluate('document.getElementById("leave").getAttribute("aria-label")'), 'Encerrar sala');
+    assert.equal(await bob.evaluate('document.getElementById("leave").getAttribute("aria-label")'), 'Sair da sala');
+    assert.equal(await alice.evaluate('document.getElementById("leave").disabled'), false);
+    assert.equal(await bob.evaluate('document.getElementById("leave").disabled'), false);
     const size = 2 * 1024 * 1024;
     await alice.evaluate('window.__poc.sendFile(new File([Uint8Array.from({length:' + size +
       '},(_,i)=>i%253)],"real-session-transfer.bin"))');
@@ -96,13 +149,226 @@ async function run() {
     }
     await until(() => alice.evaluate('window.__poc.snapshot().peers.every(p=>p.outgoingPhase===null)'),
       'acknowledgment not delivered via actual /ws', 15_000);
+    // A guest can leave independently without closing the host's room or
+    // disturbing another guest. A concurrent create must be aborted and must
+    // not log a stale AbortError after the guest leaves.
+    await bob.evaluate(`(async () => {
+      window.__staleConsentSends = 0;
+      const nativeSend = WebSocket.prototype.send;
+      window.__restoreConsentSend = () => { WebSocket.prototype.send = nativeSend; };
+      WebSocket.prototype.send = function (data) {
+        try {
+          const message = JSON.parse(data);
+          if (message.type === 'consent' && message.requestId === 'stale-consent-request') {
+            window.__staleConsentSends += 1;
+          }
+        } catch { /* Non-JSON WebSocket frames are not consent messages. */ }
+        return nativeSend.call(this, data);
+      };
+      await window.__testSockets.at(-1).onmessage({ data: JSON.stringify({
+        type: 'peer-request', requestId: 'stale-consent-request', username: 'synthetic',
+      }) });
+      window.__staleConsentButton = document.querySelector('[data-testid=accept-peer]');
+      if (!window.__staleConsentButton) throw new Error('synthetic consent control missing');
+    })()`);
+    await bob.evaluate(`(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.__createAbortObserved = false;
+      window.__restoreCreateFetch = () => { window.fetch = originalFetch; };
+      window.fetch = (input, init = {}) => {
+        const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (url.pathname === '/p2p/rooms' && init.method === 'POST') {
+          return new Promise((resolve, reject) => {
+            const signal = init.signal;
+            const abort = () => {
+              window.__createAbortObserved = true;
+              reject(new DOMException('Aborted', 'AbortError'));
+            };
+            if (!signal) return reject(new Error('missing create abort signal'));
+            if (signal.aborted) return abort();
+            signal.addEventListener('abort', abort, { once: true });
+          });
+        }
+        return originalFetch(input, init);
+      };
+      document.getElementById('create').click();
+    })()`);
+    await until(() => bob.evaluate('document.getElementById("create").disabled && ' +
+      'document.getElementById("createObjectRoom").disabled'),
+    'room-create controls were not locked during the pending request');
+    await bob.evaluate('document.getElementById("leave").click()');
+    await until(() => bob.evaluate('window.__poc.snapshot().roomId===null && ' +
+      'window.__poc.snapshot().role===null && window.__poc.snapshot().peers.length===0 && ' +
+      'document.getElementById("leave").disabled && window.__createAbortObserved && ' +
+      '!document.getElementById("create").disabled && !document.getElementById("createObjectRoom").disabled'),
+    'guest leave did not abort creation, clear local state and release the controls');
+    assert.equal(await bob.evaluate('document.getElementById("state").textContent'), 'Você saiu da sala',
+      'stale AbortError overwrote the guest leave status');
+    await bob.evaluate('window.__restoreCreateFetch()');
+    await until(() => alice.evaluate('window.__poc.snapshot().role==="host" && ' +
+      'window.__poc.snapshot().peers.length===1'), 'guest leave disturbed the remaining room');
+    await joinAs(bob, await invite('bob'), 2);
+    await bob.evaluate('window.__staleConsentButton.click()');
+    await bob.evaluate('new Promise(resolve => setTimeout(resolve, 0))');
+    assert.equal(await bob.evaluate('window.__staleConsentSends'), 0,
+      'stale consent callback from the previous room was sent on the replacement socket');
+    await bob.evaluate('window.__restoreConsentSend()');
+    assert.equal(await bob.evaluate('document.getElementById("leave").textContent'), 'Sair da sala');
     // Change the same real user store backing /auth/me and the upgrade guard.
     f.users.find(user => user.username === 'bob').sessionVersion += 1;
     writeFileSync(f.usersPath, JSON.stringify(f.users));
-    await until(() => bob.evaluate('window.__poc.snapshot().peers.length===0'),
+    await until(() => bob.evaluate('window.__poc.snapshot().roomId===null && ' +
+      'window.__poc.snapshot().role===null && window.__poc.snapshot().peers.length===0 && ' +
+      'document.getElementById("leave").disabled'),
       'revoked Root.ark session left live P2P peer', 8_000);
     await until(() => alice.evaluate('window.__poc.snapshot().peers.length===1'),
       'revoked peer not removed from real server', 8_000);
+    // The host ends the room for every remaining participant. All transient
+    // peer, invitation, transfer and download UI must be retired on both sides.
+    assert.equal(await alice.evaluate('document.getElementById("leave").textContent'), 'Encerrar sala');
+    await alice.evaluate(`(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.__createResponseHeld = false;
+      window.__createResponseReleased = false;
+      window.__releaseCreateResponse = null;
+      window.__createSignal = null;
+      window.__createPostCount = 0;
+      window.__restoreFetch = () => { window.fetch = originalFetch; };
+      window.fetch = async (input, init) => {
+        const response = await originalFetch(input, init);
+        const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (url.pathname === '/p2p/rooms' && init?.method === 'POST') {
+          window.__createPostCount += 1;
+          window.__createSignal = init.signal;
+          const originalJson = response.json.bind(response);
+          response.json = async (...args) => {
+            const payload = await originalJson(...args);
+            window.__createResponseHeld = true;
+            await new Promise(resolve => { window.__releaseCreateResponse = resolve; });
+            window.__createResponseReleased = true;
+            return payload;
+          };
+        }
+        return response;
+      };
+      document.getElementById('create').click();
+    })()`);
+    await until(() => alice.evaluate('window.__createResponseHeld === true'),
+      'pending create-room JSON response was not held');
+    assert.equal(await alice.evaluate('document.getElementById("create").disabled && ' +
+      'document.getElementById("createObjectRoom").disabled'), true,
+    'both create actions must remain disabled while one create is in flight');
+    assert.equal(await alice.evaluate('window.__poc.createRoom()'), false,
+      'a second programmatic create must be rejected while the first is pending');
+    assert.equal(await alice.evaluate('window.__createPostCount'), 1,
+      'single-flight guard allowed a second room reservation');
+    await alice.evaluate('document.getElementById("leave").click()');
+    const cleared = 'window.__poc.snapshot().roomId===null && window.__poc.snapshot().role===null && ' +
+      'window.__poc.snapshot().peers.length===0 && document.getElementById("leave").disabled && ' +
+      '["invites","peers","incoming","transfers","downloads"].every(id => ' +
+      'document.getElementById(id).childElementCount===0)';
+    await until(() => alice.evaluate(cleared), 'host leave did not clear host room state');
+    await until(() => carol.evaluate(cleared), 'host leave did not clear guest room state');
+    assert.equal(await alice.evaluate('window.__createSignal.aborted'), true,
+      'host leave did not abort the in-flight create request');
+    await alice.evaluate('window.__releaseCreateResponse()');
+    await until(() => alice.evaluate('window.__createResponseReleased === true'),
+      'pending create-room response was not released');
+    await alice.evaluate('new Promise(resolve => setTimeout(resolve, 0))');
+    await until(() => alice.evaluate('!document.getElementById("create").disabled && ' +
+      '!document.getElementById("createObjectRoom").disabled'),
+    'create controls were not released after the aborted response settled');
+    await alice.evaluate('window.__restoreFetch()');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().roomId'), null,
+      'late create-room response re-entered after the host left');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().role'), null,
+      'late create-room response restored the host role after leaving');
+    // A Join must also invalidate an older create whose HTTP response has
+    // arrived but whose JSON body is still pending. The stale body must not
+    // replace the newly admitted guest room when it is finally released.
+    await carol.evaluate('window.__poc.createRoom()');
+    const carolRoomId = await until(() => carol.evaluate(
+      'window.__poc.snapshot().role==="host" && window.__poc.snapshot().roomId'),
+    'Carol could not create the replacement host room');
+    await carol.evaluate('window.__poc.invite("alice")');
+    const carolInvitation = await until(() => carol.evaluate(
+      'window.__poc.invitations().at(-1)?.recipient==="alice" && window.__poc.invitations().at(-1)?.invitation'),
+    'Carol could not invite Alice to the replacement room');
+    await alice.evaluate(`(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.__createResponseHeld = false;
+      window.__createResponseReleased = false;
+      window.__createSignal = null;
+      window.__releaseCreateResponse = null;
+      window.__restoreFetch = () => { window.fetch = originalFetch; };
+      window.fetch = async (input, init) => {
+        const response = await originalFetch(input, init);
+        const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (url.pathname === '/p2p/rooms' && init?.method === 'POST') {
+          window.__createSignal = init.signal;
+          const originalJson = response.json.bind(response);
+          response.json = async (...args) => {
+            const payload = await originalJson(...args);
+            window.__createResponseHeld = true;
+            await new Promise(resolve => { window.__releaseCreateResponse = resolve; });
+            window.__createResponseReleased = true;
+            return payload;
+          };
+        }
+        return response;
+      };
+      document.getElementById('create').click();
+    })()`);
+    await until(() => alice.evaluate('window.__createResponseHeld === true'),
+      'pending create JSON was not held before Join');
+    await alice.evaluate('window.__poc.joinRoom(' + JSON.stringify(carolRoomId) + ',' +
+      JSON.stringify(carolInvitation) + ')');
+    await until(() => alice.evaluate('window.__poc.snapshot().role==="guest" && ' +
+      'window.__poc.snapshot().roomId===' + JSON.stringify(carolRoomId)),
+    'Join did not complete while the earlier create JSON was held');
+    assert.equal(await alice.evaluate('window.__createSignal.aborted'), true,
+      'Join did not abort the earlier create intent');
+    await alice.evaluate('window.__releaseCreateResponse()');
+    await until(() => alice.evaluate('window.__createResponseReleased === true'),
+      'held create JSON was not released after Join');
+    await alice.evaluate('new Promise(resolve => setTimeout(resolve, 0))');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().role'), 'guest',
+      'stale create JSON replaced the newly joined guest role');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().roomId'), carolRoomId,
+      'stale create JSON replaced the newly joined room ID');
+    assert.equal(await alice.evaluate('!document.getElementById("create").disabled && ' +
+      '!document.getElementById("createObjectRoom").disabled'), true,
+    'create controls remained locked after the new room was admitted');
+    await alice.evaluate('window.__restoreFetch()');
+    // A failed protected-object create must not leave the retired room ID/key
+    // visible or keep the client in a protected-room-only state.
+    await alice.evaluate(`(() => {
+      const originalFetch = window.fetch.bind(window);
+      window.__restoreBoundFailureFetch = () => { window.fetch = originalFetch; };
+      window.fetch = (input, init = {}) => {
+        const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (url.pathname === '/p2p/rooms' && init.method === 'POST' && init.body) {
+          return Promise.resolve(new Response('{"error":"Denied"}', {
+            status: 403, headers: { 'content-type': 'application/json' },
+          }));
+        }
+        return originalFetch(input, init);
+      };
+      document.getElementById('createObjectRoom').click();
+    })()`);
+    await until(() => alice.evaluate('document.getElementById("state").textContent===' +
+      '"A autorização do arquivo foi negada"'), 'bound-object denial was not reported');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().roomId'), null,
+      'failed bound create retained a stale room ID');
+    assert.equal(await alice.evaluate('document.getElementById("room").textContent'), '',
+      'failed bound create retained stale room text');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().role'), null,
+      'failed bound create retained a stale role');
+    assert.equal(await alice.evaluate('document.getElementById("leave").disabled'), true,
+      'failed bound create left the leave action enabled without a room');
+    assert.equal(await alice.evaluate('document.getElementById("createObjectRoom").disabled'), false,
+      'failed bound create did not release the create controls');
+    await alice.evaluate('window.__restoreBoundFailureFetch()');
     // Even a valid, explicit legacy ACL is insufficient for immutable-version
     // and all-party snapshot custody. Refuse bound admission before hashing.
     const ciphertext = Buffer.from(Array.from({ length: 92 }, (_, i) => i + 11));

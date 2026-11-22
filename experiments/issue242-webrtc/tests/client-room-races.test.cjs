@@ -16,7 +16,10 @@ function browser({ fetch, digest = async () => new Uint8Array(32).buffer,
   const sockets = [];
   const peerConnections = [];
   const element = () => ({
-    hidden: false, disabled: false, textContent: '', dataset: {},
+    hidden: false, disabled: false, textContent: '', dataset: {}, attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, String(value)); },
+    getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; },
+    removeAttribute(name) { this.attributes.delete(name); },
     replaceChildren() {}, append() {}, remove() {}, addEventListener() {},
   });
   const document = {
@@ -67,7 +70,7 @@ function browser({ fetch, digest = async () => new Uint8Array(32).buffer,
     peerConnections.at(-1).ondatachannel({ channel: dc });
     return dc;
   };
-  return { window, sockets, peerConnections, joined, channel,
+  return { window, sockets, peerConnections, elements, joined, channel,
     getElement: id => elements.get(id) };
 }
 
@@ -174,6 +177,44 @@ test('1:N full sender path cancels only stalled peer; healthy sibling still rece
     'the failure must remain visible in the event history after the healthy peer confirms receipt');
 });
 
+test('late stall rejection from a retired room cannot cancel a new transfer to the same peer ID', async () => {
+  let obsoleteChannel;
+  let rejectObsoleteStall;
+  let created = 0;
+  const b = browser({
+    fetch: async () => ({ ok: true, json: async () =>
+      ({ roomId: 'room-' + ++created, hostKey: 'test' }) }),
+    waitForSendWindow: dc => dc === obsoleteChannel
+      ? new Promise((_resolve, reject) => { rejectObsoleteStall = reject; })
+      : Promise.resolve(),
+  });
+  await b.window.__poc.createRoom();
+  b.joined(b.sockets[0]);
+  obsoleteChannel = b.channel(b.sockets[0], 'same-guest');
+  await b.window.__poc.sendFile(smallFile());
+  const firstOffer = obsoleteChannel.sent.find(m => m.type === 'offer-file');
+  await obsoleteChannel.onmessage({ data: JSON.stringify({ type: 'accept-file', id: firstOffer.id }) });
+  assert.equal(typeof rejectObsoleteStall, 'function', 'old sender must be suspended on backpressure');
+
+  b.window.__poc.joinRoom('fresh-room', 'fresh-invitation');
+  b.joined(b.sockets[1]);
+  const current = b.channel(b.sockets[1], 'same-guest');
+  await b.window.__poc.sendFile(smallFile());
+  const secondOffer = current.sent.find(m => m.type === 'offer-file');
+  assert.ok(secondOffer, 'new room must offer a fresh transfer');
+  rejectObsoleteStall(new Error('P2P_SEND_BUFFER_STALLED'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(b.window.__poc.snapshot().roomId, 'fresh-room');
+  assert.equal(b.window.__poc.snapshot().peers[0].outgoingPhase, 'offered',
+    'obsolete stall rejection must not clear the new transfer');
+  assert.equal(b.window.__poc.snapshot().diagnostics.rejected.includes('P2P_SEND_BUFFER_STALLED'), false,
+    'obsolete stall must not be reported as a current-room error');
+  await current.onmessage({ data: JSON.stringify({ type: 'accept-file', id: secondOffer.id }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(current.sent.some(m => m.type === 'end-file'),
+    'a healthy new room must still complete its file stream');
+});
+
 test('P2: sender resumes after drain below send-window limit without waiting for 64 KiB', async () => {
   const b = browser({
     fetch: async () => ({ ok: true, json: async () => ({ roomId: 'test', hostKey: 'local' }) }),
@@ -275,6 +316,47 @@ test('P2: a received plaintext text digest cannot finish into a different protec
   assert.deepEqual(newDc.sent, [], 'no stale room content may reach the new DataChannel');
 });
 
+test('incoming plaintext SHA completing after room switch cannot enter protected-room diagnostics', async () => {
+  const digests = [];
+  let created = 0;
+  const b = browser({
+    digest: () => new Promise(resolve => digests.push(resolve)),
+    fetch: async () => ({ ok: true, json: async () => created++ === 0
+      ? { roomId: 'unbound', hostKey: 'old' }
+      : { roomId: 'protected', hostKey: 'new', boundObject } }),
+  });
+  await b.window.__poc.createRoom();
+  b.joined(b.sockets[0]);
+  const oldChannel = b.channel(b.sockets[0], 'old-guest');
+  const incoming = oldChannel.onmessage({ data: JSON.stringify({
+    type: 'text', text: 'OLD_ROOM_PLAINTEXT', digest: '0'.repeat(64),
+  }) });
+  assert.equal(digests.length, 1, 'the receive callback must wait on real async digest');
+  assert.equal(b.window.__poc.snapshot().diagnostics.verifiedTexts.length, 0);
+
+  await b.window.__poc.createRoom({ folderId: 'root', fileName: 'sealed.bin' });
+  b.joined(b.sockets[1], boundObject);
+  assert.equal(b.peerConnections[0].closed, true, 'the old peer must have been retired');
+  digests[0](new Uint8Array(32).buffer); // Exact accepted SHA-256 string in this fixture.
+  await incoming;
+  assert.equal(b.window.__poc.snapshot().boundObject.sha256, boundObject.sha256);
+  assert.equal(b.window.__poc.snapshot().diagnostics.verifiedTexts.length, 0,
+    'a stale plaintext result must never appear as a verified text in the protected room');
+  assert.equal(b.window.__poc.snapshot().diagnostics.rejected.length, 0,
+    'stale results must not be reported as new-room digest failures either');
+
+  const live = browser({ fetch: async () => ({ ok: true, json: async () =>
+    ({ roomId: 'unbound', hostKey: 'current' }) }) });
+  await live.window.__poc.createRoom();
+  live.joined(live.sockets[0]);
+  const liveChannel = live.channel(live.sockets[0], 'current-guest');
+  await liveChannel.onmessage({ data: JSON.stringify({
+    type: 'text', text: 'CURRENT_ROOM_TEXT', digest: '0'.repeat(64),
+  }) });
+  assert.equal(live.window.__poc.snapshot().diagnostics.verifiedTexts[0].text, 'CURRENT_ROOM_TEXT',
+    'ordinary same-room verified text must continue to work');
+});
+
 test('starting a protected room intent cancels pending plaintext before HTTP completes', async () => {
   const pendingDigests = [];
   const requests = [];
@@ -298,23 +380,65 @@ test('starting a protected room intent cancels pending plaintext before HTTP com
   assert.equal(b.window.__poc.snapshot().roomId, 'protected');
 });
 
-test('late response to older unbound createRoom cannot downgrade newer protected room', async () => {
+test('pending unbound create cannot overlap a protected create or downgrade it later', async () => {
   const requests = [];
   const b = browser({ fetch: () => new Promise(resolve => requests.push(resolve)) });
   const older = b.window.__poc.createRoom();
+  assert.equal(await b.window.__poc.createRoom({ folderId: 'root', fileName: 'sealed.bin' }),
+    false, 'concurrent room creation must be rejected before a second HTTP request');
+  assert.equal(requests.length, 1, 'create-room lock prevents overlapping responses');
+  requests[0]({ ok: true, json: async () =>
+    ({ roomId: 'unbound', hostKey: 'obsolete' }) });
+  await older;
+  b.joined(b.sockets[0]);
+  const obsoleteSocket = b.sockets[0];
   const newer = b.window.__poc.createRoom({ folderId: 'root', fileName: 'sealed.bin' });
   assert.equal(requests.length, 2);
   requests[1]({ ok: true, json: async () =>
     ({ roomId: 'protected', hostKey: 'current', boundObject }) });
   await newer;
-  b.joined(b.sockets[0], boundObject);
-  const protectedSocket = b.sockets[0];
-  requests[0]({ ok: true, json: async () =>
-    ({ roomId: 'unbound', hostKey: 'obsolete' }) });
-  await older;
-  assert.equal(b.sockets.length, 1, 'obsolete response replaced protected WebSocket');
+  b.joined(b.sockets[1], boundObject);
+  const protectedSocket = b.sockets[1];
+  obsoleteSocket.onmessage({ data: JSON.stringify({
+    type: 'joined', role: 'host', peerId: 'late-old-room', boundObject: null,
+  }) });
+  obsoleteSocket.onclose();
+  assert.equal(b.sockets.length, 2, 'stale callbacks must not open another WebSocket');
   assert.equal(protectedSocket.readyState, 1, 'obsolete response closed protected WebSocket');
   assert.equal(b.window.__poc.snapshot().roomId, 'protected');
+  assert.equal(b.window.__poc.snapshot().boundObject.sha256, boundObject.sha256);
+});
+
+test('leaving a pending creation allows a new room while stale HTTP completion stays fenced', async () => {
+  const requests = [];
+  const b = browser({ fetch: (_url, options) => new Promise(resolve =>
+    requests.push({ resolve, signal: options.signal })) });
+  const oldCreate = b.window.__poc.createRoom({ folderId: 'root', fileName: 'old.bin' });
+  assert.equal(requests.length, 1);
+  assert.equal(b.elements.get('leave').disabled, false,
+    'a pending room creation must expose a way to cancel it');
+  assert.equal(b.elements.get('leave').textContent, 'Cancelar criação');
+  b.elements.get('leave').onclick();
+  assert.equal(requests[0].signal.aborted, true);
+  assert.equal(b.window.__poc.snapshot().roomId, null);
+
+  const newCreate = b.window.__poc.createRoom({ folderId: 'root', fileName: 'new.bin' });
+  assert.equal(requests.length, 2,
+    'the old server/response must not hold the creation lock after leave');
+  requests[0].resolve({ ok: true, json: async () => ({ roomId: 'stale', hostKey: 'old' }) });
+  assert.equal(await oldCreate, false, 'a canceled response must not reconnect');
+  assert.equal(await b.window.__poc.createRoom(), false,
+    'stale completion must not unlock the second pending creation');
+  assert.equal(requests.length, 2);
+  assert.equal(b.elements.get('leave').disabled, false,
+    'the active creation must retain its cancel control');
+
+  requests[1].resolve({ ok: true, json: async () =>
+    ({ roomId: 'current', hostKey: 'new', boundObject }) });
+  assert.equal(await newCreate, true);
+  assert.equal(b.sockets.length, 1);
+  b.joined(b.sockets[0], boundObject);
+  assert.equal(b.window.__poc.snapshot().roomId, 'current');
   assert.equal(b.window.__poc.snapshot().boundObject.sha256, boundObject.sha256);
 });
 

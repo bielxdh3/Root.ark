@@ -137,6 +137,17 @@ test('1:N guest roster and membership events remain private between recipients',
   ]);
   assert.equal((await host.next('peer-joined')).username, 'bob');
 
+  // Host-to-recipient consent remains functional without exposing a guest
+  // to any other guest's membership or signaling channel.
+  host.send({ type: 'request-peer', to: bobJoined.peerId });
+  const request = await bob.next('peer-request');
+  assert.equal(request.peerId, hostJoined.peerId);
+  bob.send({ type: 'consent', requestId: request.requestId, accept: true });
+  assert.equal((await host.next('peer-accepted')).peerId, bobJoined.peerId);
+  host.send({ type: 'signal', to: bobJoined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'consented' } } });
+  assert.equal((await bob.next('signal')).peerId, hostJoined.peerId);
+
   const bobSawGuestEvents = [];
   bob.ws.on('message', bytes => {
     const message = JSON.parse(bytes.toString());
@@ -159,6 +170,11 @@ test('1:N guest roster and membership events remain private between recipients',
   bob.send({ type: 'invite', recipient: 'eve' });
   assert.equal((await bob.next('error')).code, 'FORBIDDEN');
   assert.deepEqual(bobSawGuestEvents, [], 'Bob must not receive Eve\'s peer-joined event');
+
+  bob.send({ type: 'signal', to: eveJoined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'cross-guest' } } });
+  assert.equal((await bob.next('error')).code, 'FORBIDDEN',
+    'consent with the host must not authorize signaling to another guest');
 
   host.send({ type: 'kick', to: eveJoined.peerId });
   assert.equal((await eve.next('error')).code, 'REVOKED');
