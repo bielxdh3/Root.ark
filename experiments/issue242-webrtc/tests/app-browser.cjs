@@ -231,6 +231,7 @@ async function run() {
       const originalFetch = window.fetch.bind(window);
       window.__createResponseHeld = false;
       window.__createResponseReleased = false;
+      window.__orphanReleaseAcknowledged = false;
       window.__releaseCreateResponse = null;
       window.__createSignal = null;
       window.__createPostCount = 0;
@@ -238,6 +239,9 @@ async function run() {
       window.fetch = async (input, init) => {
         const response = await originalFetch(input, init);
         const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (url.pathname === '/p2p/rooms/release' && init?.method === 'POST') {
+          window.__orphanReleaseAcknowledged = response.status === 204;
+        }
         if (url.pathname === '/p2p/rooms' && init?.method === 'POST') {
           window.__createPostCount += 1;
           window.__createSignal = init.signal;
@@ -275,6 +279,8 @@ async function run() {
     await alice.evaluate('window.__releaseCreateResponse()');
     await until(() => alice.evaluate('window.__createResponseReleased === true'),
       'pending create-room response was not released');
+    await until(() => alice.evaluate('window.__orphanReleaseAcknowledged === true'),
+      'canceled HTTP room was not released by the authenticated server');
     await alice.evaluate('new Promise(resolve => setTimeout(resolve, 0))');
     await until(() => alice.evaluate('!document.getElementById("create").disabled && ' +
       '!document.getElementById("createObjectRoom").disabled'),
@@ -299,12 +305,16 @@ async function run() {
       const originalFetch = window.fetch.bind(window);
       window.__createResponseHeld = false;
       window.__createResponseReleased = false;
+      window.__orphanReleaseAcknowledged = false;
       window.__createSignal = null;
       window.__releaseCreateResponse = null;
       window.__restoreFetch = () => { window.fetch = originalFetch; };
       window.fetch = async (input, init) => {
         const response = await originalFetch(input, init);
         const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (url.pathname === '/p2p/rooms/release' && init?.method === 'POST') {
+          window.__orphanReleaseAcknowledged = response.status === 204;
+        }
         if (url.pathname === '/p2p/rooms' && init?.method === 'POST') {
           window.__createSignal = init.signal;
           const originalJson = response.json.bind(response);
@@ -332,6 +342,8 @@ async function run() {
     await alice.evaluate('window.__releaseCreateResponse()');
     await until(() => alice.evaluate('window.__createResponseReleased === true'),
       'held create JSON was not released after Join');
+    await until(() => alice.evaluate('window.__orphanReleaseAcknowledged === true'),
+      'Join did not release the displaced HTTP reservation');
     await alice.evaluate('new Promise(resolve => setTimeout(resolve, 0))');
     assert.equal(await alice.evaluate('window.__poc.snapshot().role'), 'guest',
       'stale create JSON replaced the newly joined guest role');

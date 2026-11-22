@@ -8,7 +8,7 @@ const vm = require('node:vm');
 const boundObject = { folderId: 'root', fileName: 'sealed.bin', size: 92,
   sha256: 'a'.repeat(64) };
 
-function browser({ fetch, digest = async () => new Uint8Array(32).buffer }) {
+function browser({ fetch, cookie = '', digest = async () => new Uint8Array(32).buffer }) {
   const elements = new Map();
   const sockets = [];
   const peerConnections = [];
@@ -20,7 +20,7 @@ function browser({ fetch, digest = async () => new Uint8Array(32).buffer }) {
     replaceChildren() {}, append() {}, remove() {}, addEventListener() {},
   });
   const document = {
-    cookie: '',
+    cookie,
     getElementById(id) {
       if (!elements.has(id)) elements.set(id, element());
       return elements.get(id);
@@ -216,6 +216,54 @@ test('leaving a pending creation allows a new room while stale HTTP completion s
   b.joined(b.sockets[0], boundObject);
   assert.equal(b.window.__poc.snapshot().roomId, 'current');
   assert.equal(b.window.__poc.snapshot().boundObject.sha256, boundObject.sha256);
+});
+
+test('canceling a delivered room POST reclaims its exact unused server reservation', async () => {
+  const held = [], released = [];
+  const reservation = { roomId: 'a'.repeat(16), hostKey: 'b'.repeat(64) };
+  const b = browser({ cookie: 'rootark_csrf=csrf-test',
+    fetch: (url, options) => {
+      if (url === '/p2p/rooms/release') {
+        released.push({ proof: JSON.parse(options.body), headers: options.headers });
+        return Promise.resolve({ status: 204 });
+      }
+      return new Promise(resolve => held.push({ resolve, signal: options.signal }));
+    },
+  });
+  const pending = b.window.__poc.createRoom();
+  assert.equal(held.length, 1);
+  b.elements.get('leave').onclick();
+  assert.equal(held[0].signal.aborted, true);
+  held[0].resolve({ ok: true, json: async () => reservation });
+  assert.equal(await pending, false, 'obsolete POST must not connect its canceled room');
+  assert.equal(b.sockets.length, 0);
+  assert.equal(b.window.__poc.snapshot().roomId, null);
+  assert.equal(released.length, 1, 'late completed POST must release the orphan capacity');
+  assert.deepEqual(released[0].proof, reservation,
+    'release must use the exact server-issued room ID and host secret');
+  assert.equal(released[0].headers['X-CSRF-Token'], 'csrf-test');
+});
+
+test('canceling an unjoined signaling handshake releases its reserved room, not a joined room', async () => {
+  const released = [];
+  const reservation = { roomId: 'c'.repeat(16), hostKey: 'd'.repeat(64) };
+  const b = browser({ cookie: 'rootark_csrf=csrf-test',
+    fetch: async (url, options) => {
+      if (url === '/p2p/rooms/release') {
+        released.push(JSON.parse(options.body));
+        return { status: 204 };
+      }
+      return { ok: true, json: async () => reservation };
+    },
+  });
+  await b.window.__poc.createRoom();
+  assert.equal(b.sockets.length, 1);
+  assert.equal(b.window.__poc.snapshot().role, null);
+  b.elements.get('leave').onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(b.window.__poc.snapshot().roomId, null);
+  assert.equal(released.length, 1);
+  assert.deepEqual(released[0], reservation);
 });
 
 test('new text and file cannot leave the old unbound channel after protected intent, before HTTP responds', async () => {

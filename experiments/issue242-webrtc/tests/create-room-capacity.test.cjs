@@ -117,3 +117,27 @@ test('unbound room creation also respects active owner and global limits', async
   assert.equal((await broker.createRoom(request('alice'))).status, 429);
   assert.equal(hashes, 0);
 });
+
+test('abandoned HTTP room can be released only by its authenticated original owner and exact host key', async t => {
+  const broker = await brokerFixture(t, async () => grant);
+  const alice = { headers: { 'x-owner': 'alice' } };
+  const bob = { headers: { 'x-owner': 'bob' } };
+  const first = await broker.createRoom(alice);
+  const second = await broker.createRoom(alice);
+  assert.equal((await broker.createRoom(alice)).status, 429,
+    'two unjoined rooms still consume the enforced quota until safely released');
+
+  const proof = { roomId: first.roomId, hostKey: first.hostKey };
+  assert.equal(broker.releaseReservedRoom(bob, proof).status, 204);
+  assert.equal(broker.releaseReservedRoom(alice,
+    { roomId: first.roomId, hostKey: second.hostKey }).status, 204);
+  assert.equal(broker.releaseReservedRoom(alice,
+    { roomId: first.roomId, hostKey: { toString() { throw Error('untrusted'); } } }).status, 403);
+  assert.equal((await broker.createRoom(alice)).status, 429,
+    'foreign owner, wrong key and non-string key must not release capacity');
+  assert.equal(broker.releaseReservedRoom(alice, proof).status, 204);
+  assert.equal(broker.releaseReservedRoom(alice, proof).status, 204,
+    'a repeat release reveals no room-existence information');
+  assert.equal((await broker.createRoom(alice)).status, 200,
+    'releasing the real unjoined reservation restores capacity immediately');
+});
