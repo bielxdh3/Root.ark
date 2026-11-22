@@ -2981,6 +2981,77 @@ class SyncEngine {
     throw lastError;
   }
 
+  async recoverHistoricalRestoreConflictIfVerified(operation, historicalRestoreEnvelope, rawCurrent, currentRevision, summary) {
+    assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
+    const tryCandidate = async (rawCandidate) => {
+      if (!rawCandidate || typeof rawCandidate !== "object") return null;
+      const candidate = envelopeCopy(protocol.validateStoredOperation(rawCandidate));
+      if (candidate.operationId === operation.operationId) return null;
+      if (canonicalJson(candidate.revision) === canonicalJson(operation.revision)) return null;
+      if (candidate.objectId !== operation.objectId
+        && candidate.metadata?.path !== operation.metadata?.path) {
+        return null;
+      }
+      if (operation.baseRevision
+        && (canonicalJson(candidate.revision) === canonicalJson(operation.baseRevision)
+          || protocol.compareRevisions(candidate.revision, operation.baseRevision) < 0)) {
+        return null;
+      }
+      const verifiedFreshDigest = await this.verifyIncomingOperation(candidate);
+      return { candidate, verifiedFreshDigest };
+    };
+    let verified = null;
+    if (rawCurrent) {
+      verified = await tryCandidate(rawCurrent);
+    } else if (typeof this.adapter?.list === "function") {
+      const listed = await this.adapter.list();
+      const operations = nativeArrayIsArray(listed) ? listed : listed ? [listed] : [];
+      for (let index = 0; index < operations.length; index += 1) {
+        const entry = operations[index];
+        if (!entry || entry.operationId === operation.operationId || this.journal.hasSeen(entry.operationId)) continue;
+        try {
+          const candidate = await tryCandidate(entry);
+          if (candidate) verified = candidate;
+        } catch {
+          // Ignore unrelated or unverified entries while scanning for a newer matching winner.
+        }
+      }
+    }
+    if (!verified) return false;
+    const { candidate } = verified;
+    summary.conflicts.push({
+      operationId: operation.operationId,
+      policy: "remote-wins",
+      currentRevision: currentRevision || candidate.revision || null,
+    });
+    try {
+      await this.recoverConflict(operation, summary);
+    } catch (error) {
+      if (!nativeReflectApply(nativeArrayIncludes,
+        ["authorization_rejected", "stale_key_epoch", "sync_key_epoch_mismatch", "key_unavailable"],
+        [ownDataValue(error, "code")])) {
+        throw error;
+      }
+    }
+    let appliedDigest;
+    if (this.operationDestinationIsSelected(candidate)) {
+      appliedDigest = await this._apply(candidate, summary);
+    } else {
+      appliedDigest = verified.verifiedFreshDigest;
+      const reconciled = await this.reconcileOutOfScopeMove(candidate, summary, {
+        preservedOperationIds: [operation.operationId], conflictAlreadyRecorded: true,
+      });
+      if (!reconciled) {
+        this.rememberRemoteOnly(candidate, "excluded");
+        await this.persistSnapshot();
+      }
+    }
+    await this.journal.markSeen(candidate.operationId, appliedDigest);
+    await nativeReflectApply(historicalRestoreEnvelope.journalMethods.markSeenExact,
+      this.journal, [historicalRestoreEnvelope.operationId, historicalRestoreEnvelope.digest, null]);
+    return true;
+  }
+
   async recoverConflict(operation, summary) {
     if (operation.operation === "delete" || operation.tombstone) return;
     const key = await this.keyFor(operation);
@@ -3450,20 +3521,37 @@ class SyncEngine {
           // bytes and its snapshot. Never trust a replaceable snapshot alone
           // as evidence; a local edit or deletion after successful restore
           // must still be reconciled in a later signed CAS revision.
-          const expected = await nativeReflectApply(historicalRestoreEnvelope.engineMethods.hashPendingPayload,
-            this, [operation]);
-          historicalRestorePayloadHash = expected;
+          let expected = null;
+          let expectedKeyError = null;
+          try {
+            expected = await nativeReflectApply(historicalRestoreEnvelope.engineMethods.hashPendingPayload,
+              this, [operation]);
+            historicalRestorePayloadHash = expected;
+          } catch (error) {
+            if (!nativeReflectApply(nativeArrayIncludes,
+              ["authorization_rejected", "stale_key_epoch", "sync_key_epoch_mismatch", "key_unavailable"],
+              [ownDataValue(error, "code")])) {
+              throw error;
+            }
+            expectedKeyError = error;
+          }
           assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
           const snapshot = this.snapshot.files[operation.metadata.path];
-          const durablyMaterialized = nativeReflectApply(historicalRestoreEnvelope.journalMethods.hasMaterializedRestore,
-            journal, [operation])
-            && snapshot && !snapshot.deleted && !snapshot.directory
+          const snapshotMatches = Boolean(snapshot && !snapshot.deleted && !snapshot.directory
             && snapshot.objectId === operation.objectId
             && snapshot.fileId === operation.fileId
             && snapshot.versionId === operation.versionId
-            && snapshot.hash === expected
-            && canonicalJson(snapshot.revision) === canonicalJson(operation.revision);
+            && regexTest(/^[a-f0-9]{64}$/, snapshot.hash || "")
+            && canonicalJson(snapshot.revision) === canonicalJson(operation.revision));
+          const durablyMaterialized = nativeReflectApply(historicalRestoreEnvelope.journalMethods.hasMaterializedRestore,
+            journal, [operation])
+            && snapshotMatches
+            && (expectedKeyError ? true : snapshot.hash === expected);
+          if (durablyMaterialized && expectedKeyError) {
+            historicalRestorePayloadHash = snapshot.hash;
+          }
           if (!durablyMaterialized) {
+            if (expectedKeyError) throw expectedKeyError;
             let observed;
             try {
               const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
@@ -3556,7 +3644,7 @@ class SyncEngine {
             const errorCode = ownDataValue(error, "code");
             if (uncertainRemoteOutcome(error)
               || nativeReflectApply(nativeArrayIncludes,
-                ["authorization_rejected", "authorization_required", "authorization_expired", "sync_conflict"], [errorCode])) {
+                ["authorization_rejected", "authorization_required", "authorization_expired", "stale_key_epoch", "sync_key_epoch_mismatch", "key_unavailable", "sync_conflict"], [errorCode])) {
               // A lost ACK may be followed by 409, an offline retry, or an
               // expired grant. None of those responses proves the exact
               // restore is durable. The independent read is still allowed.
@@ -3592,6 +3680,19 @@ class SyncEngine {
             assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
           }
           catch (error) {
+            const uncertainStatus = uncertain ? ownDataValue(uncertain, "status") : undefined;
+            const uncertainCode = uncertain ? ownDataValue(uncertain, "code") : undefined;
+            if (uncertain && (uncertainStatus === 409 || uncertainCode === "sync_conflict")) {
+              const recovered = await this.recoverHistoricalRestoreConflictIfVerified(
+                operation,
+                historicalRestoreEnvelope,
+                ownDataValue(uncertain, "current") || ownDataValue(result, "current"),
+                ownDataValue(uncertain, "currentRevision") || ownDataValue(result, "currentRevision") || null,
+                summary,
+              );
+              assertPushRuntime();
+              if (recovered) continue;
+            }
             // A disconnected readback cannot prove a lost transport ACK. Keep
             // the exact signed operation queued for a later independent read.
             if (uncertain && uncertainRemoteOutcome(uncertain)) { summary.offline = true; continue; }
