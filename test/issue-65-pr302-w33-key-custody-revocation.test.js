@@ -219,7 +219,7 @@ test("P2 public composite Promise cannot forge committed inventory after hostile
   assert.ok(handle, "real native Ed25519 KeyObject required");
   let getterReads = 0, forgedCalls = 0;
   const hostilePin = Object.create(originalPin);
-  Object.defineProperty(hostilePin, handle, { get() {
+  Object.defineProperty(hostilePin, "type", { get() {
     getterReads += 1;
     Object.defineProperty(Promise.prototype, "constructor", { configurable: true,
       writable: true, value: function ForgedPromise() {} });
@@ -231,7 +231,7 @@ test("P2 public composite Promise cannot forge committed inventory after hostile
           physicalReadback: { status: "PHYSICALLY_REREAD_PG_COMMITTED" },
           authorizesIo: false });
       } });
-    return originalPin[handle];
+    return "public";
   } });
   try {
     let rejected = false;
@@ -270,7 +270,7 @@ test("P2 public composite then/catch cannot accept forged success after native k
   const originalCatch = Object.getOwnPropertyDescriptor(Promise.prototype, "catch");
   const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
   let poisonedReads = 0, forgedThen = 0, forgedCatch = 0;
-  Object.defineProperty(poisoned, handle, { get() {
+  Object.defineProperty(poisoned, "type", { get() {
     poisonedReads++;
     Object.defineProperty(Promise.prototype, "constructor", { configurable: true,
       writable: true, value: function ForgedPromise() {} });
@@ -284,7 +284,7 @@ test("P2 public composite then/catch cannot accept forged success after native k
         forgedCatch++;
         return Promise.resolve({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING" });
       } });
-    return signer[handle];
+    return "public";
   } });
   try {
     const invalid = compositeOptions(f, badReceipt, physicalBytes, poisoned);
@@ -328,14 +328,14 @@ test("P2 composite public finally cannot replace a denied Ed25519 receipt with f
   const originalFinally = Object.getOwnPropertyDescriptor(Promise.prototype, "finally");
   const nativeThen = Promise.prototype.then;
   let reads = 0, forgedCalls = 0;
-  Object.defineProperty(hostile, handle, { get() {
+  Object.defineProperty(hostile, "type", { get() {
     reads++;
     Promise.prototype.finally = function forgedFinally() {
       forgedCalls++;
       return Promise.resolve({ status: "VERIFIED_COMPOSITE_NONAUTHORIZING",
         independentPhysicalAttestationVerified: true, authorizesIo: false });
     };
-    return signer[handle];
+    return "public";
   } });
   try {
     const pending = verifyAttestedInventoryCommit(compositeOptions(f,
@@ -370,7 +370,7 @@ test("P2 public PG verifier cannot forge signed physical admission through Promi
   const originalConstructor = Object.getOwnPropertyDescriptor(Promise.prototype, "constructor");
   const originalThen = Object.getOwnPropertyDescriptor(Promise.prototype, "then");
   let pending, reads = 0, forgedCalls = 0;
-  Object.defineProperty(hostile, handle, { get() {
+  Object.defineProperty(hostile, "type", { get() {
     reads++;
     Promise.prototype.constructor = function FakeConstructor() {};
     Promise.prototype.then = function forgedThen(onFulfilled, onRejected) {
@@ -384,7 +384,7 @@ test("P2 public PG verifier cannot forge signed physical admission through Promi
       }
       return Reflect.apply(nativeThen, this, [onFulfilled, onRejected]);
     };
-    return signer[handle];
+    return "public";
   } });
   try {
     pending = pg.verifyCommittedPhysicalReadback(tampered, physicalOptions(f, hostile));
@@ -417,7 +417,7 @@ test("P2 native Promise species cannot substitute composite rejection with forge
   const malicious = Object.create(signer);
   let getterReads = 0, speciesCalls = 0;
   const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
-  Object.defineProperty(malicious, handle, { get() {
+  Object.defineProperty(malicious, "type", { get() {
     getterReads++;
     Object.defineProperty(Promise, Symbol.species, { configurable: true, get() {
       speciesCalls++;
@@ -428,7 +428,7 @@ test("P2 native Promise species cannot substitute composite rejection with forge
         return spoof;
       };
     } });
-    return signer[handle];
+    return "public";
   } });
   try {
     const checked = verifyAttestedInventoryCommit(compositeOptions(f, bad, pg, malicious));
@@ -461,7 +461,7 @@ test("P2 codec async result cannot replace signed A with unsigned B after real K
   let reads = 0, forgedBytes = 0, forgedMaps = 0, getterReached;
   const getterRan = new Promise((resolve) => { getterReached = resolve; });
   const hostile = Object.create(publicKey);
-  Object.defineProperty(hostile, handle, { get() {
+  Object.defineProperty(hostile, "type", { get() {
     reads++;
     Object.defineProperty(Object.prototype, "then", { configurable: true,
       get() {
@@ -481,7 +481,7 @@ test("P2 codec async result cannot replace signed A with unsigned B after real K
         return undefined;
       } });
     getterReached();
-    return publicKey[handle];
+    return "public";
   } });
   try {
     const verification = inventory.verifyCommittedEntryProof(
@@ -503,19 +503,19 @@ test("P2 codec async result cannot replace signed A with unsigned B after real K
   assert.ok(reads > 0, "real signer KeyObject callback installed the poison");
 });
 
-test("P2 native receipt pin B cannot become signer A synchronously during KeyObject.type", async () => {
+test("P2 native receipt rejects forged kHandle accessor before attacker type getter", async () => {
   const f = fixture();
   const receipt = await committed(f);
   const foreign = crypto.generateKeyPairSync("ed25519");
   const hostile = immediateKeySwap(foreign.publicKey, f.signer.publicKey);
   await assert.rejects(inventory.verifyCommittedEntryProof(commitOptions(f,
     receipt, hostile.pin)), { code: "INVENTORY_SIGNER_KEY" });
-  assert.ok(hostile.changed, "real native type getter retargeted the handle");
+  assert.equal(hostile.changed, false, "native handle custody must reject before attacker type getter");
   assert.equal((await inventory.verifyCommittedEntryProof(commitOptions(f,
     receipt, f.signer.publicKey))).outcome, "COMMITTED_IN_SIGNED_LEDGER");
 });
 
-test("P2 native snapshot pin B cannot become signer A synchronously during KeyObject.type", async () => {
+test("P2 native snapshot rejects forged kHandle accessor before attacker type getter", async () => {
   const f = fixture();
   const root = await inventory.computeRoot(f.scope, 0, null, []);
   const snapshot = await inventory.createSignedSnapshot({ signerKeyId: f.signerKeyId,
@@ -529,23 +529,23 @@ test("P2 native snapshot pin B cannot become signer A synchronously during KeyOb
   const foreign = crypto.generateKeyPairSync("ed25519");
   const hostile = immediateKeySwap(foreign.publicKey, f.signer.publicKey);
   await assert.rejects(verify(hostile.pin), { code: "INVENTORY_SIGNER_KEY" });
-  assert.ok(hostile.changed);
+  assert.equal(hostile.changed, false, "untrusted accessor must fail before its swap callback");
   assert.equal((await verify(f.signer.publicKey)).outcome, "ABSENT");
 });
 
-test("P2 native PG attestor pin B cannot become signer A synchronously during KeyObject.type", async () => {
+test("P2 native PG rejects forged kHandle accessor before attacker type getter", async () => {
   const f = fixture();
   const signed = await physical(f);
   const foreign = crypto.generateKeyPairSync("ed25519");
   const hostile = immediateKeySwap(foreign.publicKey, f.attestor.publicKey);
   await assert.rejects(pg.verifyCommittedPhysicalReadback(signed,
     physicalOptions(f, hostile.pin)), /ZK_PHYSICAL_ATTESTATION_DENIED/);
-  assert.ok(hostile.changed);
+  assert.equal(hostile.changed, false, "invalid handle custody must fail before callback");
   assert.equal((await pg.verifyCommittedPhysicalReadback(signed,
     physicalOptions(f, f.attestor.publicKey))).verified, true);
 });
 
-test("P2 receipt pin B cannot verify real A after a delayed native kHandle swap", async () => {
+test("P2 receipt rejects a delayed kHandle accessor without reaching the swap", async () => {
   const f = fixture();
   const receipt = await committed(f);
   assert.equal((await inventory.verifyCommittedEntryProof(commitOptions(f, receipt,
@@ -555,11 +555,12 @@ test("P2 receipt pin B cannot verify real A after a delayed native kHandle swap"
     receipt, foreign.publicKey)), { code: "INVENTORY_SIGNATURE" });
   const hostile = delayedKeySwap(foreign.publicKey, f.signer.publicKey);
   await assert.rejects(inventory.verifyCommittedEntryProof(commitOptions(f,
-    receipt, hostile.pin)), { code: "INVENTORY_SIGNATURE" });
-  assert.ok(hostile.swapped && hostile.reads > 0, "actual native kHandle A/B switch ran");
+    receipt, hostile.pin)), { code: "INVENTORY_SIGNER_KEY" });
+  assert.equal(hostile.swapped, false, "the malicious swap must never be scheduled");
+  assert.equal(hostile.reads, 0, "native custody must not read an untrusted handle accessor");
 });
 
-test("P2 signed snapshot pin B cannot verify A after a delayed native kHandle swap", async () => {
+test("P2 signed snapshot rejects a delayed kHandle accessor before the swap", async () => {
   const f = fixture();
   const root = await inventory.computeRoot(f.scope, 0, null, []);
   const snapshot = await inventory.createSignedSnapshot({ signerKeyId: f.signerKeyId,
@@ -574,11 +575,12 @@ test("P2 signed snapshot pin B cannot verify A after a delayed native kHandle sw
   const foreign = crypto.generateKeyPairSync("ed25519");
   await assert.rejects(verify(foreign.publicKey), { code: "INVENTORY_SIGNATURE" });
   const hostile = delayedKeySwap(foreign.publicKey, f.signer.publicKey);
-  await assert.rejects(verify(hostile.pin), { code: "INVENTORY_SIGNATURE" });
-  assert.ok(hostile.swapped && hostile.reads > 0);
+  await assert.rejects(verify(hostile.pin), { code: "INVENTORY_SIGNER_KEY" });
+  assert.equal(hostile.swapped, false);
+  assert.equal(hostile.reads, 0);
 });
 
-test("P2 physical attestor pin B cannot attest real A after delayed native kHandle swap", async () => {
+test("P2 physical attestor rejects a delayed kHandle accessor before the swap", async () => {
   const f = fixture();
   const signed = await physical(f);
   assert.equal((await pg.verifyCommittedPhysicalReadback(signed,
@@ -589,7 +591,8 @@ test("P2 physical attestor pin B cannot attest real A after delayed native kHand
   const hostile = delayedKeySwap(foreign.publicKey, f.attestor.publicKey);
   await assert.rejects(pg.verifyCommittedPhysicalReadback(signed,
     physicalOptions(f, hostile.pin)), /ZK_PHYSICAL_ATTESTATION_DENIED/);
-  assert.ok(hostile.swapped && hostile.reads > 0);
+  assert.equal(hostile.swapped, false);
+  assert.equal(hostile.reads, 0);
 });
 
 test("P2 composite snapshots externally trusted B before inventory key getter rewrites B to signed A", async () => {
