@@ -125,9 +125,11 @@ constexpr CF_CALLBACK_REGISTRATION kCallbacks[] = {
 int wmain(int argc, wchar_t** argv) {
   if (argc != 3 || (std::wcscmp(argv[1], L"--disposable-live") != 0
       && std::wcscmp(argv[1], L"--disposable-live-stdin") != 0
-      && std::wcscmp(argv[1], L"--disposable-live-alias") != 0)) return 2;
+      && std::wcscmp(argv[1], L"--disposable-live-alias") != 0
+      && std::wcscmp(argv[1], L"--disposable-native-names") != 0)) return 2;
   const bool streamed = std::wcscmp(argv[1], L"--disposable-live-stdin") == 0;
   const bool aliasMode = std::wcscmp(argv[1], L"--disposable-live-alias") == 0;
+  const bool nameMode = std::wcscmp(argv[1], L"--disposable-native-names") == 0;
   const wchar_t* root = argv[2];
   if (!root || std::wcslen(root) < 8 || std::wcslen(root) > 4096
       || root[1] != L':' || root[2] != L'\\') return 3;
@@ -194,6 +196,7 @@ int wmain(int argc, wchar_t** argv) {
   bool finalCloudReparse = false;
   bool finalOwnerAcl = false;
   bool alienAliasDenied = false;
+  unsigned unsafeNameDenials = 0;
   bool nativeRelativeOpen = false;
   DWORD finalTag = 0;
   int exitCode = 8;
@@ -219,6 +222,22 @@ int wmain(int argc, wchar_t** argv) {
     ScopedHandle original(INVALID_HANDLE_VALUE);
     if (!openNativeCloudChild(held.handle, L"payload.bin", original.value)) break;
     nativeRelativeOpen = true;
+    if (nameMode) {
+      // All of these names would be dangerous if a future RootSession simply
+      // used Win32's default case-insensitive or DOS-short-name resolution.
+      const wchar_t* invalid[] = { L"PAYLOAD.BIN", L"payload~1.bin",
+        L"..\\payload.bin", L"payload.bin:stream", L"payload.bin.", L"payload.bin ",
+        L"*", L"" };
+      for (const auto* name : invalid) {
+        HANDLE alien = INVALID_HANDLE_VALUE;
+        if (openNativeCloudChild(held.handle, name, alien)) {
+          if (alien != INVALID_HANDLE_VALUE) CloseHandle(alien);
+          break;
+        }
+        ++unsafeNameDenials;
+      }
+      if (unsafeNameDenials != sizeof(invalid) / sizeof(invalid[0])) break;
+    }
     BY_HANDLE_FILE_INFORMATION physical{};
     if (!GetFileInformationByHandle(original.value, &physical)
         || physical.nNumberOfLinks != 1
@@ -291,7 +310,7 @@ int wmain(int argc, wchar_t** argv) {
     "\"rejectedTransfers\":%u,\"verifiedBytes\":%zu,"
     "\"finalRootIdentity\":%s,\"finalAncestorsHeld\":%s,\"finalRootPolicy\":%s,"
     "\"finalCloudReparse\":%s,\"finalOwnerAcl\":%s,\"alienAliasDenied\":%s,"
-    "\"nativeRelativeOpen\":%s,"
+    "\"nativeRelativeOpen\":%s,\"unsafeNameDenials\":%u,"
     "\"finalReparseTag\":%lu,"
     "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
     context.callbacks, context.successful, context.rejected, context.payload.size(),
@@ -299,7 +318,7 @@ int wmain(int argc, wchar_t** argv) {
     finalPolicy ? "true" : "false",
     finalCloudReparse ? "true" : "false", finalOwnerAcl ? "true" : "false",
     alienAliasDenied ? "true" : "false",
-    nativeRelativeOpen ? "true" : "false", finalTag,
+    nativeRelativeOpen ? "true" : "false", unsafeNameDenials, finalTag,
     SUCCEEDED(unregisterResult) ? "true" : "false",
     exitCode == 0 ? "true" : "false");
   return exitCode;

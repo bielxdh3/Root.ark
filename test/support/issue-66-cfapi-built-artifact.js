@@ -133,9 +133,10 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
     "../../sync-client/rootark-sync-windows-cfapi-root-policy.hpp");
   const nativeRoot = path.resolve(__dirname,
     "../../sync-client/rootark-sync-windows-native-root-session.hpp");
+  // The inherit-only fixture includes the production preflight translation
+  // unit, so it transitively consumes both native headers too.
   const dependencies = ["acl-preflight.exe", "inherit-only-fixture.exe", "live-fetch.exe"]
-    .includes(name) ? ["acl-preflight.exe", "live-fetch.exe"].includes(name)
-      ? [sharedPolicy, nativeRoot] : [sharedPolicy] : [];
+    .includes(name) ? [sharedPolicy, nativeRoot] : [];
   for (const filename of [vcvars, source, ...dependencies,
     executable, objectFile, pdbFile]) {
     assert.doesNotMatch(filename, /[\r\n\x00-\x1f\x7f"%!^&|<>]/, FAIL);
@@ -204,7 +205,8 @@ function validateFixtureArgs(name, scratch, args) {
       || (["--connect", "--register", "--hydrate"].includes(values[0]) && scope());
   } else if (name === "live-fetch.exe") {
     allowed = values.length === 2
-      && ["--disposable-live", "--disposable-live-stdin", "--disposable-live-alias"].includes(values[0])
+      && ["--disposable-live", "--disposable-live-stdin", "--disposable-live-alias",
+        "--disposable-native-names"].includes(values[0])
       && comparable(values[1]) === comparable(path.join(scratch, "owner-only"));
   }
   assert.ok(allowed, FAIL);

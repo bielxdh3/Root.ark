@@ -157,16 +157,63 @@ struct HeldAncestors {
 // The caller retains both parent and returned child handles across its I/O.
 // This is a read-only RootSession primitive: no signed object or write trust
 // is inferred from a successful open alone.
+bool exactHeldChildFileId(HANDLE directory, const wchar_t* expected,
+    std::size_t count, ULONGLONG& id) {
+  constexpr DWORD kBufferSize = 64 * 1024;
+  constexpr std::size_t kMinEntry = offsetof(FILE_ID_BOTH_DIR_INFO, FileName);
+  std::vector<unsigned char> bytes(kBufferSize);
+  bool restart = true;
+  bool found = false;
+  for (;;) {
+    const auto info = restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo;
+    restart = false;
+    if (!GetFileInformationByHandleEx(directory, info, bytes.data(), kBufferSize)) {
+      return GetLastError() == ERROR_NO_MORE_FILES && found;
+    }
+    std::size_t at = 0;
+    for (;;) {
+      if (at > kBufferSize || kBufferSize - at < kMinEntry) return false;
+      const auto* item = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(bytes.data() + at);
+      const auto next = item->NextEntryOffset;
+      const std::size_t available = next ? next : kBufferSize - at;
+      if (available < kMinEntry || available > kBufferSize - at
+          || !item->FileNameLength || item->FileNameLength % sizeof(WCHAR) != 0
+          || item->FileNameLength > available - kMinEntry) return false;
+      const int itemChars = static_cast<int>(item->FileNameLength / sizeof(WCHAR));
+      const bool exact = static_cast<std::size_t>(itemChars) == count
+        && std::memcmp(item->FileName, expected, item->FileNameLength) == 0;
+      const int comparison = CompareStringOrdinal(item->FileName, itemChars,
+        expected, static_cast<int>(count), TRUE);
+      // A case-only alternate directory entry cannot alias a portable file
+      // identity, and a DOS short name must not silently select another inode.
+      if (comparison == 0 || (comparison == CSTR_EQUAL && !exact)) return false;
+      if (exact) {
+        if (found) return false;
+        found = true;
+        id = static_cast<ULONGLONG>(item->FileId.QuadPart);
+      }
+      if (!next) break;
+      if (next < kMinEntry + sizeof(WCHAR) || next % sizeof(ULONG) != 0) return false;
+      at += next;
+    }
+  }
+}
+
 bool openNativeCloudChild(HANDLE parent, const wchar_t* exactName, HANDLE& child) {
   child = INVALID_HANDLE_VALUE;
   if (!parent || parent == INVALID_HANDLE_VALUE || !exactName) return false;
-  const std::size_t count = std::wcslen(exactName);
+  std::size_t count = 0;
+  while (count <= 255 && exactName[count] != L'\0') ++count;
   if (!count || count > 255 || exactName[0] == L'.'
     || exactName[count - 1] == L'.' || exactName[count - 1] == L' ') return false;
   for (std::size_t i = 0; i < count; ++i) {
     if (exactName[i] == L'\\' || exactName[i] == L'/' || exactName[i] == L':'
+      || exactName[i] == L'*' || exactName[i] == L'?' || exactName[i] == L'"'
+      || exactName[i] == L'<' || exactName[i] == L'>' || exactName[i] == L'|'
       || exactName[i] < 0x20) return false;
   }
+  ULONGLONG listedId = 0;
+  if (!exactHeldChildFileId(parent, exactName, count, listedId)) return false;
   FILE_ID_INFO parentId{};
   if (!GetFileInformationByHandleEx(parent, FileIdInfo, &parentId, sizeof(parentId))) return false;
   HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -205,7 +252,9 @@ bool openNativeCloudChild(HANDLE parent, const wchar_t* exactName, HANDLE& child
     && !(tags.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
     && (tags.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
     && (tags.ReparseTag & 0xFFFF0FFFUL) == IO_REPARSE_TAG_CLOUD
-    && fileInfo.nNumberOfLinks == 1;
+    && fileInfo.nNumberOfLinks == 1
+    && ((static_cast<ULONGLONG>(fileInfo.nFileIndexHigh) << 32)
+      | fileInfo.nFileIndexLow) == listedId;
   if (!trusted) { CloseHandle(opened); return false; }
   child = opened;
   return true;
