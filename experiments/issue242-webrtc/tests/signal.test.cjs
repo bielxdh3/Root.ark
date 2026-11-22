@@ -175,3 +175,58 @@ test('room expires even when idle, and rejected consent cannot forward SDP', asy
   assert.equal((await host.next('error')).code, 'ROOM_CLOSED');
   assert.equal((await guest.next('error')).code, 'ROOM_CLOSED');
 });
+
+test('P2: a stalled signaling recipient is evicted without blocking healthy peers', async t => {
+  const serverSockets = [];
+  const originalEmit = WebSocket.WebSocketServer.prototype.emit;
+  WebSocket.WebSocketServer.prototype.emit = function (name, ...args) {
+    if (name === 'connection') serverSockets.push(args[0]);
+    return originalEmit.call(this, name, ...args);
+  };
+  t.after(() => { WebSocket.WebSocketServer.prototype.emit = originalEmit; });
+
+  const h = await setup(t);
+  const { roomId, hostKey } = await h.room();
+  const host = await h.connect();
+  host.send({ type: 'join', roomId, hostKey });
+  const hp = await host.next('joined');
+  host.send({ type: 'invite' });
+  const invite = await host.next('invited');
+  const guest = await h.connect();
+  guest.send({ type: 'join', roomId, invitation: invite.invitation });
+  const gp = await guest.next('joined');
+  await host.next('peer-joined');
+  host.send({ type: 'request-peer', to: gp.peerId });
+  const request = await guest.next('peer-request');
+  guest.send({ type: 'consent', requestId: request.requestId, accept: true });
+  await host.next('peer-accepted');
+  await guest.next('peer-allowed');
+
+  // Positive control: normal consented signaling reaches the recipient.
+  host.send({ type: 'signal', to: gp.peerId, signal: { kind: 'ice', candidate: { candidate: 'normal' } } });
+  assert.equal((await guest.next('signal')).signal.candidate.candidate, 'normal');
+
+  // Model a remote client that has stopped consuming its transport: the server
+  // sees a fixed queued-byte count, irrespective of socket/network scheduling.
+  assert.equal(serverSockets.length, 2);
+  Object.defineProperty(serverSockets[1], 'bufferedAmount', { configurable: true, value: 512 * 1024 });
+  host.send({ type: 'signal', to: gp.peerId, signal: { kind: 'ice', candidate: { candidate: 'flood' } } });
+  assert.equal((await host.next('peer-left')).peerId, gp.peerId,
+    'stalled recipient must be evicted instead of accumulating an unbounded send queue');
+
+  // The same room stays usable for a freshly invited, consenting recipient.
+  host.send({ type: 'invite' });
+  const replacementInvite = await host.next('invited');
+  const replacement = await h.connect();
+  replacement.send({ type: 'join', roomId, invitation: replacementInvite.invitation });
+  const rp = await replacement.next('joined');
+  await host.next('peer-joined');
+  host.send({ type: 'request-peer', to: rp.peerId });
+  const replacementRequest = await replacement.next('peer-request');
+  replacement.send({ type: 'consent', requestId: replacementRequest.requestId, accept: true });
+  await host.next('peer-accepted');
+  await replacement.next('peer-allowed');
+  host.send({ type: 'signal', to: rp.peerId, signal: { kind: 'ice', candidate: { candidate: 'healthy' } } });
+  assert.equal((await replacement.next('signal')).signal.candidate.candidate, 'healthy');
+  assert.equal(hp.role, 'host');
+});

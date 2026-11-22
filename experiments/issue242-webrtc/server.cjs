@@ -13,6 +13,7 @@ const UNJOINED_ROOM_TTL_MS = 15_000;
 const MAX_ACTIVE_ROOMS_PER_OWNER = 2;
 const INVITE_TTL_MS = 60_000;
 const MAX_SIGNAL_BYTES = 16_384;
+const MAX_OUTBOUND_BUFFER_BYTES = 512 * 1024;
 const token = () => randomBytes(32).toString('hex');
 const shortId = () => randomBytes(8).toString('hex');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -51,7 +52,15 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     return false;
   }
   function send(ws, data) {
-    if (ws.readyState === WebSocket.OPEN && sessionCurrent(ws)) ws.send(JSON.stringify(data));
+    if (ws.readyState !== WebSocket.OPEN || !sessionCurrent(ws)) return;
+    const payload = JSON.stringify(data);
+    // One non-reading recipient must not exhaust signaling transport memory.
+    if (ws.bufferedAmount + Buffer.byteLength(payload) > MAX_OUTBOUND_BUFFER_BYTES) {
+      ws.terminate();
+      removePeer(ws);
+      return;
+    }
+    ws.send(payload);
   }
   function error(ws, code) { send(ws, { type: 'error', code }); }
   function roomOf(ws) {
