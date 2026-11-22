@@ -115,6 +115,167 @@ test("issue 66: exclusion cannot evict a pinned file, and a missing pinned file 
   assert.equal((await restarted.pinStatus("docs/a.txt")).pinned, true);
 });
 
+test("issue 66 P2 RED: missing pinned descendant cannot leave an ancestor DELETE in signed outbox", async (t) => {
+  const { rootDir, open, state, remote } = await fixture(t);
+  const client = await open();
+  await client.apply(await remote("create", "object-directory", "docs", "", 1,
+    undefined, "inode/directory"));
+  await client.pinLocal("docs/a.txt");
+  assert.deepEqual(Object.keys(client.snapshot.files).slice(0, 2), ["docs", "docs/a.txt"],
+    "tracked directory must precede its pinned child to reproduce the ordering hazard");
+  const priorFiles = structuredClone(client.snapshot.files);
+  const beforeJournal = await fsp.readFile(client.journal.filePath);
+  const snapshotPath = path.join(rootDir, ".rootark-sync-index.json");
+  const beforeDisk = await fsp.readFile(snapshotPath);
+
+  await fsp.rm(path.join(rootDir, "docs"), { recursive: true, force: true });
+  await assert.rejects(client.reconcileLocal(), { code: "pinned_file_missing" });
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal,
+    "failed pinned descendant preflight cannot durably enqueue ancestor DELETE");
+  assert.deepEqual(client.snapshot.files, priorFiles,
+    "failed reconciliation cannot stage a directory tombstone even in memory");
+  assert.deepEqual(await fsp.readFile(snapshotPath), beforeDisk);
+  assert.equal((await client.journal.recover()).some((op) => op.operation === "delete"
+    && op.metadata?.path === "docs"), false, "no delayed ancestor DELETE may be dispatched");
+  await fsp.mkdir(path.join(rootDir, "docs"), { recursive: true });
+  await fsp.writeFile(path.join(rootDir, "docs/a.txt"), "authenticated remote bytes");
+  await (await open()).syncOnce();
+  assert.equal(state.pushes, 0, "restoring the missing pin must not transmit any latent directory tombstone");
+});
+
+test("issue 66 P2 RED: enqueueChange rejects pinned DELETE without poisoning restart snapshot", async (t) => {
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  await client.pinLocal("docs/a.txt");
+  const prior = client.snapshot.files["docs/a.txt"];
+  assert.equal((await client.pinStatus("docs/a.txt")).pinned, true);
+  const snapshotPath = path.join(rootDir, ".rootark-sync-index.json");
+  const beforeDisk = await fsp.readFile(snapshotPath);
+  const beforeJournal = await fsp.readFile(client.journal.filePath);
+
+  await assert.rejects(client.enqueueChange({ operation: "delete",
+    objectId: prior.objectId, fileId: prior.fileId,
+    versionId: crypto.randomUUID(), baseRevision: prior.revision,
+    revision: { counter: prior.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/a.txt" } }), { code: "file_pinned" });
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal,
+    "public enqueue entry point cannot persist a forbidden signed DELETE");
+  assert.deepEqual(await fsp.readFile(snapshotPath), beforeDisk,
+    "failed public enqueue must preserve a reopenable pinned snapshot");
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true,
+    "a rejected local mutation may not poison CLI pin status after restart");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2 peer RED: excluded missing pinned child cannot enqueue selected ancestor DELETE", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  const initial = await open();
+  await initial.apply(await remote("create", "object-directory", "docs", "", 1,
+    undefined, "inode/directory"));
+  await initial.pinLocal("docs/a.txt");
+  const excluded = await open(["docs/a.txt"]);
+  const priorJournal = await fsp.readFile(excluded.journal.filePath);
+  const priorSnapshot = await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"));
+  await fsp.rm(path.join(rootDir, "docs"), { recursive: true, force: true });
+  await assert.rejects(excluded.reconcileLocal(), { code: "pinned_file_missing" },
+    "excluding a pinned child must not authorize the selected parent deletion");
+  assert.deepEqual(await fsp.readFile(excluded.journal.filePath), priorJournal,
+    "no delayed ancestor DELETE may be signed while the child is missing");
+  assert.deepEqual(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json")), priorSnapshot);
+  assert.equal((await excluded.journal.recover()).some((operation) =>
+    operation.operation === "delete" && operation.metadata?.path === "docs"), false);
+});
+
+test("issue 66 P2 peer RED: direct directory CREATE cannot replace pinned ancestor identity", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  const client = await open();
+  await client.apply(await remote("create", "object-directory", "docs", "", 1,
+    undefined, "inode/directory"));
+  await client.pinLocal("docs/a.txt");
+  const priorJournal = await fsp.readFile(client.journal.filePath);
+  const priorSnapshot = await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"));
+  await assert.rejects(client.enqueueChange({ operation: "create", objectId: "other-directory",
+    fileId: "other-file", versionId: crypto.randomUUID(), baseRevision: null,
+    revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "docs", contentType: "inode/directory" }, plaintext: Buffer.alloc(0) }),
+  { code: "file_pinned" }, "pinned child must not tolerate a conflicting parent directory identity");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), priorJournal);
+  assert.deepEqual(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json")), priorSnapshot);
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+});
+
+test("issue 66 P2 peer RED: pending pinned UPDATE cannot hide a missing child before ancestor DELETE", async (t) => {
+  const { rootDir, open, remote, state } = await fixture(t);
+  const client = await open();
+  await client.apply(await remote("create", "object-directory", "docs", "", 1,
+    undefined, "inode/directory"));
+  await client.pinLocal("docs/a.txt");
+  const prior = client.snapshot.files["docs/a.txt"];
+  await client.enqueueChange({ operation: "update", objectId: prior.objectId,
+    fileId: prior.fileId, versionId: crypto.randomUUID(),
+    baseRevision: prior.revision,
+    revision: { counter: prior.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/a.txt" }, plaintext: Buffer.from("pending signed update") });
+  assert.equal((await client.journal.recover()).some((op) => op.operation === "update"
+    && op.metadata?.path === "docs/a.txt"), true,
+  "fixture must contain a genuine signed pending child UPDATE");
+  const beforeJournal = await fsp.readFile(client.journal.filePath);
+  const indexPath = path.join(rootDir, ".rootark-sync-index.json");
+  const beforeIndex = await fsp.readFile(indexPath);
+  const beforeFiles = structuredClone(client.snapshot.files);
+
+  await fsp.rm(path.join(rootDir, "docs"), { recursive: true, force: true });
+  await assert.rejects(client.reconcileLocal(), { code: "pinned_file_missing" },
+    "a pending UPDATE cannot exempt a missing pin when its tracked parent is deleted");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal,
+    "the failed group preflight preserves only the existing signed UPDATE");
+  assert.deepEqual(await fsp.readFile(indexPath), beforeIndex);
+  assert.deepEqual(client.snapshot.files, beforeFiles);
+  assert.equal((await client.journal.recover()).some((op) => op.operation === "delete"
+    && op.metadata?.path === "docs"), false);
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2 peer RED: case-alias directory CREATE cannot adopt a pinned descendant", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  const client = await open();
+  await client.apply(await remote("create", "object-directory", "docs", "", 1,
+    undefined, "inode/directory"));
+  await client.pinLocal("docs/a.txt");
+  const tracked = client.snapshot.files.docs;
+  assert.ok(tracked?.directory);
+  const beforeJournal = await fsp.readFile(client.journal.filePath);
+  const indexPath = path.join(rootDir, ".rootark-sync-index.json");
+  const beforeIndex = await fsp.readFile(indexPath);
+  await assert.rejects(client.enqueueChange({ operation: "create",
+    objectId: tracked.objectId, fileId: tracked.fileId,
+    versionId: crypto.randomUUID(), baseRevision: null,
+    revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "DOCS", contentType: "inode/directory" },
+    plaintext: Buffer.alloc(0) }), { code: "file_pinned" },
+  "matching object identity cannot authorize an alternate-case ancestor of a pin");
+  assert.deepEqual(await fsp.readFile(client.journal.filePath), beforeJournal);
+  assert.deepEqual(await fsp.readFile(indexPath), beforeIndex);
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+});
+
+test("issue 66: a real untracked ancestor can be enrolled without replacing a pinned file", async (t) => {
+  const { rootDir, open } = await fixture(t);
+  const client = await open();
+  await client.pinLocal("docs/a.txt");
+  assert.equal(client.snapshot.files.docs, undefined,
+    "hydrating the child can create a physical parent before its sync identity arrives");
+  assert.equal((await fsp.lstat(path.join(rootDir, "docs"))).isDirectory(), true);
+  const operation = await client.enqueueChange({ operation: "create",
+    objectId: "directory-object", fileId: "directory-file", versionId: crypto.randomUUID(),
+    baseRevision: null, revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "docs", contentType: "inode/directory" },
+    plaintext: Buffer.alloc(0) });
+  assert.equal(operation.operation, "create");
+  assert.equal(client.snapshot.files.docs.objectId, "directory-object");
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, true);
+});
+
 test("issue 66: excluded file is evicted after explicit unpin, without remote DELETE", async (t) => {
   const { rootDir, open, state } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
@@ -304,13 +465,13 @@ test("issue 66 P2 POSIX: signed legacy case-alias files cannot create a second d
 
 // Force the exact post-rename directory durability barrier to fail, not an
 // early JSON write: at this point the new snapshot is already visible on disk.
-function interceptSnapshotDirectoryFsync(t, directory, failures) {
+function interceptSnapshotDirectoryFsync(t, directory, failures, enabled = () => true) {
   const realOpen = fsp.open;
   let injected = 0;
   fsp.open = async (...args) => {
     const handle = await realOpen(...args);
     if (String(args[0]) !== directory || args[1] !== fs.constants.O_RDONLY
-      || injected >= failures) return handle;
+      || injected >= failures || !enabled()) return handle;
     injected++;
     return {
       close: () => handle.close(),
@@ -320,6 +481,100 @@ function interceptSnapshotDirectoryFsync(t, directory, failures) {
   t.after(() => { fsp.open = realOpen; });
   return { restore: () => { fsp.open = realOpen; }, count: () => injected };
 }
+
+// Cross-platform equivalent of a post-rename fsync/lstat failure: first let
+// the REAL durable snapshot transaction finish, then throw as its caller
+// resumes. This proves a failed PIN cannot leave opposite policies in memory
+// and on disk even where Windows does not support directory fsync.
+function failAfterDurablePinCommit(t, client, count) {
+  const original = client.persistSnapshot;
+  let injected = 0;
+  let armed = false;
+  client.persistSnapshot = async function (...args) {
+    const result = await original.apply(this, args);
+    armed ||= Object.values(client.snapshot.pinnedFiles || {}).some((pin) => pin.objectId === "object-a");
+    if (armed && injected < count) {
+      injected++;
+      throw Object.assign(new Error("simulated failure after real PIN disk commit"), { code: "EIO" });
+    }
+    return result;
+  };
+  t.after(() => { client.persistSnapshot = original; });
+  return { count: () => injected };
+}
+
+test("issue 66 P2 cross-platform: completed PIN disk write then thrown EIO rolls back durably", async (t) => {
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  const injected = failAfterDurablePinCommit(t, client, 1);
+  await assert.rejects(client.pinLocal("docs/a.txt"), { code: "EIO" });
+  assert.equal(injected.count(), 1, "must throw after first real pinned snapshot was written");
+  assert.equal((await client.pinStatus("docs/a.txt")).pinned, false);
+  const onDisk = JSON.parse(await fsp.readFile(path.join(rootDir, ".rootark-sync-index.json"), "utf8"));
+  assert.deepEqual(onDisk.pinnedFiles || {}, {},
+    "failed pin may not persist a policy the process denies");
+  assert.equal((await (await open()).pinStatus("docs/a.txt")).pinned, false);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2 cross-platform: failed PIN rollback holds recovery lock", async (t) => {
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  const injected = failAfterDurablePinCommit(t, client, 2);
+  await assert.rejects(client.pinLocal("docs/a.txt"), { code: "pinned_policy_indeterminate" });
+  assert.equal(injected.count(), 2, "failed initial PIN and failed compensation both write to disk");
+  await assert.rejects(client.evictLocal("docs/a.txt"), { code: "sync_root_busy" });
+  await assert.rejects(open(), { code: "sync_root_busy" });
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"), "authenticated remote bytes");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: failed post-rename PIN fsync compensates disk and memory together", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX directory fsync failure boundary");
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  // Reach the actual pin-policy commit, not an earlier signed hydration fsync.
+  let armed = false;
+  const injector = interceptSnapshotDirectoryFsync(t, rootDir, 1, () => {
+    armed ||= Object.values(client.snapshot.pinnedFiles || {}).some((pin) => pin.objectId === "object-a");
+    return armed;
+  });
+  try {
+    await assert.rejects(client.pinLocal("docs/a.txt"), { code: "EIO" });
+    assert.equal(injector.count(), 1, "the failed barrier followed the pinned snapshot rename");
+  } finally { injector.restore(); }
+  assert.equal((await client.pinStatus("docs/a.txt")).pinned, false,
+    "a failed pin cannot leave a phantom in-memory retention policy");
+  const resumed = await open();
+  assert.equal((await resumed.pinStatus("docs/a.txt")).pinned, false,
+    "post-rename failure must not leave a different durable retention policy");
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes", "failed pin compensation must preserve hydrated bytes");
+  assert.equal(state.pushes, 0);
+});
+
+test("issue 66 P2: failed PIN compensation quarantines the root before a local eviction", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX directory fsync failure boundary");
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  let armed = false;
+  const injector = interceptSnapshotDirectoryFsync(t, rootDir, 2, () => {
+    armed ||= Object.values(client.snapshot.pinnedFiles || {}).some((pin) => pin.objectId === "object-a");
+    return armed;
+  });
+  try {
+    await assert.rejects(client.pinLocal("docs/a.txt"), { code: "pinned_policy_indeterminate" });
+    assert.equal(injector.count(), 2, "both PIN commit and compensation failed after rename");
+  } finally { injector.restore(); }
+  await assert.rejects(client.evictLocal("docs/a.txt"), { code: "sync_root_busy" },
+    "the same process must not evict while its retained PIN is indeterminate");
+  await assert.rejects(open(), { code: "sync_root_busy" },
+    "a second process must not assume the partially committed PIN was removed");
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes");
+  assert.equal(state.pushes, 0);
+});
 
 test("issue 66 P2 POSIX: post-rename unpin fsync EIO compensates durable pin before allowing restart", async (t) => {
   if (process.platform === "win32") return t.skip("POSIX directory fsync failure boundary");
@@ -1582,4 +1837,44 @@ test("issue 66 #278 P2: pinStatus listing passes known pins without quadratic re
   } finally {
     Object.values = realValues;
   }
+});
+
+test("issue 66 #292+#286: independently signed 409 leaves a verified remote tombstone unconsumed", async (t) => {
+  const { rootDir, open, adapter, remote, state } = await fixture(t);
+  const client = await open();
+  await client.pinLocal("docs/a.txt");
+  // A second independently signed object is locally hydrated, then deleted
+  // remotely. Its tombstone would normally retire that clean cached file.
+  await client.apply(await remote("create", "object-b", "docs/b.txt", "second signed bytes"));
+  const bPath = path.join(rootDir, "docs/b.txt");
+  assert.equal(await fsp.readFile(bPath, "utf8"), "second signed bytes");
+  await remote("delete", "object-b", "docs/b.txt", "", 2);
+
+  const originalA = state.records.get("object-a");
+  const aFile = client.snapshot.files["docs/a.txt"];
+  await client.enqueueChange({
+    operation: "update", objectId: aFile.objectId, fileId: aFile.fileId,
+    versionId: crypto.randomUUID(), baseRevision: aFile.revision,
+    revision: { counter: aFile.revision.counter + 1, deviceId: "device-a" },
+    metadata: { path: "docs/a.txt" }, plaintext: Buffer.from("signed pending update"),
+  });
+  const originalOutbox = await client.journal.recover();
+  assert.equal(originalOutbox.length, 1, "fixture must have an actual signed pending UPDATE");
+  let conflicts = 0;
+  adapter.push = async () => {
+    conflicts++;
+    return { status: 409, current: originalA, code: "sync_conflict" };
+  };
+  const inventoryBefore = state.inventoryReads;
+  const summary = await client.syncOnce();
+  assert.equal(conflicts, 1, "must process the real 409 callback path");
+  assert.equal(summary.indeterminate, 1,
+    "an old signed winner is not independent proof of CURRENT physical admission");
+  assert.equal(state.inventoryReads, inventoryBefore,
+    "the unresolved 409 must defer subsequent metadata and tombstone sweeps");
+  assert.equal(await fsp.readFile(bPath, "utf8"), "second signed bytes");
+  assert.equal(client.snapshot.files["docs/b.txt"].deleted, false);
+  assert.equal((await client.pinStatus("docs/a.txt")).pinned, true);
+  assert.deepEqual(await client.journal.recover(), originalOutbox,
+    "the original signed pending operation must remain durable and unchanged");
 });
