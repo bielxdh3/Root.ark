@@ -4228,14 +4228,6 @@ class SyncEngine {
         fail("Unresolved historical restore staging file requires explicit recovery",
           "restore_local_materialization_missing");
       }
-      // Recovery can return early when a missing/changed target leaves its
-      // recorded staging pathname behind. Never scan that file as a CREATE.
-      const remainingStage = await fsp.lstat(recordedPath, { bigint: true })
-        .catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
-      if (remainingStage) {
-        fail("Unresolved historical restore staging file requires explicit recovery",
-          "restore_local_materialization_missing");
-      }
     }
     const scanned = await this.scanFiles();
     const current = {};
