@@ -5,6 +5,9 @@ on:
     branches:
       - agent/pr286-picker-integration-w181-20261122
       - agent/pr292-move-picker-w181-20261122
+      - agent/mission-20261122-pr286-ci-prime-r1
+      - agent/pr295-picker-pin-w190-20261122
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,6 +26,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
+      # The picker suite imports the real ZK1/HPKE and encrypted sync engine.
+      # A bare checkout does not contain node_modules; always install the
+      # exact lockfile dependencies before running the unfiltered cases.
+      - name: Install pinned dependencies
+        run: npm ci
       - name: Verify all issue 66 picker, signed pin, MOVE and hydration contracts
         shell: bash
         run: |
