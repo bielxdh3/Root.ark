@@ -9,6 +9,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
+const { privateAuthorityDirectory } = require("./support/issue-65-private-authority-directory");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = process.env.SERVER_UNDER_TEST || path.join(ROOT, "server.js");
@@ -147,7 +148,7 @@ test("stop rejects when a process does not close after termination", { timeout: 
 });
 
 function fixture() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-webdav-crash-"));
+  const dir = privateAuthorityDirectory("rootark-webdav-crash-");
   fs.mkdirSync(path.join(dir, "data"));
   fs.mkdirSync(path.join(dir, "uploads"));
   fs.writeFileSync(path.join(dir, "data", "users.json"), JSON.stringify([{ username: "agent", password: bcrypt.hashSync("password", 10), role: "admin", permissions: { upload: true }, sessionVersion: 0 }]));
