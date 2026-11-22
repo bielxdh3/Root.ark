@@ -65,7 +65,8 @@ function createTapProgressRecorder(write) {
         ? ` aclStage=${pending.acl.stage} aclError=${pending.acl.code} aclTrust=${pending.acl.trust}` : "";
       const edge = pending.edge
         ? ` edgeStage=${pending.edge.stage} edgeError=${pending.edge.code}` : "";
-      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${acl}${edge}`);
+      const assertion = pending.assertionLine === null ? "" : ` assertionLine=${pending.assertionLine}`;
+      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${assertion}${acl}${edge}`);
       detailed++;
     } else if (pending.acl && verifiedAclOverflowDetails < 4) {
       // Numerous unrelated failed tests must not suppress the bounded, strictly
@@ -101,7 +102,7 @@ function createTapProgressRecorder(write) {
           const nameHash = hash(result[3]);
           write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
           pending = { index: result[2], nameHash, pathHash: "none",
-            failureType: "unknown", code: "unknown" };
+            failureType: "unknown", code: "unknown", assertionLine: null };
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
         }
@@ -111,6 +112,13 @@ function createTapProgressRecorder(write) {
         if (location) {
           const file = /(?:^|[\\/]+)test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js):\d+:\d+$/.exec(location[1]);
           if (file) pending.pathHash = hash(`test/${file[1]}`);
+        }
+        // Extract only an integer stack frame line for the already verified
+        // test file. Do not print stack content, private paths or assertions.
+        if (pending.pathHash !== "none" && pending.assertionLine === null) {
+          const frame = /(?:^|[\\/])test[\\/]([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}/.exec(line);
+          if (frame && hash(`test/${frame[1]}`) === pending.pathHash)
+            pending.assertionLine = Number(frame[2]);
         }
         const kind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
         if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
