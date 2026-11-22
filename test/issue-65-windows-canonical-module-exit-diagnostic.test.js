@@ -110,3 +110,24 @@ test("pre-YAML code cannot combine with later module exit evidence", () => {
   assert.equal(tracker.state.failures, 1);
   assert.doesNotMatch(report, /moduleExitCode=137/);
 });
+
+test("canonical Windows preserves bounded safe diagnostics after twelve failures", () => {
+  const messages = [];
+  const tracker = createTapProgressRecorder((line) => messages.push(line));
+  for (let index = 1; index <= 23; index++) {
+    tracker.accept(`not ok ${index} - private fixture failure ${index}`);
+    tracker.accept("  ---");
+    tracker.accept("  location: 'D:\\private\\test\\file-read-handle-security.test.js:451:10'");
+    tracker.accept("  failureType: 'testCodeFailure'");
+    tracker.accept("  code: 'ERR_ASSERTION'");
+    tracker.accept("  error: 'secret private fixture token' "); // malformed: never printed
+    tracker.accept("  operator: 'strictEqual'");
+    tracker.accept("  ...");
+  }
+  tracker.finish();
+  const output = messages.join("\n");
+  assert.equal(tracker.state.failures, 23);
+  assert.equal(messages.filter((line) => line.startsWith("FAIL detail")).length, 23);
+  assert.match(output, /FAIL detail index=23 .*locationLine=451 .*operator=strictEqual/);
+  assert.doesNotMatch(output, /secret private fixture token|D:\\private/);
+});
