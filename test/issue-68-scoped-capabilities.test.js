@@ -30,12 +30,15 @@ function getUnusedPort() {
   });
 }
 
-function request(port, requestPath, { method = "GET", headers = {}, body = "" } = {}) {
+function request(port, requestPath, { method = "GET", headers = {}, body = "", signal } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers }, (res) => {
+    const req = http.request({ host: "127.0.0.1", port, path: requestPath, method, headers, signal }, (res) => {
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
+      res.on("end", () => {
+        const bodyBytes = Buffer.concat(chunks);
+        resolve({ status: res.statusCode, headers: res.headers, body: bodyBytes.toString(), bodyBytes });
+      });
     });
     req.once("error", reject);
     req.end(body);
@@ -94,7 +97,9 @@ async function startFixture(t, mode, extraEnv = {}) {
 
   const password = crypto.randomBytes(24).toString("base64url");
   fs.writeFileSync(path.join(dataDir, "users.local.json"), JSON.stringify([
-    { username: "tester", password: bcrypt.hashSync(password, 4), role: "admin", permissions: { listFiles: true }, sessionVersion: 0 },
+    { username: "tester", password: bcrypt.hashSync(password, 4),
+      role: options.caseDistinctAccounts ? "user" : "admin",
+      permissions: { listFiles: true }, sessionVersion: 0 },
     { username: "other", password: bcrypt.hashSync(password, 4), role: "admin", permissions: { listFiles: true }, sessionVersion: 0 },
   ]));
   fs.writeFileSync(path.join(dataDir, "folders.json"), JSON.stringify([
@@ -138,7 +143,8 @@ async function startFixture(t, mode, extraEnv = {}) {
     ...(extraEnv.ROOTARK_TEST_SHARE_PAUSE_POINT === "exchange-commit"
       ? { ROOTARK_TEST_SHARE_PAUSE_MARKER: pauseMarker,
         ROOTARK_TEST_SHARE_PAUSE_RELEASE: pauseRelease } : {}),
-    NODE_ENV: "test", CLOUD_STORAGE_PROVIDER: "local", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
+    NODE_ENV: "test", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled",
+    CLOUD_STORAGE_PROVIDER: "local", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
   for (const key of Object.keys(env)) if (/^(AWS_|GOOGLE_DRIVE_)/.test(key)) delete env[key];
   delete env.TRUSTED_PROXIES;
   const port = await getUnusedPort();
@@ -174,18 +180,27 @@ async function startFixture(t, mode, extraEnv = {}) {
     fs.rmSync(sandbox, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  const deadline = Date.now() + 15_000;
+  // Windows process/SQLite startup can exceed 15s under concurrent test load.
+  // Keep a finite platform-specific readiness budget, without weakening auth.
+  const deadline = Date.now() + (process.platform === "win32" ? 35_000 : 15_000);
   let ready = null;
+  let lastProbeErrorCode = null;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`disposable server exited (${child.exitCode})`);
     try {
-      ready = await request(port, "/login.html");
+      // Bound each localhost probe too: an accepted but stalled HTTP socket
+      // must not hold readiness past its finite startup budget.
+      ready = await request(port, "/login.html", { signal: AbortSignal.timeout(2_500) });
+      lastProbeErrorCode = null;
       if (ready.status === 200) break;
-    } catch { /* A port probe may precede the actual child listener. */ }
+    } catch (error) {
+      // Report only a short transport code, never credentials or env values.
+      lastProbeErrorCode = typeof error?.code === "string" ? error.code : "unknown";
+    }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   assert.equal(ready?.status, 200,
-    `disposable server must serve its public login page (last status: ${ready?.status ?? "none"})`);
+    `disposable server must serve its public login page (last status: ${ready?.status ?? "none"}; last transport code: ${lastProbeErrorCode ?? "none"}; child exit: ${child.exitCode ?? "running"})`);
 
   // SQLite mode stores users in the database, so it uses the non-production bootstrap admin (NODE_ENV=test).
   const credentials = mode === "sqlite" ? { username: "admin", password: "admin123" } : { username: "tester", password };
@@ -250,8 +265,462 @@ async function startFixture(t, mode, extraEnv = {}) {
   return { port, origin, authed, publicPost, exchangeCapability, legacyToken, dataDir, password, pauseMarker, pauseRelease };
 }
 
+test("P2 SQLite WebDAV Basic: case-distinct users authenticate against their exact stored account", {
+  timeout: 120_000,
+}, async (t) => {
+  const { port, authed, dataDir } = await startFixture(t, "sqlite", {
+    WEBDAV_ENABLED: "true",
+    WEBDAV_PATH: "/dav",
+    TOTP_POLICY: "optional",
+    ROOTARK_ZK10_SYNC_CUTOVER_STRICT: "off",
+  });
+  const lowerPassword = crypto.randomBytes(24).toString("base64url");
+  const upperPassword = crypto.randomBytes(24).toString("base64url");
+  assert.notEqual(lowerPassword, upperPassword);
+  for (const [username, password] of [["tester", lowerPassword], ["TESTER", upperPassword]]) {
+    const created = await authed("/users", {
+      username, password, role: "user", permissions: { listFiles: true },
+    });
+    assert.equal(created.status, 201, created.body);
+  }
+
+  const Database = require("better-sqlite3");
+  const db = new Database(path.join(dataDir, "rootark.sqlite"),
+    { readonly: true, fileMustExist: true });
+  try {
+    // This is the exact ordering of usersRepository.loadUsers(), not an
+    // assumption about which colliding account SQLite enumerates first.
+    const users = db.prepare(`SELECT id, username, password_hash FROM users
+      WHERE username IN (?, ?) AND deleted_at IS NULL ORDER BY id ASC`)
+      .all("tester", "TESTER");
+    assert.deepEqual(users.map((user) => user.username), ["tester", "TESTER"],
+      "the lowercase account must precede the distinct uppercase account");
+    assert.notEqual(users[0].password_hash, users[1].password_hash);
+    assert.equal(bcrypt.compareSync(lowerPassword, users[0].password_hash), true);
+    assert.equal(bcrypt.compareSync(upperPassword, users[1].password_hash), true);
+    assert.equal(bcrypt.compareSync(upperPassword, users[0].password_hash), false,
+      "the uppercase user's valid password must NOT verify against the first account");
+  } finally { db.close(); }
+
+  const propfind = (username, password) => request(port, "/dav", {
+    method: "PROPFIND",
+    headers: {
+      authorization: `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`,
+      depth: "0",
+    },
+  });
+  const lower = await propfind("tester", lowerPassword);
+  assert.equal(lower.status, 207, lower.body);
+  assert.match(lower.body, /<D:multistatus\b/);
+  const upper = await propfind("TESTER", upperPassword);
+  assert.equal(upper.status, 207,
+    "valid uppercase Basic credentials must reach the real WebDAV handler");
+  assert.match(upper.body, /<D:multistatus\b/);
+  assert.equal((await propfind("TESTER", lowerPassword)).status, 401,
+    "uppercase identity must not inherit the lowercase password");
+  // The reciprocal incorrect password is already proved against the exact
+  // persisted bcrypt hash above. A second failed Basic attempt on this same
+  // server legitimately trips the production IP rate limiter (429), so do
+  // not confuse that security response with a WebDAV identity regression.
+});
+
+test("P2 SQLite WebDAV Basic: case-aliased identity cannot authenticate with another account password", {
+  timeout: 120_000,
+}, async (t) => {
+  const { port, authed } = await startFixture(t, "sqlite", {
+    WEBDAV_ENABLED: "true", WEBDAV_PATH: "/dav", TOTP_POLICY: "optional",
+    ROOTARK_ZK10_SYNC_CUTOVER_STRICT: "off",
+  });
+  const lowerPassword = crypto.randomBytes(24).toString("base64url");
+  const upperPassword = crypto.randomBytes(24).toString("base64url");
+  assert.notEqual(lowerPassword, upperPassword);
+  for (const [username, password] of [["tester", lowerPassword], ["TESTER", upperPassword]]) {
+    const created = await authed("/users", {
+      username, password, role: "user", permissions: { listFiles: true },
+    });
+    assert.equal(created.status, 201, created.body);
+  }
+  // This is the FIRST Basic attempt in a fresh server process. Neither
+  // expired/locked credentials nor a prior 401/429 can explain the result.
+  // The original code resolves TESTER to the earlier 'tester' account via
+  // sameUsername and incorrectly accepts that account's lower-case password.
+  const forged = await request(port, "/dav", {
+    method: "PROPFIND", headers: {
+      authorization: `Basic ${Buffer.from(`TESTER:${lowerPassword}`, "utf8").toString("base64")}`,
+      depth: "0",
+    },
+  });
+  assert.equal(forged.status, 401,
+    "case-aliased Basic username must never select a different SQLite principal's hash");
+  assert.doesNotMatch(forged.body, /<D:multistatus\b/,
+    "a forged Basic identity must not reach an authenticated WebDAV listing");
+});
+
 function viewerCookieFrom(response) {
   return (response.headers["set-cookie"] || []).map((value) => value.split(";", 1)[0]).join("; ");
+}
+
+test("P2 SQLite: case-distinct uploader cannot preview or enumerate another account's pending bytes", {
+  timeout: 120_000,
+}, async (t) => {
+  const { port, origin, authed, dataDir } = await startFixture(t, "sqlite");
+  const ownerPassword = crypto.randomBytes(24).toString("base64url");
+  const otherPassword = crypto.randomBytes(24).toString("base64url");
+  assert.notEqual(ownerPassword, otherPassword, "the accounts have separate credentials");
+  for (const [username, password] of [["tester", ownerPassword], ["TESTER", otherPassword]]) {
+    const created = await authed("/users", {
+      username, password, role: "user", permissions: { upload: true, listPending: false },
+    });
+    assert.equal(created.status, 201, created.body);
+  }
+  const loginAs = async (username, password) => {
+    const body = JSON.stringify({ username, password });
+    const login = await request(port, "/auth/login", {
+      method: "POST", body,
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+    });
+    assert.equal(login.status, 200, login.body);
+    assert.equal(JSON.parse(login.body).username, username);
+    assert.equal(JSON.parse(login.body).role, "user");
+    const cookies = (login.headers["set-cookie"] || []).map((value) => value.split(";", 1)[0]);
+    const csrf = cookies.find((value) => value.startsWith("rootark_csrf="))?.split("=", 2)[1];
+    assert.ok(csrf);
+    return { cookie: cookies.join("; "), csrf };
+  };
+  const owner = await loginAs("tester", ownerPassword);
+  const impostor = await loginAs("TESTER", otherPassword);
+  assert.notEqual(owner.cookie, impostor.cookie);
+
+  // Server-created SQLite custody via real authenticated multipart upload.
+  const name = `p-${crypto.randomBytes(8).toString("hex")}.png`;
+  const bytes = Buffer.from(PNG_BASE64, "base64");
+  const boundary = `----rootark-${crypto.randomBytes(12).toString("hex")}`;
+  const multipart = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: image/png\r\n\r\n`),
+    bytes, Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const upload = await request(port, "/upload?folderId=root", {
+    method: "POST", body: multipart,
+    headers: { origin, cookie: owner.cookie, "x-csrf-token": owner.csrf,
+      "content-type": `multipart/form-data; boundary=${boundary}`,
+      "content-length": multipart.length },
+  });
+  assert.equal(upload.status, 200, upload.body);
+  // Keep the randomly unique basename below the 30-character server limit.
+  // The HTTP receipt must prove no shortening/alias before SQLite lookup.
+  const uploadInfo = JSON.parse(upload.body);
+  assert.equal(uploadInfo.folderId, "root");
+  assert.equal(uploadInfo.originalName, name);
+  assert.equal(uploadInfo.fileName, name);
+  assert.equal(uploadInfo.renamed, false);
+  const Database = require("better-sqlite3");
+  const db = new Database(path.join(dataDir, "rootark.sqlite"), { readonly: true });
+  try {
+    const users = db.prepare("SELECT username, role, permissions_json FROM users WHERE username IN (?, ?) AND deleted_at IS NULL")
+      .all("tester", "TESTER");
+    assert.deepEqual(users.map((u) => u.username).sort(), ["TESTER", "tester"].sort());
+    for (const user of users) {
+      assert.equal(user.role, "user");
+      assert.equal(JSON.parse(user.permissions_json).upload, true);
+      assert.equal(JSON.parse(user.permissions_json).listPending, false);
+    }
+    const pending = db.prepare("SELECT uploaded_by, folder_id, file_name, original_name FROM pending_uploads WHERE id = ?")
+      .get(`root/${name}`);
+    assert.deepEqual(pending, { uploaded_by: "tester", folder_id: "root",
+      file_name: name, original_name: null },
+    "real pending SQLite row must match the HTTP-returned filename and original owner");
+  } finally { db.close(); }
+
+  const url = `/preview/file/pending/${encodeURIComponent(name)}?folderId=root`;
+  const ownerRead = await request(port, url, { headers: { cookie: owner.cookie, origin } });
+  assert.equal(ownerRead.status, 200, ownerRead.body);
+  assert.deepEqual(ownerRead.bodyBytes, bytes, "owner receives the exact original PNG bytes, without lossy UTF-8 decoding");
+  const otherRead = await request(port, url, { headers: { cookie: impostor.cookie, origin } });
+  // Unmodified HEAD returns 200 with owner PNG; patched code must return 403.
+  assert.equal(otherRead.status, 403, "cross-principal pending preview denied");
+  assert.notEqual(otherRead.body, ownerRead.body);
+  const ownerList = await request(port, "/pending?folderId=root", { headers: { cookie: owner.cookie, origin } });
+  const otherList = await request(port, "/pending?folderId=root", { headers: { cookie: impostor.cookie, origin } });
+  assert.equal(ownerList.status, 200, ownerList.body);
+  assert.equal(otherList.status, 200, otherList.body);
+  assert.equal(JSON.parse(ownerList.body).some((item) => item.name === name), true);
+  assert.equal(JSON.parse(otherList.body).some((item) => item.name === name), false);
+});
+
+test("P2 SQLite: case-distinct ACL reader cannot decrypt owner-only user-key file", {
+  timeout: 120_000,
+}, async (t) => {
+  const { port, origin, authed, dataDir } = await startFixture(t, "sqlite");
+  const ownerPassword = crypto.randomBytes(24).toString("base64url");
+  const otherPassword = crypto.randomBytes(24).toString("base64url");
+  assert.notEqual(ownerPassword, otherPassword);
+  for (const [username, password, uploadAllowed] of [
+    ["tester", ownerPassword, true], ["TESTER", otherPassword, false],
+  ]) {
+    const created = await authed("/users", {
+      username, password, role: "user",
+      permissions: { upload: uploadAllowed, listFiles: true, listPending: false },
+    });
+    assert.equal(created.status, 201, created.body);
+  }
+  const loginAs = async (username, password) => {
+    const body = JSON.stringify({ username, password });
+    const loggedIn = await request(port, "/auth/login", { method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
+    assert.equal(loggedIn.status, 200, loggedIn.body);
+    assert.equal(JSON.parse(loggedIn.body).username, username);
+    assert.equal(JSON.parse(loggedIn.body).role, "user");
+    const cookies = (loggedIn.headers["set-cookie"] || []).map((value) => value.split(";", 1)[0]);
+    const csrf = cookies.find((value) => value.startsWith("rootark_csrf="))?.split("=", 2)[1];
+    assert.ok(csrf);
+    return { cookie: cookies.join("; "), csrf };
+  };
+  const owner = await loginAs("tester", ownerPassword);
+  const other = await loginAs("TESTER", otherPassword);
+  assert.notEqual(owner.cookie, other.cookie);
+
+  // Real upload encrypts plaintext with a user-key derived from the exact
+  // "tester" owner. The server, not this fixture, creates encrypted metadata.
+  const name = `k-${crypto.randomBytes(8).toString("hex")}.txt`;
+  const plaintext = `owner-only decrypted secret ${crypto.randomUUID()}`;
+  const boundary = `----rootark-${crypto.randomBytes(12).toString("hex")}`;
+  const multipart = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="encryptionLevel"\r\n\r\nuser-key\r\n`),
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: text/plain\r\n\r\n`),
+    Buffer.from(plaintext), Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
+  const upload = await request(port, "/upload?folderId=root", { method: "POST",
+    headers: { origin, cookie: owner.cookie, "x-csrf-token": owner.csrf,
+      "content-type": `multipart/form-data; boundary=${boundary}`,
+      "content-length": multipart.length }, body: multipart });
+  assert.equal(upload.status, 200, upload.body);
+  const uploadInfo = JSON.parse(upload.body);
+  assert.equal(uploadInfo.folderId, "root");
+  assert.equal(uploadInfo.originalName, name);
+  assert.equal(uploadInfo.fileName, name);
+  assert.equal(uploadInfo.renamed, false);
+  assert.equal(uploadInfo.encryptionLevel, "user-key");
+  assert.equal(uploadInfo.encrypted, true);
+  const pendingDb = new (require("better-sqlite3"))(path.join(dataDir, "rootark.sqlite"),
+    { readonly: true, fileMustExist: true });
+  try {
+    const pending = pendingDb.prepare(`SELECT id, file_name, original_name, folder_id, uploaded_by
+      FROM pending_uploads WHERE folder_id = ? AND file_name = ?`).get("root", name);
+    assert.deepEqual(pending, { id: `root/${name}`, file_name: name,
+      original_name: null, folder_id: "root", uploaded_by: "tester" },
+    "owner's genuine encrypted upload must be pending before authenticated approval");
+  } finally { pendingDb.close(); }
+  const approved = await authed(`/approve/${encodeURIComponent(name)}?folderId=root`, {}, "POST");
+  assert.equal(approved.status, 200, approved.body);
+
+  // File ACL read access is deliberately valid for TESTER; encrypted metadata
+  // remains a SECOND, owner-only authorization boundary.
+  const acl = { name, folderId: "root", public: false,
+    users: { TESTER: { read: true, edit: false } } };
+  const savedAcl = await authed("/file-access", acl, "PUT");
+  assert.equal(savedAcl.status, 200, savedAcl.body);
+  assert.equal(JSON.parse(savedAcl.body).owner, "tester");
+  const Database = require("better-sqlite3");
+  const db = new Database(path.join(dataDir, "rootark.sqlite"), { readonly: true });
+  try {
+    const users = db.prepare("SELECT username, role, permissions_json FROM users WHERE username IN (?, ?) AND deleted_at IS NULL")
+      .all("tester", "TESTER");
+    assert.deepEqual(users.map((u) => u.username).sort(), ["TESTER", "tester"].sort());
+    assert.ok(users.every((u) => u.role === "user"));
+    const encrypted = db.prepare("SELECT encryption_level, metadata_json FROM encrypted_files WHERE folder_id = ? AND file_name = ?")
+      .get("root", name);
+    assert.equal(encrypted?.encryption_level, "user-key", "real encryption metadata persisted to SQLite");
+    const authorized = JSON.parse(encrypted.metadata_json).accessControl;
+    assert.equal(authorized.owner, "tester");
+    assert.deepEqual(authorized.authorizedUsers, ["tester"],
+      "TESTER is a legitimate file ACL reader, not an authorized decryptor");
+    const fileAccess = db.prepare("SELECT allowed_users_json FROM file_permissions WHERE folder_id = ? AND file_name = ?")
+      .get("root", name);
+    const persistedAcl = JSON.parse(fileAccess.allowed_users_json);
+    assert.equal(persistedAcl.owner, "tester");
+    assert.equal(persistedAcl.public, false);
+    assert.equal(persistedAcl.users.TESTER.read, true);
+  } finally { db.close(); }
+
+  const metadataUrl = `/encrypted/${encodeURIComponent(name)}/metadata?folderId=root`;
+  const plaintextUrl = `/encrypted-download/${encodeURIComponent(name)}?folderId=root`;
+  const postDecrypt = (session) => {
+    const body = "{}";
+    return request(port, plaintextUrl, { method: "POST", body, headers: {
+      cookie: session.cookie, origin, "x-csrf-token": session.csrf,
+      "content-type": "application/json", "content-length": Buffer.byteLength(body),
+    } });
+  };
+  const ownerMetadata = await request(port, metadataUrl, { headers: { cookie: owner.cookie, origin } });
+  assert.equal(ownerMetadata.status, 200, ownerMetadata.body);
+  assert.equal(JSON.parse(ownerMetadata.body).encryptionLevel, "user-key");
+  const ownerDecrypt = await postDecrypt(owner);
+  assert.equal(ownerDecrypt.status, 200, ownerDecrypt.body);
+  assert.equal(ownerDecrypt.body, plaintext, "exact owner genuinely decrypts original AES-GCM bytes");
+  const aclControl = await request(port, `/files/${encodeURIComponent(name)}?folderId=root`,
+    { headers: { cookie: other.cookie, origin } });
+  assert.equal(aclControl.status, 403);
+  assert.match(aclControl.body, /Use a rota de download criptografado/,
+    "TESTER must pass the independent file-level ACL before the encrypted-only route veto");
+  const otherMetadata = await request(port, metadataUrl, { headers: { cookie: other.cookie, origin } });
+  assert.equal(otherMetadata.status, 403,
+    "valid read ACL cannot bypass case-sensitive owner-only encryption authorization");
+  const otherDecrypt = await postDecrypt(other);
+  // RED production would return HTTP 200 + owner plaintext: server derives the
+  // decryption key from signed-off metadata.owner, not the requesting user.
+  assert.equal(otherDecrypt.status, 403, "case-colliding account must not decrypt owner user-key file");
+  assert.equal(otherDecrypt.body.includes(plaintext), false);
+});
+
+test("P2 SQLite: distinct non-admin tester and TESTER cannot cross-read or edit a private file", { timeout: 60_000 }, async (t) => {
+  const { port, origin, authed, password, dataDir } = await startFixture(t, "sqlite", {},
+    { caseDistinctAccounts: true });
+  const otherPassword = crypto.randomBytes(24).toString("base64url");
+  assert.notEqual(password, otherPassword, "two SQLite case-distinct accounts must have separate passwords");
+  // The JSON-to-SQLite bootstrap may already import tester; either way the
+  // actual account must authenticate as a non-admin and the case-distinct
+  // TESTER must be a separately created, non-admin SQLite principal.
+  const ownerCreate = await authed("/users", {
+    username: "tester", password, role: "user", permissions: { listFiles: true },
+  });
+  assert.ok([201, 409].includes(ownerCreate.status), ownerCreate.body);
+  const otherCreate = await authed("/users", {
+    username: "TESTER", password: otherPassword, role: "user", permissions: { listFiles: true },
+  });
+  assert.equal(otherCreate.status, 201, otherCreate.body);
+
+  const loginAs = async (username, credential) => {
+    const body = JSON.stringify({ username, password: credential });
+    const login = await request(port, "/auth/login", { method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
+    assert.equal(login.status, 200, login.body);
+    assert.equal(JSON.parse(login.body).username, username,
+      "login must bind the exact case-sensitive SQLite account");
+    assert.equal(JSON.parse(login.body).role, "user", "neither principal may be administrator");
+    const cookies = login.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+    const cookie = cookies.join("; ");
+    const csrf = cookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+    const get = (url) => request(port, url, { headers: { origin, cookie } });
+    const put = (url, payload) => {
+      const body = JSON.stringify(payload);
+      return request(port, url, { method: "PUT", headers: {
+        origin, cookie, "x-csrf-token": csrf,
+        "content-type": "application/json", "content-length": Buffer.byteLength(body),
+      }, body });
+    };
+    return { cookie, get, put };
+  };
+  const owner = await loginAs("tester", password);
+  const impostor = await loginAs("TESTER", otherPassword);
+  assert.notEqual(owner.cookie, impostor.cookie, "two independent authenticated sessions are required");
+
+  // Change ACL through the actual authenticated mutation endpoint and verify
+  // SQLite persistence: no mocked `public:false` response or synthetic guard.
+  const acl = { name: FILE_NAME, folderId: "root", public: false, users: {} };
+  const restrict = await authed("/file-access", acl, "PUT");
+  assert.equal(restrict.status, 200, restrict.body);
+  assert.equal(JSON.parse(restrict.body).owner, "tester");
+  assert.equal(JSON.parse(restrict.body).public, false);
+  const Database = require("better-sqlite3");
+  const database = new Database(path.join(dataDir, "rootark.sqlite"), { readonly: true });
+  try {
+    const accounts = database.prepare("SELECT username, role FROM users WHERE username IN (?, ?) AND deleted_at IS NULL")
+      .all("tester", "TESTER");
+    assert.deepEqual(accounts.map(({ username, role }) => [username, role]).sort(),
+      [["TESTER", "user"], ["tester", "user"]].sort(),
+      "SQLite must store distinct non-admin accounts differing only by case");
+    const saved = database.prepare("SELECT allowed_users_json FROM file_permissions WHERE folder_id = ? AND file_name = ?")
+      .get("root", FILE_NAME);
+    assert.ok(saved, "a private ACL must be persisted in SQLite");
+    const persisted = JSON.parse(saved.allowed_users_json);
+    assert.equal(persisted.owner, "tester");
+    assert.equal(persisted.public, false);
+    assert.deepEqual(persisted.users, {});
+  } finally { database.close(); }
+
+  const fileUrl = `/files/${encodeURIComponent(FILE_NAME)}?folderId=root`;
+  const aclUrl = `/file-access?name=${encodeURIComponent(FILE_NAME)}&folderId=root`;
+  const legitimateRead = await owner.get(fileUrl);
+  assert.equal(legitimateRead.status, 200, legitimateRead.body);
+  assert.equal(legitimateRead.body, FILE_CONTENT, "exact private owner retains file access");
+  assert.equal((await owner.get(aclUrl)).status, 200,
+    "exact private owner retains permission management");
+
+  const illegalRead = await impostor.get(fileUrl);
+  const illegalAclRead = await impostor.get(aclUrl);
+  const illegalEdit = await impostor.put("/file-access", { ...acl, public: true });
+  // On the original HEAD these are 200, 200 and 200 respectively: the second
+  // account is falsely identified as the owner and can expose private bytes
+  // and promote the private ACL to public. The fixed policy must reject all.
+  assert.equal(illegalRead.status, 403, "case-colliding non-admin cannot GET private owner bytes");
+  assert.equal(illegalRead.body.includes(FILE_CONTENT), false, "denied read contains no private bytes");
+  assert.equal(illegalAclRead.status, 403, "case-colliding account cannot read owner ACL");
+  assert.equal(illegalEdit.status, 403, "case-colliding account cannot publish/modify owner ACL");
+
+  const unchanged = await owner.get(aclUrl);
+  assert.equal(unchanged.status, 200);
+  assert.equal(JSON.parse(unchanged.body).owner, "tester");
+  assert.equal(JSON.parse(unchanged.body).public, false,
+    "rejected edit cannot change the persisted private ACL");
+  assert.equal((await owner.put("/file-access", acl)).status, 200,
+    "exact owner may still edit their own file permissions");
+});
+
+for (const mode of ["json", "sqlite"]) {
+  test(`P2: case-distinct account cannot create or revoke another account's capability (${mode})`,
+    { timeout: 60_000 }, async (t) => {
+      const { authed, port, origin, password, publicPost } = await startFixture(t, mode);
+      const issuer = mode === "json" ? "tester" : "admin";
+      const wrongAccount = issuer.toUpperCase();
+      const wrongPassword = crypto.randomBytes(24).toString("base64url");
+      assert.notEqual(wrongPassword, password, "case-distinct issuer has independent credentials");
+      // Both names are legitimate, separately authenticated users: the
+      // account store and login perform exact-case lookup, unlike the old
+      // share-owner comparison. No forged cookie or storage mutation needed.
+      const createdAccount = await authed("/users", {
+        username: wrongAccount, password: wrongPassword, role: "user", permissions: { listFiles: true },
+      });
+      assert.equal(createdAccount.status, 201, createdAccount.body);
+      const loginBody = JSON.stringify({ username: wrongAccount, password: wrongPassword });
+      const login = await request(port, "/auth/login", {
+        method: "POST", headers: { "content-type": "application/json",
+          "content-length": Buffer.byteLength(loginBody) }, body: loginBody,
+      });
+      assert.equal(login.status, 200, login.body);
+      assert.equal(JSON.parse(login.body).username, wrongAccount,
+        "login really authenticated a separate case-sensitive account");
+      const cookies = login.headers["set-cookie"].map((cookie) => cookie.split(";", 1)[0]);
+      const impostorCookie = cookies.join("; ");
+      const csrf = cookies.find((cookie) => cookie.startsWith("rootark_csrf=")).split("=", 2)[1];
+      const asImpostor = (url, data, method = "POST") => {
+        const body = JSON.stringify(data);
+        return request(port, url, { method,
+          headers: { cookie: impostorCookie, origin, "x-csrf-token": csrf,
+            "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
+      };
+
+      const policy = { name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+        permissions: ["download"], maxDownloads: 2 };
+      if (mode === "json") {
+        const spoofedOwner = await asImpostor("/share/capabilities", policy);
+        assert.equal(spoofedOwner.status, 403,
+          "a case-colliding user with listFiles cannot issue a capability for the original file owner");
+      }
+      const created = await authed("/share/capabilities", policy);
+      assert.equal(created.status, 201, created.body);
+      const { token } = JSON.parse(created.body);
+      const deniedRevoke = await asImpostor("/share/capabilities/revoke", { token }, "DELETE");
+      assert.equal(deniedRevoke.status, 403,
+        "a different account cannot revoke an issuer's capability just by matching username casing");
+      const stillLive = await publicPost(token, "view");
+      assert.equal(stillLive.status, 200,
+        "denied cross-account revocation must leave the legitimate issuer's grant live");
+      const legitimateRevoke = await authed("/share/capabilities/revoke", { token }, "DELETE");
+      assert.equal(legitimateRevoke.status, 204,
+        "exact issuer must retain the ability to revoke their own capability");
+      const afterRevoke = await publicPost(token, "view");
+      assert.equal(afterRevoke.status, 404);
+    });
 }
 
 for (const mode of ["json", "sqlite"]) {
