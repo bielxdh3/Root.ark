@@ -17,6 +17,7 @@ const NAMES = new Map([
   ["inherit-only-fixture.exe", "rootark-cfapi-ace-native-"],
   ["deny-fetch.exe", "rootark-cfapi-abi-"],
   ["positive-shape.exe", "rootark-cfapi-positive-abi-"],
+  ["live-fetch.exe", "rootark-cfapi-live-"],
 ]);
 const FAIL = "UNTRUSTED_EXECUTABLE";
 const UNSAFE_BUILD_ENV = new Set([
@@ -125,6 +126,8 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
       ? path.resolve(__dirname, "../../sync-client/rootark-sync-windows-cfapi-deny-callback.cpp")
       : name === "positive-shape.exe"
         ? path.resolve(__dirname, "../../sync-client/rootark-sync-windows-cfapi-positive-shape.cpp")
+        : name === "live-fetch.exe"
+          ? path.resolve(__dirname, "../../sync-client/rootark-sync-windows-cfapi-live-fixture.cpp")
         : path.join(scratch, "inherit-only-fixture.cpp");
   for (const filename of [vcvars, source, executable, objectFile, pdbFile]) {
     assert.doesNotMatch(filename, /[\r\n\x00-\x1f\x7f"%!^&|<>]/, FAIL);
@@ -191,6 +194,9 @@ function validateFixtureArgs(name, scratch, args) {
     allowed = values.length === 0
       || (values.length === 1 && values[0] === "--self-test")
       || (["--connect", "--register", "--hydrate"].includes(values[0]) && scope());
+  } else if (name === "live-fetch.exe") {
+    allowed = values.length === 2 && values[0] === "--disposable-live"
+      && comparable(values[1]) === comparable(`${scratch}-root`);
   }
   assert.ok(allowed, FAIL);
   return values;
