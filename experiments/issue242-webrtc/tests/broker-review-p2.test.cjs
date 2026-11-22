@@ -460,3 +460,47 @@ test('valid revoke rechecks current ACL and never ACKs a revoked owner', async t
   assert.equal(host.received.some(message => message.type === 'revoked' &&
     message.inviteId === second.inviteId), false, 'stale ACL cannot authorize a revoke');
 });
+
+test('P2: a stalled trusted ACL callback cannot accumulate an unbounded room action queue',
+  { timeout: 10_000 }, async t => {
+    // Use an otherwise valid, synthetic immutable version and signed-session
+    // broker. The ACL callback stalls only AFTER the real host has joined.
+    const gate = deferred(), entered = deferred();
+    let stalled = false;
+    const f = await fixture(t, async ({ recipient }) => {
+      if (stalled && recipient === null) {
+        entered.release();
+        await gate.promise;
+      }
+      return authorized();
+    });
+    const room = await f.room();
+    const host = await f.connect('owner');
+    host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+    assert.equal((await host.next('joined')).role, 'host');
+    stalled = true;
+    const closed = new Promise(resolve => host.ws.once('close', (code, reason) =>
+      resolve({ code, reason: reason.toString() })));
+    host.send({ type: 'invite', recipient: 'guest1' });
+    await entered.promise;
+    // These are individually valid, sub-16 KiB actions and remain below the
+    // 120-in-10s transport rate cap; only the unresolved authority causes the
+    // broker to retain closures indefinitely in an unbounded promise chain.
+    for (let i = 0; i < 72; i++) host.send({ type: 'invite', recipient: 'guest1' });
+    let timer;
+    try {
+      const result = await Promise.race([closed, new Promise(resolve => {
+        timer = setTimeout(() => resolve(null), 900);
+      })]);
+      assert.ok(result, 'the peer must be disconnected before backlog can grow without a bound');
+      assert.equal(result.code, 1008, 'the overflow is a policy denial, not a server crash');
+      assert.match(result.reason, /action backlog exceeded/);
+    } finally {
+      clearTimeout(timer);
+      stalled = false;
+      gate.release();
+    }
+    const replacement = await f.room();
+    assert.equal(replacement.status, 200,
+      'the offending stalled host must release scarce room capacity for a legitimate retry');
+  });

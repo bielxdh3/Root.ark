@@ -13,6 +13,9 @@ const UNJOINED_ROOM_TTL_MS = 15_000;
 const MAX_ACTIVE_ROOMS_PER_OWNER = 2;
 const INVITE_TTL_MS = 60_000;
 const MAX_SIGNAL_BYTES = 16_384;
+// The wire rate cap does not bound a Promise chain held behind a stalled
+// trusted ACL/storage callback. Limit queued closures per room independently.
+const MAX_PENDING_ROOM_ACTIONS = 64;
 const token = () => randomBytes(32).toString('hex');
 const shortId = () => randomBytes(8).toString('hex');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -472,6 +475,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     // ws emits an error before closing an oversized frame; keep the broker alive.
     ws.on('error', () => {});
     ws.on('message', (raw, binary) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
       let message;
       if (sharedWss) {
         // Reuse Root.ark's established /ws socket. Ignore the application's
@@ -492,9 +496,19 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       const roomId = participants.get(ws)?.roomId || message?.roomId;
       const room = rooms.get(roomId);
       if (!room) { void onMessage(ws, raw).catch(() => error(ws, 'FORBIDDEN')); return; }
+      if ((room.pendingActions || 0) >= MAX_PENDING_ROOM_ACTIONS) {
+        // Do not keep retaining attacker-supplied frames while the queue's
+        // head awaits a noncooperative callback. Immediately revoke this
+        // peer's participation; existing room expiry handles stale work.
+        ws.close(1008, 'action backlog exceeded');
+        removePeer(ws);
+        return;
+      }
+      room.pendingActions = (room.pendingActions || 0) + 1;
       room.actionQueue = (room.actionQueue || Promise.resolve())
         .then(() => onMessage(ws, raw))
-        .catch(() => { if (rooms.get(room.id) === room) expireRoom(room); });
+        .catch(() => { if (rooms.get(room.id) === room) expireRoom(room); })
+        .finally(() => { room.pendingActions--; });
     });
     ws.on('close', () => removePeer(ws));
   }
