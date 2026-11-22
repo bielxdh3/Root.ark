@@ -726,7 +726,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       .find((symbol) => symbol.description === "kHandle");
     assert.ok(handle, "actual native Ed25519 key handle is required");
     const poisonedKey = Object.create(key);
-    Object.defineProperty(poisonedKey, handle, { get() {
+    Object.defineProperty(poisonedKey, "type", { get() {
       getterReads++;
       if (armed) Buffer.from = function postKeyBufferSubstitution(...args) {
         if (originalWire && Buffer.isBuffer(args[0])
@@ -736,7 +736,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
         }
         return Reflect.apply(originalFrom, Buffer, args);
       };
-      return key[handle];
+      return "public";
     } });
     const client = h.makeClient("reader", { inventoryPublicKey: poisonedKey });
     armed = true;
@@ -778,7 +778,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       .find((symbol) => symbol.description === "kHandle");
     assert.ok(handle, "actual native Ed25519 key handle is required");
     const poisonedKey = Object.create(key);
-    Object.defineProperty(poisonedKey, handle, { get() {
+    Object.defineProperty(poisonedKey, "type", { get() {
       getterReads++;
       if (armed) Buffer.from = function postKeyBufferSubstitution(...args) {
         if (originalProof && Buffer.isBuffer(args[0])
@@ -788,7 +788,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
         }
         return Reflect.apply(originalFrom, Buffer, args);
       };
-      return key[handle];
+      return "public";
     } });
     const client = h.makeClient("status-reader", { inventoryPublicKey: poisonedKey });
     armed = true;
@@ -1069,7 +1069,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
         receiptDigest: Buffer.alloc(32, 0x71), authorizesIo: false };
       const fakeSnapshot = { sequence: committedHead.sequence,
         root: Buffer.from(committedHead.root), outcome: "PRESENT" };
-      Object.defineProperty(poisonedPin, handle, { get() {
+      Object.defineProperty(poisonedPin, "type", { get() {
         getterReads++;
         if (armed) {
           reachedGetter();
@@ -1082,7 +1082,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
               resolve(method === "append" ? [fakeSnapshot, fakeChecked] : fakeChecked);
             } });
         }
-        return signer[handle];
+        return "public";
       } });
       const client = h.makeClient(method === "append" ? "writer" : "status-reader",
         { inventoryPublicKey: poisonedPin });
@@ -1129,7 +1129,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     let armed = false, keyReads = 0, forgedPageReads = 0;
     let notifyGetter;
     const getterRan = new Promise((resolve) => { notifyGetter = resolve; });
-    Object.defineProperty(hostile, handle, { get() {
+    Object.defineProperty(hostile, "type", { get() {
       keyReads++;
       if (armed) {
         Object.defineProperty(Object.prototype, "then", { configurable: true,
@@ -1145,7 +1145,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
         });
         notifyGetter();
       }
-      return signer[handle];
+      return "public";
     } });
 
     const client = h.makeClient("status-reader", { inventoryPublicKey: hostile });
@@ -1195,7 +1195,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       genuinePhysical !== null && Buffer.isBuffer(candidate)
       && candidate.length === genuinePhysical.length
       && crypto.timingSafeEqual(candidate, genuinePhysical);
-    Object.defineProperty(hostile, handle, { get() {
+    Object.defineProperty(hostile, "type", { get() {
       getterReads++;
       if (armed) {
         Array.prototype.push = function poisonedPush(...items) {
@@ -1215,7 +1215,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
           return Reflect.apply(originalMap, this, [fn, thisArg]);
         };
       }
-      return signer[handle];
+      return "public";
     } });
     const client = h.makeClient("status-reader", { inventoryPublicKey: hostile });
     armed = true;
@@ -1264,7 +1264,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const poisoned = Object.create(signer);
     let reads = 0, forgedCatch = 0, forgedFinally = 0, armed = false, getterReached;
     const getterRan = new Promise((resolve) => { getterReached = resolve; });
-    Object.defineProperty(poisoned, handle, { get() {
+    Object.defineProperty(poisoned, "type", { get() {
       reads++;
       if (armed) {
         getterReached();
@@ -1281,7 +1281,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
               root: Buffer.from(genesis.root), authorizesIo: false });
           } });
       }
-      return signer[handle];
+      return "public";
     } });
     const client = h.makeClient("reader", { inventoryPublicKey: poisoned });
     armed = true;
@@ -1323,7 +1323,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
     let armed = false, keyReads = 0, speciesReads = 0, reachedGetter;
     const getterRan = new Promise((resolve) => { reachedGetter = resolve; });
-    Object.defineProperty(hostile, handle, { get() {
+    Object.defineProperty(hostile, "type", { get() {
       keyReads++;
       if (armed) {
         reachedGetter();
@@ -1338,7 +1338,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
           };
         } });
       }
-      return publicKey[handle];
+      return "public";
     } });
     const client = h.makeClient("status-reader", { inventoryPublicKey: hostile });
     armed = true;
@@ -1373,7 +1373,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const hostile = Object.create(publicKey);
     const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
     let reads = 0, poisonedResults = 0, armed = false;
-    Object.defineProperty(hostile, handle, { get() {
+    Object.defineProperty(hostile, "type", { get() {
       reads++;
       if (armed) {
         Object.defineProperty(Object.prototype, "then", { configurable: true,
@@ -1391,7 +1391,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
             };
           } });
       }
-      return publicKey[handle];
+      return "public";
     } });
     const client = h.makeClient("reader", { inventoryPublicKey: hostile });
     armed = true;
@@ -1419,7 +1419,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const poisoned = Object.create(signer);
     const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
     let armed = false, keyReads = 0, mappedReads = 0, forgedCalls = 0;
-    Object.defineProperty(poisoned, handle, { get() {
+    Object.defineProperty(poisoned, "type", { get() {
       keyReads++;
       if (armed) Object.defineProperty(Object.prototype, "then", { configurable: true,
         get() {
@@ -1436,7 +1436,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
           };
         },
       });
-      return signer[handle];
+      return "public";
     } });
     const client = h.makeClient("reader", { inventoryPublicKey: poisoned });
     armed = true;
@@ -1487,7 +1487,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     const poisoned = Object.create(signer);
     const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
     let armed = false, getterReads = 0, outcomeReads = 0, forgedCalls = 0;
-    Object.defineProperty(poisoned, handle, { get() {
+    Object.defineProperty(poisoned, "type", { get() {
       getterReads++;
       if (armed) Object.defineProperty(Object.prototype, "then", { configurable: true,
         get() {
@@ -1500,7 +1500,7 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
           };
         },
       });
-      return signer[handle];
+      return "public";
     } });
     const writer = h.makeClient("writer", { inventoryPublicKey: poisoned });
     armed = true;

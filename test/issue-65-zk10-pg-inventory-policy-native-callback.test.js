@@ -1,7 +1,7 @@
 "use strict";
 
-// Real disposable Ed25519 signatures. The inherited native kHandle getter is
-// invoked by the product verifier, after the modules were loaded, and then
+// Real disposable Ed25519 signatures. Native kHandle accessor spoofing is
+// rejected before invocation. Instead, a reachable KeyObject.type getter
 // attempts to replace mutable same-realm cryptographic/Array methods.
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -22,10 +22,10 @@ function nativeGetter(publicKey, onRead) {
   assert.ok(symbol, "Node22 KeyObject native kHandle needed");
   const forged = Object.create(publicKey);
   let reads = 0;
-  Object.defineProperty(forged, symbol, { get() {
+  Object.defineProperty(forged, "type", { get() {
     reads += 1;
     onRead();
-    return publicKey[symbol];
+    return "public";
   } });
   return { forged, get reads() { return reads; } };
 }
@@ -364,11 +364,6 @@ test("P2 inventory signed A must not verify tampered B after hostile Buffer.conc
       return originalConcat(segments, ...args);
     };
   });
-  Object.defineProperty(evil.forged, "type", { get() {
-    const handle = Object.getOwnPropertySymbols(f.signer.publicKey).find((k) => k.description === "kHandle");
-    assert.ok(evil.forged[handle], "real native handle getter reached");
-    return "public";
-  } });
   const opts = (serialized, key) => ({ serialized, pinnedPublicKey: key,
     pinnedSignerKeyId: f.signerKeyId, expectedScope: f.scope, operation: f.operation });
   assert.equal((await inventory.verifyCommittedEntryProof(opts(good, f.signer.publicKey))).authorizesIo, false);
@@ -410,11 +405,6 @@ test("P2 PG signed A must not verify generation B after hostile Buffer.concat re
       return originalConcat(segments, ...args);
     };
   });
-  Object.defineProperty(evil.forged, "type", { get() {
-    const handle = Object.getOwnPropertySymbols(f.signer.publicKey).find((k) => k.description === "kHandle");
-    assert.ok(evil.forged[handle], "real native handle getter reached");
-    return "public";
-  } });
   try {
     await assert.rejects(pg.verifyCommittedPhysicalReadback(forged, options(evil.forged)),
       /ZK_PHYSICAL_ATTESTATION_DENIED/, "signed A must never authenticate generation B");
@@ -441,12 +431,6 @@ test("P2 PG signed scope A cannot authorize foreign scope B via hostile Array.ev
       return originalEvery.call(this, callback, ...args);
     };
   });
-  Object.defineProperty(evil.forged, "type", { get() {
-    const handle = Object.getOwnPropertySymbols(f.signer.publicKey)
-      .find((k) => k.description === "kHandle");
-    assert.ok(evil.forged[handle], "real inherited native getter invoked");
-    return "public";
-  } });
   try {
     await assert.rejects(pg.verifyCommittedPhysicalReadback(signed,
       opts(evil.forged, scopeB)), /ZK_PHYSICAL_ATTESTATION_DENIED/,

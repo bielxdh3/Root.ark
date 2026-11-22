@@ -298,7 +298,8 @@ test("P2 native owner handle cannot pin SPKI B while verifying genuine owner Ed2
     independentOwnerSpkiSha256: foreignPin,
   }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
   "caller-controlled native kHandle must never mix B identity with A signature");
-  assert.ok(returnedForeignDuringSpki > 0, "native export must have observed attacker B handle");
+  assert.equal(returnedForeignDuringSpki, 0,
+    "caller-owned native handle accessors must be rejected before SPKI export");
   assert.equal(returnedGenuineDuringVerification, 0,
     "the verifier must not return to the caller-owned A handle after pinning B");
   assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true,
@@ -352,7 +353,8 @@ test("P2 native inventory handle cannot pin signer B while verifying genuine sig
     ...claimedB, inventoryPublicKey: hybrid,
   }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
   "signed B inventory identity cannot validate genuine A snapshot through mutable kHandle");
-  assert.ok(spkiBReads > 0, "fingerprint path exercised the foreign inventory handle");
+  assert.equal(spkiBReads, 0,
+    "the native SPKI path must not execute a caller-owned kHandle accessor");
   assert.equal(checkedAReads, 0,
     "nested inventory signature verifier must never use caller-owned A handle");
   // The caller's public key getter can also retarget the mutable Node
@@ -379,7 +381,7 @@ test("P2 native inventory handle cannot pin signer B while verifying genuine sig
       ...claimedB, inventoryPublicKey: poisoned,
     }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
     "owner-signed B must not accept inventory-signed A via retargeted dynamic crypto.verify");
-    assert.ok(exportBRuns > 0, "attack must execute inside a real native inventory getter");
+    assert.equal(exportBRuns, 0, "foreign kHandle accessor must fail closed before callback");
     assert.equal(injectedVerifyRuns, 0, "nested verification must retain the native crypto.verify");
   } finally {
     crypto.verify = originalVerify;

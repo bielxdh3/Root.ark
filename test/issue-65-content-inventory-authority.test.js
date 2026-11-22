@@ -108,7 +108,8 @@ test("P2 genuine Ed25519 receipts with a false intermediate root cannot bypass i
   const poisonedKey = Object.create(f.keys.publicKey);
   const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
   let nativeGetterReads = 0, poisonedRootReads = 0;
-  Object.defineProperty(poisonedKey, handle, { get() {
+  // kHandle own-accessors are rejected before invocation; poison a reachable type getter.
+  Object.defineProperty(poisonedKey, "type", { get() {
     nativeGetterReads++;
     Object.defineProperty(Object.prototype, "then", { configurable: true,
       get() {
@@ -119,7 +120,7 @@ test("P2 genuine Ed25519 receipts with a false intermediate root cannot bypass i
         return undefined;
       },
     });
-    return f.keys.publicKey[handle];
+    return "public";
   } });
   try {
     await assert.rejects(inventory.verifySnapshot({ ...args, pinnedPublicKey: poisonedKey }),
