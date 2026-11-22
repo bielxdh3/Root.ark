@@ -2027,9 +2027,10 @@ class SyncEngine {
     };
     const validId = (value) => typeof value === "string" && regexTest(/^[A-Za-z0-9._:-]{1,160}$/, value);
     if (!validId(objectId) || !validId(versionId)) fail("Invalid historical restore identifier", "invalid_restore_id");
-    // Without separately provisioned physical witness and CURRENT CAS, do
-    // not start a restore that could stage local bytes and strand its outbox.
-    assertHistoricalRestorePhysicalAuthority(this);
+    // Read-only preview verification does not mutate state or enqueue an outbox
+    // entry, whereas restore execution requires separately provisioned physical
+    // witness and CURRENT CAS authority before staging local bytes.
+    if (verifyRetained !== true) assertHistoricalRestorePhysicalAuthority(this);
     if (typeof adapterHistory !== "function" || typeof adapterList !== "function"
       || typeof adapterPush !== "function") fail("Sync history is unavailable", "history_unavailable");
     if ((await nativeReflectApply(journalMethods.recover, journal, [])).length) {
