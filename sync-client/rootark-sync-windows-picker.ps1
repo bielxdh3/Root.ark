@@ -46,7 +46,19 @@ function Resolve-RootArkPath([string]$base, [string]$target) {
 $Config = Resolve-RootArkPath (Get-Location).ProviderPath $Config
 
 $previousOutputEncoding = [Console]::OutputEncoding
+$configLease = $null
 try {
+# The same private config must authorize inventory, signed hydration and the
+# Explorer target. Hold an OS read-sharing lease so another process cannot
+# rewrite or rename this file between the Node calls and the final reveal.
+$configLease = [IO.File]::Open($Config, [IO.FileMode]::Open,
+  [IO.FileAccess]::Read, [IO.FileShare]::Read)
+$configContents = Get-Content -LiteralPath $Config -Raw -Encoding UTF8
+$localFolder = [string](($configContents | ConvertFrom-Json).localFolder)
+if ([string]::IsNullOrWhiteSpace($localFolder)) { throw 'Local sync folder unavailable.' }
+$configDir = Split-Path -Parent $Config
+$root = Resolve-RootArkPath $configDir $localFolder
+
 # Windows PowerShell 5.1 otherwise decodes Node's UTF-8 JSON using the OEM
 # codepage, corrupting signed remote filenames before the hydrate lookup.
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -99,10 +111,11 @@ if ($hydrated.action -ne 'hydrate' -or $hydrated.result -isnot [bool] -or $hydra
 }
 
 # Reveal only. Opening an associated app automatically could execute remote content.
-$localFolder = [string]((Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json).localFolder)
-if ([string]::IsNullOrWhiteSpace($localFolder)) { throw 'Local sync folder unavailable.' }
-$configDir = Split-Path -Parent $Config
-$root = Resolve-RootArkPath $configDir $localFolder
+# If the config path has been redirected despite the held file handle, refuse
+# to reveal a path based on settings different from those used for hydration.
+if ((Get-Content -LiteralPath $Config -Raw -Encoding UTF8) -cne $configContents) {
+  throw 'Root.ark private config changed during hydration; Explorer was not opened.'
+}
 $target = [IO.Path]::GetFullPath((Join-Path $root ([string]$chosen[0].Path -replace '/', '\')))
 $rootPrefix = $root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
 if (-not $target.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
@@ -130,5 +143,6 @@ while ($true) {
 }
 Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList @(('/select,"' + $target + '"')) | Out-Null
 } finally {
+  if ($null -ne $configLease) { $configLease.Dispose() }
   [Console]::OutputEncoding = $previousOutputEncoding
 }

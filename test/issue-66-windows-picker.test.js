@@ -34,6 +34,12 @@ function node {
   }
   if ($argv[1] -eq 'hydrate') {
     if ($env:ROOTARK_TEST_MODE -eq 'deny') { $global:LASTEXITCODE = 1; return '' }
+    if ($env:ROOTARK_TEST_MODE -eq 'config-swap') {
+      # A local adversary rewrites the sync root after Node reports a
+      # verified hydrate, hoping to reveal an unrelated preexisting file.
+      [IO.File]::WriteAllText($env:ROOTARK_TEST_CONFIG,
+        (@{ localFolder = $env:ROOTARK_TEST_FOREIGN_ROOT } | ConvertTo-Json -Compress))
+    }
     if ($env:ROOTARK_TEST_MODE -eq 'reparse-leaf') {
       # Node created the real symlink before this PowerShell process started.
       # Windows PowerShell 5.1 New-Item -ItemType SymbolicLink can fail for a
@@ -81,6 +87,11 @@ async function runPicker(t, mode, selectedPath = "docs/verified.txt", options = 
   const trace = path.join(temp, "trace.txt");
   const launch = path.join(temp, "launch.json");
   const target = path.join(local, "docs", "verified.txt");
+  const foreignRoot = path.join(temp, "foreign-root");
+  if (mode === "config-swap") {
+    await fs.mkdir(path.join(foreignRoot, "docs"), { recursive: true });
+    await fs.writeFile(path.join(foreignRoot, "docs", "verified.txt"), "foreign bytes were not verified");
+  }
   const outside = path.join(temp, mode === "reparse-parent" ? "outside-dir" : "outside.txt");
   const prepared = path.join(temp, mode === "reparse-parent" ? "prepared-junction" : "prepared-symlink.txt");
   if (mode === "reparse-leaf" || mode === "reparse-parent") {
@@ -116,6 +127,7 @@ async function runPicker(t, mode, selectedPath = "docs/verified.txt", options = 
       ROOTARK_TEST_CONFIG: options.relativeConfig ? ".\\private-config.json" : config,
       ROOTARK_TEST_LOCATION: options.relativeConfig ? temp : options.differentLocation ? otherLocation : "",
       ROOTARK_TEST_PICKER: picker,
+      ROOTARK_TEST_FOREIGN_ROOT: foreignRoot,
       ROOTARK_TEST_TARGET: target, ROOTARK_TEST_PARENT: path.dirname(target),
       ROOTARK_TEST_PREPARED_LINK: prepared },
     encoding: "utf8", timeout: 20000,
@@ -190,6 +202,17 @@ test("issue 66 Windows: failed verified hydration does not reveal or alter local
   assert.match(trace, /\|hydrate\|/);
   assert.equal(await fs.readFile(path.join(local, "docs", "verified.txt"), "utf8"), "unchanged local bytes");
 });
+
+test("issue 66 Windows P2: config root cannot change between verified hydrate and Explorer reveal",
+  { skip: process.platform !== "win32" }, async (t) => {
+    const { result, local, launch, trace } = await runPicker(t, "config-swap");
+    assert.notEqual(result.status, 0, "the config rewrite must fail during the guarded hydrate");
+    assert.match(trace, /\|hydrate\|/, "the malicious rewrite must be attempted after a positive inventory");
+    assert.equal(launch, null, "Explorer must never reveal the unrelated foreign file");
+    assert.equal(await fs.readFile(path.join(local, "docs", "verified.txt"), "utf8"), "unchanged local bytes");
+    assert.equal(await fs.readFile(path.join(path.dirname(local), "foreign-root", "docs", "verified.txt"), "utf8"),
+      "foreign bytes were not verified");
+  });
 
 for (const { mode, reparseComponent } of [
   { mode: "reparse-leaf", reparseComponent: "verified.txt" },
