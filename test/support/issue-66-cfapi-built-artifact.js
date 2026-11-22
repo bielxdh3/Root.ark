@@ -221,7 +221,7 @@ function validateFixtureArgs(name, scratch, args) {
     allowed = values.length === 2
       && ["--disposable-live", "--disposable-live-stdin", "--disposable-live-alias",
         "--disposable-native-names", "--disposable-concurrent-alias",
-        "--disposable-no-authority"].includes(values[0])
+        "--disposable-no-authority", "--disposable-repin-during-authority"].includes(values[0])
       && comparable(values[1]) === comparable(path.join(scratch, "owner-only"));
   }
   assert.ok(allowed, FAIL);
