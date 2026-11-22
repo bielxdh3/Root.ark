@@ -54,6 +54,11 @@ test("P2: an unresponsive HPKE worker times out and is terminated without CEK re
     location);
   } finally { global.setTimeout = realSetTimeout; }
   const issued = injected.exports.__testMakeWorker();
+  // The reservation has no CEK and may remain alive while independently
+  // trusted authority is consulted. The deadline starts exactly when a CEK
+  // would cross the worker boundary; prove the production timeout still
+  // denies and terminates that unresponsive worker after arming it.
+  issued.armSecretDeadline();
   await assert.rejects(issued.reply, /ZK_OWNER_HPKE_WORKER_TIMEOUT/);
   assert.equal(created, 1);
   assert.equal(terminated, 1);

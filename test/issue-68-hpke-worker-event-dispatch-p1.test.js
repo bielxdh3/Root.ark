@@ -83,6 +83,55 @@ test("P1: callback-patched EventEmitter.emit cannot forge owner CEK ciphertext o
   }
 });
 
+test("P2: callback-poisoned EventEmitter.once cannot strand the owner HPKE worker termination", async () => {
+  const helper = privateSealHelpers();
+  const pair = await z.hpkeSuite().kem.generateKeyPair();
+  const pub = Buffer.from(await z.hpkeSuite().kem.serializePublicKey(pair.publicKey));
+  const info = Buffer.from("Root.ark/sharing/worker-once-exit-p2/info\0");
+  const aad = Buffer.from("Root.ark/sharing/worker-once-exit-p2/aad\0");
+  const ownerCek = crypto.randomBytes(32);
+  const savedOnce = EventEmitter.prototype.once;
+  const terminate = Worker.prototype.terminate;
+  let issued, onceSpyCalls = 0, opened;
+  try {
+    // The owner now reserves a genuine Worker BEFORE the authority callback.
+    // Node 22 terminate() dynamically reads this.once('exit', resolve).
+    issued = helper.__newPrivateHpkeWorker();
+    EventEmitter.prototype.once = function (kind, listener) {
+      if (issued && this === issued.worker && kind === "exit") {
+        onceSpyCalls++;
+        return this; // attacker silently drops the worker-exit listener
+      }
+      return Reflect.apply(savedOnce, this, [kind, listener]);
+    };
+    const sealed = await helper.__sealPrivateCekHpke(issued, pub, ownerCek, info, aad);
+    assert.ok(issued.worker.threadId >= 0,
+      "test must terminate a real active Worker, not accept an already stopped fixture");
+    let timer;
+    const settled = await Promise.race([
+      Reflect.apply(terminate, issued.worker, []).then(() => true, () => false),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(false), 3000); }),
+    ]).finally(() => clearTimeout(timer));
+    assert.equal(settled, true,
+      "the real Worker.terminate() promise must settle despite the poisoned exit listener");
+    assert.equal(onceSpyCalls, 0,
+      "worker termination may never call callback-replaced EventEmitter.once");
+    for (const key of ["on", "once", "emit"]) {
+      const pinned = Object.getOwnPropertyDescriptor(issued.worker, key);
+      assert.equal(pinned?.writable, false, `${key} must be pinned on the worker instance`);
+      assert.equal(pinned?.configurable, false, `${key} must not be replaceable`);
+    }
+    opened = Buffer.from(await z.hpkeOpen({ recipientKey: pair.privateKey,
+      enc: sealed.enc, ciphertext: sealed.ciphertext, info, aad }));
+    assert.deepEqual(opened, ownerCek, "the actual HPKE result must still be intact");
+  } finally {
+    EventEmitter.prototype.once = savedOnce;
+    if (issued) await Reflect.apply(terminate, issued.worker, []).catch(() => {});
+    opened?.fill(0);
+    ownerCek.fill(0);
+  }
+});
+
 test("P1: callback-patched MessagePort.postMessage cannot read transferred owner CEK", async () => {
   const helper = privateSealHelpers();
   const pair = await z.hpkeSuite().kem.generateKeyPair();
@@ -95,9 +144,9 @@ test("P1: callback-patched MessagePort.postMessage cannot read transferred owner
   let messagesObserved = 0, exposedCek = false;
   let issued;
   try {
-    // Installed exactly where an untrusted authority callback can poison the
-    // caller's global prototype. The native Worker method delegates through
-    // private MessagePorts, so capturing only Worker.postMessage is unsafe.
+    // The trusted worker bootstrap is already complete before this callback
+    // can poison the parent's global transport prototype.
+    issued = helper.__newPrivateHpkeWorker();
     MessagePort.prototype.postMessage = function (value, ...args) {
       if (value && value.type === "seal") {
         messagesObserved++;
@@ -108,7 +157,6 @@ test("P1: callback-patched MessagePort.postMessage cannot read transferred owner
       }
       return Reflect.apply(originalPostMessage, this, [value, ...args]);
     };
-    issued = helper.__newPrivateHpkeWorker();
     const encrypted = await helper.__sealPrivateCekHpke(issued, pub, realCek, info, aad);
     // Restore the untrusted global immediately after the sensitive handoff;
     // verify an actual authenticated HPKE round-trip using the private key.
@@ -127,7 +175,7 @@ test("P1: callback-patched MessagePort.postMessage cannot read transferred owner
   }
 });
 
-test("P1: forged valid HPKE reply through MessagePort.on fails authentication before owner signing", async () => {
+test("P1: poisoned pre-bootstrap MessagePort.on is denied before a worker can receive CEK", async () => {
   const helper = privateSealHelpers();
   const pair = await z.hpkeSuite().kem.generateKeyPair();
   const pub = Buffer.from(await z.hpkeSuite().kem.serializePublicKey(pair.publicKey));
@@ -155,18 +203,148 @@ test("P1: forged valid HPKE reply through MessagePort.on fails authentication be
         return Reflect.apply(listener, this, [payload, ...args]);
       }]);
     };
-    issued = helper.__newPrivateHpkeWorker();
-    await assert.rejects(helper.__sealPrivateCekHpke(issued, pub, realCek, info, aad),
+    assert.throws(() => { issued = helper.__newPrivateHpkeWorker(); },
       /ZK_OWNER_FILE_CEK_DENIED/,
-      "callback-forged HPKE ciphertext must not receive a valid owner signature");
-    assert.ok(registeredHandlers > 0,
-      "the patched native transport listener must be exercised");
-    assert.ok(injectedReplies > 0,
-      "the test must substitute a REAL attacker-key HPKE reply");
+      "worker bootstrap must fail closed if the callback replaced MessagePort.on");
+    assert.equal(registeredHandlers, 0,
+      "no attacker-controlled listener may run during a denied LOAD_SCRIPT bootstrap");
+    assert.equal(injectedReplies, 0,
+      "no attacker HPKE reply may reach a worker that was never created");
   } finally {
     MessagePort.prototype.on = originalOn;
     if (issued) await Reflect.apply(terminate, issued.worker, []).catch(() => {});
     realCek.fill(0);
     attackerCek.fill(0);
+  }
+});
+
+test("P1: forged worker HPKE reply plus poisoned native HMAC binding cannot manufacture owner signature", async () => {
+  const helper = privateSealHelpers();
+  const pair = await z.hpkeSuite().kem.generateKeyPair();
+  const pub = Buffer.from(await z.hpkeSuite().kem.serializePublicKey(pair.publicKey));
+  const info = Buffer.from("Root.ark/sharing/worker-hmac-binding-p1/info\0");
+  const aad = Buffer.from("Root.ark/sharing/worker-hmac-binding-p1/aad\0");
+  const ownerCek = crypto.randomBytes(32);
+  const attackCek = crypto.randomBytes(32);
+  const forged = await z.hpkeSeal({ recipientPublicKey: pair.publicKey,
+    plaintext: attackCek, info, aad });
+  const fakeAck = crypto.randomBytes(32);
+  const handleCarrier = crypto.createHmac("sha256", Buffer.alloc(32));
+  const handleSymbol = Reflect.ownKeys(handleCarrier).find((key) =>
+    typeof key === "symbol" && String(key) === "Symbol(kHandle)");
+  assert.ok(handleSymbol, "Node22 HMAC test requires the genuine native binding handle");
+  const nativeHandlePrototype = Object.getPrototypeOf(handleCarrier[handleSymbol]);
+  const originalDigest = Object.getOwnPropertyDescriptor(nativeHandlePrototype, "digest");
+  assert.ok(originalDigest && originalDigest.configurable);
+  const terminate = Worker.prototype.terminate;
+  let bindingSpyCalls = 0, issued;
+  try {
+    // A test-only injected response simulates compromised delivery EVEN
+    // though the production Worker listeners are now prepared earlier.
+    issued = helper.__newPrivateHpkeWorker();
+    Object.defineProperty(nativeHandlePrototype, "digest", { ...originalDigest,
+      value() { bindingSpyCalls++; return Buffer.from(fakeAck); } });
+    const activeProbe = crypto.createHmac("sha256", Buffer.alloc(32)).update("oracle").digest();
+    assert.deepEqual(activeProbe, fakeAck,
+      "oracle must prove that an ordinary JS HMAC digest is callback-replaceable");
+    bindingSpyCalls = 0;
+    issued.reply = Promise.resolve({ ok: true, enc: forged.enc,
+      ciphertext: forged.ciphertext, ackMac: Buffer.from(fakeAck) });
+    await assert.rejects(helper.__sealPrivateCekHpke(issued, pub, ownerCek, info, aad),
+      /ZK_OWNER_FILE_CEK_DENIED/,
+      "a modified native HMAC binding cannot authenticate another CEK and induce owner signature");
+    assert.equal(bindingSpyCalls, 0,
+      "WebCrypto native HMAC verification must not call callback-poisoned Hmac binding.digest");
+  } finally {
+    Object.defineProperty(nativeHandlePrototype, "digest", originalDigest);
+    if (issued) await Reflect.apply(terminate, issued.worker, []).catch(() => {});
+    ownerCek.fill(0);
+    attackCek.fill(0);
+    fakeAck.fill(0);
+  }
+});
+
+test("P1: LOAD_SCRIPT replacement via MessagePort.postMessage is denied before bootstrap", async () => {
+  const helper = privateSealHelpers();
+  const actualPost = MessagePort.prototype.postMessage;
+  let replacedBoot = 0;
+  try {
+    // This is the actual Node22 worker bootstrap message, NOT merely the
+    // later application-level {type:'seal'} message. A malicious callback
+    // could swap it for attacker-controlled Worker eval code and steal CEK.
+    MessagePort.prototype.postMessage = function (payload, ...args) {
+      if (payload?.type === "loadScript") {
+        replacedBoot++;
+        return Reflect.apply(actualPost, this, [{ ...payload,
+          filename: "globalThis.onmessage=()=>{};", doEval: "classic" }, ...args]);
+      }
+      return Reflect.apply(actualPost, this, [payload, ...args]);
+    };
+    assert.throws(() => helper.__newPrivateHpkeWorker(),
+      /ZK_OWNER_FILE_CEK_DENIED/,
+      "a tainted LOAD_SCRIPT transport must reject before creating any worker");
+    assert.equal(replacedBoot, 0,
+      "the compromised constructor method must never receive LOAD_SCRIPT");
+  } finally {
+    MessagePort.prototype.postMessage = actualPost;
+  }
+});
+
+test("P1: callback MessagePort.on cannot reentrantly replace worker LOAD_SCRIPT after transport guard", async () => {
+  const helper = privateSealHelpers();
+  const actualOn = MessagePort.prototype.on;
+  const actualPost = MessagePort.prototype.postMessage;
+  let constructorOnCalls = 0, swappedBoots = 0;
+  try {
+    // A precheck only of postMessage is bypassable: on('message') occurs
+    // earlier inside Node22 Worker constructor. Enforce pristine `.on` too.
+    MessagePort.prototype.on = function (...args) {
+      constructorOnCalls++;
+      MessagePort.prototype.postMessage = function (payload, ...postArgs) {
+        if (payload?.type === "loadScript") swappedBoots++;
+        return Reflect.apply(actualPost, this, [payload, ...postArgs]);
+      };
+      return Reflect.apply(actualOn, this, args);
+    };
+    assert.throws(() => helper.__newPrivateHpkeWorker(),
+      /ZK_OWNER_FILE_CEK_DENIED/,
+      "a callback-controlled .on hook must not run inside the constructor");
+    assert.equal(constructorOnCalls, 0, "no reentrant constructor hook may fire");
+    assert.equal(swappedBoots, 0, "no bootstrap can be rewritten after a partial precheck");
+  } finally {
+    MessagePort.prototype.on = actualOn;
+    MessagePort.prototype.postMessage = actualPost;
+  }
+});
+
+test("P1: a poisoned WeakMap lookup cannot replace the prepared trusted CEK worker", async () => {
+  const helper = privateSealHelpers();
+  const reservation = helper.reserveOwnerHpkeWorker();
+  const nativeGet = WeakMap.prototype.get;
+  const nativeDelete = WeakMap.prototype.delete;
+  let forgedLookups = 0, forgedDeletes = 0;
+  try {
+    // The reservation crosses an external authority callback. If its one-shot
+    // lookup dispatches to the callback-replaced WeakMap.prototype.get, an
+    // attacker can supply an entirely different real Worker to receive CEK.
+    WeakMap.prototype.get = function (key) {
+      if (key === reservation) { forgedLookups++; return { worker: {} }; }
+      return Reflect.apply(nativeGet, this, [key]);
+    };
+    WeakMap.prototype.delete = function (key) {
+      if (key === reservation) { forgedDeletes++; return true; }
+      return Reflect.apply(nativeDelete, this, [key]);
+    };
+    await assert.rejects(helper.sealOwnerAuthorizedFileCek(null, reservation),
+      /ZK_OWNER_FILE_CEK_DENIED/,
+      "invalid owner input must deny while consuming the authentic reservation");
+    assert.equal(forgedLookups, 0,
+      "the owner must not dispatch its one-shot worker lookup to a patched WeakMap.get");
+    assert.equal(forgedDeletes, 0,
+      "the owner must consume its one-shot token through the pinned native delete");
+  } finally {
+    WeakMap.prototype.get = nativeGet;
+    WeakMap.prototype.delete = nativeDelete;
+    await helper.discardOwnerHpkeWorker(reservation);
   }
 });

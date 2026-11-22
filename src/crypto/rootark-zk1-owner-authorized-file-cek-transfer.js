@@ -8,11 +8,15 @@ const path = require("node:path");
 const { createRequire } = require("node:module");
 const { Worker, MessagePort } = require("node:worker_threads");
 const nativeEventOn = require("node:events").EventEmitter.prototype.on;
+const nativeEventOnce = require("node:events").EventEmitter.prototype.once;
 const nativeEventEmit = require("node:events").EventEmitter.prototype.emit;
 const nativeSetTimeout = setTimeout;
 const nativeClearTimeout = clearTimeout;
 const NativePromise = Promise;
 const nativePromiseThen = Promise.prototype.then;
+const nativeWeakMapGet = WeakMap.prototype.get;
+const nativeWeakMapSet = WeakMap.prototype.set;
+const nativeWeakMapDelete = WeakMap.prototype.delete;
 const nativeTypes = require("node:util").types;
 const nativeIsProxy = nativeTypes.isProxy;
 const nativeIsUint8Array = nativeTypes.isUint8Array;
@@ -62,7 +66,6 @@ const nativeBufferConcat = Buffer.concat.bind(Buffer);
 const nativeBufferToString = Buffer.prototype.toString;
 const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
 const nativeCreateHash = crypto.createHash.bind(crypto);
-const nativeCreateHmac = crypto.createHmac.bind(crypto);
 const nativeCreatePublicKey = crypto.createPublicKey.bind(crypto);
 const nativeSign = crypto.sign.bind(crypto);
 const nativeVerify = crypto.verify.bind(crypto);
@@ -78,10 +81,15 @@ const nativeKeyObjectExport = nativeGetPrototypeOf(nativeCreatePublicKey({
 const nativeSubtle = crypto.webcrypto.subtle;
 const nativeSubtleExportKey = nativeSubtle.exportKey;
 const nativeSubtleEncrypt = nativeSubtle.encrypt;
+const nativeSubtleImportKey = nativeSubtle.importKey;
+const nativeSubtleSign = nativeSubtle.sign;
 const nativeWorkerPostMessage = Worker.prototype.postMessage;
 const nativeWorkerTerminate = Worker.prototype.terminate;
 const nativeMessagePortPrototype = MessagePort.prototype;
 const nativeMessagePortPostMessage = MessagePort.prototype.postMessage;
+const nativeMessagePortOn = MessagePort.prototype.on;
+const nativeMessagePortStart = MessagePort.prototype.start;
+const nativeMessagePortUnref = MessagePort.prototype.unref;
 const hpkeSealWorkerPath = path.join(__dirname,
   "rootark-zk1-owner-authorized-hpke-seal-worker.js");
 const nativeJsonStringify = JSON.stringify;
@@ -106,9 +114,6 @@ const nativeTargetDigest = browserPop.targetDigest.bind(browserPop);
 const nativeHashPrototype = nativeGetPrototypeOf(nativeCreateHash("sha256"));
 const nativeHashUpdate = nativeHashPrototype.update;
 const nativeHashDigest = nativeHashPrototype.digest;
-const nativeHmacPrototype = nativeGetPrototypeOf(nativeCreateHmac("sha256", nativeBufferAlloc(32)));
-const nativeHmacUpdate = nativeHmacPrototype.update;
-const nativeHmacDigest = nativeHmacPrototype.digest;
 const HPKE_WORKER_ACK_DOMAIN = nativeBufferFrom("Root.ark/zk-1/owner-hpke-worker-ack/v1\0");
 function nativeSha256(value) {
   const hash = nativeCreateHash("sha256");
@@ -266,10 +271,38 @@ function wipeOwnedBytes(value) {
     nativeApply(nativeTypedFill, value, [0]);
   }
 }
+// A Worker constructor itself sends LOAD_SCRIPT through its private port
+// before returning. Checking postMessage alone is insufficient: an attacker
+// can poison MessagePort.on to change postMessage during that constructor.
+// Walk captured native descriptors without invoking any caller getter or
+// iterator. Only a pristine constructor dispatch may bootstrap CEK workers.
+function intrinsicMethod(receiverPrototype, name) {
+  let prototype = receiverPrototype;
+  while (prototype !== null) {
+    if (nativeIsProxy(prototype)) deny();
+    const descriptor = nativeGetOwnPropertyDescriptor(prototype, name);
+    if (descriptor) {
+      if (!nativeHasOwn(descriptor, "value")) deny();
+      return descriptor.value;
+    }
+    prototype = nativeGetPrototypeOf(prototype);
+  }
+  deny();
+}
+function requireTrustedWorkerBootstrap() {
+  if (intrinsicMethod(nativeMessagePortPrototype, "postMessage") !== nativeMessagePortPostMessage
+    || intrinsicMethod(nativeMessagePortPrototype, "on") !== nativeMessagePortOn
+    || intrinsicMethod(nativeMessagePortPrototype, "start") !== nativeMessagePortStart
+    || intrinsicMethod(nativeMessagePortPrototype, "unref") !== nativeMessagePortUnref
+    || intrinsicMethod(Worker.prototype, "on") !== nativeEventOn
+    || intrinsicMethod(Worker.prototype, "once") !== nativeEventOnce
+    || intrinsicMethod(Worker.prototype, "emit") !== nativeEventEmit) deny();
+}
 function newPrivateHpkeWorker() {
-  // Construct a fresh worker only after valid owner authorization. No
-  // authority callback can mutate this worker's separate V8 realm, even when
-  // those callbacks have already changed the caller realm's prototypes.
+  // Never bootstrap through callback-replaced Node internal transport.
+  // Real owner flows reserve this worker BEFORE their first independent
+  // authority callback; a later prototype mutation cannot replace LOAD_SCRIPT.
+  requireTrustedWorkerBootstrap();
   const options = nativeCreate(null);
   options.execArgv = [];
   // Do not inherit unrelated process credentials/environment into a helper
@@ -298,6 +331,15 @@ function newPrivateHpkeWorker() {
   }
   // Fail closed if a future Node version changes the Worker transport layout.
   if (pinnedPorts !== 2) deny();
+  // Worker.terminate() calls this.once("exit", ...) dynamically in Node 22.
+  // A post-authority callback must not be able to suppress that listener and
+  // indefinitely stall the owner's final signed release or cleanup.
+  nativeDefineProperty(worker, "on", {
+    value: nativeEventOn, writable: false, configurable: false,
+  });
+  nativeDefineProperty(worker, "once", {
+    value: nativeEventOnce, writable: false, configurable: false,
+  });
   // Worker inherits EventEmitter.emit from the caller's mutable realm. An
   // authority callback can replace that method after the worker is started
   // and substitute a valid HPKE envelope for a different CEK. Pin the native
@@ -330,17 +372,21 @@ function newPrivateHpkeWorker() {
   nativeApply(nativeEventOn, worker, ["exit", () => {
     settle(false, "ZK_OWNER_HPKE_WORKER_EXITED");
   }]);
-  // Never wait indefinitely with a sensitive CEK detached into a worker.
-  // Terminate a stalled worker and deny, without accepting a late ciphertext.
-  deadline = nativeSetTimeout(() => {
-    if (completed) return;
-    settle(false, "ZK_OWNER_HPKE_WORKER_TIMEOUT");
-    try {
-      const dying = nativeApply(nativeWorkerTerminate, worker, []);
-      nativeApply(nativePromiseThen, dying, [() => {}, () => {}]);
-    } catch (_) { /* only the denial may escape */ }
-  }, 45_000);
-  return { worker, reply };
+  // A prepared worker may wait on a genuine external-authority callback.
+  // Start the absolute 45s timeout only when the secret crosses its port,
+  // otherwise a slow but valid trusted read spuriously expires the worker.
+  const armSecretDeadline = () => {
+    if (deadline !== undefined || completed) deny();
+    deadline = nativeSetTimeout(() => {
+      if (completed) return;
+      settle(false, "ZK_OWNER_HPKE_WORKER_TIMEOUT");
+      try {
+        const dying = nativeApply(nativeWorkerTerminate, worker, []);
+        nativeApply(nativePromiseThen, dying, [() => {}, () => {}]);
+      } catch (_) { /* only the denial may escape */ }
+    }, 45_000);
+  };
+  return { worker, reply, armSecretDeadline };
   } catch (error) {
     // A malicious callback can poison Promise[Symbol.species] or another
     // mutable intrinsic between construction and listener installation. Do
@@ -351,6 +397,23 @@ function newPrivateHpkeWorker() {
     catch (_) { /* preserve the original fail-closed setup error */ }
     throw error;
   }
+}
+// A portable sharing operation performs its own independent-authority await
+// BEFORE calling the owner CEK sealer. Reserve a pristine, authenticated
+// bootstrap before that external callback can alter Node's global transports.
+// Tokens are opaque and one-shot; callers cannot inject their own Worker.
+const reservedHpkeWorkers = new WeakMap();
+function reserveOwnerHpkeWorker() {
+  const token = nativeFreeze(nativeCreate(null));
+  nativeApply(nativeWeakMapSet, reservedHpkeWorkers, [token, newPrivateHpkeWorker()]);
+  return token;
+}
+async function discardOwnerHpkeWorker(token) {
+  const issued = nativeApply(nativeWeakMapGet, reservedHpkeWorkers, [token]);
+  if (!issued) return;
+  nativeApply(nativeWeakMapDelete, reservedHpkeWorkers, [token]);
+  try { await nativeApply(nativeWorkerTerminate, issued.worker, []); }
+  catch (_) { /* explicit failed owner operation never releases ciphertext */ }
 }
 async function sealPrivateCekHpke(isolatedWorker, recipientPublicKeyRaw, plaintext, info, aad) {
   // The only secret-bearing message crosses the native structured-clone
@@ -387,6 +450,7 @@ async function sealPrivateCekHpke(isolatedWorker, recipientPublicKeyRaw, plainte
     request.aad = copyOwnedBytes(aad);
     // The native Worker method is pinned at module initialization, and the
     // transfer detaches the CEK bytes from this realm synchronously.
+    isolatedWorker.armSecretDeadline();
     nativeApply(nativeWorkerPostMessage, isolatedWorker.worker, [request, [isolated, ackKey]]);
     const response = await isolatedWorker.reply;
     if (!response || response.ok !== true) deny();
@@ -396,11 +460,23 @@ async function sealPrivateCekHpke(isolatedWorker, recipientPublicKeyRaw, plainte
     if (nativeApply(nativeTypedByteLength, enc, []) !== 32
       || nativeApply(nativeTypedByteLength, ciphertext, []) !== 48
       || nativeApply(nativeTypedByteLength, ackMac, []) !== 32) deny();
-    const verifier = nativeCreateHmac("sha256", ackSecret);
-    nativeApply(nativeHmacUpdate, verifier, [HPKE_WORKER_ACK_DOMAIN]);
-    nativeApply(nativeHmacUpdate, verifier, [enc]);
-    nativeApply(nativeHmacUpdate, verifier, [ciphertext]);
-    if (!nativeTimingSafeEqual(nativeApply(nativeHmacDigest, verifier, []), ackMac)) deny();
+    // crypto.createHmac() is a JS wrapper which dynamically invokes the
+    // native binding's mutable .digest prototype. A post-authority callback
+    // can replace that method and bless a forged HPKE reply. Use captured
+    // WebCrypto native entry points, importing a nonextractable per-operation
+    // HMAC key from an owned ArrayBuffer with no mutable typed-array getters.
+    const verifierRaw = new nativeArrayBuffer(32);
+    const verifierView = new nativeUint8Array(verifierRaw);
+    nativeApply(nativeTypedSet, verifierView, [ackSecret]);
+    let verifier;
+    try {
+      verifier = await nativeApply(nativeSubtleImportKey, nativeSubtle,
+        ["raw", verifierRaw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]]);
+    } finally { nativeApply(nativeTypedFill, verifierView, [0]); }
+    const signedBytes = nativeBufferConcat([HPKE_WORKER_ACK_DOMAIN, enc, ciphertext]);
+    const expectedAck = nativeBufferFrom(await nativeApply(nativeSubtleSign, nativeSubtle,
+      ["HMAC", verifier, signedBytes]));
+    if (expectedAck.length !== 32 || !nativeTimingSafeEqual(expectedAck, ackMac)) deny();
     return { enc, ciphertext };
   } finally {
     nativeApply(nativeTypedFill, ackSecret, [0]);
@@ -572,10 +648,19 @@ async function binding({ metadata, revision, ciphertext, ciphertextRoot, authori
     ciphertext_root: b64(pin),
     ciphertext_sha256: b64(sha(data)) };
 }
-async function sealOwnerAuthorizedFileCek(input) {
+async function sealOwnerAuthorizedFileCek(input, reservedToken) {
   const wallClock = Date.now;
   let cek, checked, stable, isolatedWorker;
   try {
+    // The standalone owner path creates its Worker before its own authority
+    // callbacks. The portable path consumes one pre-authority reservation.
+    isolatedWorker = reservedToken === undefined
+      ? newPrivateHpkeWorker()
+      : nativeApply(nativeWeakMapGet, reservedHpkeWorkers, [reservedToken]);
+    if (!isolatedWorker) deny();
+    if (reservedToken !== undefined) {
+      nativeApply(nativeWeakMapDelete, reservedHpkeWorkers, [reservedToken]);
+    }
     stable = snapshotFields(input);
     exact(stable, ["ownerPrivateKey", "ownerHeldCek", "metadata",
       "objectRevision", "ciphertext", "ciphertextRoot", "authority"]);
@@ -601,7 +686,9 @@ async function sealOwnerAuthorizedFileCek(input) {
     exact(core, CORE);
     if (!compare(from64(core.hpke_public_key, 32), ownerApprovedHpkePublicKey)) deny();
     const context = nativeBufferFrom(await nativeEncodeDeterministic(core));
-    isolatedWorker = newPrivateHpkeWorker();
+    // Consume only the pristine Worker reserved before the first authority
+    // callback. Reconstructing it here would reintroduce LOAD_SCRIPT hijack
+    // and orphan the original worker thread on every successful seal.
     const sealed = await sealPrivateCekHpke(isolatedWorker, ownerApprovedHpkePublicKey, cek,
       nativeBufferConcat([INFO, context]), nativeBufferConcat([AAD, context]));
     // The helper wipes its CEK before returning ciphertext. Ensure the
@@ -695,4 +782,5 @@ async function openOwnerAuthorizedFileCek(input) {
     wipeOwnedBytes(stable?.deviceHpkePrivateKey?.hpkePrivateRaw);
   }
 }
-module.exports = { sealOwnerAuthorizedFileCek, openOwnerAuthorizedFileCek };
+module.exports = { sealOwnerAuthorizedFileCek, openOwnerAuthorizedFileCek,
+  reserveOwnerHpkeWorker, discardOwnerHpkeWorker };

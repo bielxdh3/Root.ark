@@ -50,7 +50,8 @@ function nativeBase64Url(value) {
 }
 const { redeemProtectedCiphertextShare } =
   require("../../public/client/rootark-zk1-recipient-share");
-const { openOwnerAuthorizedFileCek, sealOwnerAuthorizedFileCek } =
+const { openOwnerAuthorizedFileCek, sealOwnerAuthorizedFileCek,
+  reserveOwnerHpkeWorker, discardOwnerHpkeWorker } =
   require("./rootark-zk1-owner-authorized-file-cek-transfer");
 const fileContent = require("../../public/client/rootark-zk1-file-content");
 const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
@@ -263,7 +264,7 @@ async function verifyOfferAuthority(authority, statement, bytes, signature, pin,
 // The owner also pins recipient keys outside the untrusted grant/ACK.
 async function createProtectedRecipientShareOffer(input) {
   const wallClock = Date.now;
-  let ownerCek, ciphertext;
+  let ownerCek, ciphertext, reservedWorker;
   try {
     strict(input, ["grant", "recipientPin", "issuerPin", "readIndependentAuthority",
       "ownerPrivateKey", "ownerHeldCek", "metadata", "objectRevision",
@@ -314,6 +315,9 @@ async function createProtectedRecipientShareOffer(input) {
     const statementBytes = from64(grant.shareStatementBase64,
       nativeBufferFrom(grant.shareStatementBase64, "base64url").length);
     if (statementBytes.length < 1 || statementBytes.length > 4096) denyOffer();
+    // Prepare the trusted LOAD_SCRIPT bootstrap before the FIRST await.
+    // Even a CBOR promise continuation must not precede Worker construction.
+    reservedWorker = reserveOwnerHpkeWorker();
     const statement = await nativeDecodeDeterministic(statementBytes);
     strict(statement, SHARE);
     if (!same(nativeBufferFrom(await nativeEncodeDeterministic(statement)), statementBytes)
@@ -346,7 +350,8 @@ async function createProtectedRecipientShareOffer(input) {
       ownerPrivateKey: d.ownerPrivateKey.value, ownerHeldCek: ownerCek,
       metadata, objectRevision: d.objectRevision.value, ciphertext,
       ciphertextRoot, authority: d.authority.value,
-    });
+    }, reservedWorker);
+    reservedWorker = null;
     if (envelope.core.device_id !== pin.deviceId
       || envelope.core.hpke_public_key !== pin.hpkePublicKey
       || envelope.core.object_id !== statement.object_id
@@ -375,7 +380,11 @@ async function createProtectedRecipientShareOffer(input) {
       authorizesProductionIo: false, externalCustodyProven: false,
     });
   } catch (_) { denyOffer(); }
-  finally { wipeOwnedBytes(ownerCek); wipeOwnedBytes(ciphertext); }
+  finally {
+    if (reservedWorker) await discardOwnerHpkeWorker(reservedWorker);
+    wipeOwnedBytes(ownerCek);
+    wipeOwnedBytes(ciphertext);
+  }
 }
 function safeEnvelope(value) {
   strict(value, ENVELOPE);

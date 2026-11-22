@@ -472,6 +472,11 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       packageEnvelopes: state.packageEnvelopes, now: 1400,
     });
     const freshWitnessKeyId = crypto.randomBytes(16);
+    // The early deterministic fixture uses a fixed clock. Later, independently
+    // signed HTTP redeems can outlive that instant under real worker isolation.
+    // Switch both the disposable server admission clock and signed witness
+    // observation to the same live clock before those later operations.
+    let liveWitnessClock = null;
     const witnessProvider = {
       async freshHead({ nonce }) {
         const statement = { type: "rootark-recovery-witness-head/v1",
@@ -479,7 +484,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
           current_revision: currentManifest.revision,
           current_manifest_digest: currentDigest,
           witness_sequence: currentManifest.revision, nonce,
-          observed_at: now + 9, status: "committed", pending_reservation_id: null };
+          observed_at: liveWitnessClock ? liveWitnessClock() : now + 9,
+          status: "committed", pending_reservation_id: null };
         return z.encodeDeterministic({ ...statement, signature: crypto.sign(null,
           Buffer.concat([Buffer.from("Root.ark/zk-1/recovery-witness-head/v1\0"),
             Buffer.from(await z.encodeDeterministic(statement))]), witness.privateKey) });
@@ -1513,7 +1519,22 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "the final independent authority callback must poison mutable reflection, Buffer and crypto globals");
     // Each later export is a new owner action: the independently trusted
     // adapter supplies a fresh clock, not a timestamp from fixture setup.
-    const testWallSeconds = () => Math.floor(Date.now() / 1000);
+    const actualFixtureDateNow = Date.now;
+    const actualFixtureApply = Reflect.apply;
+    const actualFixtureFloor = Math.floor;
+    // Hostile recipient callbacks later replace global Date.now to prove a
+    // fail-closed client clock. That synthetic clock must NEVER advance the
+    // independently clocked disposable HTTP server's durable CAS watermark.
+    const testWallSeconds = () => actualFixtureFloor(
+      actualFixtureApply(actualFixtureDateNow, Date, []) / 1000);
+    // The recipient's independently signed HTTP operations also require a
+    // fresh request clock. Worker-isolated real HPKE can add several seconds
+    // to the fixture; using the initial (now + 9) exceeds the strict 30s
+    // skew limit during a subsequent batch despite valid owner custody.
+    recipientShareInput.nowSeconds = testWallSeconds;
+    liveWitnessClock = testWallSeconds;
+    store.nowSeconds = testWallSeconds;
+    storeArgs.nowSeconds = testWallSeconds;
     Object.defineProperties(ownerOfferArgs, {
       nowSeconds: { enumerable: true, get: testWallSeconds },
       authority: { enumerable: true,
@@ -1524,16 +1545,26 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(offer.externalCustodyProven, false);
     assert.equal(JSON.stringify(offer).includes(b64(ownerHeldCek)), false,
       "portable handoff must not contain an unwrapped owner CEK");
+    const initialRecipientSeconds = testWallSeconds();
     const openedOffer = await openPortableProtectedRecipientShareFile({
       offer: JSON.parse(JSON.stringify(offer)), redeemInput: recipientShareInput,
-      authority: { ...linked, nowSeconds: now + 9 },
+      authority: { ...linked, nowSeconds: initialRecipientSeconds },
       operatorMinimumSequence: signedCommittedHead.sequence,
-      deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9 });
+      deviceHpkePrivateKey: bRecipient, nowSeconds: initialRecipientSeconds });
     assert.deepEqual(Buffer.from(openedOffer.data), bytes,
       "a separately authenticated recipient account/device opens the real AEAD bytes");
     openedOffer.data.fill(0);
     assert.ok(realShareReads >= 1,
       "recipient actually made a signed HTTP share/read request to the disposable SQLite server");
+    // Exercise the full owner-to-recipient HTTP/HPKE/AEAD path while its
+    // genuinely signed owner approval is still live. Adversarial rejection
+    // cases below deliberately consume time and may outlive that approval.
+    bridgeArgs.nowSeconds = testWallSeconds();
+    bridgeArgs.authority = { ...bridgeArgs.authority, nowSeconds: bridgeArgs.nowSeconds };
+    const shared = await openProtectedRecipientShareFile(bridgeArgs);
+    assert.deepEqual(Buffer.from(shared.data), bytes);
+    assert.equal(shared.authorizesProductionIo, false);
+    shared.data.fill(0);
     assert.equal(typeof portableCli.run, "function",
       "missing owner-export/recipient-redeem local CLI for existing trusted contexts");
     // A real owner/recipient trust adapter supplies the already pinned keys and
@@ -1569,6 +1600,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       }
       if (role === "redeem") {
         const originalFetch = recipientShareInput.fetchImpl;
+        const currentRecipientSeconds = testWallSeconds();
         return { redeemInput: {
           ...recipientShareInput, grant: input.grant,
           readIndependentAuthority: withoutTrustedAuthority ? null
@@ -1619,9 +1651,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
             return new Response(JSON.stringify(body), { status: 200,
               headers: { "content-type": "application/json" } });
           } : originalFetch,
-        }, authority: { ...linked, nowSeconds: now + 9 },
+        }, authority: { ...linked, nowSeconds: currentRecipientSeconds },
         operatorMinimumSequence: signedCommittedHead.sequence,
-        deviceHpkePrivateKey: bRecipient, nowSeconds: now + 9 };
+        deviceHpkePrivateKey: bRecipient, nowSeconds: currentRecipientSeconds };
       }
       throw Error("UNTRUSTED_MODE");
     };
@@ -2182,12 +2214,6 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       deviceHpkePrivateKey: bRecipient, nowSeconds: testWallSeconds(),
     }), /ZK_SHARE_FILE_OPEN_DENIED/,
     "revoked server grant cannot be bypassed by an otherwise valid portable CEK offer");
-    bridgeArgs.nowSeconds = testWallSeconds();
-    bridgeArgs.authority = { ...bridgeArgs.authority, nowSeconds: bridgeArgs.nowSeconds };
-    const shared = await openProtectedRecipientShareFile(bridgeArgs);
-    assert.deepEqual(Buffer.from(shared.data), bytes);
-    assert.equal(shared.authorizesProductionIo, false);
-    shared.data.fill(0);
     {
     // P2 regression: a genuinely signed share grant can outlive the owner
     // HPKE approval and witness. Expiration during real file AEAD must deny.
