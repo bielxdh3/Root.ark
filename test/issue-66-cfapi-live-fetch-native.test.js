@@ -148,3 +148,40 @@ test("#66 native CFAPI registration rejects a broad DACL before creating any pla
       "broad ACL must fail the held-root preflight before any native registration");
     assert.deepEqual(await fs.readdir(root), [], "denied root remains unmodified");
   });
+
+for (const length of [1, 65537]) {
+  test(`#66 native kernel CFAPI hydrates ${length} binary bytes across aligned EOF ranges`,
+    { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
+      const where = spawnSync("C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe",
+        ["-all", "-products", "*", "-prerelease", "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"],
+        { encoding: "utf8", timeout: 6000, windowsHide: true });
+      const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
+      if (!vcvars) { t.skip("MSVC x64 unavailable"); return; }
+      const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-live-"));
+      const root = path.join(scratch, "owner-only");
+      t.after(async () => {
+        await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        await fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      });
+      await fs.mkdir(root);
+      protectDisposableRoot(root, scratch);
+      const { receipt } = buildCompiledFixture(scratch, "live-fetch.exe", vcvars);
+      const bytes = Buffer.alloc(length);
+      for (let i = 0; i < bytes.length; ++i) bytes[i] = (i * 29 + 3) % 251;
+      const outcome = runCompiledFixture(receipt, ["--disposable-live-stdin", root],
+        25000, bytes);
+      bytes.fill(0);
+      assert.equal(outcome.status, 0,
+        `native short EOF/multirange physical hydration: ${outcome.stdout}\n${outcome.stderr}`);
+      const evidence = JSON.parse(outcome.stdout.trim());
+      assert.equal(evidence.positiveReadVerified, true);
+      assert.equal(evidence.verifiedBytes, length);
+      assert.ok(evidence.liveKernelCallbackCount >= 1);
+      assert.ok(evidence.successfulTransfers >= 1);
+      assert.equal(evidence.rejectedTransfers, 0);
+      assert.equal(evidence.finalRootIdentity, true);
+      assert.equal(evidence.finalAncestorsHeld, true);
+      assert.equal(evidence.finalRootPolicy, true);
+      assert.equal(evidence.unregistered, true);
+    });
+}
