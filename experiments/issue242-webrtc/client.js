@@ -24,6 +24,36 @@
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
 
+  function dropPeer(id) {
+    const p = peers.get(id);
+    if (p) {
+      p.outgoing = null;
+      p.incoming = null;
+      p.pendingOffer = null;
+      p.pc.close();
+      peers.delete(id);
+    }
+    document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
+      if (el.dataset.peerId === id) el.remove();
+    });
+    document.querySelectorAll('#incoming [data-peer-id]').forEach(el => {
+      if (el.dataset.peerId === id) el.remove();
+    });
+  }
+
+  function revokeRoomConsent() {
+    // Once the broker denies the room, never wait for the WebSocket close
+    // handshake before closing direct WebRTC transports. A data channel can
+    // otherwise keep transferring bytes after an explicit revocation.
+    roomGeneration++;
+    for (const id of [...peers.keys()]) dropPeer(id);
+    $('peers').replaceChildren();
+    $('incoming').replaceChildren();
+    $('invite').disabled = true;
+    role = null;
+    selfId = null;
+  }
+
   function connect(credentials) {
     roomGeneration++;
     const oldSocket = ws;
@@ -48,7 +78,11 @@
       if (ws !== eventSocket) return;
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
-      if (m.type === 'error') { record(diagnostics.rejected, m.code); return log('Erro: ' + m.code); }
+      if (m.type === 'error') {
+        if (m.code === 'REVOKED' || m.code === 'ROOM_CLOSED') revokeRoomConsent();
+        record(diagnostics.rejected, m.code);
+        return log('Erro: ' + m.code);
+      }
       if (m.type === 'joined') {
         selfId = m.peerId; role = m.role;
         $('invite').disabled = role !== 'host';
@@ -76,7 +110,12 @@
         line.textContent = 'Convidado ' + m.peerId.slice(0, 5) + ' ';
         const kick = document.createElement('button');
         kick.textContent = 'Revogar participante';
-        kick.addEventListener('click', () => wire({ type: 'kick', to: m.peerId }));
+        kick.addEventListener('click', () => {
+          // Revoke local consent immediately; the peer-left event may arrive
+          // later than direct DataChannel messages already queued by this UI.
+          wire({ type: 'kick', to: m.peerId });
+          dropPeer(m.peerId);
+        });
         line.append(kick);
         $('peers').append(line);
         wire({ type: 'request-peer', to: m.peerId });
@@ -124,12 +163,7 @@
           }
         } catch (e) { log('Negociação falhou: ' + e.name); }
       } else if (m.type === 'peer-left') {
-        const p = peers.get(m.peerId);
-        if (p) p.pc.close();
-        peers.delete(m.peerId);
-        document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
-          if (el.dataset.peerId === m.peerId) el.remove();
-        });
+        dropPeer(m.peerId);
         log('Par desconectado');
       }
     };
@@ -159,6 +193,7 @@
   }
   function attachChannel(p, dc) {
     p.dc = dc;
+    const active = () => peers.get(p.id) === p && p.dc === dc && dc.readyState === 'open';
     dc.binaryType = 'arraybuffer';
     dc.bufferedAmountLowThreshold = 32 * 1024;
     dc.onopen = () => {
@@ -166,6 +201,7 @@
       log('DataChannel aberto: ' + p.id.slice(0, 5));
     };
     dc.onclose = () => {
+      if (p.dc !== dc || peers.get(p.id) !== p) return;
       p.incoming = null;
       p.outgoing = null;
       log('DataChannel fechado: ' + p.id.slice(0, 5));
@@ -182,6 +218,7 @@
       log('Chunk rejeitado');
     }
     dc.onmessage = async event => {
+      if (!active()) return;
       if (event.data instanceof ArrayBuffer) {
         const rx = p.incoming;
         if (!rx || event.data.byteLength === 0 || rx.chunks.length >= MAX_FILE_CHUNKS ||
@@ -195,6 +232,7 @@
       try { m = JSON.parse(event.data); } catch { return; }
       if (m.type === 'text' && typeof m.text === 'string' && m.text.length <= 1000 && /^[0-9a-f]{64}$/.test(m.digest)) {
         const hash = await sha(new TextEncoder().encode(m.text));
+        if (!active()) return;
         if (hash === m.digest) {
           record(diagnostics.verifiedTexts, { from: p.id, text: m.text, sha256: hash });
           log('Texto SHA-256 OK de ' + p.id.slice(0, 5));
@@ -207,11 +245,13 @@
         p.pendingOffer = m.id;
         const div = document.createElement('div');
         div.className = 'entry';
+        div.dataset.peerId = p.id;
         div.textContent = 'Arquivo ' + m.name + ' (' + m.size + ' bytes) ';
         const button = document.createElement('button');
         button.textContent = 'Aceitar arquivo';
         button.dataset.testid = 'accept-file';
         button.addEventListener('click', () => {
+          if (!active() || p.pendingOffer !== m.id) return;
           p.incoming = { ...m, chunksSize: 0, chunks: [] };
           p.pendingOffer = null;
           dc.send(JSON.stringify({ type: 'accept-file', id: m.id }));
@@ -220,6 +260,7 @@
         const decline = document.createElement('button');
         decline.textContent = 'Recusar arquivo';
         decline.addEventListener('click', () => {
+          if (!active() || p.pendingOffer !== m.id) return;
           p.pendingOffer = null;
           dc.send(JSON.stringify({ type: 'decline-file', id: m.id }));
           div.remove();
@@ -242,6 +283,7 @@
         let offset = 0;
         for (const chunk of rx.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
         const digest = await sha(bytes);
+        if (!active()) return;
         if (digest !== rx.digest) { record(diagnostics.rejected, 'FILE_DIGEST'); return log('Arquivo corrompido'); }
         record(diagnostics.verifiedFiles, { from: p.id, name: rx.name, size: rx.size, sha256: digest });
         log('Arquivo SHA-256 OK: ' + rx.name);

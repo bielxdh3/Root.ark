@@ -194,3 +194,63 @@ test('P2: a late create-room HTTP response cannot replace a newer join intent', 
   assert.equal(f.snapshot().roomId, 'chosen-C', 'fresh explicit room creation still works');
   assert.equal(f.sockets.length, 2);
 });
+
+test('P2: host kick immediately closes the direct channel before a delayed peer-left event', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'host-invite');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-joined', role: 'guest', peerId: 'guest-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const guestChannel = f.peerConnections[0].channel;
+  assert.equal(guestChannel.readyState, 'open', 'control: WebRTC channel is connected');
+  await f.sendText('before kick');
+  assert.deepEqual(guestChannel.sent.filter(m => m.type === 'text').map(m => m.text), ['before kick']);
+  const kick = f.elements.get('peers').children[0].children.at(-1);
+  kick.onclick(); // Locally initiated revocation. Broker peer-left is deliberately delayed.
+  assert.deepEqual(socket.sent.at(-1), { type: 'kick', to: 'guest-A' });
+  assert.equal(guestChannel.readyState, 'closed',
+    'host must close the direct channel synchronously when revoking consent');
+  await f.sendText('after kick');
+  assert.deepEqual(guestChannel.sent.filter(m => m.type === 'text').map(m => m.text), ['before kick'],
+    'sensitive bytes must not be queued to revoked guest while signaling catches up');
+});
+
+test('P2: guest revoke/expiry error closes a live RTC channel before WebSocket closes', async () => {
+  for (const code of ['REVOKED', 'ROOM_CLOSED']) {
+    const f = clientFixture();
+    f.joinRoom('room-A', 'invite-A');
+    const socket = f.sockets[0];
+    await f.incoming(socket, { type: 'joined', role: 'guest', peerId: 'guest-A' });
+    await f.incoming(socket, { type: 'peer-allowed', peerId: 'host-A' });
+    const peer = f.peerConnections[0];
+    assert.equal(peer.closed, false);
+    await f.incoming(socket, { type: 'error', code });
+    assert.equal(peer.closed, true, `${code}: close RTC immediately on authoritative denial`);
+    assert.equal(f.snapshot().peers.length, 0,
+      `${code}: stale consent must not remain in client peer state`);
+  }
+});
+
+test('P2: a text hash started before revocation cannot publish a stale verified transfer', async () => {
+  let releaseHash;
+  const gate = new Promise(resolve => { releaseHash = resolve; });
+  const f = clientFixture({ digest: async (...args) => {
+    await gate;
+    return crypto.webcrypto.subtle.digest(...args);
+  } });
+  f.joinRoom('room-A', 'invitation');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const channel = f.peerConnections[0].channel;
+  const digest = crypto.createHash('sha256').update('stale peer data').digest('hex');
+  const pending = channel.onmessage({ data: JSON.stringify({
+    type: 'text', text: 'stale peer data', digest,
+  }) });
+  await f.incoming(socket, { type: 'peer-left', peerId: 'guest-A' });
+  releaseHash();
+  await pending;
+  assert.equal(f.snapshot().diagnostics.verifiedTexts.length, 0,
+    'late SHA completion must not treat a disconnected peer as a verified transfer');
+});
