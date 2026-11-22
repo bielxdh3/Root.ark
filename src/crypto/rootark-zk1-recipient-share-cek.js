@@ -183,7 +183,9 @@ function snapshotAuthority(value) {
   strict(headValue, ["revision", "epoch", "digest"]);
   const h = nativeGetOwnPropertyDescriptors(headValue);
   if (!hasOwnDataFields(h, ["revision", "epoch", "digest"])) denyOffer();
-  if (isProxy(h.digest.value) || !(h.digest.value instanceof Uint8Array)
+  if (!nativeNumberIsSafeInteger(h.revision.value) || h.revision.value < 0
+    || !nativeNumberIsSafeInteger(h.epoch.value) || h.epoch.value < 0
+    || isProxy(h.digest.value) || !(h.digest.value instanceof Uint8Array)
     || h.digest.value.length !== 32) denyOffer();
   const head = { revision: h.revision.value, epoch: h.epoch.value,
     digest: nativeBufferFrom(h.digest.value) };
@@ -205,7 +207,12 @@ function snapshotAuthority(value) {
       "enrolledEpoch", "revokedAtEpoch"])
       || isProxy(d.authorizationPublicKey.value)
       || !(d.authorizationPublicKey.value instanceof Uint8Array)
-      || d.authorizationPublicKey.value.length !== 32) denyOffer();
+      || d.authorizationPublicKey.value.length !== 32
+      || !nativeNumberIsSafeInteger(d.enrolledEpoch.value)
+      || d.enrolledEpoch.value < 0
+      || !(d.revokedAtEpoch.value === null
+        || (nativeNumberIsSafeInteger(d.revokedAtEpoch.value)
+          && d.revokedAtEpoch.value >= d.enrolledEpoch.value))) denyOffer();
     devices[index] = { deviceId: d.deviceId.value,
       authorizationPublicKey: nativeBufferFrom(d.authorizationPublicKey.value),
       enrolledEpoch: d.enrolledEpoch.value, revokedAtEpoch: d.revokedAtEpoch.value };
@@ -300,6 +307,7 @@ async function createProtectedRecipientShareOffer(input) {
       || !same(nativeBufferFrom(statement.grant_id || []), from64(grant.grantId, 32))
       || statement.expires_at !== grant.expiresAt
       || !nativeNumberIsSafeInteger(statement.issued_at) || statement.issued_at < 1
+      || statement.issued_at > d.nowSeconds.value + 30
       || !nativeNumberIsSafeInteger(statement.expires_at)
       || statement.expires_at <= nativeMathMax(d.nowSeconds.value, statement.issued_at)
       || statement.expires_at - statement.issued_at > 86400

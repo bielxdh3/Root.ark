@@ -368,6 +368,32 @@ async function createMinimalOfferFixture() {
 }
 
 
+test("issue 68: future-dated signed offer is rejected before consulting recipient authority", async () => {
+  const f = await createMinimalOfferFixture();
+  const statement = await z.decodeDeterministic(
+    Buffer.from(f.grant.shareStatementBase64, "base64url"));
+  statement.issued_at = f.now + 35;
+  statement.expires_at = statement.issued_at + 60;
+  const statementBytes = Buffer.from(await z.encodeDeterministic(statement));
+  const domain = Buffer.from("Root.ark/zk-1/protected-ciphertext-share/v1\0");
+  const futureGrant = {
+    ...f.grant,
+    expiresAt: statement.expires_at,
+    shareStatementBase64: b64(statementBytes),
+    shareSignatureBase64: b64(crypto.sign(null,
+      Buffer.concat([domain, statementBytes]), f.issuer.privateKey)),
+  };
+  let authorityReads = 0;
+  await assert.rejects(createProtectedRecipientShareOffer({
+    grant: futureGrant, recipientPin: f.recipientPin, issuerPin: f.issuerPin,
+    readIndependentAuthority: async () => { authorityReads++; return f.baseAuthority; },
+    ownerPrivateKey: f.owner.privateKey, ownerHeldCek: f.ownerHeldCek,
+    metadata: f.metadata, objectRevision: 1, ciphertext: f.ciphertext,
+    ciphertextRoot: f.ciphertextRoot, authority: f.baseAuthority, nowSeconds: f.now,
+  }), /ZK_SHARE_OFFER_DENIED/);
+  assert.equal(authorityReads, 0, "future-issued grant must fail at signed time admission");
+});
+
 test("issue 68: poisoned scope iterator and Array.some cannot suppress an independent owner scope mismatch", async () => {
   const f = await createMinimalOfferFixture();
   const originalIterator = Array.prototype[Symbol.iterator];
