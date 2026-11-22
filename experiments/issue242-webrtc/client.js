@@ -31,6 +31,25 @@
   const peers = new Map(), invites = new Map();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
+  async function releaseUnusedRoom(reservation) {
+    // Only the real signed-session adapter can cancel an HTTP reservation.
+    // Standalone and synthetic fixture room IDs are not server capabilities.
+    if (!inRootark || typeof reservation?.roomId !== 'string' ||
+      !/^[a-f0-9]{16}$/.test(reservation.roomId) ||
+      typeof reservation.hostKey !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(reservation.hostKey)) return;
+    const csrf = document.cookie.split(';').map(value => value.trim())
+      .find(value => value.startsWith('rootark_csrf='));
+    if (!csrf) return;
+    try {
+      await fetch('/p2p/rooms/release', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json',
+          'X-CSRF-Token': csrf.slice('rootark_csrf='.length) },
+        body: JSON.stringify({ roomId: reservation.roomId, hostKey: reservation.hostKey }),
+      });
+    } catch { /* Expiry is still the fail-safe if the release request is lost. */ }
+  }
   const setCreateButtonsDisabled = disabled => {
     const awaitingAdmission = Boolean(ws && ws.readyState !== WebSocket.CLOSED && !role);
     const locked = Boolean(disabled || awaitingAdmission);
@@ -79,12 +98,14 @@
     if (!ws && !creating) return false;
     const previousRole = role;
     const connecting = Boolean(ws && !previousRole);
+    const unjoinedReservation = !previousRole ? { roomId, hostKey } : null;
     invalidateRoomIntent(); // A pending create must not restore this room.
     retireRoom();
     roomId = null;
     hostKey = null;
     protectedRoomRequired = false;
     $('room').textContent = '';
+    if (unjoinedReservation) void releaseUnusedRoom(unjoinedReservation);
     log(creating && !previousRole ? 'Criação de sala cancelada' :
       connecting ? 'Conexão cancelada' :
       previousRole === 'host' ? 'Sala encerrada' : 'Você saiu da sala');
@@ -113,6 +134,7 @@
         // room can lose ACL/object eligibility between its successful POST
         // and the WebSocket recheck; never retain that pending room identity.
         if (!role) {
+          void releaseUnusedRoom({ roomId, hostKey });
           invalidateRoomIntent();
           retireRoom();
           roomId = null;
@@ -251,6 +273,7 @@
     };
     ws.onclose = () => {
       if (ws !== eventSocket) return;
+      if (!role) void releaseUnusedRoom({ roomId, hostKey });
       // A signaling socket can close while a room-creation POST is still
       // awaiting its response body. Retire that intent too, otherwise the
       // late JSON response could reconnect a room after the socket was lost.
@@ -693,10 +716,15 @@
       const body = inRootark && boundObject ? JSON.stringify({ boundObject }) : undefined;
       const response = await fetch(inRootark ? '/p2p/rooms' : '/rooms',
         { method: 'POST', headers, body, credentials: 'same-origin', signal: controller.signal });
-      if (intent !== roomIntent) return false;
-      if (!response.ok) throw new Error('room creation failed');
+      if (!response.ok) {
+        if (intent !== roomIntent) return false;
+        throw new Error('room creation failed');
+      }
       const result = await response.json();
-      if (intent !== roomIntent) return false;
+      if (intent !== roomIntent) {
+        await releaseUnusedRoom(result);
+        return false;
+      }
       ({ roomId, hostKey } = result);
       $('room').textContent = roomId;
       if (result.boundObject) log('Sala vinculada à ACL e SHA-256: ' +
@@ -729,6 +757,7 @@
     }
   }
   function joinRoom(room, invitation) {
+    if (!role) void releaseUnusedRoom({ roomId, hostKey });
     invalidateRoomIntent();
     protectedRoomRequired = false;
     roomId = room; $('room').textContent = roomId;

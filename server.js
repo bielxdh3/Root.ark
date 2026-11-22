@@ -6394,6 +6394,13 @@ function registerExperimentalP2p() {
     const { roomId, hostKey, expires, boundObject } = result;
     return p2pHeaders(res).json({ roomId, hostKey, expires, ...(boundObject ? { boundObject } : {}) });
   });
+  app.post("/p2p/rooms/release", authenticate, requirePermission("listFiles"), (req, res) => {
+    if (req.get("origin") !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+      return res.status(403).json({ error: "Origin denied" });
+    }
+    const result = p2pBroker.releaseReservedRoom(req, req.body);
+    return res.sendStatus(result.status);
+  });
   server.once("close", () => { void p2pBroker.close(); });
 }
 

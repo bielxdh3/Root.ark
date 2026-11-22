@@ -166,3 +166,31 @@ test('P2: 16 hostile room creates by one real user cannot globally starve anothe
       'normal multi-client host join must remain functional');
   }
 });
+
+test('P2: signed room release frees abandoned capacity but cannot free a different principal or key', { timeout: 110_000 }, async t => {
+  const f = await fixture();
+  t.after(f.close);
+  const alice = await f.login('alice');
+  const bob = await f.login('bob');
+  const first = await f.request('/p2p/rooms', { method: 'POST', session: alice });
+  const second = await f.request('/p2p/rooms', { method: 'POST', session: alice });
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal((await f.request('/p2p/rooms', { method: 'POST', session: alice })).status, 429);
+  const { roomId, hostKey } = JSON.parse(first.text);
+  const proof = { roomId, hostKey };
+  const release = (session, body, csrf = true) => f.request('/p2p/rooms/release', {
+    method: 'POST', session, body: JSON.stringify(body), csrf,
+  });
+
+  assert.equal((await release(bob, proof)).status, 204);
+  assert.equal((await release(alice, { ...proof, hostKey: '0'.repeat(64) })).status, 204);
+  assert.equal((await release(alice, proof, false)).status, 403,
+    'browser release requires the same session CSRF proof as creating a room');
+  assert.equal((await f.request('/p2p/rooms', { method: 'POST', session: alice })).status, 429,
+    'unauthorized release attempts must not return owner capacity');
+  assert.equal((await release(alice, proof)).status, 204);
+  assert.equal((await release(alice, proof)).status, 204);
+  assert.equal((await f.request('/p2p/rooms', { method: 'POST', session: alice })).status, 200,
+    'canceling the delivered-but-unjoined room must immediately restore one owner slot');
+});

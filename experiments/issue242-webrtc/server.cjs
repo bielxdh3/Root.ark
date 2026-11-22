@@ -2,7 +2,7 @@
 
 // Disposable loopback-only experiment. No Root.ark modules, storage, auth or keys.
 const { createServer: createHttpServer } = require('node:http');
-const { randomBytes } = require('node:crypto');
+const { randomBytes, timingSafeEqual } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const WebSocket = require('ws');
@@ -114,6 +114,27 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       return false;
     }
     return true;
+  }
+  // An HTTP room reservation may have been delivered before the browser's
+  // response.json() is canceled. Reclaim only that signed-in owner's *unused*
+  // reservation; never terminate a joined host or a different session's room.
+  function releaseReservedRoom(req, input) {
+    const user = identify(req);
+    if (!authenticated || !user) return { status: 401 };
+    if (!object(input) || Object.keys(input).length !== 2 ||
+      typeof input.roomId !== 'string' || typeof input.hostKey !== 'string' ||
+      !/^[a-f0-9]{16}$/.test(input.roomId) ||
+      !/^[a-f0-9]{64}$/.test(input.hostKey)) return { status: 403 };
+    const room = rooms.get(input.roomId);
+    if (room && room.owner === user.username &&
+      room.ownerSessionVersion === user.sessionVersion &&
+      !room.hostJoined && room.members.size === 0 &&
+      timingSafeEqual(Buffer.from(input.hostKey, 'hex'), Buffer.from(room.hostKey, 'hex'))) {
+      expireRoom(room);
+    }
+    // Return the same response for unknown IDs, wrong keys and repeated
+    // releases. A client cannot use the endpoint to enumerate room existence.
+    return { status: 204 };
   }
   async function objectAllowed(room, recipient = null) {
     if (!room.boundObject) return true;
@@ -664,6 +685,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
   expirySweep.unref();
   return {
     createRoom,
+    releaseReservedRoom,
     async listen() {
       if (!server) throw new Error('Room broker is mounted on an existing Root.ark server');
       await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
