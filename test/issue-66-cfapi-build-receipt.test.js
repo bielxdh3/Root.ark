@@ -4,10 +4,47 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
-const { buildCompiledFixture, runCompiledFixture, sanitizeBuildEnvironment } =
+const { buildCompiledFixture, runCompiledFixture, sanitizeBuildEnvironment, unchangedDirectory } =
   require("./support/issue-66-cfapi-built-artifact");
+
+test("CFAPI build receipt permits genuine NTFS 8.3 TEMP ancestor, never redirected scratch leaf", (t) => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cfapi-live-"));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const verified = unchangedDirectory(scratch, "rootark-cfapi-live-");
+  assert.equal(verified.ino, fs.lstatSync(scratch, { bigint: true }).ino);
+  if (process.platform === "win32") {
+    const response = spawnSync("C:\\Windows\\System32\\cmd.exe", ["/d", "/q"], {
+      input: `for %I in ("${os.tmpdir()}") do @echo %~sI\r\nexit\r\n`,
+      encoding: "utf8", windowsHide: true,
+    });
+    const short = response.stdout.trim().split(/\r?\n/).at(-1);
+    if (response.status === 0 && short && fs.existsSync(short)) {
+      const alias = path.join(short, path.basename(scratch));
+      const physical = unchangedDirectory(alias, "rootark-cfapi-live-");
+      assert.equal(physical.dev, verified.dev);
+      assert.equal(physical.ino, verified.ino,
+        "NTFS short spelling must name the same physical directory");
+    }
+  }
+  const link = path.join(os.tmpdir(), "rootark-cfapi-live-" + crypto.randomBytes(8).toString("hex"));
+  try { fs.symlinkSync(scratch, link, process.platform === "win32" ? "junction" : "dir"); }
+  catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) return t.diagnostic("link privilege unavailable");
+    throw error;
+  }
+  t.after(() => {
+    if (!fs.existsSync(link)) return;
+    assert.equal(fs.lstatSync(link).isSymbolicLink(), true,
+      "never clean a replacement real directory");
+    if (process.platform === "win32") fs.rmdirSync(link);
+    else fs.unlinkSync(link);
+  });
+  assert.throws(() => unchangedDirectory(link, "rootark-cfapi-live-"), /UNTRUSTED_EXECUTABLE/);
+});
 
 test("CFAPI compiler ignores inherited tool selectors and PATH before vcvars initializes", () => {
   const incoming = {

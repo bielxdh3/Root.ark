@@ -11,6 +11,7 @@ test("#66 native CFAPI fixture helper accepts only fixed operation modes and own
   const deny = path.join(os.tmpdir(), "rootark-cfapi-abi-owned");
   const positive = path.join(os.tmpdir(), "rootark-cfapi-positive-abi-owned");
   const inherit = path.join(os.tmpdir(), "rootark-cfapi-ace-native-owned");
+  const live = path.join(os.tmpdir(), "rootark-cfapi-live-owned");
   const accepted = [
     ["acl-preflight.exe", acl, ["--inspect", path.join(acl, "owner-only")]],
     ["acl-preflight.exe", acl, ["--inspect", path.join(acl, "junction")]],
@@ -24,6 +25,7 @@ test("#66 native CFAPI fixture helper accepts only fixed operation modes and own
     ["positive-shape.exe", positive, ["--register", positive]],
     ["positive-shape.exe", positive, ["--hydrate", positive]],
     ["inherit-only-fixture.exe", inherit, []],
+    ["live-fetch.exe", live, ["--disposable-repin-during-authority", path.join(live, "owner-only")]],
   ];
   for (const [name, scratch, args] of accepted) {
     assert.deepEqual(validateFixtureArgs(name, scratch, args), args);
@@ -39,6 +41,8 @@ test("#66 native CFAPI fixture helper accepts only fixed operation modes and own
     ["positive-shape.exe", positive, ["--hydrate", path.join(os.tmpdir(), "foreign")]],
     ["positive-shape.exe", positive, ["--self-test", "--connect"]],
     ["inherit-only-fixture.exe", inherit, ["--self-test"]],
+    ["live-fetch.exe", live, ["--disposable-repin-during-authority", path.join(os.tmpdir(), "foreign")]],
+    ["live-fetch.exe", live, ["--disposable-repin-during-authority", path.join(live, "owner-only"), "--extra"]],
     ["anything.exe", acl, []],
     ["acl-preflight.exe", acl, ["--inspect", "owner-only"]],
     ["acl-preflight.exe", acl, ["--inspect", path.join(acl, "owner-only") + "\n"]],

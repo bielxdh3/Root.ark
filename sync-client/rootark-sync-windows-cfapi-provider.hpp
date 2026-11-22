@@ -8,7 +8,9 @@
 #include <vector>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include "rootark-sync-windows-cfapi-cancel-fence.hpp"
 #include "rootark-sync-windows-native-root-session.hpp"
 namespace {
 constexpr NTSTATUS kCloudFailure = static_cast<NTSTATUS>(0xC000CF12UL);
@@ -25,15 +27,55 @@ struct Context {
   const HeldAncestors* ancestors = nullptr;
   const NativeOriginalEnrollment* enrollment = nullptr;
   const wchar_t* path = nullptr;
-  // Bind the callback to the exact native placeholder inode, independently
-  // of user-controlled FileIdentity or a reopened mutable pathname.
+private:
+  // A revoke/reissue, even to the same physical inode, must invalidate an
+  // in-flight FETCH_DATA authorization rather than lending it a new pin.
   std::atomic<ULONGLONG> placeholderFileId{0};
   std::atomic<bool> placeholderPinned{false};
+  std::atomic<std::uint64_t> placeholderGeneration{0};
+public:
+  void publishPlaceholder(ULONGLONG fileId) noexcept {
+    placeholderPinned.store(false, std::memory_order_release);
+    placeholderFileId.store(fileId, std::memory_order_release);
+    placeholderGeneration.fetch_add(1, std::memory_order_acq_rel);
+    placeholderPinned.store(true, std::memory_order_release);
+  }
+  void revokePlaceholder() noexcept {
+    placeholderPinned.store(false, std::memory_order_release);
+    placeholderGeneration.fetch_add(1, std::memory_order_acq_rel);
+  }
+  std::uint64_t pinGeneration() const noexcept {
+    return placeholderGeneration.load(std::memory_order_acquire);
+  }
+  ULONGLONG pinnedFileId() const noexcept {
+    return placeholderFileId.load(std::memory_order_acquire);
+  }
+  bool isPlaceholderPinned() const noexcept {
+    return placeholderPinned.load(std::memory_order_acquire);
+  }
   std::atomic<unsigned> callbacks{0};
   std::atomic<unsigned> successful{0};
   std::atomic<unsigned> rejected{0};
+  rootark_cfapi::CancelFence cancellations;
   ~Context() { if (!payload.empty()) SecureZeroMemory(payload.data(), payload.size()); }
 };
+
+bool matchesPinnedPlaceholder(const Context& ctx, const CF_CALLBACK_INFO* info) noexcept {
+  return info && info->FileIdentity
+    && !ctx.identity.empty() && ctx.identity.size() <= 256
+    && info->FileIdentityLength == ctx.identity.size()
+    && std::memcmp(info->FileIdentity, ctx.identity.data(), ctx.identity.size()) == 0
+    && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size())
+    && ctx.isPlaceholderPinned()
+    && static_cast<ULONGLONG>(info->FileId.QuadPart) == ctx.pinnedFileId();
+}
+
+bool retainsNativeCustody(const Context& ctx) {
+  return ctx.root && ctx.ancestors && ctx.enrollment && ctx.path
+    && matchesOriginalEnrollment(*ctx.enrollment, *ctx.root, *ctx.ancestors)
+    && ctx.ancestors->samePaths() && ctx.root->samePath(ctx.path)
+    && ctx.root->registeredPolicy();
+}
 
 void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS* params) {
   if (!info || !params || !info->CallbackContext) return;
@@ -58,26 +100,20 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
   // Each request must be bound to the provider's exact identity and checked
   // against the verified immutable buffer. This fixture does not certify a
   // production owner-signed object or live revocation policy.
-  const bool identityMatches = info->FileIdentity
-    && !ctx.identity.empty() && ctx.identity.size() <= 256
-    && info->FileIdentityLength == ctx.identity.size()
-    && std::memcmp(info->FileIdentity, ctx.identity.data(), ctx.identity.size()) == 0
-    && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size())
-    && ctx.placeholderPinned.load(std::memory_order_acquire)
-    && static_cast<ULONGLONG>(info->FileId.QuadPart)
-      == ctx.placeholderFileId.load(std::memory_order_relaxed);
+  const auto admittedPinGeneration = ctx.pinGeneration();
+  const bool identityMatches = matchesPinnedPlaceholder(ctx, info);
   const bool rangeMatches = offset >= 0 && offset % 4096 == 0 && length > 0
     && offset < static_cast<LONGLONG>(ctx.payload.size())
     && length <= static_cast<LONGLONG>(ctx.payload.size()) - offset
     && (length % 4096 == 0 || offset + length == static_cast<LONGLONG>(ctx.payload.size()));
-  const bool physicalCustody = ctx.root && ctx.ancestors && ctx.enrollment && ctx.path
-    && matchesOriginalEnrollment(*ctx.enrollment, *ctx.root, *ctx.ancestors)
-    && ctx.ancestors->samePaths() && ctx.root->samePath(ctx.path)
-    && ctx.root->registeredPolicy();
   const bool independentlyAdmitted = identityMatches && rangeMatches
-    && physicalCustody && ctx.authorize
+    && !ctx.cancellations.canceled(info) && retainsNativeCustody(ctx) && ctx.authorize
     && ctx.authorize(info, ctx.authorityContext);
-  if (independentlyAdmitted) {
+  // Recheck after callback-time authorization, which may race CANCEL,
+  // revocation, ABA pin reissue, or a physical root replacement.
+  if (independentlyAdmitted && !ctx.cancellations.canceled(info)
+      && ctx.pinGeneration() == admittedPinGeneration
+      && matchesPinnedPlaceholder(ctx, info) && retainsNativeCustody(ctx)) {
     transfer.TransferData.CompletionStatus = 0;
     transfer.TransferData.Buffer = ctx.payload.data() + static_cast<std::size_t>(offset);
     if (SUCCEEDED(CfExecute(&op, &transfer))) ++ctx.successful;
@@ -87,7 +123,11 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
   (void)CfExecute(&op, &transfer);
 }
 
-void CALLBACK onCancel(const CF_CALLBACK_INFO*, const CF_CALLBACK_PARAMETERS*) {}
+void CALLBACK onCancel(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS*) {
+  if (!info || !info->CallbackContext) return;
+  auto& ctx = *static_cast<Context*>(info->CallbackContext);
+  ctx.cancellations.cancel(info);
+}
 constexpr CF_CALLBACK_REGISTRATION kCallbacks[] = {
   {CF_CALLBACK_TYPE_FETCH_DATA, onFetch},
   {CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, onCancel},

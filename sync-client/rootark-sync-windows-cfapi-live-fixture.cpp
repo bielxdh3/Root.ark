@@ -61,6 +61,17 @@ bool disposableLabAuthorize(const CF_CALLBACK_INFO* info, void* opaque) noexcept
     static_cast<const Context*>(opaque)->root != nullptr;
 }
 
+// Test-only ABA adversary: a revoked then reissued pin on the SAME inode
+// cannot inherit authorization from the preceding generation.
+bool disposableRePinAuthorize(const CF_CALLBACK_INFO* info, void* opaque) noexcept {
+  if (!info || !opaque) return false;
+  auto& ctx = *static_cast<Context*>(opaque);
+  const auto originalFileId = ctx.pinnedFileId();
+  ctx.revokePlaceholder();
+  ctx.publishPlaceholder(originalFileId);
+  return matchesPinnedPlaceholder(ctx, info);
+}
+
 
 }
 
@@ -69,6 +80,7 @@ int wmain(int argc, wchar_t** argv) {
       && std::wcscmp(argv[1], L"--disposable-live-stdin") != 0
       && std::wcscmp(argv[1], L"--disposable-live-alias") != 0
       && std::wcscmp(argv[1], L"--disposable-concurrent-alias") != 0
+      && std::wcscmp(argv[1], L"--disposable-repin-during-authority") != 0
       && std::wcscmp(argv[1], L"--disposable-no-authority") != 0
       && std::wcscmp(argv[1], L"--disposable-stale-enrollment") != 0
       && std::wcscmp(argv[1], L"--disposable-stale-ancestor") != 0
@@ -77,6 +89,7 @@ int wmain(int argc, wchar_t** argv) {
   const bool streamed = std::wcscmp(argv[1], L"--disposable-live-stdin") == 0;
   const bool aliasMode = std::wcscmp(argv[1], L"--disposable-live-alias") == 0;
   const bool concurrentMode = std::wcscmp(argv[1], L"--disposable-concurrent-alias") == 0;
+  const bool repinDuringAuthority = std::wcscmp(argv[1], L"--disposable-repin-during-authority") == 0;
   const bool nameMode = std::wcscmp(argv[1], L"--disposable-native-names") == 0;
   const bool denyAuthority = std::wcscmp(argv[1], L"--disposable-no-authority") == 0;
   const bool staleEnrollment = std::wcscmp(argv[1], L"--disposable-stale-enrollment") == 0;
@@ -139,7 +152,8 @@ int wmain(int argc, wchar_t** argv) {
   context.payload = makePayload();
   context.identity.assign(kIdentity, kIdentity + sizeof(kIdentity) - 1);
   if (!denyAuthority) {
-    context.authorize = disposableLabAuthorize;
+    context.authorize = repinDuringAuthority ? disposableRePinAuthorize
+      : disposableLabAuthorize;
     context.authorityContext = &context;
   }
   context.root = &held;
@@ -171,6 +185,12 @@ int wmain(int argc, wchar_t** argv) {
   unsigned unsafeNameDenials = 0;
   bool nativeRelativeOpen = false;
   bool positiveReadVerified = false;
+  bool nativeReadSuccess = false;
+  bool nativePayloadMatch = false;
+  DWORD nativeReadError = 0;
+  DWORD nativeBytesRead = 0;
+  unsigned successfulAtConsumerRead = 0;
+  bool successfulCallbackSettled = false;
   bool nativeNoReplacePublished = false;
   unsigned nativePublishStage = 0;
   DWORD nativePublishError = 0;
@@ -218,10 +238,8 @@ int wmain(int argc, wchar_t** argv) {
     if (!GetFileInformationByHandle(original.value, &physical)
         || physical.nNumberOfLinks != 1
         || !(physical.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) break;
-    context.placeholderFileId.store(
-      (static_cast<ULONGLONG>(physical.nFileIndexHigh) << 32) | physical.nFileIndexLow,
-      std::memory_order_relaxed);
-    context.placeholderPinned.store(true, std::memory_order_release);
+    context.publishPlaceholder(
+      (static_cast<ULONGLONG>(physical.nFileIndexHigh) << 32) | physical.nFileIndexLow);
     HANDLE handle = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, nullptr,
       OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (handle == INVALID_HANDLE_VALUE) break;
@@ -229,8 +247,13 @@ int wmain(int argc, wchar_t** argv) {
     DWORD got = 0;
     const BOOL read = ReadFile(handle, received.data(),
       static_cast<DWORD>(received.size()), &got, nullptr);
+    nativeReadSuccess = read != FALSE;
+    nativeReadError = read ? ERROR_SUCCESS : GetLastError();
+    nativeBytesRead = got;
+    nativePayloadMatch = nativeReadSuccess && got == context.payload.size()
+      && std::memcmp(received.data(), context.payload.data(), context.payload.size()) == 0;
     CloseHandle(handle);
-    if (denyAuthority || staleEnrollment || staleAncestor) {
+    if (denyAuthority || staleEnrollment || staleAncestor || repinDuringAuthority) {
       if (read || got != 0 || context.successful.load() != 0
           || context.rejected.load() == 0) break;
       exitCode = 0;
@@ -253,10 +276,15 @@ int wmain(int argc, wchar_t** argv) {
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         &owner, nullptr, &dacl, nullptr, &descriptor.value) == ERROR_SUCCESS
       && trustedDacl(descriptor.value, dacl, owner, sid);
-    if (!read || !finalIdentity || !finalAncestors || !finalPolicy
-        || got != context.payload.size()
-        || std::memcmp(received.data(), context.payload.data(), context.payload.size()) != 0
-        || context.callbacks == 0 || context.successful == 0) break;
+    successfulAtConsumerRead = context.successful.load(std::memory_order_acquire);
+    if (nativePayloadMatch && context.callbacks.load(std::memory_order_acquire) != 0) {
+      const ULONGLONG deadline = GetTickCount64() + 2000;
+      while (context.successful.load(std::memory_order_acquire) == 0
+          && GetTickCount64() < deadline) Sleep(1);
+    }
+    successfulCallbackSettled = context.successful.load(std::memory_order_acquire) != 0;
+    if (!nativePayloadMatch || !finalIdentity || !finalAncestors || !finalPolicy
+        || context.callbacks == 0 || !successfulCallbackSettled) break;
     positiveReadVerified = true;
     if (publicationMode) {
       // Exercise future production's shared HANDLE-relative publishing
@@ -395,7 +423,10 @@ int wmain(int argc, wchar_t** argv) {
     "\"concurrentAliasDenials\":%u,\"nativeNoReplacePublished\":%s,"
     "\"nativePublishStage\":%u,\"nativePublishError\":%lu,"
     "\"finalReparseTag\":%lu,"
-    "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
+    "\"unregistered\":%s,\"positiveReadVerified\":%s,"
+    "\"nativeReadSuccess\":%s,\"nativeBytesRead\":%lu,"
+    "\"nativeReadError\":%lu,\"nativePayloadMatch\":%s,"
+    "\"successfulAtConsumerRead\":%u,\"successfulCallbackSettled\":%s}\n",
     context.callbacks.load(), context.successful.load(), context.rejected.load(),
     context.payload.size(),
     finalIdentity ? "true" : "false", finalAncestors ? "true" : "false",
@@ -406,6 +437,9 @@ int wmain(int argc, wchar_t** argv) {
     concurrentAliasDenials, nativeNoReplacePublished ? "true" : "false",
     nativePublishStage, static_cast<unsigned long>(nativePublishError), finalTag,
     SUCCEEDED(unregisterResult) ? "true" : "false",
-    positiveReadVerified && exitCode == 0 ? "true" : "false");
+    positiveReadVerified && exitCode == 0 ? "true" : "false",
+    nativeReadSuccess ? "true" : "false", nativeBytesRead, nativeReadError,
+    nativePayloadMatch ? "true" : "false", successfulAtConsumerRead,
+    successfulCallbackSettled ? "true" : "false");
   return exitCode;
 }
