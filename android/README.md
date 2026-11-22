@@ -19,7 +19,7 @@ Targets: minSdk 29 (proposed in the architecture doc, owner to confirm), compile
 - Android SDK with `platforms;android-35`, `build-tools;34.0.0` and `build-tools;35.0.0` (Android Studio's SDK Manager, or `sdkmanager`). AGP 8.7.3 can require 34.0.0 even when 35.0.0 is installed.
 - A Gradle 8.10.2 distribution (the version used by CI), or Android Studio configured to use that version.
 
-The Gradle wrapper (`gradlew`, `gradle/wrapper/`) is not checked in. Generate it once with a local Gradle 8.10.2 install:
+The Gradle wrapper (`gradlew`, `gradle/wrapper/`) is not checked in. Generate it once with a local Gradle 8.10+ install:
 
 ```
 cd android
