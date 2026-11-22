@@ -3576,3 +3576,109 @@ test("#262 P1: excluded signed restore LIST echo cannot consume pending physical
   assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"),
     "original authenticated bytes");
 });
+
+test("#262 P2: committed restore recovers after key epoch rotation without old file key", async (t) => {
+  const f = await fixture(t);
+  let committedOp = null;
+  let witnessOffline = true;
+  const origPush = f.adapter.push;
+  const statePath = path.join(f.root, "witness-store-current.json");
+  f.adapter.push = async (operation) => {
+    if (!committedOp) {
+      committedOp = await origPush(operation);
+      throw Object.assign(new Error("ACK lost after remote commit"), { code: "ECONNRESET" });
+    }
+    throw Object.assign(new Error("Replay conflict after rotation"), { status: 409, code: "sync_conflict" });
+  };
+  f.physical.useReopenedPhysicalSource(async () => {
+    if (witnessOffline) throw Object.assign(new Error("witness offline"), { code: "ECONNRESET" });
+    return JSON.parse(await fsp.readFile(statePath, "utf8"));
+  });
+  f.adapter.list = async () => [structuredClone(f.current())];
+  const queued = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(queued.restored, true);
+  assert.equal(queued.pushed, false);
+  assert.equal(queued.pending, true);
+  const [pendingOp] = await f.engine.journal.recover();
+  assert.ok(pendingOp?.operationId.startsWith("histrestore-"));
+  assert.ok(committedOp);
+  witnessOffline = false;
+
+  const epoch2Key = crypto.randomBytes(32);
+  const rotatedEngine = await new SyncEngine({
+    rootDir: f.local,
+    adapter: f.adapter,
+    deviceId: "device-a",
+    keyEpoch: "epoch-2",
+    compartmentId: "private",
+    fileKeyResolver: (op) => (op.keyEpoch === "epoch-2" ? epoch2Key : null),
+    requireAuthorization: true,
+    authorize: () => true,
+    authorizeOutgoing: () => true,
+    verifyIncoming: (record) => verifyAuthorizationProof(record.authorization, record, f.trusted),
+    authorizationFactory: (operation) => createAuthorizationProof(operation, {
+      username: "alice", privateKey: f.privateKey, publicKey: f.publicKeySpki,
+    }),
+    ...f.physical.options,
+  }).open();
+
+  const summary = await rotatedEngine.syncOnce();
+  assert.equal(summary.offline, false);
+  assert.equal(summary.pushed, 1);
+  assert.deepEqual(await rotatedEngine.journal.recover(), []);
+  assert.equal(rotatedEngine.journal.hasSeen(pendingOp.operationId), true);
+  assert.equal(rotatedEngine.journal.durableSignedReceiptDigest(pendingOp.operationId) !== null, true);
+  assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"), "original authenticated bytes");
+});
+
+test("#262 P2: genuine 409 restore conflict recovers verified remote winner instead of stalling offline", async (t) => {
+  for (const mode of ["inline-current", "list-fallback"]) {
+    await t.test(mode, async (st) => {
+      const f = await fixture(st);
+      let offline = true;
+      f.adapter.push = async (operation) => {
+        if (offline) throw Object.assign(new Error("offline during restore"), { code: "ECONNRESET" });
+        const err = new Error("Stale baseRevision conflict");
+        err.status = 409;
+        err.code = "sync_conflict";
+        if (mode === "inline-current") err.current = structuredClone(f.current());
+        throw err;
+      };
+      const queued = await f.engine.restoreHistoricalVersion("file-1", "first");
+      assert.equal(queued.pending, true);
+      const [pendingOp] = await f.engine.journal.recover();
+      assert.ok(pendingOp?.operationId.startsWith("histrestore-"));
+
+      const { privateKey: keyB, publicKey: pubB } = crypto.generateKeyPairSync("ed25519");
+      const pubBSpki = pubB.export({ type: "spki", format: "der" }).toString("base64url");
+      f.trusted.trustedDevicePublicKeys["device-b"] = pubBSpki;
+      const remoteWin = protocol.createOperation({
+        objectId: "file-1", fileId: "file-1", deviceId: "device-b", keyEpoch: "epoch-1",
+        compartmentId: "private", fileKey: f.privateFileKey,
+        operation: "update", versionId: "remote-v3", operationId: `remote-win-${crypto.randomUUID()}`,
+        revision: { counter: 3, deviceId: "device-b" }, baseRevision: f.deleted.revision,
+        metadata: { path: "document.txt", name: "document.txt" },
+        plaintext: Buffer.from("device-b winner"),
+      });
+      remoteWin.authorization = await createAuthorizationProof(remoteWin, {
+        username: "alice", privateKey: keyB, publicKey: pubBSpki,
+      });
+      f.setCurrent(remoteWin);
+      f.versions.push(remoteWin);
+      await f.physical.physicalStoreCommitted(remoteWin);
+      f.adapter.list = async () => [structuredClone(f.current())];
+      offline = false;
+
+      const summary = await f.engine.syncOnce();
+      assert.equal(summary.offline, false, "genuine 409 conflict must not stall syncOnce offline");
+      assert.equal(summary.conflicts.length, 1);
+      assert.equal(summary.conflicts[0].operationId, pendingOp.operationId);
+      assert.deepEqual(await f.engine.journal.recover(), [], "rejected restore must not remain pending");
+      assert.equal(f.engine.journal.state.admitted[pendingOp.operationId], undefined,
+        "rejected restore must never be fabricated as admitted");
+      assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"), "device-b winner");
+      assert.equal(await fsp.readFile(path.join(f.local, ".rootark-conflicts", `${pendingOp.operationId}.conflict`), "utf8"),
+        "original authenticated bytes");
+    });
+  }
+});
