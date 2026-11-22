@@ -79,6 +79,7 @@
     const creating = Boolean(pendingCreateController);
     if (!ws && !creating) return false;
     const previousRole = role;
+    const connecting = Boolean(ws && !previousRole);
     invalidateRoomIntent(); // A pending create must not restore this room.
     retireRoom();
     roomId = null;
@@ -86,6 +87,7 @@
     protectedRoomRequired = false;
     $('room').textContent = '';
     log(creating && !previousRole ? 'Criação de sala cancelada' :
+      connecting ? 'Conexão cancelada' :
       previousRole === 'host' ? 'Sala encerrada' : 'Você saiu da sala');
     return true;
   }
@@ -94,6 +96,10 @@
     setCreateButtonsDisabled(true);
     ws = new WebSocket(wsUrl);
     const eventSocket = ws;
+    // A stalled WebSocket handshake must be cancellable before `joined`.
+    $('leave').disabled = false;
+    $('leave').textContent = 'Cancelar conexão';
+    $('leave').setAttribute('aria-label', 'Cancelar conexão');
     ws.onopen = () => {
       if (ws !== eventSocket) return;
       wire({ type: 'join', roomId, ...credentials });

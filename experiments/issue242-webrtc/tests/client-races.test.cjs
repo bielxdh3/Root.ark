@@ -106,6 +106,33 @@ test('P2: delayed old-room close cannot revoke or tear down new-room peer', asyn
   assert.equal(f.peerConnections.at(-1).closed, false);
 });
 
+test('P2: a signaling connection can be canceled before joined without stale reconnection', async () => {
+  const f = clientFixture();
+  f.joinRoom('pending', 'invite-old');
+  const pendingSocket = f.sockets[0];
+  assert.equal(f.elements.get('leave').disabled, false,
+    'the user must be able to cancel a stalled signaling connection');
+  assert.equal(f.elements.get('leave').textContent, 'Cancelar conexão');
+  f.elements.get('leave').onclick();
+  assert.equal(pendingSocket.closeRequested, true);
+  assert.equal(f.snapshot().roomId, null);
+  assert.equal(f.elements.get('leave').disabled, true);
+
+  f.joinRoom('fresh', 'invite-new');
+  const newSocket = f.sockets[1];
+  pendingSocket.onopen();
+  await f.incoming(pendingSocket, { type: 'joined', role: 'host', peerId: 'stale' });
+  pendingSocket.onclose();
+  assert.equal(f.snapshot().roomId, 'fresh');
+  assert.equal(f.snapshot().role, null);
+  assert.equal(newSocket.closeRequested, undefined);
+
+  await f.incoming(newSocket, { type: 'joined', role: 'guest', peerId: 'fresh-peer' });
+  assert.equal(f.snapshot().role, 'guest');
+  assert.equal(f.elements.get('leave').textContent, 'Sair da sala');
+  assert.equal(f.elements.get('leave').disabled, false);
+});
+
 test('P2: leaving retires an old file-hash lock without clearing a newer room send', async () => {
   const f = clientFixture();
   f.joinRoom('room-A', 'invite-A');
