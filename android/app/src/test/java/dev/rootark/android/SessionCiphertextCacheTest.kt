@@ -6,6 +6,7 @@ import org.junit.After
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.File
+import java.net.SocketTimeoutException
 import java.nio.file.Files
 import javax.crypto.KeyGenerator
 
@@ -170,5 +171,23 @@ class SessionCiphertextCacheTest {
         assertThrows(SecurityException::class.java) { cache.inspect(binding, "fixture-object-1") }
         assertThrows(SecurityException::class.java) { cache.save(binding, "fixture-object-1", body) }
         assertThrows(SecurityException::class.java) { cache.snapshot(binding) }
+    }
+
+    @Test fun failedNetworkRecaptureKeepsPreviouslyAuthenticatedCiphertext() {
+        val cache = SessionCiphertextCache(root, binding, key)
+        val original = cache.save(binding, "fixture-object-1", body)
+        val ciphertext = File(root, "packet.bin").readBytes()
+        var discards = 0
+
+        // The new GET never returned a signed envelope: no observed integrity
+        // failure or revocation justifies destroying the old local AEAD record.
+        val result = CiphertextCaptureFailurePolicy.handle(SocketTimeoutException("fixture timeout")) {
+            discards++
+            cache.clear()
+        }
+        assertEquals(CiphertextCaptureUiResult.FAILED, result)
+        assertEquals(0, discards)
+        assertArrayEquals(ciphertext, File(root, "packet.bin").readBytes())
+        assertEquals(original, cache.inspect(binding, "fixture-object-1"))
     }
 }
