@@ -12,7 +12,7 @@ const test = require("node:test");
 const { promisify } = require("node:util");
 const express = require("express");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
-const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 const { runMigrations } = require("../db/migrations");
@@ -249,7 +249,7 @@ test("registered signer can commit; wrong signer, revoked signer, and legacy pro
   assert.deepEqual(store.list("alice").map((record) => record.objectId), ["object-good"]);
 });
 
-test("atomic device authorization expires during Ed25519 verification before durable commit", async (t) => {
+test("atomic device authorization expires after native Ed25519 verification before durable commit", async (t) => {
   const directory = await isolatedRegistryDirectory("rootark-sync-expiry-race-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const store = await new SyncObjectStore(path.join(directory, "objects.json"),
@@ -265,26 +265,33 @@ test("atomic device authorization expires during Ed25519 verification before dur
     metadata: { path: "expired.txt" }, plaintext: Buffer.from("ciphertext fixture"),
     fileKey: crypto.randomBytes(32) });
   const nativeNow = Date.now;
-  const nativeVerify = crypto.verify;
   const expiresAt = nativeNow() + 60_000;
   operation.authorization = await createAuthorizationProof(operation,
     { username: "alice", publicKey, privateKey: signer.privateKey, expiresAt });
-  let verifiedRealSignature = false;
+  assert.equal(await verifyAuthorizationProof(operation.authorization, operation, {
+    username: "alice", trustedDevicePublicKeys: { "device-expiry": publicKey },
+    revokedDeviceIds: [],
+  }), true, "real pinned Ed25519 proof is valid before the clock advances");
+  // Crypto verification uses a captured native intrinsic; replacing
+  // crypto.verify would never prove that the signature was checked. The store
+  // calls now() after await verification and before its final expiry fence.
+  const originalStoreNow = store.now;
+  let enteredPostVerificationCommit = false;
   try {
-    Date.now = () => verifiedRealSignature ? expiresAt + 1 : nativeNow();
-    crypto.verify = function (...args) {
-      const result = nativeVerify.apply(this, args);
-      if (result === true) verifiedRealSignature = true;
-      return result;
+    store.now = () => {
+      enteredPostVerificationCommit = true;
+      return nativeNow();
     };
+    Date.now = () => enteredPostVerificationCommit ? expiresAt + 1 : nativeNow();
     await assert.rejects(store.put("alice", operation),
       { code: "SYNC_ATOMIC_DEVICE_AUTH_REJECTED" },
-      "real signed proof must be rejected if its clock expires before persistence");
+      "signed proof expiring after verification must not commit ciphertext");
   } finally {
-    crypto.verify = nativeVerify;
+    store.now = originalStoreNow;
     Date.now = nativeNow;
   }
-  assert.equal(verifiedRealSignature, true, "native Ed25519 signature must actually verify");
+  assert.equal(enteredPostVerificationCommit, true,
+    "valid Ed25519 verification reached the pre-commit expiry boundary");
   assert.deepEqual(store.list("alice"), [], "expired proof cannot durably write ciphertext");
   const restarted = await new SyncObjectStore(path.join(directory, "objects.json"),
     { atomicDeviceRegistry: true }).open();

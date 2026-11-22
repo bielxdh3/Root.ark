@@ -1,6 +1,73 @@
 "use strict";
 
 const crypto = require("node:crypto");
+// The canonical codec must not reread these mutable exported helpers after a
+// caller-owned KeyObject getter has already run in the same Node realm.
+const CODEC_BUFFER_FROM = Buffer.from.bind(Buffer);
+const CODEC_IS_BUFFER = Buffer.isBuffer.bind(Buffer);
+const CODEC_TIMING_SAFE_EQUAL = crypto.timingSafeEqual.bind(crypto);
+const CODEC_OBJECT_KEYS = Object.keys.bind(Object);
+const CODEC_OBJECT_HAS_OWN = Object.hasOwn.bind(Object);
+const CODEC_OBJECT_GET_PROTOTYPE = Object.getPrototypeOf.bind(Object);
+const CODEC_OBJECT_SET_PROTOTYPE = Object.setPrototypeOf.bind(Object);
+const CODEC_OBJECT_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
+const CODEC_OBJECT_CREATE = Object.create.bind(Object);
+const CODEC_OBJECT_DEFINE_PROPERTY = Object.defineProperty.bind(Object);
+const CODEC_ARRAY_IS_ARRAY = Array.isArray.bind(Array);
+const CODEC_PLAIN_OBJECT_PROTOTYPE = Object.prototype;
+// The cycle guard executes before the signed-map copy: KeyObject.type can
+// replace Set.prototype.has and temporarily turn unsigned B into signed A.
+// Keep this guard on load-time native references, without a late .call lookup.
+const CODEC_SET = Set;
+const CODEC_SET_HAS = Set.prototype.has;
+const CODEC_SET_ADD = Set.prototype.add;
+const CODEC_SET_DELETE = Set.prototype.delete;
+const CODEC_APPLY = Reflect.apply.bind(Reflect);
+const CODEC_PROMISE = Promise;
+const { types: { isProxy: CODEC_IS_PROXY, isPromise: CODEC_IS_PROMISE } } = require("node:util");
+function codecNativePromise(value) {
+  if (CODEC_IS_PROXY(value) || !CODEC_IS_PROMISE(value)) {
+    throw new TypeError("non-native codec Promise");
+  }
+  CODEC_OBJECT_DEFINE_PROPERTY(value, "constructor", {
+    value: CODEC_PROMISE, configurable: false, writable: false,
+  });
+  return value;
+}
+
+function codecNonThenableResult(value) {
+  // Node's async PromiseResolve assimilates returned Buffers, arrays and maps
+  // through inherited Object.prototype.then BEFORE the caller can pin its
+  // Promise. An untrusted native KeyObject getter may install that inherited
+  // method after real signature validation. Prevent this at the codec result.
+  if (value !== null && typeof value === "object") {
+    if (!CODEC_ARRAY_IS_ARRAY(value) && !isBytes(value)) {
+      // Canonical decoded maps are consumed by exact() validators that count
+      // Reflect.ownKeys. Adding even a nonenumerable own "then" here corrupts
+      // the signed field set and makes genuine persisted ledgers unreadable.
+      // A null prototype preserves *all* signed DATA fields while excluding
+      // any hostile Object.prototype.then from async PromiseResolve.
+      const prototype = CODEC_OBJECT_GET_PROTOTYPE(value);
+      if (prototype !== null && prototype !== CODEC_PLAIN_OBJECT_PROTOTYPE) {
+        fail("UNSUPPORTED_CBOR_VALUE");
+      }
+      const present = CODEC_OBJECT_DESCRIPTOR(value, "then");
+      if (present && (!CODEC_OBJECT_HAS_OWN(present, "value")
+        || typeof present.value === "function")) fail("UNSUPPORTED_CBOR_VALUE");
+      if (prototype !== null) CODEC_OBJECT_SET_PROTOTYPE(value, null);
+      return value;
+    }
+    const ownThen = CODEC_OBJECT_DESCRIPTOR(value, "then");
+    if (ownThen) {
+      if (!CODEC_OBJECT_HAS_OWN(ownThen, "value")
+        || typeof ownThen.value === "function") fail("UNSUPPORTED_CBOR_VALUE");
+    } else {
+      CODEC_OBJECT_DEFINE_PROPERTY(value, "then", { value: undefined,
+        enumerable: false, writable: false, configurable: false });
+    }
+  }
+  return value;
+}
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { CipherSuite, HkdfSha256, Aes256Gcm } = require("@hpke/core");
@@ -88,12 +155,14 @@ function fail(code, classification) {
 }
 
 function isBytes(value) {
-  return Buffer.isBuffer(value) || value instanceof Uint8Array;
+  return CODEC_IS_BUFFER(value) || value instanceof Uint8Array;
 }
 
 function bytes(value, code = "INVALID_BYTES", exact, min, max) {
   if (!isBytes(value)) fail(code);
-  const result = Buffer.from(value);
+  // A KeyObject getter may execute before a canonical readback is decoded.
+  // Never copy owner-hashed or signature-bound wire through a mutable global.
+  const result = CODEC_BUFFER_FROM(value);
   if (exact !== undefined && result.length !== exact) fail("INVALID_LENGTH");
   if (min !== undefined && result.length < min) fail("INVALID_LENGTH");
   if (max !== undefined && result.length > max) fail("INVALID_LENGTH");
@@ -136,55 +205,122 @@ function safeMap(value, required, exact) {
   return map;
 }
 
-function validateCborValue(value, seen = new Set()) {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return;
+// Third-party cborg may consult a poisoned global Object.keys after an
+// attacker-owned native KeyObject getter. Take two separate descriptor-only
+// snapshots so its encoder never receives the protected expected values.
+function snapshotCborValue(value, seen = new CODEC_SET()) {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return value;
   if (typeof value === "number") {
     if (!Number.isSafeInteger(value) || value < 0) fail("UNSUPPORTED_CBOR_VALUE");
-    return;
+    return value;
   }
   if (typeof value === "bigint") {
     if (value < 0n || value > MAX_U64) fail("UNSUPPORTED_CBOR_VALUE");
-    return;
+    return value;
   }
-  if (isBytes(value)) return;
-  if (typeof value !== "object" || seen.has(value)) fail("UNSUPPORTED_CBOR_VALUE");
-  seen.add(value);
-  if (Array.isArray(value)) {
-    value.forEach((entry) => validateCborValue(entry, seen));
+  if (isBytes(value)) return CODEC_BUFFER_FROM(value);
+  if (typeof value !== "object" || CODEC_APPLY(CODEC_SET_HAS, seen, [value])) {
+    fail("UNSUPPORTED_CBOR_VALUE");
+  }
+  CODEC_APPLY(CODEC_SET_ADD, seen, [value]);
+  let result;
+  if (CODEC_ARRAY_IS_ARRAY(value)) {
+    const length = value.length;
+    if (!Number.isSafeInteger(length) || length < 0
+      || CODEC_OBJECT_KEYS(value).length !== length) fail("UNSUPPORTED_CBOR_VALUE");
+    result = [];
+    for (let i = 0; i < length; i += 1) {
+      const descriptor = CODEC_OBJECT_DESCRIPTOR(value, i);
+      if (!descriptor || !CODEC_OBJECT_HAS_OWN(descriptor, "value")) fail("UNSUPPORTED_CBOR_VALUE");
+      CODEC_OBJECT_DEFINE_PROPERTY(result, i, { value: snapshotCborValue(descriptor.value, seen),
+        enumerable: true, configurable: true, writable: true });
+    }
   } else {
-    const map = plainObject(value);
-    for (const key of Object.keys(map)) {
+    const prototype = CODEC_OBJECT_GET_PROTOTYPE(value);
+    if (prototype !== CODEC_PLAIN_OBJECT_PROTOTYPE && prototype !== null) fail("AMBIGUOUS_MAP");
+    result = CODEC_OBJECT_CREATE(null);
+    const keys = CODEC_OBJECT_KEYS(value);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
       if (key === "__proto__" || key === "constructor" || key === "prototype") fail("INVALID_MAP_KEY");
-      validateCborValue(map[key], seen);
+      const descriptor = CODEC_OBJECT_DESCRIPTOR(value, key);
+      if (!descriptor || !CODEC_OBJECT_HAS_OWN(descriptor, "value")) fail("UNSUPPORTED_CBOR_VALUE");
+      CODEC_OBJECT_DEFINE_PROPERTY(result, key, {
+        value: snapshotCborValue(descriptor.value, seen),
+        enumerable: true, configurable: true, writable: true,
+      });
     }
   }
-  seen.delete(value);
+  CODEC_APPLY(CODEC_SET_DELETE, seen, [value]);
+  return result;
+}
+
+function sameCborValue(a, b) {
+  if (isBytes(a)) return isBytes(b) && a.length === b.length
+    && CODEC_TIMING_SAFE_EQUAL(a, b);
+  if (typeof a === "bigint" && typeof b === "number") {
+    return Number.isSafeInteger(b) && BigInt(b) === a;
+  }
+  if (typeof b === "bigint" && typeof a === "number") {
+    return Number.isSafeInteger(a) && a === Number(b);
+  }
+  if (a === null || typeof a !== "object") return a === b;
+  if (b === null || typeof b !== "object" || CODEC_ARRAY_IS_ARRAY(a) !== CODEC_ARRAY_IS_ARRAY(b)) {
+    return false;
+  }
+  if (CODEC_ARRAY_IS_ARRAY(a) && a.length !== b.length) return false;
+  const keysA = CODEC_OBJECT_KEYS(a);
+  const keysB = CODEC_OBJECT_KEYS(b);
+  if (keysA.length !== keysB.length) return false;
+  for (let index = 0; index < keysA.length; index += 1) {
+    const key = keysA[index];
+    // Canonical CBOR reorders map keys, so compare by own key and value.
+    if (!CODEC_OBJECT_HAS_OWN(b, key)) return false;
+    const left = CODEC_OBJECT_DESCRIPTOR(a, key);
+    const right = CODEC_OBJECT_DESCRIPTOR(b, key);
+    if (!left || !right || !CODEC_OBJECT_HAS_OWN(left, "value")
+      || !CODEC_OBJECT_HAS_OWN(right, "value") || !sameCborValue(left.value, right.value)) return false;
+  }
+  return true;
 }
 
 let cborgPromise;
-function cborg() {
-  if (!cborgPromise) cborgPromise = import("cborg").catch((error) => {
+async function loadCborg() {
+  try {
+    return await codecNativePromise(import("cborg"));
+  } catch (error) {
     const searchPath = process.env.NODE_PATH?.split(path.delimiter).find((entry) => entry);
     if (!searchPath) throw error;
-    return import(pathToFileURL(path.join(searchPath, "cborg", "cborg.js")).href);
-  });
+    return await codecNativePromise(import(pathToFileURL(path.join(searchPath, "cborg", "cborg.js")).href));
+  }
+}
+function cborg() {
+  if (!cborgPromise) cborgPromise = codecNativePromise(loadCborg());
   return cborgPromise;
 }
 
-async function encodeDeterministic(value) {
-  validateCborValue(value);
+async function encodeDeterministicInternal(value) {
+  const expected = snapshotCborValue(value);
+  const isolated = snapshotCborValue(expected);
   try {
-    const api = await cborg();
-    return Buffer.from(api.encode(value, {
+    const api = await codecNativePromise(cborg());
+    const encoded = CODEC_BUFFER_FROM(api.encode(isolated, {
       ...api.rfc8949EncodeOptions,
       ignoreUndefinedProperties: false,
     }));
+    // Compare synchronously: queueMicrotask can restore malicious mutations
+    // only after this frame returns.
+    const roundtrip = api.decode(encoded, { strict: true, allowIndefinite: false,
+      allowUndefined: false, allowInfinity: false, allowNaN: false,
+      allowBigInt: true, rejectDuplicateMapKeys: true });
+    if (!sameCborValue(expected, roundtrip)) fail("CBOR_ENCODE_FAILED");
+    return codecNonThenableResult(encoded);
   } catch (_) {
     fail("CBOR_ENCODE_FAILED");
   }
 }
 
-function inspectDecoded(value, seen = new Set()) {
+function inspectDecoded(value, seen = new CODEC_SET()) {
   if (value === null || typeof value === "boolean" || typeof value === "string") return;
   if (typeof value === "number") {
     if (!Number.isSafeInteger(value) || value < 0) fail("UNSUPPORTED_CBOR_VALUE");
@@ -195,8 +331,10 @@ function inspectDecoded(value, seen = new Set()) {
     return;
   }
   if (isBytes(value)) return;
-  if (typeof value !== "object" || seen.has(value)) fail("UNSUPPORTED_CBOR_VALUE");
-  seen.add(value);
+  if (typeof value !== "object" || CODEC_APPLY(CODEC_SET_HAS, seen, [value])) {
+    fail("UNSUPPORTED_CBOR_VALUE");
+  }
+  CODEC_APPLY(CODEC_SET_ADD, seen, [value]);
   if (Array.isArray(value)) value.forEach((entry) => inspectDecoded(entry, seen));
   else {
     const map = plainObject(value);
@@ -205,13 +343,13 @@ function inspectDecoded(value, seen = new Set()) {
       inspectDecoded(map[key], seen);
     }
   }
-  seen.delete(value);
+  CODEC_APPLY(CODEC_SET_DELETE, seen, [value]);
 }
 
-async function decodeDeterministic(input) {
+async function decodeDeterministicInternal(input) {
   const encoded = bytes(input);
   try {
-    const api = await cborg();
+    const api = await codecNativePromise(cborg());
     const value = api.decode(encoded, {
       strict: true,
       allowIndefinite: false,
@@ -222,15 +360,24 @@ async function decodeDeterministic(input) {
       rejectDuplicateMapKeys: true,
     });
     inspectDecoded(value);
-    const canonical = await encodeDeterministic(value);
-    if (!crypto.timingSafeEqual(encoded, canonical)) fail("NON_CANONICAL_ENCODING");
-    return value;
+    const canonical = await codecNativePromise(encodeDeterministic(value));
+    if (encoded.length !== canonical.length ||
+        !CODEC_TIMING_SAFE_EQUAL(encoded, canonical)) fail("NON_CANONICAL_ENCODING");
+    return codecNonThenableResult(value);
   } catch (error) {
     if (error instanceof RootarkZkError) throw error;
     fail("CBOR_DECODE_FAILED");
   }
 }
 
+// The caller's await is also a trust boundary: never expose an async return
+// whose inherited Promise constructor/then can be replaced after a key getter.
+function encodeDeterministic(value) {
+  return codecNativePromise(encodeDeterministicInternal(value));
+}
+function decodeDeterministic(input) {
+  return codecNativePromise(decodeDeterministicInternal(input));
+}
 function resolveSuite(suite = SUITE_ID, version = SUITE_VERSION) {
   if (suite !== SUITE_ID) fail("UNKNOWN_SUITE");
   if (version !== SUITE_VERSION) fail("UNSUPPORTED_SUITE_VERSION");
