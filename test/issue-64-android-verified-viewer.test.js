@@ -17,6 +17,7 @@ test("selected sync metadata retains opaque object id and never carries protecte
 test("native protected text view requires provisioned trust, authenticated fetch and clears on lifecycle", () => {
   const viewer = read("android/app/src/main/java/dev/rootark/android/VerifiedTextPreview.kt");
   const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
+  const buffer = read("android/app/src/main/java/dev/rootark/android/SecurePreviewBuffer.kt");
   assert.match(viewer, /withVerifiedContent/);
   assert.match(viewer, /TrustedContentGrantProvider/);
   assert.match(viewer, /decodeVerifiedText/);
@@ -27,7 +28,14 @@ test("native protected text view requires provisioned trust, authenticated fetch
   assert.match(activity, /isForeground = true/, "onStart must set isForeground = true");
   assert.match(activity, /isForeground = false/, "onStop must set isForeground = false");
   assert.match(activity, /stillActive = \{ isForeground && generation == startedGeneration/, "stillActive must verify isForeground and atomic startedGeneration");
-  assert.match(activity, /setText\(characters,\s*0,\s*characters\.size\)/, "must use CharArray setText without immutable String heap copy");
+  assert.match(activity, /securePreviewText\.show\(characters,\s*\{\s*retained\s*->/,
+    "verified characters must enter the owned preview buffer");
+  assert.match(activity, /previewText\.setText\(retained,\s*0,\s*retained\.size\)/,
+    "must use the retained CharArray directly, without an immutable String heap copy");
+  assert.match(buffer, /previous\?\.fill\(/,
+    "the previous CharArray must be wiped when the display is cleared or replaced");
+  assert.match(activity, /previewText\.text\s*=\s*""/,
+    "clear must remove the TextView's reference to the old backing buffer");
   assert.doesNotMatch(activity, /text\(view,\s*String\(characters\)\)/, "must not wrap characters in String");
   assert.doesNotMatch(activity, /\.ciphertext|\.nonce|\.tag|\.aad|\.authorization|SharedPreferences|ClipboardManager|WebView/);
 });
