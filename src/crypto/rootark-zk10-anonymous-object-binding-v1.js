@@ -5,6 +5,7 @@
 // complete object corpus, or an independently retained owner/corpus head.
 // A valid owner signature therefore NEVER authorizes I/O or proves ownership.
 const crypto = require("node:crypto");
+const { types: { isProxy } } = require("node:util");
 const {
   exact, decode, hex, key, verifyOwnerRotationKeys, verifyOwnerCutoverHistory,
 } = require("./rootark-zk10-account-cutover-v1");
@@ -15,6 +16,7 @@ const INVENTORY_KEY = Buffer.from("Root.ark/zk10/anonymous-object-smt-key/v1\0",
 const INVENTORY_LEAF = Buffer.from("Root.ark/zk10/anonymous-object-smt-leaf/v1\0", "ascii");
 const INVENTORY_NODE = Buffer.from("Root.ark/zk10/anonymous-object-smt-node/v1\0", "ascii");
 const INVENTORY_EMPTY = Buffer.from("Root.ark/zk10/anonymous-object-smt-empty/v1\0", "ascii");
+const NATIVE_TIMING_SAFE_EQUAL = crypto.timingSafeEqual;
 const FIELDS = Object.freeze([
   "type", "kind", "immutable_account_id", "zk_account_id",
   "owner_generation", "owner_cutover_digest", "inventory_head",
@@ -104,22 +106,34 @@ for (let depth = 0; depth < 256; depth += 1) {
   EMPTY.push(sha(INVENTORY_NODE, EMPTY[depth], EMPTY[depth]));
 }
 function verifySparseObjectInventoryProof(accountId, generation, object, siblings, root) {
+  // Public callers can supply a plain Array whose indexed getter runs before
+  // the final cryptographic comparison. A getter or Proxy trap can replace a
+  // mutable process-wide crypto primitive and forge membership in a signed
+  // inventory. Snapshot only native own data slots before hashing anything.
+  if (isProxy(siblings) || !Array.isArray(siblings)
+    || Object.getPrototypeOf(siblings) !== Array.prototype
+    || siblings.length !== 256 || Reflect.ownKeys(siblings).length !== 257) deny();
+  const branch = [];
+  for (let index = 0; index < 256; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(siblings, String(index));
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+    branch.push(hex(descriptor.value));
+  }
+  const expectedObject = exact(object, OBJECT_FIELDS);
   const entry = normalizedInventoryEntry({
     immutable_account_id: accountId, owner_generation: generation,
-    object_id: object.object_id, revision: object.revision,
-    ciphertext_sha256: object.ciphertext_sha256,
+    object_id: expectedObject.object_id, revision: expectedObject.revision,
+    ciphertext_sha256: expectedObject.ciphertext_sha256,
   });
-  if (!Array.isArray(siblings) || siblings.length !== 256
-    || Reflect.ownKeys(siblings).length !== 257) deny();
   let position = inventoryPosition(entry);
   let current = inventoryLeaf(entry);
-  for (const sibling of siblings) {
+  for (const sibling of branch) {
     const bytes = Buffer.from(hex(sibling), "hex");
     current = position & 1n
       ? sha(INVENTORY_NODE, bytes, current) : sha(INVENTORY_NODE, current, bytes);
     position >>= 1n;
   }
-  if (!crypto.timingSafeEqual(current, Buffer.from(hex(root), "hex"))) deny();
+  if (!NATIVE_TIMING_SAFE_EQUAL(current, Buffer.from(hex(root), "hex"))) deny();
   return true;
 }
 // Deterministic synthetic-proof helper. It cannot establish external custody,
