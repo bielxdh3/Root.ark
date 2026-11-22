@@ -152,6 +152,13 @@ int wmain(int argc, wchar_t** argv) {
   unsigned unsafeNameDenials = 0;
   bool nativeRelativeOpen = false;
   bool positiveReadVerified = false;
+  // A successful CfExecute callback only acknowledges the provider handoff.
+  // It does NOT prove ReadFile returned exact authenticated bytes on the
+  // consumer HANDLE. Surface non-secret diagnostics when a runner differs.
+  bool nativeReadSuccess = false;
+  bool nativePayloadMatch = false;
+  DWORD nativeReadError = 0;
+  DWORD nativeBytesRead = 0;
   DWORD finalTag = 0;
   int exitCode = 8;
   do {
@@ -207,6 +214,11 @@ int wmain(int argc, wchar_t** argv) {
     DWORD got = 0;
     const BOOL read = ReadFile(handle, received.data(),
       static_cast<DWORD>(received.size()), &got, nullptr);
+    nativeReadSuccess = read != FALSE;
+    nativeReadError = read ? ERROR_SUCCESS : GetLastError();
+    nativeBytesRead = got;
+    nativePayloadMatch = nativeReadSuccess && got == context.payload.size()
+      && std::memcmp(received.data(), context.payload.data(), context.payload.size()) == 0;
     CloseHandle(handle);
     if (denyAuthority) {
       if (read || got != 0 || context.successful.load() != 0
@@ -231,9 +243,7 @@ int wmain(int argc, wchar_t** argv) {
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         &owner, nullptr, &dacl, nullptr, &descriptor.value) == ERROR_SUCCESS
       && trustedDacl(descriptor.value, dacl, owner, sid);
-    if (!read || !finalIdentity || !finalAncestors || !finalPolicy
-        || got != context.payload.size()
-        || std::memcmp(received.data(), context.payload.data(), context.payload.size()) != 0
+    if (!nativePayloadMatch || !finalIdentity || !finalAncestors || !finalPolicy
         || context.callbacks == 0 || context.successful == 0) break;
     positiveReadVerified = true;
     if (aliasMode) {
@@ -317,7 +327,9 @@ int wmain(int argc, wchar_t** argv) {
     "\"nativeRelativeOpen\":%s,\"unsafeNameDenials\":%u,"
     "\"concurrentAliasDenials\":%u,"
     "\"finalReparseTag\":%lu,"
-    "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
+    "\"unregistered\":%s,\"positiveReadVerified\":%s,"
+    "\"nativeReadSuccess\":%s,\"nativeBytesRead\":%lu,"
+    "\"nativeReadError\":%lu,\"nativePayloadMatch\":%s}\n",
     context.callbacks.load(), context.successful.load(), context.rejected.load(),
     context.payload.size(),
     finalIdentity ? "true" : "false", finalAncestors ? "true" : "false",
@@ -327,6 +339,8 @@ int wmain(int argc, wchar_t** argv) {
     nativeRelativeOpen ? "true" : "false", unsafeNameDenials,
     concurrentAliasDenials, finalTag,
     SUCCEEDED(unregisterResult) ? "true" : "false",
-    positiveReadVerified && exitCode == 0 ? "true" : "false");
+    positiveReadVerified && exitCode == 0 ? "true" : "false",
+    nativeReadSuccess ? "true" : "false", nativeBytesRead, nativeReadError,
+    nativePayloadMatch ? "true" : "false");
   return exitCode;
 }

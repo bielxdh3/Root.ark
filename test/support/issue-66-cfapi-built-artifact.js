@@ -59,8 +59,13 @@ function unchangedDirectory(scratch, prefix) {
   assert.ok(path.isAbsolute(scratch), FAIL);
   assert.match(path.basename(scratch), new RegExp(`^${prefix}[A-Za-z0-9_-]{6,}$`), FAIL);
   assert.equal(comparable(path.dirname(scratch)), comparable(os.tmpdir()), FAIL);
+  // NTFS 8.3 temp ancestors may expand (RUNNER~1 -> runneradmin). Only
+  // accept the unchanged named child under the SAME canonical temp parent.
+  const temp = fs.realpathSync.native(os.tmpdir());
+  const tempStat = fs.lstatSync(os.tmpdir(), { bigint: true });
+  assert.ok(tempStat.isDirectory() && !tempStat.isSymbolicLink(), FAIL);
   const actual = fs.realpathSync.native(scratch);
-  assert.equal(comparable(actual), comparable(scratch), FAIL);
+  assert.equal(comparable(actual), comparable(path.join(temp, path.basename(scratch))), FAIL);
   const stat = fs.lstatSync(scratch, { bigint: true });
   assert.ok(stat.isDirectory() && !stat.isSymbolicLink(), FAIL);
   return stat;
@@ -70,7 +75,8 @@ function inspect(scratch, name) {
   assert.ok(NAMES.has(name), FAIL);
   const root = unchangedDirectory(scratch, NAMES.get(name));
   const executable = path.join(scratch, name);
-  assert.equal(comparable(fs.realpathSync.native(executable)), comparable(executable), FAIL);
+  assert.equal(comparable(fs.realpathSync.native(executable)),
+    comparable(path.join(fs.realpathSync.native(scratch), name)), FAIL);
   const fd = fs.openSync(executable, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
   try {
     const opened = fs.fstatSync(fd, { bigint: true });
@@ -145,7 +151,12 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
     assert.doesNotMatch(filename, /[\r\n\x00-\x1f\x7f"%!^&|<>]/, FAIL);
   }
   for (const filename of [vcvars, source, ...dependencies]) {
-    assert.equal(comparable(fs.realpathSync.native(filename)), comparable(filename), FAIL);
+    // The generated inherit-only C++ fixture is the only input under the
+    // short-path TEMP root. Do not loosen the real toolchain's path checks.
+    const expected = name === "inherit-only-fixture.exe" && filename === source
+      ? path.join(fs.realpathSync.native(scratch), path.basename(filename))
+      : filename;
+    assert.equal(comparable(fs.realpathSync.native(filename)), comparable(expected), FAIL);
     const stat = fs.lstatSync(filename, { bigint: true });
     assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n, FAIL);
   }
@@ -244,4 +255,4 @@ function runCompiledFixture(receipt, args, timeout = 10000, input = undefined) {
 }
 
 module.exports = { buildCompiledFixture, runCompiledFixture, validateFixtureArgs,
-  sanitizeBuildEnvironment };
+  sanitizeBuildEnvironment, unchangedDirectory };
