@@ -1,9 +1,9 @@
 package dev.rootark.android
 
 import android.app.Activity
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
-import android.os.Build
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
@@ -27,6 +27,17 @@ internal fun inventoryPageFailureMessage(failure: Exception?): String = when (fa
     is SyncListingValidationException ->
         "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
     else -> inventoryPageRequestFailureMessage(failure)
+}
+
+// Keep the stricter legacy LIST diagnostics as a separate public-to-tests
+// contract; paginated inventory must never present these larger LIST limits.
+/** Listing-specific presentation; keep the two explicit response categories separate. */
+internal fun inventoryListFailureMessage(failure: Exception?): String = when (failure) {
+    is SyncListingLimitException ->
+        "Não foi possível carregar a lista. A resposta excede o limite do protótipo (1 MiB / 128 registros)."
+    is SyncListingValidationException ->
+        "Não foi possível carregar a lista. Os dados de sincronização retornados pelo servidor são inválidos."
+    else -> inventoryListRequestFailureMessage(failure)
 }
 
 class MainActivity : Activity() {
@@ -378,10 +389,7 @@ class MainActivity : Activity() {
             setPadding(padding, padding, padding, padding)
         }
         scroll.addView(layout)
-        text(layout, title).apply {
-            textSize = 24f
-            isAccessibilityHeading = true
-        }
+        text(layout, title).apply { textSize = 24f; setAccessibilityHeading(true) }
         text(layout, description)
         setContentView(scroll)
         if (Build.VERSION.SDK_INT >= 35) scroll.requestApplyInsets()
