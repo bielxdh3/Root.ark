@@ -61,7 +61,17 @@ object ProtectedSyncContent {
     fun verifyAndDecrypt(record: SyncRecord, fileKey: ByteArray, context: PinnedSyncReadContext): ByteArray =
         verifyAndDecryptAt(record, fileKey, context, System.currentTimeMillis())
 
-    /** Clock injection is package-local and used only by disposable protocol fixtures. */
+    /**
+     * Verifies the cryptographic envelope and decrypts protected content.
+     *
+     * CEK ownership note: caller owns fileKey zeroization (e.g. wiping the byte array
+     * with `fileKey.fill(0)` after use). Due to JVM implementation limits in [SecretKeySpec],
+     * which makes an internal defensive copy of the raw key bytes that cannot be explicitly
+     * zeroized, caller zeroization of the input buffer is the primary key-sanitization guarantee.
+     *
+     * Envelope verification and expiration checks are performed prior to length-dependent
+     * key checks to provide uniform failure ordering.
+     */
     internal fun verifyAndDecryptAt(
         record: SyncRecord,
         fileKey: ByteArray,
@@ -69,8 +79,8 @@ object ProtectedSyncContent {
         nowMillis: Long,
     ): ByteArray {
         try {
-            check(fileKey.size == 32)
             val verified = verifyEnvelopeAt(record, context, nowMillis)
+            check(fileKey.size == 32)
             val decipher = Cipher.getInstance("AES/GCM/NoPadding")
             decipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(fileKey, "AES"), GCMParameterSpec(128, verified.nonce))
             decipher.updateAAD(verified.aad)
@@ -203,9 +213,16 @@ object ProtectedSyncContent {
         check(m.deviceId == record.deviceId && m.sourcePath == null)
         val path = m.path ?: throw ProtectedSyncException()
         PortablePathValidator.validate(path)
-        for (optionalId in listOf(m.parentId)) optionalId?.let(::id)
+        check(path.toByteArray(StandardCharsets.UTF_8).size <= 2048)
+        for (optionalId in listOf(m.parentId)) optionalId?.let {
+            id(it)
+            check(it.toByteArray(StandardCharsets.UTF_8).size <= 1024)
+        }
         for (value in listOf(m.name, m.contentType)) {
-            value?.let { check(it.isNotEmpty() && it.length <= 512 && !CONTROL.containsMatchIn(it)) }
+            value?.let {
+                val bytes = it.toByteArray(StandardCharsets.UTF_8)
+                check(it.isNotEmpty() && it.length <= 512 && bytes.size <= 2048 && !CONTROL.containsMatchIn(it))
+            }
         }
         check(m.size == null || m.size in 0..9_007_199_254_740_991L)
         val metadata = linkedMapOf<String, Any?>(
@@ -316,6 +333,10 @@ object ProtectedSyncContent {
                 len <= 255 -> { output.write(0x78); output.write(len.toInt()) }
                 len <= 65535 -> {
                     output.write(0x79); output.write((len shr 8).toInt()); output.write(len.toInt())
+                }
+                len <= 0xffffffffL -> {
+                    output.write(0x7a)
+                    for (shift in 24 downTo 0 step 8) output.write((len shr shift).toInt())
                 }
                 else -> throw ProtectedSyncException()
             }

@@ -46,7 +46,13 @@ class SessionOfflineInventory(private val session: OfflineSession) {
 
     fun pages(requester: OfflineSession): List<OfflineInventoryPage> {
         require(requester == session) { "Offline session mismatch" }
-        return captured.values.map { it.page }
+        // A Kotlin List is only read-only at the type level. Returning the
+        // mutable ArrayList created by map() lets callers cast and replace
+        // rows without passing capture's validation/duplicate checks.
+        return captured.values.map { capturedPage ->
+            OfflineInventoryPage(capturedPage.page.number,
+                java.util.Collections.unmodifiableList(capturedPage.page.rows.toList()))
+        }
     }
 
     fun clear() = captured.clear()

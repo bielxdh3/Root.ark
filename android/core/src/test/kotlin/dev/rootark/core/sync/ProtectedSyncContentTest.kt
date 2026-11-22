@@ -11,6 +11,7 @@ import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
@@ -309,5 +310,35 @@ class ProtectedSyncContentTest {
         assertTrue(ProtectedSyncContent.canonicalJson(
             mapOf("path" to "docs/📄.txt"),
         ).contains("📄"))
+    }
+
+    @Test
+    fun canonicalCborEncodesMultibyteUtf8AndLongStringsOver64k() {
+        val utf8Sample = "a".repeat(100) + "🔥" + "日本語"
+        val cbor = ProtectedSyncContent.canonicalCbor(utf8Sample)
+        assertTrue(cbor.isNotEmpty())
+
+        val longString = "x".repeat(70_000)
+        val longCbor = ProtectedSyncContent.canonicalCbor(longString)
+        // Major type 3, additional info 26 -> byte 0x7a
+        assertEquals(0x7a.toByte(), longCbor[0])
+        val lengthFromCbor = ((longCbor[1].toLong() and 0xff shl 24) or
+            (longCbor[2].toLong() and 0xff shl 16) or
+            (longCbor[3].toLong() and 0xff shl 8) or
+            (longCbor[4].toLong() and 0xff))
+        assertEquals(70_000L, lengthFromCbor)
+    }
+
+    @Test
+    fun ordersEnvelopeVerificationBeforeKeyDiagnostics() {
+        val (record, _, now) = encryptedSample()
+        val trust = context(record, now)
+        val badKey = ByteArray(16) // Not 32 bytes
+
+        // Tampered envelope must throw ProtectedSyncException from envelope check
+        val tampered = record.copy(ciphertext = mutate(record.ciphertext))
+        assertFailsWith<ProtectedSyncException> {
+            ProtectedSyncContent.verifyAndDecryptAt(tampered, badKey, trust, now)
+        }
     }
 }

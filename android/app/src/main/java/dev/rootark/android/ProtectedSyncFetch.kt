@@ -57,6 +57,7 @@ internal class ProtectedSyncFetch(
     companion object {
         // An 8 MiB ciphertext becomes ~11.2 MiB base64url, plus signed metadata/AAD.
         const val MAX_RESPONSE_BYTES = 12 * 1024 * 1024
+        const val BODY_READ_DEADLINE_NANOS = 10_000_000_000L
         private val TOKEN = Regex("[A-Za-z0-9._~-]{1,4096}")
     }
 
@@ -107,11 +108,16 @@ internal class ProtectedSyncFetch(
             if (connection.contentLengthLong > maxResponseBytes) {
                 throw IOException("Protected sync response exceeds limit")
             }
+            val deadlineNanos = System.nanoTime() + BODY_READ_DEADLINE_NANOS
             val body = connection.inputStream.use { input ->
                 val output = ByteArrayOutputStream()
                 val buffer = ByteArray(8192)
                 var size = 0
                 while (true) {
+                    if (System.nanoTime() > deadlineNanos) {
+                        connection.disconnect()
+                        throw IOException("Protected sync response read deadline exceeded")
+                    }
                     val read = input.read(buffer)
                     if (read < 0) break
                     if (read > maxResponseBytes - size) {
@@ -144,10 +150,14 @@ internal class ProtectedSyncFetch(
     ) {
         origin.syncObjectUrl(objectId)
         if (!ReadOnlyFileListPolicy.canList(session.permissions)) throw ProtectedSyncException()
-        val grant = grantProvider.obtain(session.username, objectId) ?: throw ProtectedSyncException()
+        var grant: ProtectedContentGrant? = null
         try {
-            if (grant.context.username != session.username || grant.context.objectId != objectId ||
-                grant.context.trustedDevicePublicKeys.isEmpty() || grant.fileKey.size != 32) {
+            grant = grantProvider.obtain(session.username, objectId)
+            val currentGrant = grant ?: throw ProtectedSyncException()
+            val context = currentGrant.context
+            if (currentGrant.fileKey.size != 32 ||
+                context.username != session.username || context.objectId != objectId ||
+                context.trustedDevicePublicKeys.isEmpty()) {
                 throw ProtectedSyncException()
             }
             if (!stillActive()) throw ProtectedSyncException()
@@ -155,7 +165,7 @@ internal class ProtectedSyncFetch(
             // The window may have stopped while the HTTPS response arrived.
             // Never decrypt a response after foreground authorization ended.
             if (!stillActive()) throw ProtectedSyncException()
-            val plaintext = ProtectedSyncContent.verifyAndDecrypt(record, grant.fileKey, grant.context)
+            val plaintext = ProtectedSyncContent.verifyAndDecrypt(record, currentGrant.fileKey, context)
             try {
                 if (!stillActive()) throw ProtectedSyncException()
                 consume(plaintext)
@@ -163,7 +173,7 @@ internal class ProtectedSyncFetch(
                 plaintext.fill(0)
             }
         } finally {
-            grant.fileKey.fill(0)
+            grant?.fileKey?.fill(0)
         }
     }
 }

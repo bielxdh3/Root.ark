@@ -35,6 +35,7 @@ test("real signed server listing with protocol-accepted 300 name and 512 content
 test("native list limits responses, checks listFiles, handles denied sessions and renders a metadata-only projection", () => {
   const transport = read("android/app/src/main/java/dev/rootark/android/AuthHttpTransport.kt");
   const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
+  const failureMessage = read("android/app/src/main/java/dev/rootark/android/InventoryPageFailureMessage.kt");
   const policy = read("android/core/src/main/kotlin/dev/rootark/core/sync/ReadOnlyFileListPolicy.kt");
   const origin = read("android/core/src/main/kotlin/dev/rootark/core/auth/ServerOrigin.kt");
   assert.match(origin, /\/sync\/v1\/objects/);
@@ -54,4 +55,11 @@ test("native list limits responses, checks listFiles, handles denied sessions an
   assert.match(activity, /row\.name/);
   assert.doesNotMatch(activity, /\.ciphertext|\.nonce|\.tag|\.aad|\.authorization/);
   assert.doesNotMatch(transport, /Log\.|printStackTrace|SharedPreferences|CookieManager/);
+  assert.match(transport, /JSONException/, "malformed JSON parsing must catch JSONException");
+  assert.match(transport, /SyncListingLimitException/, "size limit failures must be distinct");
+  assert.match(transport, /SyncListingValidationException/, "validation failures must be distinct");
+  assert.match(activity, /inventoryPageFailureMessage\(failure\)/);
+  assert.match(failureMessage, /SyncListingLimitException/);
+  assert.match(failureMessage, /SyncListingValidationException/);
+  assert.match(policy, /Character\.FORMAT|Character\.CONTROL|Character\.LINE_SEPARATOR|Character\.PARAGRAPH_SEPARATOR/);
 });

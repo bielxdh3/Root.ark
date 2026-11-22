@@ -76,22 +76,29 @@ class MainActivity : Activity() {
     private var sessionToken: String? = null
     private var sessionUsername: String? = null
     private var authenticatedSession: LoginOutcome.Authenticated? = null
-    private var securePreviewText: TextView? = null
+    private val securePreviewText = SecurePreviewBuffer()
     private var sessionCanListFiles = false
     private var offlineSession: OfflineSession? = null
     private var offlineInventory: SessionOfflineInventory? = null
     private var ciphertextCache: SessionCiphertextCache? = null
     private val ciphertextRoot: File get() = File(noBackupFilesDir, "ciphertext-staging-v1")
     @Volatile private var generation = 0
+    @Volatile private var isForeground = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(null)
-        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         showLogin()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        isForeground = true
     }
 
     override fun onStop() {
         super.onStop()
+        isForeground = false
         generation++
         clearSensitiveState()
         showLogin()
@@ -106,8 +113,7 @@ class MainActivity : Activity() {
         offlineInventory?.clear()
         offlineInventory = null
         offlineSession = null
-        securePreviewText?.text = ""
-        securePreviewText = null
+        securePreviewText.clear()
         sessionToken = null
         sessionUsername = null
         authenticatedSession = null
@@ -262,7 +268,7 @@ class MainActivity : Activity() {
             showSession("Cursor de inventário inválido. Reinicie a listagem.")
             return
         }
-        runRequest({ transport.listInventoryPage(origin, token, tracker.cursor) }) { page, failure ->
+        runRequest({ transport.listInventoryPage(origin, token, tracker.cursor, tracker.usedCursors) }) { page, failure ->
             if (page != null) {
                 val nextTracker = tracker.advance(page.nextCursor)
                 val next = page.nextCursor
@@ -383,21 +389,30 @@ class MainActivity : Activity() {
             text(layout, "Bloqueado: este dispositivo ainda não recebeu uma autorização de chave e época verificável. Use um dispositivo autorizado.")
         } else {
             button(layout, "Abrir texto verificado") {
-                val requestGeneration = generation + 1
-                runRequest({
-                    preview.open(origin, session, objectId) { generation == requestGeneration }
+                runCheckedRequest({ stillActive ->
+                    preview.open(origin, session, objectId, stillActive)
                 }) { characters, failure ->
                     if (characters != null) {
                         try {
                             val view = screen("Texto verificado", "Conteúdo autenticado localmente. Feche para descartá-lo da tela.")
-                            securePreviewText = text(view, String(characters)).apply {
+                            val previewText = TextView(this).apply {
                                 isSaveEnabled = false
                                 importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
                                 setTextIsSelectable(false)
+                                setPadding(0, 0, 0, (16 * resources.displayMetrics.density).toInt())
                             }
-                            button(view, "Fechar conteúdo") { backToPage() }
-                        } finally {
+                            securePreviewText.show(characters, { retained ->
+                                previewText.setText(retained, 0, retained.size)
+                                view.addView(previewText)
+                            }, { previewText.text = "" })
+                            button(view, "Fechar conteúdo") {
+                                securePreviewText.clear()
+                                backToPage()
+                            }
+                        } catch (failure: Throwable) {
                             characters.fill('\u0000')
+                            securePreviewText.clear()
+                            throw failure
                         }
                     } else when ((failure as? RootArkApiException)?.statusCode) {
                         401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
@@ -457,25 +472,29 @@ class MainActivity : Activity() {
         button(layout, "Voltar") { backToPage() }
     }
 
-    private fun <T> runRequest(operation: () -> T, done: (T?, Exception?) -> Unit) {
-        val started = ++generation
+    private fun <T> runCheckedRequest(operation: (stillActive: () -> Boolean) -> T, done: (T?, Exception?) -> Unit) {
+        val startedGeneration = ++generation
+        val stillActive = { isForeground && generation == startedGeneration && !isFinishing && !isDestroyed }
         screen("Conectando", "Aguardando resposta do servidor...")
         Thread {
             var response: T? = null
             var failure: Exception? = null
             try {
-                response = operation()
-            } catch (caught: Exception) {
-                failure = caught
+                response = operation(stillActive)
+            } catch (caught: Throwable) {
+                failure = if (caught is Exception) caught else RuntimeException(caught)
             }
             val completedResponse = response
             val completedFailure = failure
             runOnUiThread {
-                if (generation == started && !isFinishing && !isDestroyed) done(completedResponse, completedFailure)
+                if (stillActive()) done(completedResponse, completedFailure)
                 else if (completedResponse is CharArray) completedResponse.fill('\u0000')
             }
         }.start()
     }
+
+    private fun <T> runRequest(operation: () -> T, done: (T?, Exception?) -> Unit) =
+        runCheckedRequest({ _ -> operation() }, done)
 
     private fun errorText(error: Exception?): String = when ((error as? RootArkApiException)?.statusCode) {
         401, 400 -> "Credenciais ou código inválidos."
@@ -485,8 +504,7 @@ class MainActivity : Activity() {
     }
 
     private fun screen(title: String, description: String): LinearLayout {
-        securePreviewText?.text = ""
-        securePreviewText = null
+        securePreviewText.clear()
         val scroll = ScrollView(this)
         if (Build.VERSION.SDK_INT >= 35) {
             // Keep the platform default keyboard behavior on older Android versions.

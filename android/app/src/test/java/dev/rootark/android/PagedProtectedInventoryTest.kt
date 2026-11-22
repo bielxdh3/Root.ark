@@ -9,6 +9,7 @@ import dev.rootark.core.sync.SessionOfflineInventory
 import dev.rootark.core.sync.PagedInventoryPolicy
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.URL
 import java.security.Principal
 import java.security.cert.Certificate
@@ -38,10 +39,11 @@ class PagedProtectedInventoryTest {
         private val mime: String? = "application/json; charset=utf-8",
         private val encoding: String? = null,
         private val declaredSize: Long = -1L,
+        private val stream: InputStream? = null,
     ) : HttpsURLConnection(url) {
         var disconnected = false
         override fun getResponseCode() = status
-        override fun getInputStream() = ByteArrayInputStream(payload)
+        override fun getInputStream() = stream ?: ByteArrayInputStream(payload)
         override fun getContentType(): String? = mime
         override fun getContentEncoding(): String? = encoding
         override fun getContentLengthLong() = declaredSize
@@ -131,6 +133,30 @@ class PagedProtectedInventoryTest {
         }
     }
 
+    @Test fun tricklingInventoryResponseStopsAtTotalDeadlineEvenWithinEachSocketReadTimeout() {
+        var nowNanos = 0L
+        var reads = 0
+        val trickle = object : InputStream() {
+            override fun read(): Int = throw AssertionError("Expected bulk reads")
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                // Nine seconds per byte: always below the 10-second socket idle timeout.
+                nowNanos += 9_000_000_000L
+                buffer[offset] = '{'.code.toByte()
+                return 1
+            }
+        }
+        val response = SecureResponse(origin.syncInventoryUrl(), stream = trickle)
+        val adapter = AuthHttpTransport(clockNanos = { nowNanos }) { response }
+
+        val failure = assertThrows(SyncListingException::class.java) {
+            adapter.listInventoryPage(origin, "fixture-token")
+        }
+        assertTrue(failure.message.orEmpty().contains("deadline"))
+        assertEquals(4, reads)
+        assertTrue(response.disconnected)
+    }
+
     @Test fun realHttpCaptureCanBeReadOfflineOnlyByOriginalLogin() {
         val pages = fixture.getJSONArray("pages")
         val binding = OfflineSession("https://files.example.org:9443", "alice", "ephemeral-login-A")
@@ -181,6 +207,12 @@ class PagedProtectedInventoryTest {
                 AuthHttpTransport { response }.listInventoryPage(origin, "fixture-token")
             }
             assertTrue(response.disconnected)
+        }
+
+        // Repeated cursor must be rejected by AuthHttpTransport
+        val adapter = AuthHttpTransport { url -> SecureResponse(url, payload = raw.toByteArray()) }
+        assertThrows(IllegalArgumentException::class.java) {
+            adapter.listInventoryPage(origin, "fixture-token", cursor = "already_used", usedCursors = setOf("already_used"))
         }
     }
 

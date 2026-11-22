@@ -2,12 +2,15 @@ package dev.rootark.android
 
 import dev.rootark.core.auth.ServerOrigin
 import dev.rootark.core.sync.ReadOnlyFileListPolicy
+import dev.rootark.core.sync.ReadOnlyFileRow
 import dev.rootark.core.sync.InventoryPage
 import dev.rootark.core.sync.PagedInventoryPolicy
 import dev.rootark.core.sync.LoginOutcome
 import dev.rootark.core.sync.RootArkApiException
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.math.BigDecimal
+import java.math.BigInteger
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLConnection
@@ -15,19 +18,21 @@ import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import javax.net.ssl.HttpsURLConnection
+import org.json.JSONException
 import org.json.JSONObject
 
-/** Listing-only failures; they do not change the HTTP or core API contract. */
+/** Listing-only failures do not alter the HTTP or core API contract. */
 internal open class SyncListingException(message: String, cause: Throwable? = null) : IOException(message, cause)
-internal class SyncListingLimitException(message: String, cause: Throwable? = null) :
-    SyncListingException(message, cause)
-internal class SyncListingValidationException(message: String, cause: Throwable? = null) :
-    SyncListingException(message, cause)
+internal class SyncListingLimitException(message: String, cause: Throwable? = null) : SyncListingException(message, cause)
+internal class SyncListingValidationException(message: String, cause: Throwable? = null) : SyncListingException(message, cause)
 
 /** HTTP adapter for canonical login/TOTP and the bounded, read-only sync listing. */
 internal class AuthHttpTransport(
+    private val clockNanos: () -> Long = System::nanoTime,
     private val openInventoryConnection: (URL) -> URLConnection = { it.openConnection() },
 ) {
+    companion object { const val INVENTORY_READ_DEADLINE_NANOS = 30_000_000_000L }
+
     fun login(origin: ServerOrigin, username: String, password: String): LoginOutcome {
         val (status, json) = post(origin.loginUrl(), JSONObject().put("username", username).put("password", password))
         if (status == 403) {
@@ -51,8 +56,14 @@ internal class AuthHttpTransport(
     }
 
     /** The issue #66 endpoint returns metadata only; one page is retained at a time. */
-    fun listInventoryPage(origin: ServerOrigin, token: String, cursor: String? = null): InventoryPage {
+    fun listInventoryPage(
+        origin: ServerOrigin,
+        token: String,
+        cursor: String? = null,
+        usedCursors: Set<String> = emptySet(),
+    ): InventoryPage {
         require(token.isNotBlank() && token.length <= 4096)
+        if (cursor != null) PagedInventoryPolicy.checkCursor(cursor, usedCursors)
         val connection = openInventoryConnection(origin.syncInventoryUrl(cursor)) as? HttpsURLConnection
             ?: throw IOException("TLS inventory transport unavailable")
         try {
@@ -65,11 +76,12 @@ internal class AuthHttpTransport(
             connection.setRequestProperty("Accept", "application/json")
             connection.setRequestProperty("Accept-Encoding", "identity")
             connection.setRequestProperty("Cache-Control", "no-store")
+            val requestStartedAt = clockNanos()
             val status = connection.responseCode
             if (status != 200) throw RootArkApiException(status)
             val mime = connection.contentType?.substringBefore(';')?.trim()
             if (connection.contentLengthLong > PagedInventoryPolicy.MAX_RESPONSE_BYTES) {
-                throw SyncListingLimitException("Sync listing exceeds limit")
+                throw SyncListingLimitException("Inventory page exceeds declared size limit")
             }
             if (!"application/json".equals(mime, ignoreCase = true) ||
                 (connection.contentEncoding != null &&
@@ -81,45 +93,49 @@ internal class AuthHttpTransport(
                 val buffer = ByteArray(4096)
                 var total = 0
                 while (true) {
+                    if (clockNanos() - requestStartedAt >= INVENTORY_READ_DEADLINE_NANOS) {
+                        throw SyncListingException("Inventory response exceeded read deadline")
+                    }
                     val count = stream.read(buffer)
+                    if (clockNanos() - requestStartedAt >= INVENTORY_READ_DEADLINE_NANOS) {
+                        throw SyncListingException("Inventory response exceeded read deadline")
+                    }
                     if (count < 0) break
                     if (count > PagedInventoryPolicy.MAX_RESPONSE_BYTES - total) {
-                        throw SyncListingLimitException("Sync listing exceeds limit")
+                        throw SyncListingLimitException("Inventory page exceeds limit")
                     }
-                    out.write(buffer, 0, count)
                     total += count
+                    out.write(buffer, 0, count)
                 }
                 val chars = try {
                     StandardCharsets.UTF_8.newDecoder()
                         .onMalformedInput(CodingErrorAction.REPORT)
                         .onUnmappableCharacter(CodingErrorAction.REPORT)
                         .decode(ByteBuffer.wrap(out.toByteArray())).toString()
-                } catch (error: Exception) {
-                    throw SyncListingValidationException("Malformed UTF-8 in sync listing", error)
+                } catch (e: Exception) {
+                    throw SyncListingValidationException("Malformed UTF-8 in inventory page", e)
                 }
-                // Prevent AOSP org.json from normalizing duplicate keys or
-                // nonstandard syntax before the metadata-only projection.
                 try {
                     StrictRfc8259Json.validate(chars)
                     JSONObject(chars)
-                } catch (error: StrictRfc8259Json.LimitExceededException) {
-                    throw SyncListingLimitException("Sync listing exceeds structural limit", error)
-                } catch (error: Exception) {
-                    throw SyncListingValidationException("Malformed JSON in sync listing", error)
+                } catch (e: StrictRfc8259Json.LimitExceededException) {
+                    throw SyncListingLimitException("Sync listing exceeds structural limit", e)
+                } catch (e: Exception) {
+                    throw SyncListingValidationException("Malformed JSON in inventory page", e)
                 }
             }
-            return projectInventoryPage(json)
+            return projectInventoryPage(json, if (cursor != null) usedCursors + cursor else usedCursors)
         } finally {
             connection.disconnect()
         }
     }
 
-    private fun projectInventoryPage(response: JSONObject): InventoryPage {
+    internal fun projectInventoryPage(response: JSONObject, usedCursors: Set<String> = emptySet()): InventoryPage {
         val objects = response.optJSONArray("objects") ?: throw SyncListingValidationException("Invalid inventory page")
         if (objects.length() > PagedInventoryPolicy.MAX_ENTRIES) {
-            throw SyncListingLimitException("Sync listing exceeds maximum entry limit")
+            throw SyncListingLimitException("Inventory page exceeds maximum entry limit")
         }
-        val version = response.opt("protocolVersion") as? Int
+        val version = parseProtocolVersion(response.opt("protocolVersion"))
             ?: throw SyncListingValidationException("Invalid inventory page")
         val view = response.opt("view") as? String ?: throw SyncListingValidationException("Invalid inventory page")
         if (!response.has("nextCursor")) throw SyncListingValidationException("Invalid inventory page")
@@ -129,21 +145,17 @@ internal class AuthHttpTransport(
             else -> throw SyncListingValidationException("Invalid inventory cursor")
         }
         try {
-            PagedInventoryPolicy.checkEnvelope(version, view, objects.length(), nextCursor)
+            PagedInventoryPolicy.checkEnvelope(version, view, objects.length(), nextCursor, usedCursors)
             val rows = (0 until objects.length()).map { index ->
-                val record = objects.optJSONObject(index)
+                val record = objects.optJSONObject(index) ?: throw SyncListingValidationException("Invalid sync listing")
+                val metadata = record.optJSONObject("metadata") ?: throw SyncListingValidationException("Invalid sync listing")
+                val deleted = record.opt("tombstone") as? Boolean ?: throw SyncListingValidationException("Invalid sync listing")
+                val recordVersion = parseProtocolVersion(record.opt("protocolVersion"))
                     ?: throw SyncListingValidationException("Invalid sync listing")
-                val metadata = record.optJSONObject("metadata")
+                val revision = record.optJSONObject("revision") ?: throw SyncListingValidationException("Invalid sync listing")
+                val counter = parseNonNegativeLong(revision.opt("counter"))
                     ?: throw SyncListingValidationException("Invalid sync listing")
-                val deleted = record.opt("tombstone") as? Boolean
-                    ?: throw SyncListingValidationException("Invalid sync listing")
-                val recordVersion = record.opt("protocolVersion") as? Int
-                    ?: throw SyncListingValidationException("Invalid sync listing")
-                val revision = record.optJSONObject("revision")
-                    ?: throw SyncListingValidationException("Invalid sync listing")
-                val counter = revision.opt("counter")
-                if ((counter !is Int && counter !is Long) || (counter as Number).toLong() < 0L ||
-                    requiredListingString(revision, "deviceId").length > 256) {
+                if (requiredListingString(revision, "deviceId").length > 256) {
                     throw SyncListingValidationException("Invalid sync listing")
                 }
 
@@ -159,14 +171,95 @@ internal class AuthHttpTransport(
                 )
             }
             return InventoryPage(rows, nextCursor)
-        } catch (error: IllegalArgumentException) {
-            throw SyncListingValidationException("Invalid inventory page", error)
+        } catch (_: IllegalArgumentException) {
+            throw SyncListingValidationException("Invalid or oversized inventory page")
         }
     }
 
-    private fun requiredListingString(json: JSONObject, name: String): String =
-        (json.opt(name) as? String)?.takeIf { it.isNotBlank() }
+    internal fun projectList(response: JSONObject): List<ReadOnlyFileRow> {
+        val objects = response.optJSONArray("objects") ?: throw SyncListingValidationException("Invalid sync listing")
+        if (objects.length() > ReadOnlyFileListPolicy.MAX_ENTRIES) {
+            throw SyncListingLimitException("Sync listing exceeds maximum entry limit")
+        }
+        val version = parseProtocolVersion(response.opt("protocolVersion"))
             ?: throw SyncListingValidationException("Invalid sync listing")
+        try {
+            ReadOnlyFileListPolicy.checkEnvelope(version, objects.length())
+            return (0 until objects.length()).map { index ->
+                val record = objects.optJSONObject(index) ?: throw SyncListingValidationException("Invalid sync listing")
+                val metadata = record.optJSONObject("metadata") ?: throw SyncListingValidationException("Invalid sync listing")
+                val deleted = record.opt("tombstone") as? Boolean ?: throw SyncListingValidationException("Invalid sync listing")
+                val recordVersion = parseProtocolVersion(record.opt("protocolVersion"))
+                    ?: throw SyncListingValidationException("Invalid sync listing")
+                val revision = record.optJSONObject("revision") ?: throw SyncListingValidationException("Invalid sync listing")
+                val counter = parseNonNegativeLong(revision.opt("counter"))
+                    ?: throw SyncListingValidationException("Invalid sync listing")
+                if (requiredListingString(revision, "deviceId").length > 256) {
+                    throw SyncListingValidationException("Invalid sync listing")
+                }
+
+                ReadOnlyFileListPolicy.project(
+                    protocolVersion = recordVersion,
+                    objectId = requiredListingString(record, "objectId"),
+                    operation = requiredListingString(record, "operation"),
+                    tombstone = deleted,
+                    name = optionalString(metadata, "name"),
+                    path = optionalString(metadata, "path"),
+                    size = optionalLong(metadata, "size"),
+                    contentType = optionalString(metadata, "contentType"),
+                )
+            }
+        } catch (_: IllegalArgumentException) {
+            throw SyncListingValidationException("Invalid sync listing")
+        }
+    }
+
+    internal fun parseProtocolVersion(value: Any?): Int? = when (value) {
+        is Int -> value
+        is Short -> value.toInt()
+        is Byte -> value.toInt()
+        is Long -> if (value in Int.MIN_VALUE..Int.MAX_VALUE) value.toInt() else null
+        is BigInteger -> try {
+            value.intValueExact()
+        } catch (_: ArithmeticException) {
+            null
+        }
+        is BigDecimal -> exactBigDecimalInt(value)
+        is Double, is Float -> null
+        else -> null
+    }
+
+    internal fun parseNonNegativeLong(value: Any?): Long? = when (value) {
+        is Int -> if (value >= 0) value.toLong() else null
+        is Long -> if (value >= 0L) value else null
+        is Short -> if (value >= 0) value.toLong() else null
+        is Byte -> if (value >= 0) value.toLong() else null
+        is BigInteger -> try {
+            val l = value.longValueExact()
+            if (l >= 0L) l else null
+        } catch (_: ArithmeticException) {
+            null
+        }
+        is BigDecimal -> exactBigDecimalLong(value)?.takeIf { it >= 0L }
+        is Double, is Float -> null
+        else -> null
+    }
+
+    internal fun parsePositiveInt(value: Any?): Int? = when (value) {
+        is Int -> if (value > 0) value else null
+        is Short -> if (value > 0) value.toInt() else null
+        is Byte -> if (value > 0) value.toInt() else null
+        is Long -> if (value in 1..Int.MAX_VALUE) value.toInt() else null
+        is BigInteger -> try {
+            val i = value.intValueExact()
+            if (i > 0) i else null
+        } catch (_: ArithmeticException) {
+            null
+        }
+        is BigDecimal -> exactBigDecimalInt(value)?.takeIf { it > 0 }
+        is Double, is Float -> null
+        else -> null
+    }
 
     private fun optionalString(json: JSONObject, key: String): String? {
         val value = json.opt(key)
@@ -174,15 +267,40 @@ internal class AuthHttpTransport(
         return value as? String ?: throw SyncListingValidationException("Invalid sync listing")
     }
 
-    private fun optionalLong(json: JSONObject, key: String): Long? {
+    internal fun optionalLong(json: JSONObject, key: String): Long? {
         val value = json.opt(key)
         if (value == null || value == JSONObject.NULL) return null
         return when (value) {
             is Int -> value.toLong()
             is Long -> value
+            is Short -> value.toLong()
+            is Byte -> value.toLong()
+            is BigInteger -> try {
+                value.longValueExact()
+            } catch (_: ArithmeticException) {
+                throw SyncListingValidationException("Invalid sync listing")
+            }
+            is BigDecimal -> exactBigDecimalLong(value)
+                ?: throw SyncListingValidationException("Invalid sync listing")
+            is Double, is Float -> throw SyncListingValidationException("Invalid sync listing")
             else -> throw SyncListingValidationException("Invalid sync listing")
         }
     }
+
+    private fun exactBigDecimalLong(value: BigDecimal): Long? {
+        if (value.signum() == 0) return 0L
+        if (value.scale() !in -19..64) return null
+        val intDigits = value.precision().toLong() - value.scale().toLong()
+        if (intDigits < 1L || intDigits > 19L) return null
+        return try {
+            value.longValueExact()
+        } catch (_: ArithmeticException) {
+            null
+        }
+    }
+
+    private fun exactBigDecimalInt(value: BigDecimal): Int? =
+        exactBigDecimalLong(value)?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
 
     private fun authenticated(json: JSONObject): LoginOutcome.Authenticated {
         val rawPermissions = json.optJSONObject("permissions") ?: throw IOException("Unexpected authentication response")
@@ -200,8 +318,11 @@ internal class AuthHttpTransport(
     private fun requiredString(json: JSONObject, name: String): String =
         (json.opt(name) as? String)?.takeIf { it.isNotBlank() } ?: throw IOException("Unexpected authentication response")
 
+    private fun requiredListingString(json: JSONObject, name: String): String =
+        (json.opt(name) as? String)?.takeIf { it.isNotBlank() } ?: throw SyncListingValidationException("Invalid sync listing")
+
     private fun requiredPositiveInt(json: JSONObject, name: String): Int =
-        (json.opt(name) as? Int)?.takeIf { it > 0 } ?: throw IOException("Unexpected authentication response")
+        parsePositiveInt(json.opt(name)) ?: throw IOException("Unexpected authentication response")
 
     private fun post(url: java.net.URL, body: JSONObject): Pair<Int, JSONObject> {
         val connection = url.openConnection() as HttpURLConnection
@@ -231,7 +352,11 @@ internal class AuthHttpTransport(
                     if (total > 16 * 1024) throw IOException("Authentication response exceeds limit")
                     output.write(chunk, 0, count)
                 }
-                JSONObject(String(output.toByteArray(), StandardCharsets.UTF_8))
+                try {
+                    JSONObject(String(output.toByteArray(), StandardCharsets.UTF_8))
+                } catch (e: JSONException) {
+                    throw IOException("Malformed JSON in authentication response", e)
+                }
             }
             return status to json
         } finally {
