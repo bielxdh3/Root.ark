@@ -2287,7 +2287,7 @@ test("#262 P2: direct pushPending preserves residual staging provenance before o
   assert.equal(await f.engine.hashPendingPayload(operation),
     crypto.createHash("sha256").update(payload).digest("hex"),
     "the signed payload itself is valid and matches the standalone target");
-  assert.deepEqual(await fsp.readFile(target), payload);
+  assert.deepEqual(await readHeldRegularFile(target, independent), payload);
 
   const originalPush = f.adapter.push;
   const originalWitness = f.engine.journal.recordRestoreMaterialization;
@@ -2319,7 +2319,7 @@ test("#262 P2: direct pushPending preserves residual staging provenance before o
   assert.equal(pending.operationId, operation.operationId);
   assert.equal(f.engine.journal.hasMaterializedRestore(pending), false);
   assert.equal(f.engine.journal.restoreStagingInfo(pending).name, name);
-  assert.deepEqual(await fsp.readFile(staged), payload, "recorded staging plaintext remains for recovery");
+  assert.deepEqual(await readHeldRegularFile(staged, pinned), payload, "recorded staging plaintext remains for recovery");
   await assert.rejects(f.engine.reconcileLocal(),
     (error) => error.code === "restore_local_materialization_missing");
   assert.equal((await f.engine.journal.recover()).length, 1);
