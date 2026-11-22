@@ -680,13 +680,13 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       Math.min = () => Number.MAX_SAFE_INTEGER;
       return decrypted;
     };
-    let sealedWithPoisonedGlobals;
     try {
-      sealedWithPoisonedGlobals = await cekTransfer.sealOwnerAuthorizedFileCek({
+      await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
         ownerPrivateKey: owner.privateKey, ownerHeldCek,
         metadata, objectRevision: 1, ciphertext: sealed,
         ciphertextRoot: root, authority: publicAuthority,
-      });
+      }), /ZK_OWNER_FILE_CEK_DENIED/,
+      "an altered global clock after authenticated AEAD must fail closed, not release a CEK");
     } finally {
       delete subtle.decrypt;
       Date.now = trustedClock;
@@ -695,8 +695,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     }
     assert.equal(releaseClockPoisoned, true,
       "the direct CEK path must cross a real asynchronous authenticated-file boundary");
-    assert.equal(sealedWithPoisonedGlobals.core.expires_at, envelope.core.expires_at,
-      "callback-poisoned intrinsics cannot extend the signed owner's CEK expiry");
+    assert.equal(Date.now, trustedClock,
+      "the test must restore the genuine global clock after the denied release");
 
     for (const label of ["metadata", "ciphertext", "head", "root"]) {
       const otherMeta = { ...metadata };
@@ -745,13 +745,12 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       return result;
     };
     try {
-      const pinnedEnvelope = await cekTransfer.sealOwnerAuthorizedFileCek({
+      await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
         ownerPrivateKey: owner.privateKey, ownerHeldCek,
         metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
         authority: publicAuthority,
-      });
-      assert.equal(pinnedEnvelope.core.expires_at, envelope.core.expires_at,
-        "post-AEAD global clock mutation must not alter the signed owner CEK lease");
+      }), /ZK_OWNER_FILE_CEK_DENIED/,
+      "a callback replacing the wall clock after real AEAD must not release CEK bytes");
     } finally {
       Date.now = originalWallClock;
       delete subtle.decrypt;
