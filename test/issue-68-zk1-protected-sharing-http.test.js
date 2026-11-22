@@ -276,6 +276,30 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal(redeemed.durableCopyProven, false);
   assert.equal(redeemed.authorizesPlaintextRelease, false);
   assert.equal(redeemed.serverRevocationProofVerified, false);
+  // The HTTP server might return an authentic owner-signed reply without
+  // enforcing the local device signature. The client must check that the
+  // private signer belongs to its independently pinned recipient roster.
+  const foreignSigner = (await crypto.webcrypto.subtle.generateKey(
+    "Ed25519", false, ["sign", "verify"])).privateKey;
+  let foreignFetches = 0;
+  await assert.rejects(redeem({ signerKey: foreignSigner,
+    fetchImpl: async (...args) => { foreignFetches++; return clientFetch(...args); },
+  }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "foreign signing key cannot redeem even when the server would serve valid ciphertext");
+  assert.equal(foreignFetches, 0, "foreign signer is rejected before network activity");
+  let rotatedRecipientReads = 0;
+  await assert.rejects(redeem({ readIndependentAuthority: async () => {
+    const authority = await independentAuthority();
+    if (++rotatedRecipientReads === 2) {
+      authority.devices = authority.devices.map((device) =>
+        device.deviceId === recipient.device_id ? {
+          ...device, authorizationPublicKey: new Uint8Array(crypto.randomBytes(32)),
+        } : device);
+    }
+    return authority;
+  } }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "recipient roster-key substitution during HTTP awaits must deny the receipt");
+  assert.equal(rotatedRecipientReads, 2);
   await assert.rejects(redeem({ fetchImpl: fetch }), /ZK_SHARE_REDEMPTION_DENIED/,
     "grant possession without recipient account session must not download ciphertext");
   await assert.rejects(redeem({ readIndependentAuthority: null }),
