@@ -330,7 +330,7 @@ function run() {
   function consume(stream, streamName) {
     const decoder = new StringDecoder("utf8");
     let pending = "";
-    const acceptLine = createCanonicalTapLineAcceptor(tracker, fromStderr);
+    const acceptLine = createCanonicalTapLineAcceptor(tracker, streamName === "stderr");
     stream.on("data", (chunk) => {
       lastOutput = Date.now();
       childProgress.bytes(streamName, chunk.length);
