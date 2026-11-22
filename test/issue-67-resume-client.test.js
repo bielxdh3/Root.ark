@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const http = require("node:http");
 const path = require("node:path");
 const test = require("node:test");
 const { Readable } = require("node:stream");
