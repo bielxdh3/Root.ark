@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include "rootark-sync-windows-cfapi-cancel-fence.hpp"
 #include "rootark-sync-windows-native-root-session.hpp"
 namespace {
 constexpr NTSTATUS kCloudFailure = static_cast<NTSTATUS>(0xC000CF12UL);
@@ -31,6 +32,7 @@ struct Context {
   std::atomic<unsigned> callbacks{0};
   std::atomic<unsigned> successful{0};
   std::atomic<unsigned> rejected{0};
+  rootark_cfapi::CancelFence cancellations;
   ~Context() { if (!payload.empty()) SecureZeroMemory(payload.data(), payload.size()); }
 };
 
@@ -73,9 +75,12 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
     && ctx.ancestors->samePaths() && ctx.root->samePath(ctx.path)
     && ctx.root->registeredPolicy();
   const bool independentlyAdmitted = identityMatches && rangeMatches
-    && physicalCustody && ctx.authorize
+    && physicalCustody && !ctx.cancellations.canceled(info) && ctx.authorize
     && ctx.authorize(info, ctx.authorityContext);
-  if (independentlyAdmitted) {
+  // Authorization may yield to a concurrently delivered CANCEL_FETCH_DATA;
+  // sample the exact request tombstone again immediately before CfExecute.
+  // Bytes already submitted to the kernel cannot be clawed back here.
+  if (independentlyAdmitted && !ctx.cancellations.canceled(info)) {
     transfer.TransferData.CompletionStatus = 0;
     transfer.TransferData.Buffer = ctx.payload.data() + static_cast<std::size_t>(offset);
     if (SUCCEEDED(CfExecute(&op, &transfer))) ++ctx.successful;
@@ -85,7 +90,11 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
   (void)CfExecute(&op, &transfer);
 }
 
-void CALLBACK onCancel(const CF_CALLBACK_INFO*, const CF_CALLBACK_PARAMETERS*) {}
+void CALLBACK onCancel(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS*) {
+  if (!info || !info->CallbackContext) return;
+  auto& ctx = *static_cast<Context*>(info->CallbackContext);
+  ctx.cancellations.cancel(info);
+}
 constexpr CF_CALLBACK_REGISTRATION kCallbacks[] = {
   {CF_CALLBACK_TYPE_FETCH_DATA, onFetch},
   {CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, onCancel},

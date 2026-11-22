@@ -1,0 +1,41 @@
+name: Issue 66 CFAPI native cancel fence (candidate only)
+
+on:
+  push:
+    branches:
+      - agent/pr300-cfapi-native-w181-20261122
+    paths:
+      - '.github/workflows/issue66-cfapi-cancel-fence-w181.yml'
+      - 'sync-client/rootark-sync-windows-cfapi-cancel-fence.hpp'
+      - 'sync-client/rootark-sync-windows-cfapi-cancel-fence-test.cpp'
+      - 'sync-client/rootark-sync-windows-cfapi-provider.hpp'
+
+permissions:
+  contents: read
+
+jobs:
+  native-cancel-fence:
+    name: Windows MSVC /W4 /WX callback cancellation (no registration)
+    runs-on: windows-2022
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile and run mock-only native cancellation adversarials
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          if (!(Test-Path -LiteralPath $vswhere)) { throw 'MSVC discovery unavailable' }
+          $vcvars = & $vswhere -all -products '*' -prerelease -find 'VC\Auxiliary\Build\vcvars64.bat' | Select-Object -First 1
+          if (!$vcvars -or !(Test-Path -LiteralPath $vcvars)) { throw 'MSVC x64 tools missing' }
+          $source = Join-Path $env:GITHUB_WORKSPACE 'sync-client\rootark-sync-windows-cfapi-cancel-fence-test.cpp'
+          $out = Join-Path $env:RUNNER_TEMP 'rootark-cfapi-cancel-fence-w181'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $exe = Join-Path $out 'cancel-fence.exe'
+          $obj = Join-Path $out 'cancel-fence.obj'
+          $pdb = Join-Path $out 'cancel-fence.pdb'
+          $command = 'call "' + $vcvars + '" >nul && cl /nologo /std:c++17 /W4 /WX /EHsc /Zc:__cplusplus /O2 /Fe:"' + $exe + '" /Fo:"' + $obj + '" /Fd:"' + $pdb + '" "' + $source + '" Advapi32.lib CldApi.lib'
+          & cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw 'Native MSVC /W4 /WX compile failed' }
+          & $exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Native cancellation adversarials failed' }
