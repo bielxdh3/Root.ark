@@ -122,12 +122,13 @@ test("canonical Windows preserves bounded safe diagnostics after twelve failures
     tracker.accept("  code: 'ERR_ASSERTION'");
     tracker.accept("  error: 'secret private fixture token' "); // malformed: never printed
     tracker.accept("  operator: 'strictEqual'");
+    tracker.accept("    at TestContext.<anonymous> (D:\\private\\test\\file-read-handle-security.test.js:957:12)");
     tracker.accept("  ...");
   }
   tracker.finish();
   const output = messages.join("\n");
   assert.equal(tracker.state.failures, 23);
   assert.equal(messages.filter((line) => line.startsWith("FAIL detail")).length, 23);
-  assert.match(output, /FAIL detail index=23 .*locationLine=451 .*operator=strictEqual/);
+  assert.match(output, /FAIL detail index=23 .*locationLine=451 assertionLine=957 .*operator=strictEqual/);
   assert.doesNotMatch(output, /secret private fixture token|D:\\private/);
 });

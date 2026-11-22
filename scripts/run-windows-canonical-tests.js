@@ -107,9 +107,10 @@ function createTapProgressRecorder(write) {
         && pending.code === "ERR_TEST_FAILURE" && pending.moduleExitCode !== null
         ? ` moduleExitCode=${pending.moduleExitCode}` : "";
       const location = pending.locationLine === null ? "" : ` locationLine=${pending.locationLine}`;
+      const assertion = pending.assertionLine === null ? "" : ` assertionLine=${pending.assertionLine}`;
       const message = pending.messageHash ? ` errorSha256=${pending.messageHash}` : "";
       const operator = pending.operator ? ` operator=${pending.operator}` : "";
-      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${location}${message}${operator}${acl}${edge}`);
+      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${location}${assertion}${message}${operator}${acl}${edge}`);
       detailed++;
     } else if (pending.acl && verifiedAclOverflowDetails < 4) {
       // Numerous unrelated failed tests must not suppress the bounded, strictly
@@ -182,7 +183,7 @@ function createTapProgressRecorder(write) {
             pending = { index: result[2], nameHash, pathHash: "none",
               failureType: "unknown", code: "unknown", moduleExitCode: null,
               fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false,
-              locationLine: null, messageHash: null, operator: null };
+              locationLine: null, assertionLine: null, messageHash: null, operator: null };
           }
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
@@ -229,6 +230,13 @@ function createTapProgressRecorder(write) {
           if (error && pending.pathHash !== "none") pending.messageHash = hash(error[1]);
           const operator = /^  operator: '([a-zA-Z]{1,40})'$/.exec(line);
           if (operator && ["strictEqual", "deepStrictEqual", "throws", "rejects", "match", "ok", "notStrictEqual"].includes(operator[1])) pending.operator = operator[1];
+          // Never log or retain a stack trace. Only its first numeric line
+          // in the already verified test file is actionable and non-secret.
+          if (pending.pathHash !== "none" && pending.assertionLine === null) {
+            const frame = /(?:^|[\\/])test[\\/]([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}/.exec(line);
+            if (frame && hash(`test/${frame[1]}`) === pending.pathHash)
+              pending.assertionLine = Number(frame[2]);
+          }
           // Keep only bounded, allowlisted process evidence; never print
           // raw YAML, paths, stack traces, or failure text.
           if (line === "  error: 'test failed'") pending.fileProcessFailed = true;
