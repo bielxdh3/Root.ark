@@ -1,9 +1,9 @@
 package dev.rootark.android
 
 import android.app.Activity
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
-import android.os.Build
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
