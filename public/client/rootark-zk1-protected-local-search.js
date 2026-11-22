@@ -254,6 +254,14 @@
           live(assertLive);
         }
       }
+      // Even a genuinely verified head can advance while IndexedDB or AEAD
+      // is pending. Release no cached or freshly indexed private names until
+      // a second independent signed read proves the same pinned CAS/scope.
+      const finalVerified = await verifyPrivateListingHead(input.baseline);
+      live(assertLive);
+      if (!sameScope(finalVerified?.scope, pinned.scope)
+        || finalVerified.head?.sequence !== pinned.head.sequence
+        || finalVerified.head.digest !== pinned.head.digest) deny();
       return Object.freeze({ ...filtered(rows, input.term, pinned.head, Boolean(database)),
         reusedIndex: usedCache });
     } catch (_) { deny(); }
