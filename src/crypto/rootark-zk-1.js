@@ -3,9 +3,106 @@
 const crypto = require("node:crypto");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
+const { types: nodeUtilTypes } = require("node:util");
 const { CipherSuite, HkdfSha256, Aes256Gcm } = require("@hpke/core");
 const { DhkemX25519HkdfSha256 } = require("@hpke/dhkem-x25519");
 const sodium = require("libsodium-wrappers-sumo");
+
+// Deterministic authorization encoding can run after an untrusted sync
+// transport/readback callback. Pin the byte, object and equality primitives
+// used by its validation/encoding path before that callback can poison globals.
+const NativeBuffer = Buffer;
+const NativeUint8Array = Uint8Array;
+const NativeArray = Array;
+const NativeSet = Set;
+const NativePromise = Promise;
+const NativeObjectPrototype = Object.prototype;
+const nativeIsProxy = nodeUtilTypes.isProxy;
+const nativeIsUint8Array = nodeUtilTypes.isUint8Array;
+const nativeBufferFrom = NativeBuffer.from.bind(NativeBuffer);
+const nativeBufferFromProperty = NativeBuffer.from;
+const nativeBufferIsBufferProperty = NativeBuffer.isBuffer;
+const nativeBufferConcatProperty = NativeBuffer.concat;
+const nativeBufferAllocProperty = NativeBuffer.alloc;
+const nativeBufferByteLength = NativeBuffer.byteLength.bind(NativeBuffer);
+const nativeBufferAlloc = NativeBuffer.alloc.bind(NativeBuffer);
+const nativeTypedArrayByteLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(NativeUint8Array.prototype), "byteLength").get;
+const nativeUint8ArraySet = NativeUint8Array.prototype.set;
+const nativeBufferConcat = NativeBuffer.concat.bind(NativeBuffer);
+const nativeBufferIsBuffer = NativeBuffer.isBuffer.bind(NativeBuffer);
+const nativeBufferEquals = NativeBuffer.prototype.equals;
+const nativeBufferSubarray = NativeBuffer.prototype.subarray;
+const nativeBufferToString = NativeBuffer.prototype.toString;
+const nativeBufferFill = NativeBuffer.prototype.fill;
+const nativeUint8ArrayFill = NativeUint8Array.prototype.fill;
+const nativeArrayIsArray = Array.isArray;
+const nativeArrayValues = Array.prototype.values;
+const nativeSymbolIterator = Symbol.iterator;
+const nativeArrayIncludes = Array.prototype.includes;
+const nativeArrayPush = Array.prototype.push;
+const nativeStringSplit = String.prototype.split;
+const nativeNumberIsSafeInteger = Number.isSafeInteger;
+const nativeNumberIsInteger = Number.isInteger;
+const nativeBigInt = BigInt;
+const nativeObjectGetPrototypeOf = Object.getPrototypeOf;
+const nativeObjectKeys = Object.keys;
+const nativeObjectHasOwn = Object.hasOwn;
+const nativeObjectCreate = Object.create;
+const nativeObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const nativeObjectDefineProperty = Object.defineProperty;
+const nativeObjectSetPrototypeOf = Object.setPrototypeOf;
+const nativeObjectFreeze = Object.freeze;
+const nativeReflectOwnKeys = Reflect.ownKeys;
+const nativeSetHas = NativeSet.prototype.has;
+const nativeSetAdd = NativeSet.prototype.add;
+const nativeSetDelete = NativeSet.prototype.delete;
+const nativeReflectApply = Reflect.apply;
+const nativePromiseThen = Promise.prototype.then;
+const nativePromiseCatch = Promise.prototype.catch;
+const nativePromiseResolve = Promise.resolve.bind(Promise);
+const nativeArrayIteratorPrototype = nativeObjectGetPrototypeOf(
+  nativeReflectApply(nativeArrayValues, [], []),
+);
+const nativeArrayIteratorNext = nativeObjectGetOwnPropertyDescriptor(
+  nativeArrayIteratorPrototype, "next",
+).value;
+const nativeCryptoTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
+const nativeCryptoCreateHash = crypto.createHash.bind(crypto);
+const nativeCryptoSign = crypto.sign.bind(crypto);
+const nativeCryptoVerify = crypto.verify.bind(crypto);
+const nativeCryptoHkdfSync = crypto.hkdfSync.bind(crypto);
+const nativeCryptoRandomBytes = crypto.randomBytes.bind(crypto);
+const nativeCryptoCreateCipheriv = crypto.createCipheriv.bind(crypto);
+const nativeCryptoCreateDecipheriv = crypto.createDecipheriv.bind(crypto);
+const nativeHashUpdate = crypto.Hash.prototype.update;
+const nativeHashDigest = crypto.Hash.prototype.digest;
+const nativeSodiumReady = sodium.ready;
+const nativeSodiumPrimitivesPromise = nativeReflectApply(nativePromiseThen, nativeSodiumReady, [() => {
+  const cryptoPwhash = sodium.crypto_pwhash;
+  if (typeof cryptoPwhash !== "function" || nativeIsProxy(cryptoPwhash)) return null;
+  return {
+    cryptoPwhash: (...args) => nativeReflectApply(cryptoPwhash, sodium, args),
+    algorithm: sodium.crypto_pwhash_ALG_ARGON2ID13,
+  };
+}, () => null]);
+const nativeCipherProbe = nativeCryptoCreateCipheriv(
+  "aes-256-gcm", nativeBufferAlloc(32), nativeBufferAlloc(12), { authTagLength: 16 },
+);
+const nativeCipherPrototype = nativeObjectGetPrototypeOf(nativeCipherProbe);
+const nativeCipherSetAAD = nativeCipherPrototype.setAAD;
+const nativeCipherUpdate = nativeCipherPrototype.update;
+const nativeCipherFinal = nativeCipherPrototype.final;
+const nativeCipherGetAuthTag = nativeCipherPrototype.getAuthTag;
+nativeReflectApply(nativeCipherFinal, nativeCipherProbe, []);
+const nativeDecipherProbe = nativeCryptoCreateDecipheriv(
+  "aes-256-gcm", nativeBufferAlloc(32), nativeBufferAlloc(12), { authTagLength: 16 },
+);
+const nativeDecipherPrototype = nativeObjectGetPrototypeOf(nativeDecipherProbe);
+const nativeDecipherSetAAD = nativeDecipherPrototype.setAAD;
+const nativeDecipherSetAuthTag = nativeDecipherPrototype.setAuthTag;
+const nativeDecipherUpdate = nativeDecipherPrototype.update;
+const nativeDecipherFinal = nativeDecipherPrototype.final;
 
 const SUITE_ID = "rootark-zk-1";
 const SUITE_VERSION = 1;
@@ -14,50 +111,56 @@ const KDF_ID = 0x0001;
 const AEAD_ID = 0x0002;
 const MAX_U64 = 0xffffffffffffffffn;
 const MAX_I63 = 0x7fffffffffffffffn;
-const ASCII = Object.freeze({
+const ASCII = nativeObjectFreeze({
   HPKE_INFO: "Root.ark/zk-1/hpke-info/v1",
   HPKE_INFO_V2: "Root.ark/zk-1/hpke-info/v2",
   KEY_WRAP: "Root.ark/zk-1/key-wrap/v1",
   AUTHORIZATION: "Root.ark/zk-1/authorization-manifest/v1",
   AUTHORIZATION_V2: "Root.ark/zk-1/authorization-manifest/v2",
 });
-const PROFILE = Object.freeze({
+const PROFILE = nativeObjectFreeze({
   ROOT: "rootark-zk-1",
   AAD: "rootark-zk-1/aad/v1",
   AAD_V2: "rootark-zk-1/aad/v2",
   HPKE_INFO: "rootark-zk-1/hpke-info/v1",
   HPKE_INFO_V2: "rootark-zk-1/hpke-info/v2",
 });
-const MANIFEST_TYPE = Object.freeze({
+const MANIFEST_TYPE = nativeObjectFreeze({
   1: "rootark-authorization-manifest-v1",
   2: "rootark-authorization-manifest-v2",
 });
-const V2_EXPECTED_SCOPE = Object.freeze([
+const V2_EXPECTED_SCOPE = nativeObjectFreeze([
   "sender_key_id", "recipient_key_id", "compartment_id", "object_id", "version_id",
   "key_ref", "purpose", "epoch", "wrap_id",
 ]);
-const V1_EXPECTED_FIELDS = Object.freeze([
+const V1_EXPECTED_FIELDS = nativeObjectFreeze([
   "sender_key_id", "recipient_key_id", "compartment_id", "object_id", "version_id",
   "purpose", "epoch", "expiry", "replay_id", "idempotency_key", "wrap_id", "hpke_enc",
   "hpke_info_digest", "wrapped_key_digest", "ciphertext_digest",
 ]);
-const V2_EXPECTED_FIELDS = Object.freeze([
-  ...V1_EXPECTED_FIELDS, "type", "suite", "envelope_version", "key_ref",
-]);
-const PURPOSES = Object.freeze([
+const V2_EXPECTED_FIELDS = [];
+for (let index = 0; index < V1_EXPECTED_FIELDS.length; index += 1) {
+  nativeReflectApply(nativeArrayPush, V2_EXPECTED_FIELDS, [V1_EXPECTED_FIELDS[index]]);
+}
+const V2_EXTRA_FIELDS = ["type", "suite", "envelope_version", "key_ref"];
+for (let index = 0; index < V2_EXTRA_FIELDS.length; index += 1) {
+  nativeReflectApply(nativeArrayPush, V2_EXPECTED_FIELDS, [V2_EXTRA_FIELDS[index]]);
+}
+nativeObjectFreeze(V2_EXPECTED_FIELDS);
+const PURPOSES = nativeObjectFreeze([
   "content",
   "derived-data",
   "key-wrap",
   "recovery-package",
   "authorization",
 ]);
-const SUITE_STATES = Object.freeze({
+const SUITE_STATES = nativeObjectFreeze({
   ALLOWED: "allowed",
   DEPRECATED: "deprecated",
   REJECTED: "rejected",
 });
-const SUITE_REGISTRY = Object.freeze({
-  [SUITE_ID]: Object.freeze({
+const SUITE_REGISTRY = nativeObjectFreeze({
+  [SUITE_ID]: nativeObjectFreeze({
     version: SUITE_VERSION,
     state: SUITE_STATES.ALLOWED,
     read: "allowed",
@@ -67,7 +170,7 @@ const SUITE_REGISTRY = Object.freeze({
     aead: AEAD_ID,
   }),
 });
-const SECURITY_CLASS = Object.freeze({
+const SECURITY_CLASS = nativeObjectFreeze({
   FAIL_CLOSED: "FAIL_CLOSED_SECURITY",
   AUTHENTICATION: "AUTHENTICATION_FAILED",
   SCOPE: "SCOPE_MISMATCH",
@@ -87,13 +190,21 @@ function fail(code, classification) {
   throw new RootarkZkError(code, classification);
 }
 
+function ownDataValue(value, key) {
+  if (!value || (typeof value !== "object" && typeof value !== "function") || nativeIsProxy(value)) {
+    return undefined;
+  }
+  const descriptor = nativeObjectGetOwnPropertyDescriptor(value, key);
+  return descriptor && nativeObjectHasOwn(descriptor, "value") ? descriptor.value : undefined;
+}
+
 function isBytes(value) {
-  return Buffer.isBuffer(value) || value instanceof Uint8Array;
+  return !nativeIsProxy(value) && (nativeBufferIsBuffer(value) || nativeIsUint8Array(value));
 }
 
 function bytes(value, code = "INVALID_BYTES", exact, min, max) {
   if (!isBytes(value)) fail(code);
-  const result = Buffer.from(value);
+  const result = nativeBufferFrom(value);
   if (exact !== undefined && result.length !== exact) fail("INVALID_LENGTH");
   if (min !== undefined && result.length < min) fail("INVALID_LENGTH");
   if (max !== undefined && result.length > max) fail("INVALID_LENGTH");
@@ -108,38 +219,61 @@ function text(value) {
 function uint(value, max, code = "INVALID_INTEGER") {
   let result;
   if (typeof value === "bigint") result = value;
-  else if (Number.isSafeInteger(value)) result = BigInt(value);
+  else if (nativeNumberIsSafeInteger(value)) result = nativeBigInt(value);
   else fail(code);
   if (result < 0n || result > max) fail(code);
   return result;
 }
 
 function plainObject(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value) || isBytes(value)) {
+  if (value === null || typeof value !== "object" || nativeArrayIsArray(value)
+    || nativeIsProxy(value) || isBytes(value)) {
     fail("AMBIGUOUS_MAP");
   }
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) fail("AMBIGUOUS_MAP");
+  const proto = nativeObjectGetPrototypeOf(value);
+  if (proto !== NativeObjectPrototype && proto !== null) fail("AMBIGUOUS_MAP");
   return value;
 }
 
 function safeMap(value, required, exact) {
-  const map = plainObject(value);
-  const keys = Object.keys(map);
-  if (exact && (keys.length !== exact.length || exact.some((key) => !Object.hasOwn(map, key)))) {
-    fail("UNKNOWN_REQUIRED_FIELD");
+  const source = plainObject(value);
+  const keys = nativeObjectKeys(source);
+  const ownKeys = nativeReflectOwnKeys(source);
+  if (ownKeys.length !== keys.length) fail("CBOR maps cannot contain symbols or hidden properties", "AMBIGUOUS_MAP");
+  const map = nativeObjectCreate(null);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === "__proto__" || key === "constructor" || key === "prototype") fail("INVALID_MAP_KEY");
+    const descriptor = nativeObjectGetOwnPropertyDescriptor(source, key);
+    if (!descriptor || !nativeObjectHasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+      fail("AMBIGUOUS_MAP");
+    }
+    const item = descriptor.value;
+    map[key] = isBytes(item) ? nativeBufferFrom(item) : item;
   }
-  if (required && required.some((key) => !Object.hasOwn(map, key))) fail("MISSING_REQUIRED_FIELD");
-  if (keys.some((key) => key === "__proto__" || key === "constructor" || key === "prototype")) {
-    fail("INVALID_MAP_KEY");
+  if (exact) {
+    if (keys.length !== exact.length) fail("UNKNOWN_REQUIRED_FIELD");
+    for (let index = 0; index < exact.length; index += 1) {
+      if (!nativeObjectHasOwn(map, exact[index])) fail("UNKNOWN_REQUIRED_FIELD");
+    }
+  }
+  if (required) {
+    for (let index = 0; index < required.length; index += 1) {
+      if (!nativeObjectHasOwn(map, required[index])) fail("MISSING_REQUIRED_FIELD");
+    }
   }
   return map;
 }
 
-function validateCborValue(value, seen = new Set()) {
+function validateCborValue(value, seen = new NativeSet(), budget = { nodes: 0 }, depth = 1) {
+  // The decoder's output is untrusted too. Apply the same finite traversal
+  // budget before canonical re-encoding, even if the decoder returns aliases.
+  if (depth > CBOR_SNAPSHOT_MAX_DEPTH || ++budget.nodes > CBOR_SNAPSHOT_MAX_NODES) {
+    fail("CBOR_VALUE_TOO_LARGE");
+  }
   if (value === null || typeof value === "boolean" || typeof value === "string") return;
   if (typeof value === "number") {
-    if (!Number.isSafeInteger(value) || value < 0) fail("UNSUPPORTED_CBOR_VALUE");
+    if (!nativeNumberIsSafeInteger(value) || value < 0) fail("UNSUPPORTED_CBOR_VALUE");
     return;
   }
   if (typeof value === "bigint") {
@@ -147,72 +281,249 @@ function validateCborValue(value, seen = new Set()) {
     return;
   }
   if (isBytes(value)) return;
-  if (typeof value !== "object" || seen.has(value)) fail("UNSUPPORTED_CBOR_VALUE");
-  seen.add(value);
-  if (Array.isArray(value)) {
-    value.forEach((entry) => validateCborValue(entry, seen));
+  if (typeof value !== "object" || nativeReflectApply(nativeSetHas, seen, [value])) fail("UNSUPPORTED_CBOR_VALUE");
+  nativeReflectApply(nativeSetAdd, seen, [value]);
+  if (nativeArrayIsArray(value)) {
+    if (nativeIsProxy(value)) fail("UNSUPPORTED_CBOR_VALUE");
+    const prototype = nativeObjectGetPrototypeOf(value);
+    if (prototype !== NativeArray.prototype && prototype !== null) {
+      fail("UNSUPPORTED_CBOR_VALUE");
+    }
+    const length = value.length;
+    const keys = nativeObjectKeys(value);
+    const ownKeys = nativeReflectOwnKeys(value);
+    const iterator = nativeObjectGetOwnPropertyDescriptor(value, nativeSymbolIterator);
+    const pinnedIterator = prototype === null && iterator
+      && nativeObjectHasOwn(iterator, "value") && iterator.value === nativeArrayValues
+      && iterator.enumerable === false && iterator.configurable === false;
+    if (keys.length !== length || ownKeys.length !== length + (pinnedIterator ? 2 : 1)) {
+      fail("UNSUPPORTED_CBOR_VALUE");
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = nativeObjectGetOwnPropertyDescriptor(value, `${index}`);
+      if (!descriptor || !nativeObjectHasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+        fail("UNSUPPORTED_CBOR_VALUE");
+      }
+      validateCborValue(descriptor.value, seen, budget, depth + 1);
+    }
   } else {
     const map = plainObject(value);
-    for (const key of Object.keys(map)) {
+    const keys = nativeObjectKeys(map);
+    const ownKeys = nativeReflectOwnKeys(map);
+    if (ownKeys.length !== keys.length) fail("UNSUPPORTED_CBOR_VALUE");
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
       if (key === "__proto__" || key === "constructor" || key === "prototype") fail("INVALID_MAP_KEY");
-      validateCborValue(map[key], seen);
+      const descriptor = nativeObjectGetOwnPropertyDescriptor(map, key);
+      if (!descriptor || !nativeObjectHasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+        fail("UNSUPPORTED_CBOR_VALUE");
+      }
+      validateCborValue(descriptor.value, seen, budget, depth + 1);
     }
   }
-  seen.delete(value);
+  nativeReflectApply(nativeSetDelete, seen, [value]);
+}
+
+// Authorization encoding must snapshot before its first await. Shared but
+// acyclic CBOR maps are legal; cloning an aliased binary DAG without a budget
+// otherwise expands a few input objects into exponentially many copies.
+// The supported maximum keyring manifest contains 256 devices x 64 epochs
+// (16,384 wraps), which needs about 118k snapshot nodes. Keep that supported
+// shape below a finite bound while retaining the independent 64 MiB byte and
+// 64-level depth limits against oversized or adversarial CBOR values.
+const CBOR_SNAPSHOT_MAX_NODES = 131072;
+const CBOR_SNAPSHOT_MAX_DEPTH = 64;
+const CBOR_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
+
+function snapshotCborValue(value, seen = new NativeSet(), budget = { nodes: 0, bytes: 0 }, depth = 1) {
+  if (depth > CBOR_SNAPSHOT_MAX_DEPTH || ++budget.nodes > CBOR_SNAPSHOT_MAX_NODES) {
+    fail("CBOR_VALUE_TOO_LARGE");
+  }
+  // Nine bytes conservatively cover CBOR type/length overhead and u64 values.
+  budget.bytes += 9;
+  if (budget.bytes > CBOR_SNAPSHOT_MAX_BYTES) fail("CBOR_VALUE_TOO_LARGE");
+  if (typeof value === "string") {
+    if (value.length > CBOR_SNAPSHOT_MAX_BYTES - budget.bytes) fail("CBOR_VALUE_TOO_LARGE");
+    budget.bytes += nativeBufferByteLength(value, "utf8");
+    if (budget.bytes > CBOR_SNAPSHOT_MAX_BYTES) fail("CBOR_VALUE_TOO_LARGE");
+    return value;
+  }
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!nativeNumberIsSafeInteger(value) || value < 0) fail("UNSUPPORTED_CBOR_VALUE");
+    return value;
+  }
+  if (typeof value === "bigint") {
+    if (value < 0n || value > MAX_U64) fail("UNSUPPORTED_CBOR_VALUE");
+    return value;
+  }
+  if (isBytes(value)) {
+    // Buffer.byteLength(typedArray) consults the public byteLength property,
+    // which an untrusted caller can shadow with an own property of zero.
+    // Read the actual byte view's internal slot via the captured native getter
+    // and copy via the captured native set (not spoofable length/iterator).
+    const length = nativeReflectApply(nativeTypedArrayByteLength, value, []);
+    if (length > CBOR_SNAPSHOT_MAX_BYTES - budget.bytes) fail("CBOR_VALUE_TOO_LARGE");
+    budget.bytes += length;
+    const detachedBytes = nativeBufferAlloc(length);
+    nativeReflectApply(nativeUint8ArraySet, detachedBytes, [value]);
+    return detachedBytes;
+  }
+  if (typeof value !== "object" || nativeReflectApply(nativeSetHas, seen, [value])) fail("UNSUPPORTED_CBOR_VALUE");
+  nativeReflectApply(nativeSetAdd, seen, [value]);
+  let snapshot;
+  if (nativeArrayIsArray(value)) {
+    if (nativeIsProxy(value)) fail("UNSUPPORTED_CBOR_VALUE");
+    const prototype = nativeObjectGetPrototypeOf(value);
+    if (prototype !== NativeArray.prototype && prototype !== null) {
+      fail("UNSUPPORTED_CBOR_VALUE");
+    }
+    const length = value.length;
+    if (length > CBOR_SNAPSHOT_MAX_NODES - budget.nodes) fail("CBOR_VALUE_TOO_LARGE");
+    const keys = nativeObjectKeys(value);
+    const ownKeys = nativeReflectOwnKeys(value);
+    if (keys.length !== length || ownKeys.length !== length + 1) fail("UNSUPPORTED_CBOR_VALUE");
+    snapshot = new NativeArray(length);
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = nativeObjectGetOwnPropertyDescriptor(value, `${index}`);
+      if (!descriptor || !nativeObjectHasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+        fail("UNSUPPORTED_CBOR_VALUE");
+      }
+      snapshot[index] = snapshotCborValue(descriptor.value, seen, budget, depth + 1);
+    }
+    // cborg uses for..of. A null-prototype snapshot with its OWN captured
+    // native iterator prevents Array.prototype[Symbol.iterator] from swapping
+    // validated elements during the asynchronous dynamic import.
+    nativeObjectSetPrototypeOf(snapshot, null);
+    nativeObjectDefineProperty(snapshot, nativeSymbolIterator, {
+      value: nativeArrayValues, enumerable: false, writable: false, configurable: false,
+    });
+    nativeObjectFreeze(snapshot);
+  } else {
+    const source = plainObject(value);
+    const keys = nativeObjectKeys(source);
+    if (keys.length > CBOR_SNAPSHOT_MAX_NODES - budget.nodes) fail("CBOR_VALUE_TOO_LARGE");
+    const ownKeys = nativeReflectOwnKeys(source);
+    if (ownKeys.length !== keys.length) fail("UNSUPPORTED_CBOR_VALUE");
+    snapshot = nativeObjectCreate(null);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      if (key === "__proto__" || key === "constructor" || key === "prototype") fail("INVALID_MAP_KEY");
+      if (key.length > CBOR_SNAPSHOT_MAX_BYTES - budget.bytes) fail("CBOR_VALUE_TOO_LARGE");
+      budget.bytes += 9 + nativeBufferByteLength(key, "utf8");
+      if (budget.bytes > CBOR_SNAPSHOT_MAX_BYTES) fail("CBOR_VALUE_TOO_LARGE");
+      const descriptor = nativeObjectGetOwnPropertyDescriptor(source, key);
+      if (!descriptor || !nativeObjectHasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+        fail("UNSUPPORTED_CBOR_VALUE");
+      }
+      snapshot[key] = snapshotCborValue(descriptor.value, seen, budget, depth + 1);
+    }
+    nativeObjectFreeze(snapshot);
+  }
+  nativeReflectApply(nativeSetDelete, seen, [value]);
+  return snapshot;
 }
 
 let cborgPromise;
 function cborg() {
-  if (!cborgPromise) cborgPromise = import("cborg").catch((error) => {
-    const searchPath = process.env.NODE_PATH?.split(path.delimiter).find((entry) => entry);
+  if (!cborgPromise) {
+    const imported = import("cborg");
+    const withFallback = nativeReflectApply(nativePromiseCatch, imported, [(error) => {
+    const nodePath = process.env.NODE_PATH;
+    const entries = typeof nodePath === "string"
+      ? nativeReflectApply(nativeStringSplit, nodePath, [path.delimiter]) : [];
+    let searchPath = null;
+    for (let index = 0; index < entries.length; index += 1) {
+      if (entries[index]) { searchPath = entries[index]; break; }
+    }
     if (!searchPath) throw error;
     return import(pathToFileURL(path.join(searchPath, "cborg", "cborg.js")).href);
-  });
+    }]);
+    cborgPromise = nativeReflectApply(nativePromiseThen, withFallback, [(module) => {
+    if (!module || typeof module !== "object" || nativeIsProxy(module)) fail("CBOR_API_UNAVAILABLE");
+    const defaultApi = ownDataValue(module, "default");
+    const api = defaultApi && typeof defaultApi === "object" ? defaultApi : module;
+    if (nativeIsProxy(api)) fail("CBOR_API_UNAVAILABLE");
+    const encode = ownDataValue(api, "encode");
+    const decode = ownDataValue(api, "decode");
+    if (typeof encode !== "function" || typeof decode !== "function"
+      || nativeIsProxy(encode) || nativeIsProxy(decode)) fail("CBOR_API_UNAVAILABLE");
+    const options = safeMap(ownDataValue(api, "rfc8949EncodeOptions") || {});
+    options.ignoreUndefinedProperties = false;
+    nativeObjectFreeze(options);
+    return nativeObjectFreeze({
+      encode,
+      decode,
+      rfc8949EncodeOptions: options,
+    });
+    }]);
+  }
   return cborgPromise;
 }
 
+function invokeWithPinnedBytePrimitives(method, args) {
+  // cborg and Node's native one-shot crypto glue consult global Buffer
+  // methods synchronously even with detached inputs. Pin them only during
+  // that synchronous trusted call, restoring the prior descriptors on exit.
+  const slots = [
+    // cborg dispatches on Number.isSafeInteger inside its synchronous
+    // RFC 8949 encoder; a readback callback must not change this decision.
+    [Number, "isSafeInteger", nativeNumberIsSafeInteger],
+    // A snapshot's own Array.prototype.values iterator still inherits its
+    // mutable `next` method from %ArrayIteratorPrototype%. Pin that method
+    // across cborg's synchronous walk after the asynchronous module import.
+    [nativeArrayIteratorPrototype, "next", nativeArrayIteratorNext],
+    [NativeBuffer, "isBuffer", nativeBufferIsBufferProperty],
+    [NativeBuffer, "from", nativeBufferFromProperty],
+    [NativeBuffer, "concat", nativeBufferConcatProperty],
+    [NativeBuffer, "alloc", nativeBufferAllocProperty],
+    [NativeBuffer.prototype, "subarray", nativeBufferSubarray],
+    [NativeBuffer.prototype, "fill", nativeBufferFill],
+    [NativeBuffer.prototype, "toString", nativeBufferToString],
+  ];
+  const previous = new NativeArray(slots.length);
+  for (let index = 0; index < slots.length; index += 1) {
+    const descriptor = nativeObjectGetOwnPropertyDescriptor(slots[index][0], slots[index][1]);
+    if (!descriptor || descriptor.configurable !== true || !nativeObjectHasOwn(descriptor, "value")) {
+      fail("CBOR_API_UNAVAILABLE");
+    }
+    previous[index] = descriptor;
+  }
+  try {
+    for (let index = 0; index < slots.length; index += 1) {
+      nativeObjectDefineProperty(slots[index][0], slots[index][1], {
+        ...previous[index], value: slots[index][2],
+      });
+    }
+    return nativeReflectApply(method, undefined, args);
+  } finally {
+    for (let index = slots.length - 1; index >= 0; index -= 1) {
+      nativeObjectDefineProperty(slots[index][0], slots[index][1], previous[index]);
+    }
+  }
+}
+
 async function encodeDeterministic(value) {
-  validateCborValue(value);
+  const snapshot = snapshotCborValue(value);
+  validateCborValue(snapshot);
   try {
     const api = await cborg();
-    return Buffer.from(api.encode(value, {
-      ...api.rfc8949EncodeOptions,
-      ignoreUndefinedProperties: false,
-    }));
+    return nativeBufferFrom(invokeWithPinnedBytePrimitives(
+      api.encode, [snapshot, api.rfc8949EncodeOptions]));
   } catch (_) {
     fail("CBOR_ENCODE_FAILED");
   }
 }
 
-function inspectDecoded(value, seen = new Set()) {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return;
-  if (typeof value === "number") {
-    if (!Number.isSafeInteger(value) || value < 0) fail("UNSUPPORTED_CBOR_VALUE");
-    return;
-  }
-  if (typeof value === "bigint") {
-    if (value < 0n || value > MAX_U64) fail("UNSUPPORTED_CBOR_VALUE");
-    return;
-  }
-  if (isBytes(value)) return;
-  if (typeof value !== "object" || seen.has(value)) fail("UNSUPPORTED_CBOR_VALUE");
-  seen.add(value);
-  if (Array.isArray(value)) value.forEach((entry) => inspectDecoded(entry, seen));
-  else {
-    const map = plainObject(value);
-    for (const key of Object.keys(map)) {
-      if (key === "__proto__" || key === "constructor" || key === "prototype") fail("INVALID_MAP_KEY");
-      inspectDecoded(map[key], seen);
-    }
-  }
-  seen.delete(value);
+function inspectDecoded(value) {
+  validateCborValue(value);
 }
 
 async function decodeDeterministic(input) {
   const encoded = bytes(input);
   try {
     const api = await cborg();
-    const value = api.decode(encoded, {
+    const value = invokeWithPinnedBytePrimitives(api.decode, [encoded, {
       strict: true,
       allowIndefinite: false,
       allowUndefined: false,
@@ -220,13 +531,13 @@ async function decodeDeterministic(input) {
       allowNaN: false,
       allowBigInt: true,
       rejectDuplicateMapKeys: true,
-    });
+    }]);
     inspectDecoded(value);
     const canonical = await encodeDeterministic(value);
-    if (!crypto.timingSafeEqual(encoded, canonical)) fail("NON_CANONICAL_ENCODING");
+    if (!nativeCryptoTimingSafeEqual(encoded, canonical)) fail("NON_CANONICAL_ENCODING");
     return value;
   } catch (error) {
-    if (error instanceof RootarkZkError) throw error;
+    if (ownDataValue(error, "name") === "RootarkZkError") throw error;
     fail("CBOR_DECODE_FAILED");
   }
 }
@@ -240,7 +551,7 @@ function resolveSuite(suite = SUITE_ID, version = SUITE_VERSION) {
 
 function profile(input) {
   const map = safeMap(input);
-  if (!Number.isInteger(map.envelope_version) || map.envelope_version < 0 || map.envelope_version > 0xffff) {
+  if (!nativeNumberIsInteger(map.envelope_version) || map.envelope_version < 0 || map.envelope_version > 0xffff) {
     fail("INVALID_ENVELOPE_VERSION");
   }
   if (map.envelope_version !== 1 && map.envelope_version !== 2) fail("UNSUPPORTED_ENVELOPE_VERSION");
@@ -261,7 +572,7 @@ function scopedFields(input, includeSender) {
     version_id: bytes(map.version_id, "INVALID_VERSION_ID", undefined, 1, 128),
     key_ref: bytes(map.key_ref, "INVALID_KEY_REF", undefined, 1, 128),
   };
-  if (!PURPOSES.includes(result.purpose)) fail("INVALID_PURPOSE");
+  if (!nativeReflectApply(nativeArrayIncludes, PURPOSES, [result.purpose])) fail("INVALID_PURPOSE");
   if (includeSender) {
     result.sender_key_id = bytes(map.sender_key_id, "INVALID_SENDER_KEY_ID", undefined, 1, 128);
     result.recipient_key_id = bytes(map.recipient_key_id, "INVALID_RECIPIENT_KEY_ID", undefined, 1, 128);
@@ -308,7 +619,7 @@ async function buildManifestCoreMap(input) {
 }
 
 async function buildManifestCoreDigest(input) {
-  return crypto.createHash("sha256").update(await buildManifestCoreBytes(input)).digest();
+  return sha256(await buildManifestCoreBytes(input));
 }
 
 async function buildAadBytes(input) {
@@ -343,7 +654,7 @@ async function buildAadMap(input) {
 async function buildHpkeInfoBytes(input) {
   const infoMap = await buildHpkeInfoMap(input);
   const prefix = infoMap.profile === PROFILE.HPKE_INFO ? ASCII.HPKE_INFO : ASCII.HPKE_INFO_V2;
-  return Buffer.concat([Buffer.from(prefix, "ascii"), Buffer.from([0]), await encodeDeterministic(infoMap)]);
+  return nativeBufferConcat([nativeBufferFrom(prefix, "ascii"), nativeBufferFrom([0]), await encodeDeterministic(infoMap)]);
 }
 
 async function buildHpkeInfoMap(input) {
@@ -419,15 +730,15 @@ async function buildAuthorizationHpkeInfoV2Map(input) {
 
 async function buildAuthorizationHpkeInfoV2Bytes(input) {
   const infoMap = await buildAuthorizationHpkeInfoV2Map(input);
-  return Buffer.concat([
-    Buffer.from(ASCII.HPKE_INFO_V2, "ascii"),
-    Buffer.from([0]),
+  return nativeBufferConcat([
+    nativeBufferFrom(ASCII.HPKE_INFO_V2, "ascii"),
+    nativeBufferFrom([0]),
     await encodeDeterministic(infoMap),
   ]);
 }
 
 async function buildHpkeInfoDigest(input) {
-  return crypto.createHash("sha256").update(await buildHpkeInfoBytes(input)).digest();
+  return sha256(await buildHpkeInfoBytes(input));
 }
 
 async function buildManifestMap(input) {
@@ -437,9 +748,18 @@ async function buildManifestMap(input) {
     "sender_key_id", "recipient_key_id", "object_id", "version_id", "key_ref",
     "expiry", "replay_id", "idempotency_key", "wrap_id", "hpke_enc",
   ];
-  const exact = [...coreKeys, "hpke_info_digest", "wrapped_key_digest", "ciphertext_digest"];
+  const exact = new NativeArray(coreKeys.length + 3);
+  for (let index = 0; index < coreKeys.length; index += 1) exact[index] = coreKeys[index];
+  exact[coreKeys.length] = "hpke_info_digest";
+  exact[coreKeys.length + 1] = "wrapped_key_digest";
+  exact[coreKeys.length + 2] = "ciphertext_digest";
   safeMap(map, exact, exact);
-  const core = await manifestCore(Object.fromEntries(coreKeys.map((key) => [key, map[key]])));
+  const coreInput = nativeObjectCreate(null);
+  for (let index = 0; index < coreKeys.length; index += 1) {
+    const key = coreKeys[index];
+    coreInput[key] = map[key];
+  }
+  const core = await manifestCore(coreInput);
   return {
     ...core,
     hpke_info_digest: bytes(map.hpke_info_digest, "INVALID_HPKE_INFO_DIGEST", 32, 32, 32),
@@ -453,10 +773,11 @@ async function buildManifestBytes(input) {
 }
 
 async function buildAuthorizationSignatureInput(manifest) {
-  const encoded = await buildManifestBytes(manifest);
-  const type = (await buildManifestMap(manifest)).type;
+  const snapshot = snapshotCborValue(manifest);
+  const encoded = await buildManifestBytes(snapshot);
+  const type = (await buildManifestMap(snapshot)).type;
   const prefix = type === MANIFEST_TYPE[1] ? ASCII.AUTHORIZATION : ASCII.AUTHORIZATION_V2;
-  return Buffer.concat([Buffer.from(prefix, "ascii"), Buffer.from([0]), encoded]);
+  return nativeBufferConcat([nativeBufferFrom(prefix, "ascii"), nativeBufferFrom([0]), encoded]);
 }
 
 async function buildWrapInfo(input) {
@@ -475,10 +796,10 @@ async function buildWrapInfo(input) {
     version_id: bytes(map.version_id, "INVALID_VERSION_ID", undefined, 1, 128),
     key_ref: bytes(map.key_ref, "INVALID_KEY_REF", undefined, 1, 128),
   };
-  if (!PURPOSES.includes(scope.purpose)) fail("INVALID_PURPOSE");
-  return Buffer.concat([
-    Buffer.from(ASCII.KEY_WRAP, "ascii"),
-    Buffer.from([0]),
+  if (!nativeReflectApply(nativeArrayIncludes, PURPOSES, [scope.purpose])) fail("INVALID_PURPOSE");
+  return nativeBufferConcat([
+    nativeBufferFrom(ASCII.KEY_WRAP, "ascii"),
+    nativeBufferFrom([0]),
     await encodeDeterministic({
       suite: SUITE_ID,
       compartment_id: scope.compartment_id,
@@ -494,14 +815,15 @@ async function buildWrapInfo(input) {
 }
 
 function hkdfSha256(input) {
-  const ikm = bytes(input.ikm, "INVALID_HKDF_IKM");
-  const salt = bytes(input.salt === undefined ? Buffer.alloc(0) : input.salt, "INVALID_HKDF_SALT");
-  const info = bytes(input.info, "INVALID_HKDF_INFO");
-  if (!Number.isSafeInteger(input.length) || input.length < 1 || input.length > 8160) {
+  const inputMap = safeMap(input);
+  const ikm = bytes(inputMap.ikm, "INVALID_HKDF_IKM");
+  const salt = bytes(inputMap.salt === undefined ? nativeBufferAlloc(0) : inputMap.salt, "INVALID_HKDF_SALT");
+  const info = bytes(inputMap.info, "INVALID_HKDF_INFO");
+  if (!nativeNumberIsSafeInteger(inputMap.length) || inputMap.length < 1 || inputMap.length > 8160) {
     fail("INVALID_HKDF_LENGTH");
   }
   try {
-    return Buffer.from(crypto.hkdfSync("sha256", ikm, salt, info, input.length));
+    return nativeBufferFrom(nativeCryptoHkdfSync("sha256", ikm, salt, info, inputMap.length));
   } catch (_) {
     fail("HKDF_FAILED", SECURITY_CLASS.ENVIRONMENT);
   }
@@ -520,61 +842,74 @@ async function deriveWrapKey(input) {
     recipient_key_id: input.recipient_key_id,
     wrap_id: input.wrap_id,
   });
-  return hkdfSha256({ ikm: cer, salt: Buffer.alloc(0), info, length: 32 });
+  return hkdfSha256({ ikm: cer, salt: nativeBufferAlloc(0), info, length: 32 });
 }
 
 function aesGcmSeal(input) {
-  const key = bytes(input.key, "INVALID_AES_KEY", 32, 32, 32);
-  const nonce = bytes(input.nonce, "INVALID_AES_NONCE", 12, 12, 12);
-  const aad = bytes(input.aad, "INVALID_AAD");
-  const plaintext = bytes(input.plaintext, "INVALID_PLAINTEXT");
+  const inputMap = safeMap(input);
+  const key = bytes(inputMap.key, "INVALID_AES_KEY", 32, 32, 32);
+  const nonce = bytes(inputMap.nonce, "INVALID_AES_NONCE", 12, 12, 12);
+  const aad = bytes(inputMap.aad, "INVALID_AAD");
+  const plaintext = bytes(inputMap.plaintext, "INVALID_PLAINTEXT");
   try {
-    const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
-    cipher.setAAD(aad);
-    return { ciphertext: Buffer.concat([cipher.update(plaintext), cipher.final()]), tag: cipher.getAuthTag() };
+    const cipher = nativeCryptoCreateCipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
+    nativeReflectApply(nativeCipherSetAAD, cipher, [aad]);
+    return {
+      ciphertext: nativeBufferConcat([
+        nativeReflectApply(nativeCipherUpdate, cipher, [plaintext]),
+        nativeReflectApply(nativeCipherFinal, cipher, []),
+      ]),
+      tag: nativeReflectApply(nativeCipherGetAuthTag, cipher, []),
+    };
   } catch (_) {
     fail("ENCRYPTION_FAILED", SECURITY_CLASS.AUTHENTICATION);
   }
 }
 
 function aesGcmOpen(input) {
-  const key = bytes(input.key, "INVALID_AES_KEY", 32, 32, 32);
-  const nonce = bytes(input.nonce, "INVALID_AES_NONCE", 12, 12, 12);
-  const aad = bytes(input.aad, "INVALID_AAD");
-  const ciphertext = bytes(input.ciphertext, "INVALID_CIPHERTEXT");
-  const tag = bytes(input.tag, "INVALID_TAG", 16, 16, 16);
+  const inputMap = safeMap(input);
+  const key = bytes(inputMap.key, "INVALID_AES_KEY", 32, 32, 32);
+  const nonce = bytes(inputMap.nonce, "INVALID_AES_NONCE", 12, 12, 12);
+  const aad = bytes(inputMap.aad, "INVALID_AAD");
+  const ciphertext = bytes(inputMap.ciphertext, "INVALID_CIPHERTEXT");
+  const tag = bytes(inputMap.tag, "INVALID_TAG", 16, 16, 16);
   try {
-    const decipher = crypto.createDecipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
-    decipher.setAAD(aad);
-    decipher.setAuthTag(tag);
-    return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    const decipher = nativeCryptoCreateDecipheriv("aes-256-gcm", key, nonce, { authTagLength: 16 });
+    nativeReflectApply(nativeDecipherSetAAD, decipher, [aad]);
+    nativeReflectApply(nativeDecipherSetAuthTag, decipher, [tag]);
+    return nativeBufferConcat([
+      nativeReflectApply(nativeDecipherUpdate, decipher, [ciphertext]),
+      nativeReflectApply(nativeDecipherFinal, decipher, []),
+    ]);
   } catch (_) {
     fail("AUTHENTICATION_FAILED", SECURITY_CLASS.AUTHENTICATION);
   }
 }
 
 async function wrapKey(input) {
-  const plaintext = bytes(input.plaintext, "INVALID_CONTENT_KEY", 32, 32, 32);
-  const key = await deriveWrapKey(input);
-  const nonce = crypto.randomBytes(12);
+  const inputMap = safeMap(input);
+  const plaintext = bytes(inputMap.plaintext, "INVALID_CONTENT_KEY", 32, 32, 32);
+  const key = await deriveWrapKey(inputMap);
+  const nonce = nativeCryptoRandomBytes(12);
   try {
-    const sealed = aesGcmSeal({ key, nonce, aad: bytes(input.aad, "INVALID_AAD"), plaintext });
-    return Buffer.concat([nonce, sealed.ciphertext, sealed.tag]);
+    const sealed = aesGcmSeal({ key, nonce, aad: bytes(inputMap.aad, "INVALID_AAD"), plaintext });
+    return nativeBufferConcat([nonce, sealed.ciphertext, sealed.tag]);
   } finally {
     clearSecret(key);
   }
 }
 
 async function unwrapKey(input) {
-  const wrapped = bytes(input.wrapped, "INVALID_WRAPPED_KEY", 60, 60, 60);
-  const key = await deriveWrapKey(input);
+  const inputMap = safeMap(input);
+  const wrapped = bytes(inputMap.wrapped, "INVALID_WRAPPED_KEY", 60, 60, 60);
+  const key = await deriveWrapKey(inputMap);
   try {
     return aesGcmOpen({
       key,
-      nonce: wrapped.subarray(0, 12),
-      ciphertext: wrapped.subarray(12, 44),
-      tag: wrapped.subarray(44),
-      aad: bytes(input.aad, "INVALID_AAD"),
+      nonce: nativeReflectApply(nativeBufferSubarray, wrapped, [0, 12]),
+      ciphertext: nativeReflectApply(nativeBufferSubarray, wrapped, [12, 44]),
+      tag: nativeReflectApply(nativeBufferSubarray, wrapped, [44]),
+      aad: bytes(inputMap.aad, "INVALID_AAD"),
     });
   } finally {
     clearSecret(key);
@@ -590,34 +925,40 @@ function hpkeSuite() {
 }
 
 async function hpkeSeal(input) {
-  const info = bytes(input.info, "INVALID_HPKE_INFO");
-  const aad = bytes(input.aad, "INVALID_AAD");
-  const plaintext = bytes(input.plaintext, "INVALID_PLAINTEXT");
-  if (!input.recipientPublicKey) fail("INVALID_RECIPIENT_KEY");
+  const inputMap = safeMap(input);
+  const info = bytes(inputMap.info, "INVALID_HPKE_INFO");
+  const aad = bytes(inputMap.aad, "INVALID_AAD");
+  const plaintext = bytes(inputMap.plaintext, "INVALID_PLAINTEXT");
+  const recipientPublicKey = inputMap.recipientPublicKey;
+  if (!recipientPublicKey) fail("INVALID_RECIPIENT_KEY");
   try {
-    const sender = await hpkeSuite().createSenderContext({ recipientPublicKey: input.recipientPublicKey, info });
-    return { enc: Buffer.from(sender.enc), ciphertext: Buffer.from(await sender.seal(plaintext, aad)) };
+    const sender = await hpkeSuite().createSenderContext({ recipientPublicKey, info });
+    return { enc: nativeBufferFrom(sender.enc), ciphertext: nativeBufferFrom(await sender.seal(plaintext, aad)) };
   } catch (_) {
     fail("HPKE_SEAL_FAILED", SECURITY_CLASS.AUTHENTICATION);
   }
 }
 
 async function hpkeOpen(input) {
-  const info = bytes(input.info, "INVALID_HPKE_INFO");
-  const aad = bytes(input.aad, "INVALID_AAD");
-  const enc = bytes(input.enc, "INVALID_HPKE_ENC", 32, 32, 32);
-  const ciphertext = bytes(input.ciphertext, "INVALID_CIPHERTEXT");
-  if (!input.recipientKey) fail("INVALID_RECIPIENT_KEY");
+  const inputMap = safeMap(input);
+  const info = bytes(inputMap.info, "INVALID_HPKE_INFO");
+  const aad = bytes(inputMap.aad, "INVALID_AAD");
+  const enc = bytes(inputMap.enc, "INVALID_HPKE_ENC", 32, 32, 32);
+  const ciphertext = bytes(inputMap.ciphertext, "INVALID_CIPHERTEXT");
+  const recipientKey = inputMap.recipientKey;
+  if (!recipientKey) fail("INVALID_RECIPIENT_KEY");
   try {
-    const recipient = await hpkeSuite().createRecipientContext({ recipientKey: input.recipientKey, enc, info });
-    return Buffer.from(await recipient.open(ciphertext, aad));
+    const recipient = await hpkeSuite().createRecipientContext({ recipientKey, enc, info });
+    return nativeBufferFrom(await recipient.open(ciphertext, aad));
   } catch (_) {
     fail("AUTHENTICATION_FAILED", SECURITY_CLASS.AUTHENTICATION);
   }
 }
 
 function sha256(input) {
-  return crypto.createHash("sha256").update(input).digest();
+  const hash = nativeCryptoCreateHash("sha256");
+  nativeReflectApply(nativeHashUpdate, hash, [input]);
+  return nativeReflectApply(nativeHashDigest, hash, []);
 }
 
 function authorizationAadV2Input(core, digest) {
@@ -637,28 +978,31 @@ function authorizationAadV2Input(core, digest) {
 }
 
 async function sealAuthorizationEnvelopeV2(input) {
-  if (!input?.recipientPublicKey || !input?.signingKey) fail("INVALID_AUTHORIZATION_KEY");
-  const core = manifestStaticV2(input.static_core);
-  const plaintext = bytes(input.plaintext, "INVALID_PLAINTEXT");
-  const wrappedKey = bytes(input.wrapped_key, "INVALID_WRAPPED_KEY", 60, 60, 60);
-  const contentCiphertext = bytes(input.ciphertext, "INVALID_CIPHERTEXT");
+  const inputMap = safeMap(input);
+  const recipientPublicKey = inputMap.recipientPublicKey;
+  const signingKey = inputMap.signingKey;
+  if (!recipientPublicKey || !signingKey) fail("INVALID_AUTHORIZATION_KEY");
+  const core = manifestStaticV2(inputMap.static_core);
+  const plaintext = bytes(inputMap.plaintext, "INVALID_PLAINTEXT");
+  const wrappedKey = bytes(inputMap.wrapped_key, "INVALID_WRAPPED_KEY", 60, 60, 60);
+  const contentCiphertext = bytes(inputMap.ciphertext, "INVALID_CIPHERTEXT");
   const info = await buildAuthorizationHpkeInfoV2Bytes({ profile: PROFILE.HPKE_INFO_V2, ...core });
   const hpkeInfoDigest = sha256(info);
 
   let sender;
   try {
-    sender = await hpkeSuite().createSenderContext({ recipientPublicKey: input.recipientPublicKey, info });
+    sender = await hpkeSuite().createSenderContext({ recipientPublicKey, info });
   } catch (_) {
     fail("HPKE_SEAL_FAILED", SECURITY_CLASS.AUTHENTICATION);
   }
 
-  const hpkeEnc = bytes(Buffer.from(sender.enc), "INVALID_HPKE_ENC", 32, 32, 32);
+  const hpkeEnc = bytes(nativeBufferFrom(sender.enc), "INVALID_HPKE_ENC", 32, 32, 32);
   const manifestCoreMap = await manifestCore({ ...core, hpke_enc: hpkeEnc });
   const manifestCoreDigest = sha256(await encodeDeterministic(manifestCoreMap));
   const aad = await buildAadBytes(authorizationAadV2Input(manifestCoreMap, manifestCoreDigest));
   let hpkeCiphertext;
   try {
-    hpkeCiphertext = Buffer.from(await sender.seal(plaintext, aad));
+    hpkeCiphertext = nativeBufferFrom(await sender.seal(plaintext, aad));
   } catch (_) {
     fail("HPKE_SEAL_FAILED", SECURITY_CLASS.AUTHENTICATION);
   }
@@ -669,43 +1013,65 @@ async function sealAuthorizationEnvelopeV2(input) {
     wrapped_key_digest: sha256(wrappedKey),
     ciphertext_digest: sha256(contentCiphertext),
   });
-  const signature = await signAuthorization(manifest, input.signingKey);
+  const signature = await signAuthorization(manifest, signingKey);
   return { manifest, signature, info, aad, hpke_ciphertext: hpkeCiphertext };
 }
 
 async function openAuthorizationEnvelopeV2(input) {
-  if (!input || typeof input !== "object") fail("INVALID_AUTHORIZATION_INPUT");
-  const manifest = await buildManifestMap(input.manifest);
+  if (input === null || input === undefined) fail("INVALID_AUTHORIZATION_INPUT");
+  const inputMap = safeMap(input);
+  const manifestInput = snapshotCborValue(inputMap.manifest);
+  const signature = bytes(inputMap.signature, "INVALID_SIGNATURE", 64, 64, 64);
+  const recipientKey = inputMap.recipientKey;
+  const senderPublicKey = inputMap.senderPublicKey;
+  const hpkeCiphertext = bytes(inputMap.hpke_ciphertext, "INVALID_CIPHERTEXT");
+  const wrappedKey = bytes(inputMap.wrapped_key, "INVALID_WRAPPED_KEY", 60, 60, 60);
+  const contentCiphertext = bytes(inputMap.ciphertext, "INVALID_CIPHERTEXT");
+  const expectedInput = safeMap(inputMap.expected || {});
+  const now = inputMap.now;
+  const claimReplay = inputMap.claimReplay;
+  const manifest = await buildManifestMap(manifestInput);
   if (manifest.envelope_version !== 2) fail("UNSUPPORTED_ENVELOPE_VERSION");
-  if (!input?.recipientKey || !input?.senderPublicKey) fail("INVALID_AUTHORIZATION_KEY");
-  const { hpke_info_digest: _infoDigest, wrapped_key_digest: _wrappedKeyDigest, ciphertext_digest: _ciphertextDigest, ...core } = manifest;
-  const staticCore = manifestStaticV2(Object.fromEntries(Object.entries(core).filter(([key]) => key !== "hpke_enc")));
-  const info = await buildAuthorizationHpkeInfoV2Bytes({ profile: PROFILE.HPKE_INFO_V2, ...staticCore });
+  if (!recipientKey || !senderPublicKey || typeof claimReplay !== "function") fail("INVALID_AUTHORIZATION_KEY");
+  const core = nativeObjectCreate(null);
+  const manifestKeys = nativeObjectKeys(manifest);
+  for (let index = 0; index < manifestKeys.length; index += 1) {
+    const key = manifestKeys[index];
+    if (key !== "hpke_info_digest" && key !== "wrapped_key_digest" && key !== "ciphertext_digest") {
+      core[key] = manifest[key];
+    }
+  }
+  const staticCore = nativeObjectCreate(null);
+  const coreKeys = nativeObjectKeys(core);
+  for (let index = 0; index < coreKeys.length; index += 1) {
+    const key = coreKeys[index];
+    if (key !== "hpke_enc") staticCore[key] = core[key];
+  }
+  const normalizedStaticCore = manifestStaticV2(staticCore);
+  const info = await buildAuthorizationHpkeInfoV2Bytes({ profile: PROFILE.HPKE_INFO_V2, ...normalizedStaticCore });
   const manifestCoreDigest = sha256(await buildManifestCoreBytes(core));
   const aad = await buildAadBytes(authorizationAadV2Input(core, manifestCoreDigest));
-  const wrappedKey = bytes(input.wrapped_key, "INVALID_WRAPPED_KEY", 60, 60, 60);
-  const contentCiphertext = bytes(input.ciphertext, "INVALID_CIPHERTEXT");
   const expected = {
-    ...(input.expected || {}),
+    ...expectedInput,
     hpke_info_digest: sha256(info),
     wrapped_key_digest: sha256(wrappedKey),
     ciphertext_digest: sha256(contentCiphertext),
   };
-  const normalized = await verifyAuthorizationCore(manifest, input.signature, input.senderPublicKey, {
+  const normalized = await verifyAuthorizationCore(manifest, signature, senderPublicKey, {
     ...expected,
-    now: input.now,
-    claimReplay: input.claimReplay,
+    now,
+    claimReplay,
   }, false);
   const plaintext = await hpkeOpen({
-    recipientKey: input.recipientKey,
+    recipientKey,
     enc: manifest.hpke_enc,
-    ciphertext: bytes(input.hpke_ciphertext, "INVALID_CIPHERTEXT"),
+    ciphertext: hpkeCiphertext,
     info,
     aad,
   });
   let claimed;
   try {
-    claimed = await input.claimReplay(normalized);
+    claimed = await claimReplay(snapshotCborValue(normalized));
   } catch (_) {
     clearSecret(plaintext);
     fail("REPLAY_CHECK_FAILED", SECURITY_CLASS.ENVIRONMENT);
@@ -719,13 +1085,13 @@ async function openAuthorizationEnvelopeV2(input) {
 
 function signAuthorization(manifest, privateKey) {
   if (!privateKey) fail("INVALID_SIGNING_KEY");
-  return buildAuthorizationSignatureInput(manifest).then((input) => {
+  return nativeReflectApply(nativePromiseThen, buildAuthorizationSignatureInput(manifest), [(input) => {
     try {
-      return crypto.sign(null, input, privateKey);
+      return invokeWithPinnedBytePrimitives(nativeCryptoSign, [null, input, privateKey]);
     } catch (_) {
       fail("SIGNATURE_FAILED", SECURITY_CLASS.AUTHENTICATION);
     }
-  });
+  }]);
 }
 
 async function verifyAuthorization(manifest, signature, publicKey, expected = {}) {
@@ -737,14 +1103,17 @@ async function verifyAuthorizationCore(manifest, signature, publicKey, expected 
   const sig = bytes(signature, "INVALID_SIGNATURE", 64, 64, 64);
   if (!publicKey) fail("INVALID_VERIFYING_KEY");
   const expectedMap = safeMap(expected);
-  const normalized = await buildManifestMap(manifest);
+  const manifestSnapshot = snapshotCborValue(manifest);
+  const normalized = await buildManifestMap(manifestSnapshot);
   const checkExpected = (fields, source, normalizeIntegers = false) => {
-    for (const field of fields) {
-      if (Object.hasOwn(expectedMap, field)) {
+    for (let index = 0; index < fields.length; index += 1) {
+      const field = fields[index];
+      if (nativeObjectHasOwn(expectedMap, field)) {
         const actual = source[field];
         let same;
         if (isBytes(actual) && isBytes(expectedMap[field])) {
-          same = Buffer.from(actual).equals(Buffer.from(expectedMap[field]));
+          same = nativeReflectApply(nativeBufferEquals, nativeBufferFrom(actual),
+            [nativeBufferFrom(expectedMap[field])]);
         } else if (normalizeIntegers && (field === "epoch" || field === "expiry")) {
           try {
             same = uint(actual, field === "expiry" ? MAX_I63 : MAX_U64) === uint(expectedMap[field], field === "expiry" ? MAX_I63 : MAX_U64);
@@ -758,25 +1127,28 @@ async function verifyAuthorizationCore(manifest, signature, publicKey, expected 
       }
     }
   };
-  // Use the normalized detached scope rather than reading the mutable caller
-  // manifest after async normalization. Number and bigint epochs represent
-  // the same signed unsigned integer when their values are equal.
-  if (normalized.envelope_version === 1) checkExpected(V1_EXPECTED_FIELDS, normalized, true);
+  // Compare the detached original v1 scope without rereading caller input;
+  // number/bigint encodings of the same epoch remain semantically equivalent.
+  if (normalized.envelope_version === 1) checkExpected(V1_EXPECTED_FIELDS, manifestSnapshot, true);
+  if (normalized.envelope_version === 2) {
+    for (let index = 0; index < V2_EXPECTED_SCOPE.length; index += 1) {
+      if (!nativeObjectHasOwn(expectedMap, V2_EXPECTED_SCOPE[index])) {
+        fail("EXPECTED_SCOPE_REQUIRED", SECURITY_CLASS.SCOPE);
+      }
+    }
+  }
   let valid;
   try {
-    valid = crypto.verify(null, await buildAuthorizationSignatureInput(normalized), publicKey, sig);
+    valid = nativeCryptoVerify(null, await buildAuthorizationSignatureInput(normalized), publicKey, sig);
     if (!valid) fail("AUTHENTICATION_FAILED", SECURITY_CLASS.AUTHENTICATION);
   } catch (error) {
-    if (error instanceof RootarkZkError) throw error;
+    if (ownDataValue(error, "name") === "RootarkZkError") throw error;
     fail("SIGNATURE_VERIFY_FAILED", SECURITY_CLASS.AUTHENTICATION);
   }
   if (normalized.envelope_version === 2) {
-    if (V2_EXPECTED_SCOPE.some((field) => !Object.hasOwn(expectedMap, field))) {
-      fail("EXPECTED_SCOPE_REQUIRED", SECURITY_CLASS.SCOPE);
-    }
     checkExpected(V2_EXPECTED_FIELDS, normalized, true);
     if (consumeReplay) fail("V2_ENVELOPE_OPEN_REQUIRED");
-    if (!Number.isSafeInteger(expectedMap.now) || typeof expectedMap.claimReplay !== "function") {
+    if (!nativeNumberIsSafeInteger(expectedMap.now) || typeof expectedMap.claimReplay !== "function") {
       fail("REPLAY_STATE_REQUIRED", SECURITY_CLASS.ENVIRONMENT);
     }
     const now = uint(expectedMap.now, MAX_I63, "INVALID_CURRENT_TIME");
@@ -784,7 +1156,7 @@ async function verifyAuthorizationCore(manifest, signature, publicKey, expected 
     if (consumeReplay) {
       let claimed;
       try {
-        claimed = await expectedMap.claimReplay(normalized);
+        claimed = await expectedMap.claimReplay(snapshotCborValue(normalized));
       } catch (_) {
         fail("REPLAY_CHECK_FAILED", SECURITY_CLASS.ENVIRONMENT);
       }
@@ -795,14 +1167,18 @@ async function verifyAuthorizationCore(manifest, signature, publicKey, expected 
 }
 
 async function deriveRecoveryKey(input) {
-  const password = typeof input.password === "string" ? Buffer.from(input.password, "utf8") : bytes(input.password, "INVALID_PASSWORD");
-  const salt = bytes(input.salt, "INVALID_RECOVERY_SALT", 16, 16, 16);
-  if (!Number.isSafeInteger(input.opslimit) || input.opslimit < 1 || !Number.isSafeInteger(input.memlimit) || input.memlimit < 8192) {
+  const inputMap = safeMap(input);
+  const password = typeof inputMap.password === "string" ? nativeBufferFrom(inputMap.password, "utf8") : bytes(inputMap.password, "INVALID_PASSWORD");
+  const salt = bytes(inputMap.salt, "INVALID_RECOVERY_SALT", 16, 16, 16);
+  if (!nativeNumberIsSafeInteger(inputMap.opslimit) || inputMap.opslimit < 1 || !nativeNumberIsSafeInteger(inputMap.memlimit) || inputMap.memlimit < 8192) {
     fail("INVALID_ARGON2_LIMITS");
   }
   try {
-    await sodium.ready;
-    return Buffer.from(sodium.crypto_pwhash(32, password, salt, input.opslimit, input.memlimit, sodium.crypto_pwhash_ALG_ARGON2ID13));
+    const sodiumPrimitives = await nativeSodiumPrimitivesPromise;
+    if (!sodiumPrimitives) fail("SODIUM_PRIMITIVE_UNAVAILABLE");
+    return nativeBufferFrom(sodiumPrimitives.cryptoPwhash(
+      32, password, salt, inputMap.opslimit, inputMap.memlimit, sodiumPrimitives.algorithm,
+    ));
   } catch (_) {
     fail("ARGON2_FAILED", SECURITY_CLASS.ENVIRONMENT);
   } finally {
@@ -811,11 +1187,11 @@ async function deriveRecoveryKey(input) {
 }
 
 function newWrapId() {
-  return crypto.randomBytes(16);
+  return nativeCryptoRandomBytes(16);
 }
 
 function newRecoverySalt() {
-  return crypto.randomBytes(16);
+  return nativeCryptoRandomBytes(16);
 }
 
 /**
@@ -824,8 +1200,12 @@ function newRecoverySalt() {
  * helper's control; this is not a guaranteed zeroization primitive.
  */
 function clearSecret(value) {
-  if (isBytes(value)) {
-    value.fill(0);
+  if (nativeBufferIsBuffer(value)) {
+    nativeReflectApply(nativeBufferFill, value, [0]);
+    return true;
+  }
+  if (!nativeIsProxy(value) && nativeIsUint8Array(value)) {
+    nativeReflectApply(nativeUint8ArrayFill, value, [0]);
     return true;
   }
   return false;
