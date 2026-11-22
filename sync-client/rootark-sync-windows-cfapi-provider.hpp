@@ -23,6 +23,7 @@ struct Context {
   std::vector<unsigned char> identity;
   const HeldRoot* root = nullptr;
   const HeldAncestors* ancestors = nullptr;
+  const NativeOriginalEnrollment* enrollment = nullptr;
   const wchar_t* path = nullptr;
   // Bind the callback to the exact native placeholder inode, independently
   // of user-controlled FileIdentity or a reopened mutable pathname.
@@ -69,7 +70,8 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
     && offset < static_cast<LONGLONG>(ctx.payload.size())
     && length <= static_cast<LONGLONG>(ctx.payload.size()) - offset
     && (length % 4096 == 0 || offset + length == static_cast<LONGLONG>(ctx.payload.size()));
-  const bool physicalCustody = ctx.root && ctx.ancestors && ctx.path
+  const bool physicalCustody = ctx.root && ctx.ancestors && ctx.enrollment && ctx.path
+    && matchesOriginalEnrollment(*ctx.enrollment, *ctx.root, *ctx.ancestors)
     && ctx.ancestors->samePaths() && ctx.root->samePath(ctx.path)
     && ctx.root->registeredPolicy();
   const bool independentlyAdmitted = identityMatches && rangeMatches

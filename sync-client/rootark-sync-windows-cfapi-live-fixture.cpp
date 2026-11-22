@@ -70,12 +70,14 @@ int wmain(int argc, wchar_t** argv) {
       && std::wcscmp(argv[1], L"--disposable-live-alias") != 0
       && std::wcscmp(argv[1], L"--disposable-concurrent-alias") != 0
       && std::wcscmp(argv[1], L"--disposable-no-authority") != 0
+      && std::wcscmp(argv[1], L"--disposable-stale-enrollment") != 0
       && std::wcscmp(argv[1], L"--disposable-native-names") != 0)) return 2;
   const bool streamed = std::wcscmp(argv[1], L"--disposable-live-stdin") == 0;
   const bool aliasMode = std::wcscmp(argv[1], L"--disposable-live-alias") == 0;
   const bool concurrentMode = std::wcscmp(argv[1], L"--disposable-concurrent-alias") == 0;
   const bool nameMode = std::wcscmp(argv[1], L"--disposable-native-names") == 0;
   const bool denyAuthority = std::wcscmp(argv[1], L"--disposable-no-authority") == 0;
+  const bool staleEnrollment = std::wcscmp(argv[1], L"--disposable-stale-enrollment") == 0;
   const wchar_t* root = argv[2];
   if (!root || std::wcslen(root) < 8 || std::wcslen(root) > 4096
       || root[1] != L':' || root[2] != L'\\') return 3;
@@ -117,6 +119,16 @@ int wmain(int argc, wchar_t** argv) {
   if (!held.open(root) || !held.samePath(root) || !ancestors.samePaths()
     || !ancestors.sameVolume(held.id) || !inspect(root, platform)) return 14;
 
+  // Only the disposable fixture self-issues these expected IDs. In a real
+  // RootSession they must originate from a distinct enrolled owner/custodian
+  // before this program first opens any ancestor or root.
+  NativeOriginalEnrollment fixtureEnrollment{};
+  fixtureEnrollment.root = held.id;
+  for (const auto& entry : ancestors.entries)
+    fixtureEnrollment.ancestors.push_back(entry->id);
+  if (staleEnrollment)
+    fixtureEnrollment.root.FileId.Identifier[0] ^= 0x01;
+
   Context context;
   context.payload = makePayload();
   context.identity.assign(kIdentity, kIdentity + sizeof(kIdentity) - 1);
@@ -126,6 +138,7 @@ int wmain(int argc, wchar_t** argv) {
   }
   context.root = &held;
   context.ancestors = &ancestors;
+  context.enrollment = &fixtureEnrollment;
   context.path = root;
   if (streamed && !readBoundedStdin(context.payload)) return 13;
   CF_SYNC_REGISTRATION registration{};
@@ -208,7 +221,7 @@ int wmain(int argc, wchar_t** argv) {
     const BOOL read = ReadFile(handle, received.data(),
       static_cast<DWORD>(received.size()), &got, nullptr);
     CloseHandle(handle);
-    if (denyAuthority) {
+    if (denyAuthority || staleEnrollment) {
       if (read || got != 0 || context.successful.load() != 0
           || context.rejected.load() == 0) break;
       exitCode = 0;

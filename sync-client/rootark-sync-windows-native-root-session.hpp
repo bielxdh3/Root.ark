@@ -152,6 +152,37 @@ struct HeldAncestors {
   }
 };
 
+// Exact physical IDs expected from an independently authenticated enrollment
+// receipt. This native comparator never issues or authenticates that receipt:
+// a caller must verify its signer outside the mutable root and pin the whole
+// original chain BEFORE its first native open. A locally self-issued snapshot
+// can be used for tests only; it provides no production authority.
+struct NativeOriginalEnrollment {
+  FILE_ID_INFO root{};
+  std::vector<FILE_ID_INFO> ancestors;
+};
+
+bool sameEnrolledFileId(const FILE_ID_INFO& actual,
+    const FILE_ID_INFO& expected) {
+  return actual.VolumeSerialNumber == expected.VolumeSerialNumber
+    && std::memcmp(&actual.FileId, &expected.FileId,
+      sizeof(actual.FileId)) == 0;
+}
+
+bool matchesOriginalEnrollment(const NativeOriginalEnrollment& expected,
+    const HeldRoot& root, const HeldAncestors& held) {
+  if (root.handle == INVALID_HANDLE_VALUE || held.entries.empty()
+      || expected.ancestors.size() != held.entries.size()
+      || expected.ancestors.size() > 64
+      || !sameEnrolledFileId(root.id, expected.root)) return false;
+  for (std::size_t i = 0; i < held.entries.size(); ++i) {
+    if (!sameEnrolledFileId(held.entries[i]->id, expected.ancestors[i])
+        || held.entries[i]->id.VolumeSerialNumber
+          != expected.root.VolumeSerialNumber) return false;
+  }
+  return true;
+}
+
 // Open an exact child of the retained native directory HANDLE. Never
 // construct a new pathname or follow a directory alias from this operation.
 // The caller retains both parent and returned child handles across its I/O.
