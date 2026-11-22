@@ -942,8 +942,8 @@ class SyncJournal {
       }
       if (admittedDigest !== null) {
         next.admitted[operationId] = admittedDigest;
-        delete next.observed[operationId];
       }
+      delete next.observed[operationId];
     });
   }
   async markSeenMany(entries) {
