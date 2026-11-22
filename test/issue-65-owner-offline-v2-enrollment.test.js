@@ -664,6 +664,38 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "genuine approved B still unwraps the owner CEK after caller mutation");
     bOpenedRaced.fill(0);
 
+    // The owner CEK primitive may also be called directly, without the
+    // recipient-share bridge. The authenticated file AEAD awaits an external
+    // callback; a replaced global clock must fail closed, while a poisoned
+    // Math.min must never extend an owner-approved HPKE lease.
+    const trustedClock = Date.now;
+    const trustedFloor = Math.floor;
+    const trustedMin = Math.min;
+    let releaseClockPoisoned = false;
+    subtle.decrypt = async function (...args) {
+      const decrypted = await realDecrypt.apply(this, args);
+      releaseClockPoisoned = true;
+      Date.now = () => 0;
+      Math.floor = () => 0;
+      Math.min = () => Number.MAX_SAFE_INTEGER;
+      return decrypted;
+    };
+    try {
+      await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
+        ownerPrivateKey: owner.privateKey, ownerHeldCek,
+        metadata, objectRevision: 1, ciphertext: sealed,
+        ciphertextRoot: root, authority: publicAuthority,
+      }), /ZK_OWNER_FILE_CEK_DENIED/,
+      "a replaced release-time clock must fail closed after real AEAD");
+    } finally {
+      delete subtle.decrypt;
+      Date.now = trustedClock;
+      Math.floor = trustedFloor;
+      Math.min = trustedMin;
+    }
+    assert.equal(releaseClockPoisoned, true,
+      "the direct CEK path must cross a real asynchronous authenticated-file boundary");
+
     for (const label of ["metadata", "ciphertext", "head", "root"]) {
       const otherMeta = { ...metadata };
       const otherCipher = Buffer.from(sealed);
@@ -700,8 +732,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.equal(safe.core.owner_digest, committed.digest,
         `${label}: signed owner head pinned before await`);
     }
-    // The owner also must not create a fresh CEK grant after the signed
-    // approval expires while the real file AEAD open is pending.
+    // A caller callback cannot forge global wall-clock passage after a real
+    // file AEAD to release a CEK. A replaced clock fails closed.
     const originalWallClock = Date.now;
     let ownerDecryptFinished = false;
     subtle.decrypt = async function (...args) {
@@ -716,7 +748,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
         metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
         authority: publicAuthority,
       }), /ZK_OWNER_FILE_CEK_DENIED/,
-      "A must refuse CEK rewrap after authorization expires during real file AEAD open");
+      "post-AEAD forged clock must fail closed before the CEK is released");
     } finally {
       Date.now = originalWallClock;
       delete subtle.decrypt;
@@ -819,7 +851,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       const result = await realHpkeOpen(...args);
       if (expireOnOpen) {
         hpkeFinishedBeforeExpiry = true;
-        openClock.advanceTo((exactExpiry + 1) * 1000);
+        openClock.advanceTo(exactExpiry * 1000);
       }
       return result;
     } });
@@ -838,11 +870,15 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     await assert.rejects(openClock.withClock(
       () => openClock.transfer.openOwnerAuthorizedFileCek(validOpenInput)),
     /ZK_OWNER_FILE_CEK_DENIED/,
-    "B must reject at the final release fence after genuine HPKE decrypt and lease expiry");
+    "B must reject at the exact expiry second after genuine HPKE decrypt");
     assert.equal(hpkeFinishedBeforeExpiry, true,
       "test must complete actual HPKE decrypt before the protected clock expires");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
+    assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(
+      envelope.core.expires_at, issued.approval.expires_at,
+      signedCommittedHead.expires_at),
+    "owner CEK opener returns the signed owner/approval/witness expiration actually verified");
     const decrypted = await content.decryptFile({
       cek: await content.importFileCek(bCek.cek), metadata,
       envelopeBytes: recoveredCiphertext,

@@ -169,11 +169,11 @@
         || entry.revokedAtEpoch !== null) deny();
       return bytes(entry.authorizationPublicKey, 32);
     };
-    active(recipientDeviceId);
+    const recipientKey = active(recipientDeviceId);
     // Never carry a mutable provider object across crypto/network awaits.
     const stableScope = Object.fromEntries(
       Object.entries(scope).map(([key, value]) => [key, b64(value)]));
-    return { scope: stableScope, issuerKey: active(s.issuer_device_id) };
+    return { scope: stableScope, issuerKey: active(s.issuer_device_id), recipientKey };
   }
   function endpoint(origin) {
     if (typeof origin !== "string") deny();
@@ -184,6 +184,20 @@
       || (url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
       || (typeof location === "object" && location.origin && location.origin !== url.origin)) deny();
     return url.origin + "/zk-1/v1/share/read";
+  }
+  function cookieCsrfToken() {
+    // Cookie-authenticated POSTs require a same-session double-submit token.
+    if (typeof document !== "object" || typeof document.cookie !== "string") return "";
+    const matches = document.cookie.split(";").map((part) => part.trim())
+      .filter((part) => part.startsWith("rootark_csrf="));
+    if (matches.length === 0) return "";
+    if (matches.length !== 1) deny();
+    const encoded = matches[0].slice("rootark_csrf=".length);
+    if (!encoded || encoded.length > 512) deny();
+    let token;
+    try { token = decodeURIComponent(encoded); } catch (_) { deny(); }
+    if (!token || token.length > 512 || /[\r\n]/.test(token)) deny();
+    return token;
   }
   async function limitedJson(response) {
     if (response?.status !== 200 || !response.body || !response.headers
@@ -219,14 +233,18 @@
         ...(Object.hasOwn(input, "nowSeconds") ? ["nowSeconds"] : [])];
       exact(input, keys);
       exact(input.grant, ["grantId", "expiresAt", "shareStatementBase64", "shareSignatureBase64"]);
+      const authorityDescriptor = Object.getOwnPropertyDescriptor(input, "readIndependentAuthority");
+      if (!authorityDescriptor || !Object.hasOwn(authorityDescriptor, "value")
+        || typeof authorityDescriptor.value !== "function") deny();
+      const readIndependentAuthority = authorityDescriptor.value.bind(input);
       if (!crypto?.subtle || !protectedHttp?.signProtectedContentOperation
-        || typeof input.readIndependentAuthority !== "function"
         || typeof input.recipientUsername !== "string"
         || !/^[A-Za-z0-9_.@-]{1,128}$/.test(input.recipientUsername)
         || !input.signerKey || input.signerKey.type !== "private"
         || input.signerKey.algorithm?.name !== "Ed25519"
         || input.signerKey.extractable !== false
         || !input.signerKey.usages?.includes("sign")) deny();
+      const signerKey = input.signerKey;
       const fetchImpl = input.fetchImpl ?? fetch;
       const nowSeconds = input.nowSeconds ?? (() => Math.floor(Date.now() / 1000));
       if (typeof fetchImpl !== "function" || typeof nowSeconds !== "function") deny();
@@ -245,14 +263,21 @@
         if (value >= statement.expires_at) deny();
         return value;
       };
-      const first = trustedSnapshot(await input.readIndependentAuthority(),
+      const first = trustedSnapshot(await readIndependentAuthority(),
         statement, recipientDeviceId);
       const issuer = await crypto.subtle.importKey("raw", first.issuerKey,
         "Ed25519", false, ["verify"]);
       if (!await crypto.subtle.verify("Ed25519", issuer, signature,
         Uint8Array.from([...DOMAIN, ...raw]))) deny();
+      // A server response alone cannot prove possession of the enrolled
+      // recipient's signing key; verify it locally before contacting the server.
+      const recipient = await crypto.subtle.importKey("raw", first.recipientKey,
+        "Ed25519", false, ["verify"]);
+      const challenge = crypto.getRandomValues(new Uint8Array(32));
+      const localSignature = await crypto.subtle.sign("Ed25519", signerKey, challenge);
+      if (!await crypto.subtle.verify("Ed25519", recipient, localSignature, challenge)) deny();
       const signed = await protectedHttp.signProtectedContentOperation({
-        signerKey: input.signerKey, scope: first.scope, deviceId: recipientDeviceId,
+        signerKey, scope: first.scope, deviceId: recipientDeviceId,
         operation: "get", objectId: statement.object_id,
         expectedObjectRevision: statement.object_revision,
         expectedCiphertextDigest: statement.ciphertext_digest,
@@ -268,10 +293,12 @@
           controller.abort(); rejectDeadline(new Error("ZK_SHARE_DEADLINE"));
         }, 15000);
         const work = (async () => {
+          const csrf = cookieCsrfToken();
           const response = await fetchImpl(url, {
             method: "POST", redirect: "error", credentials: "same-origin",
             cache: "no-store", mode: "same-origin", signal: controller.signal,
-            headers: { "content-type": "application/json", accept: "application/json" },
+            headers: { "content-type": "application/json", accept: "application/json",
+              ...(csrf ? { "x-csrf-token": csrf } : {}) },
             body: JSON.stringify({ grantId: grant.grantId,
               authorization: signed.authorization, signatureBase64: signed.signatureBase64 }),
           });
@@ -288,9 +315,10 @@
         ciphertext = from64(response.ciphertextBase64, 16, MAX_CIPHERTEXT);
         const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", ciphertext));
         if (!equals(digest, statement.ciphertext_digest)) deny();
-        const final = trustedSnapshot(await input.readIndependentAuthority(),
+        const final = trustedSnapshot(await readIndependentAuthority(),
           statement, recipientDeviceId);
-        if (!equals(final.issuerKey, first.issuerKey)) deny();
+        if (!equals(final.issuerKey, first.issuerKey)
+          || !equals(final.recipientKey, first.recipientKey)) deny();
         // No await after this final authority/expiry fence and before release.
         currentTime();
         return Object.freeze({

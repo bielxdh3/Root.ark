@@ -198,7 +198,7 @@ function positive(v) { if (!nativeNumberIsSafeInteger(v) || v < 1) deny(); retur
 function requireUnexpiredAtRelease(expiresAt, wallClock) {
   if (!nativeNumberIsSafeInteger(expiresAt)
     || Date.now !== wallClock || !nativeNumberIsFinite(wallClock())
-    || nativeMathFloor(wallClock() / 1000) > expiresAt) deny();
+    || nativeMathFloor(wallClock() / 1000) >= expiresAt) deny();
 }
 function metadataCopy(meta) {
   exact(meta, META);
