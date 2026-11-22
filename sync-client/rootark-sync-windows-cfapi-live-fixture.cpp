@@ -15,7 +15,7 @@
 #include <memory>
 #include <atomic>
 #include <thread>
-#include "rootark-sync-windows-native-root-session.hpp"
+#include "rootark-sync-windows-cfapi-provider.hpp"
 
 namespace {
 constexpr std::size_t kPayloadLength = 4097;
@@ -26,22 +26,6 @@ std::vector<unsigned char> makePayload() {
     bytes[i] = static_cast<unsigned char>((i * 19 + 7) % 251);
   return bytes;
 }
-constexpr NTSTATUS kCloudFailure = static_cast<NTSTATUS>(0xC000CF12UL);
-struct Context {
-  std::vector<unsigned char> payload = makePayload();
-  const HeldRoot* root = nullptr;
-  const HeldAncestors* ancestors = nullptr;
-  const wchar_t* path = nullptr;
-  // Bind the callback to the exact native placeholder inode, independently
-  // of user-controlled FileIdentity or a reopened mutable pathname.
-  std::atomic<ULONGLONG> placeholderFileId{0};
-  std::atomic<bool> placeholderPinned{false};
-  std::atomic<unsigned> callbacks{0};
-  std::atomic<unsigned> successful{0};
-  std::atomic<unsigned> rejected{0};
-  ~Context() { if (!payload.empty()) SecureZeroMemory(payload.data(), payload.size()); }
-};
-
 bool readBoundedStdin(std::vector<unsigned char>& payload) {
   HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
   if (!input || input == INVALID_HANDLE_VALUE) return false;
@@ -70,59 +54,14 @@ bool readBoundedStdin(std::vector<unsigned char>& payload) {
   return true;
 }
 
-void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS* params) {
-  if (!info || !params || !info->CallbackContext) return;
-  auto& ctx = *static_cast<Context*>(info->CallbackContext);
-  ++ctx.callbacks;
-  CF_OPERATION_INFO op{};
-  op.StructSize = sizeof(op);
-  op.Type = CF_OPERATION_TYPE_TRANSFER_DATA;
-  op.ConnectionKey = info->ConnectionKey;
-  op.TransferKey = info->TransferKey;
-  op.RequestKey = info->RequestKey;
-  CF_OPERATION_PARAMETERS transfer{};
-  transfer.ParamSize = static_cast<ULONG>(offsetof(CF_OPERATION_PARAMETERS, TransferData)
-      + sizeof(transfer.TransferData));
-  transfer.TransferData.Flags = CF_OPERATION_TRANSFER_DATA_FLAG_NONE;
-  transfer.TransferData.CompletionStatus = kCloudFailure;
-  transfer.TransferData.Buffer = nullptr;
-  transfer.TransferData.Offset = params->FetchData.RequiredFileOffset;
-  transfer.TransferData.Length = params->FetchData.RequiredLength;
-  const auto offset = params->FetchData.RequiredFileOffset.QuadPart;
-  const auto length = params->FetchData.RequiredLength.QuadPart;
-  // Each request must be bound to the provider's exact identity and checked
-  // against the verified immutable buffer. This fixture does not certify a
-  // production owner-signed object or live revocation policy.
-  const bool identityMatches = info->FileIdentity
-    && info->FileIdentityLength == sizeof(kIdentity) - 1
-    && std::memcmp(info->FileIdentity, kIdentity, sizeof(kIdentity) - 1) == 0
-    && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size())
-    && ctx.placeholderPinned.load(std::memory_order_acquire)
-    && static_cast<ULONGLONG>(info->FileId.QuadPart)
-      == ctx.placeholderFileId.load(std::memory_order_relaxed);
-  const bool rangeMatches = offset >= 0 && offset % 4096 == 0 && length > 0
-    && offset < static_cast<LONGLONG>(ctx.payload.size())
-    && length <= static_cast<LONGLONG>(ctx.payload.size()) - offset
-    && (length % 4096 == 0 || offset + length == static_cast<LONGLONG>(ctx.payload.size()));
-  const bool physicalCustody = ctx.root && ctx.ancestors && ctx.path
-    && ctx.ancestors->samePaths() && ctx.root->samePath(ctx.path)
-    && ctx.root->registeredPolicy();
-  if (identityMatches && rangeMatches && physicalCustody) {
-    transfer.TransferData.CompletionStatus = 0;
-    transfer.TransferData.Buffer = ctx.payload.data() + static_cast<std::size_t>(offset);
-    if (SUCCEEDED(CfExecute(&op, &transfer))) ++ctx.successful;
-    return;
-  }
-  ++ctx.rejected;
-  (void)CfExecute(&op, &transfer);
+// Deliberately test-only authority. A production RootSession must supply a
+// distinct issuer-backed native verifier here, not this disposable callback.
+bool disposableLabAuthorize(const CF_CALLBACK_INFO* info, void* opaque) noexcept {
+  return info != nullptr && opaque != nullptr &&
+    static_cast<const Context*>(opaque)->root != nullptr;
 }
 
-void CALLBACK onCancel(const CF_CALLBACK_INFO*, const CF_CALLBACK_PARAMETERS*) {}
-constexpr CF_CALLBACK_REGISTRATION kCallbacks[] = {
-  {CF_CALLBACK_TYPE_FETCH_DATA, onFetch},
-  {CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, onCancel},
-  CF_CALLBACK_REGISTRATION_END,
-};
+
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -130,11 +69,13 @@ int wmain(int argc, wchar_t** argv) {
       && std::wcscmp(argv[1], L"--disposable-live-stdin") != 0
       && std::wcscmp(argv[1], L"--disposable-live-alias") != 0
       && std::wcscmp(argv[1], L"--disposable-concurrent-alias") != 0
+      && std::wcscmp(argv[1], L"--disposable-no-authority") != 0
       && std::wcscmp(argv[1], L"--disposable-native-names") != 0)) return 2;
   const bool streamed = std::wcscmp(argv[1], L"--disposable-live-stdin") == 0;
   const bool aliasMode = std::wcscmp(argv[1], L"--disposable-live-alias") == 0;
   const bool concurrentMode = std::wcscmp(argv[1], L"--disposable-concurrent-alias") == 0;
   const bool nameMode = std::wcscmp(argv[1], L"--disposable-native-names") == 0;
+  const bool denyAuthority = std::wcscmp(argv[1], L"--disposable-no-authority") == 0;
   const wchar_t* root = argv[2];
   if (!root || std::wcslen(root) < 8 || std::wcslen(root) > 4096
       || root[1] != L':' || root[2] != L'\\') return 3;
@@ -177,6 +118,12 @@ int wmain(int argc, wchar_t** argv) {
     || !ancestors.sameVolume(held.id) || !inspect(root, platform)) return 14;
 
   Context context;
+  context.payload = makePayload();
+  context.identity.assign(kIdentity, kIdentity + sizeof(kIdentity) - 1);
+  if (!denyAuthority) {
+    context.authorize = disposableLabAuthorize;
+    context.authorityContext = &context;
+  }
   context.root = &held;
   context.ancestors = &ancestors;
   context.path = root;
@@ -204,6 +151,7 @@ int wmain(int argc, wchar_t** argv) {
   unsigned concurrentAliasDenials = 0;
   unsigned unsafeNameDenials = 0;
   bool nativeRelativeOpen = false;
+  bool positiveReadVerified = false;
   DWORD finalTag = 0;
   int exitCode = 8;
   do {
@@ -216,8 +164,8 @@ int wmain(int argc, wchar_t** argv) {
     item.RelativeFileName = L"payload.bin";
     item.FsMetadata.FileSize.QuadPart = static_cast<LONGLONG>(context.payload.size());
     item.FsMetadata.BasicInfo.FileAttributes = FILE_ATTRIBUTE_NORMAL;
-    item.FileIdentity = kIdentity;
-    item.FileIdentityLength = sizeof(kIdentity) - 1;
+    item.FileIdentity = context.identity.data();
+    item.FileIdentityLength = static_cast<DWORD>(context.identity.size());
     DWORD processed = 0;
     result = CfCreatePlaceholders(root, &item, 1, CF_CREATE_FLAG_NONE, &processed);
     if (FAILED(result) || processed != 1 || FAILED(item.Result)) break;
@@ -260,6 +208,12 @@ int wmain(int argc, wchar_t** argv) {
     const BOOL read = ReadFile(handle, received.data(),
       static_cast<DWORD>(received.size()), &got, nullptr);
     CloseHandle(handle);
+    if (denyAuthority) {
+      if (read || got != 0 || context.successful.load() != 0
+          || context.rejected.load() == 0) break;
+      exitCode = 0;
+      break;
+    }
     finalIdentity = held.samePath(root);
     finalAncestors = ancestors.samePaths();
     finalPolicy = held.registeredPolicy();
@@ -281,6 +235,7 @@ int wmain(int argc, wchar_t** argv) {
         || got != context.payload.size()
         || std::memcmp(received.data(), context.payload.data(), context.payload.size()) != 0
         || context.callbacks == 0 || context.successful == 0) break;
+    positiveReadVerified = true;
     if (aliasMode) {
       // Reuse the exact same caller-visible FileIdentity but plant a second
       // real NTFS placeholder. A provider relying on FileIdentity alone would
@@ -372,6 +327,6 @@ int wmain(int argc, wchar_t** argv) {
     nativeRelativeOpen ? "true" : "false", unsafeNameDenials,
     concurrentAliasDenials, finalTag,
     SUCCEEDED(unregisterResult) ? "true" : "false",
-    exitCode == 0 ? "true" : "false");
+    positiveReadVerified && exitCode == 0 ? "true" : "false");
   return exitCode;
 }
