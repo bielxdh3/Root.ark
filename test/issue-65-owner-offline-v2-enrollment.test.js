@@ -1972,6 +1972,36 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     "owner logout after all three genuine CEK seals must refuse the signed batch");
     assert.equal(ownerSessionChecks, 7,
       "the final post-HPKE owner session checkpoint must be reached");
+    const ownerNativeBufferFill = Buffer.prototype.fill;
+    const ownerNativeUint8ArrayFill = Uint8Array.prototype.fill;
+    const ownerScrubObservations = [];
+    let ownerPoisonedAtFinalFence = false;
+    let ownerPoisonChecks = 0;
+    try {
+      await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
+        ownerPrivateKey: owner.privateKey, authority: publicAuthority,
+        versions: versionRows, assertLive: () => {
+          if (++ownerPoisonChecks !== 7) return;
+          ownerPoisonedAtFinalFence = true;
+          const poison = function (value, ...args) {
+            if (value === 0 && this.byteLength === 32)
+              ownerScrubObservations.push(Buffer.from(this));
+            return Reflect.apply(ownerNativeUint8ArrayFill, this, [value, ...args]);
+          };
+          Buffer.prototype.fill = poison;
+          Uint8Array.prototype.fill = poison;
+          throw Error("OWNER_REVOKED_AFTER_THREE_NATIVE_HPKE_SEALS");
+        },
+      }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/);
+    } finally {
+      Buffer.prototype.fill = ownerNativeBufferFill;
+      Uint8Array.prototype.fill = ownerNativeUint8ArrayFill;
+    }
+    assert.equal(ownerPoisonedAtFinalFence, true);
+    assert.equal(ownerPoisonChecks, 7);
+    assert.equal(ownerScrubObservations.some((bytes) =>
+      versionRows.some((row) => crypto.timingSafeEqual(bytes, row.ownerHeldCek))), false,
+    "owner callback may not intercept CEKs during failed signed-batch sealing");
     const openBatch = (overrides = {}) => cekBatch.openOwnerAuthorizedVersionedCeks({
       bundle, authority: { ...linked, nowSeconds: testWallSeconds() },
       operatorMinimumSequence: signedCommittedHead.sequence,
@@ -2004,6 +2034,38 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     "revocation after last real HPKE open must fence all CEKs at final release");
     assert.equal(localSessionChecks, 11,
       "the final post-HPKE recipient session checkpoint must be reached");
+    // P1: the final session fence executes caller code after THREE genuine
+    // native HPKE opens. It must not be able to replace the scrub intrinsic
+    // and observe historical CEKs or the recipient HPKE private raw key.
+    const originalBufferFill = Buffer.prototype.fill;
+    const originalUint8ArrayFill = Uint8Array.prototype.fill;
+    const scrubObservations = [];
+    let poisonedAtFinalFence = false;
+    let transitiveChecks = 0;
+    try {
+      await assert.rejects(openBatch({ assertLive: () => {
+        if (++transitiveChecks !== 11) return;
+        poisonedAtFinalFence = true;
+        const poison = function (value, ...args) {
+          if (value === 0 && this.byteLength === 32)
+            scrubObservations.push(Buffer.from(this));
+          return Reflect.apply(originalUint8ArrayFill, this, [value, ...args]);
+        };
+        Buffer.prototype.fill = poison;
+        Uint8Array.prototype.fill = poison;
+        throw Error("REVOKED_AFTER_THREE_NATIVE_HPKE_OPENS");
+      } }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/);
+    } finally {
+      Buffer.prototype.fill = originalBufferFill;
+      Uint8Array.prototype.fill = originalUint8ArrayFill;
+    }
+    assert.equal(poisonedAtFinalFence, true,
+      "the poisoned callback must run after three actual HPKE decryptions");
+    assert.equal(transitiveChecks, 11);
+    assert.equal(scrubObservations.some((bytes) =>
+      versionRows.some((row) => crypto.timingSafeEqual(bytes, row.ownerHeldCek))
+      || crypto.timingSafeEqual(bytes, Buffer.from(fresh.hpkePrivateRaw))), false,
+    "transitively poisoned fill must not observe CEKs or HPKE raw during scrub");
     // A revoked session must stop immediately, not perform unrelated file
     // decryptions or leak a successful partial result.
     let firstOpenChecks = 0;

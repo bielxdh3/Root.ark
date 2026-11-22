@@ -8,6 +8,19 @@ const { types: nativeTypes } = require("node:util");
 const z = require("./rootark-zk-1");
 const transfer = require("./rootark-zk1-owner-authorized-file-cek-transfer");
 
+// The session fence is an externally supplied callback. Capture the genuine
+// typed-array intrinsic before invoking it: poisoned Buffer/Uint8Array.fill
+// must never be reached while erasing owner CEKs or recipient HPKE material.
+const nativeApply = Reflect.apply;
+const nativeFill = Uint8Array.prototype.fill;
+const nativeUint8Array = Uint8Array;
+const nativeArrayBuffer = ArrayBuffer;
+function scrub(bytes) {
+  if (bytes == null) return;
+  const view = bytes instanceof nativeArrayBuffer ? new nativeUint8Array(bytes) : bytes;
+  nativeApply(nativeFill, view, [0]);
+}
+
 const DOMAIN = Buffer.from("Root.ark/zk-1/owner-versioned-cek-batch/v1\0");
 const SCHEMA = "rootark-zk1-owner-versioned-cek-batch/v1";
 const VERSION_KEYS = ["metadata", "objectRevision", "ciphertext", "ciphertextRoot", "ownerHeldCek"];
@@ -224,7 +237,7 @@ async function sealOwnerAuthorizedVersionedCeks(input) {
       signedBatchCompletenessVerified: true,
       globalAccountCompletenessProven: false, authorizesProductionRestore: false };
   } catch (_) { deny(); }
-  finally { for (const row of stable?.versions || []) row.ownerHeldCek?.fill(0); }
+  finally { for (const row of stable?.versions || []) scrub(row.ownerHeldCek); }
 }
 
 async function openOwnerAuthorizedVersionedCeks(input) {
@@ -268,7 +281,7 @@ async function openOwnerAuthorizedVersionedCeks(input) {
       });
       if (released.some((previous) => previous.cek.length === opened.cek.length
         && crypto.timingSafeEqual(previous.cek, opened.cek))) {
-        opened.cek.fill(0);
+        scrub(opened.cek);
         deny();
       }
       released.push({ metadata: row.metadata, objectRevision: row.objectRevision,
@@ -281,13 +294,11 @@ async function openOwnerAuthorizedVersionedCeks(input) {
     return { entries: released, signedBatchCompletenessVerified: true,
       globalAccountCompletenessProven: false, authorizesProductionRestore: false };
   } catch (_) {
-    for (const row of released) row.cek.fill(0);
+    for (const row of released) scrub(row.cek);
     deny();
   } finally {
-    raw?.fill(0);
-    const secret = stable?.recipientHpkePrivateRaw;
-    if (secret instanceof ArrayBuffer) new Uint8Array(secret).fill(0);
-    else secret?.fill(0);
+    scrub(raw);
+    scrub(stable?.recipientHpkePrivateRaw);
   }
 }
 
