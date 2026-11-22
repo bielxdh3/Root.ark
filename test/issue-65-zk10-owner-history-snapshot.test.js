@@ -102,5 +102,28 @@ test("a proxy cutover must not poison crypto.verify before owner signature valid
     /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/);
     assert.equal(traps, 0, "nested owner-signed array proxy hooks must not run");
     assert.strictEqual(crypto.verify, nativeVerify);
+    const accessorHistory = [unsigned];
+    Object.defineProperty(accessorHistory, 0, { configurable: true, enumerable: true,
+      get() {
+        traps += 1;
+        crypto.verify = () => true;
+        return unsigned;
+      } });
+    assert.throws(() => verifyOwnerCutoverHistory(accessorHistory,
+      [keys.publicKey], id(1)), /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/);
+    assert.equal(traps, 0, "own indexed history getters must not execute");
+    assert.strictEqual(crypto.verify, nativeVerify);
+    const accessorCompartmentList = [id(4)];
+    Object.defineProperty(accessorCompartmentList, 0, { configurable: true, enumerable: true,
+      get() {
+        traps += 1;
+        crypto.verify = () => true;
+        return id(4);
+      } });
+    assert.throws(() => verifyOwnerCutover({ ...unsigned,
+      covered_compartments: accessorCompartmentList }, keys.publicKey),
+    /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/);
+    assert.equal(traps, 0, "own indexed compartment getters must not execute");
+    assert.strictEqual(crypto.verify, nativeVerify);
   } finally { crypto.verify = nativeVerify; }
 });

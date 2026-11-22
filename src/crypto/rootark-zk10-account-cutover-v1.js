@@ -60,6 +60,21 @@ function exact(value, fields) {
   }
   return output;
 }
+function exactArray(value, minimum, maximum) {
+  // A plain Array can still contain an own accessor at an indexed position.
+  // Reading history[0], ownerKeys[0] or a signed compartment via an iterator
+  // would invoke that accessor before signature verification. Validate every
+  // bounded slot as an own DATA descriptor before consuming any element.
+  if (isProxy(value) || !Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Array.prototype
+    || value.length < minimum || value.length > maximum
+    || Reflect.ownKeys(value).length !== value.length + 1) deny();
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = OWN_DESCRIPTOR(value, index);
+    if (!descriptor || !HAS_OWN(descriptor, "value")) deny();
+  }
+  return value;
+}
 function decode(value, length) {
   if (typeof value !== "string" || !B64.test(value)) deny();
   const result = Buffer.from(value, "base64url");
@@ -117,8 +132,7 @@ function ownerPayload(payload) {
     || p.migration_disposition !== "closed") deny();
   // Completed cutover cannot carry compatibility grants. Migration windows
   // require their own separately signed pre-cutover policy protocol.
-  if (isProxy(p.grants) || !Array.isArray(p.grants) || p.grants.length !== 0
-    || Reflect.ownKeys(p.grants).length !== 1) deny();
+  exactArray(p.grants, 0, 0);
   decode(p.immutable_account_id, 16);
   decode(p.zk_account_id, 16);
   decode(p.nonce, 32);
@@ -127,9 +141,7 @@ function ownerPayload(payload) {
     || !Number.isSafeInteger(p.issued_at) || p.issued_at < 1) deny();
   if (p.previous_cutover_digest !== null) hex(p.previous_cutover_digest);
   if ((p.generation === 1) !== (p.previous_cutover_digest === null)) deny();
-  if (isProxy(p.covered_compartments) || !Array.isArray(p.covered_compartments) || p.covered_compartments.length < 1
-    || p.covered_compartments.length > 128
-    || Reflect.ownKeys(p.covered_compartments).length !== p.covered_compartments.length + 1) deny();
+  exactArray(p.covered_compartments, 1, 128);
   let previous = "";
   const names = [];
   for (const item of p.covered_compartments) {
@@ -194,8 +206,7 @@ function signOwnerRotation(payload, previousPrivateKey, nextPrivateKey) {
     signature_next: crypto.sign(null, data, nextPrivateKey).toString("base64url") });
 }
 function verifyOwnerRotationKeys(rotations, pinnedRoot, immutableAccountId) {
-  if (isProxy(rotations) || !Array.isArray(rotations) || rotations.length > 8
-    || Reflect.ownKeys(rotations).length !== rotations.length + 1) deny();
+  exactArray(rotations, 0, 8);
   let current = key(pinnedRoot, "public");
   const accepted = [current];
   let previousDigest = null;
@@ -220,9 +231,8 @@ function verifyOwnerRotationChain(rotations, pinnedRoot, immutableAccountId) {
   return keys[keys.length - 1];
 }
 function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
-  if (isProxy(history) || !Array.isArray(history) || history.length < 1 || history.length > 64
-    || Reflect.ownKeys(history).length !== history.length + 1
-    || isProxy(ownerKeys) || !Array.isArray(ownerKeys) || !ownerKeys.length) deny();
+  exactArray(history, 1, 64);
+  exactArray(ownerKeys, 1, 9);
   let previous = null;
   let keyIndex = 0;
   let last;
@@ -265,8 +275,7 @@ function pathBits(accountId) {
     decode(accountId, 16)).toString("hex")}`);
 }
 function verifySparseEnrollmentProof(accountId, cutoverDigest, siblings, expectedRoot) {
-  if (isProxy(siblings) || !Array.isArray(siblings) || siblings.length !== 256
-    || Reflect.ownKeys(siblings).length !== 257) deny();
+  exactArray(siblings, 256, 256);
   let at = pathBits(accountId), current = leaf(accountId, cutoverDigest);
   for (const sibling of siblings) {
     const siblingHash = Buffer.from(hex(sibling), "hex");
@@ -279,7 +288,7 @@ function verifySparseEnrollmentProof(accountId, cutoverDigest, siblings, expecte
 // Pure deterministic fixture/proof builder. The authority, not an app server,
 // must create and independently retain the committed head for a real deployment.
 function buildSparseEnrollmentProof(entries, accountId) {
-  if (isProxy(entries) || !Array.isArray(entries) || entries.length > 1024) deny();
+  exactArray(entries, 0, 1024);
   let level = new Map();
   for (const record of entries) {
     const v = exact(record, ["accountId", "cutoverDigest"]);
