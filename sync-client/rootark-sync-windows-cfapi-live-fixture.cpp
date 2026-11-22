@@ -25,8 +25,13 @@ std::vector<unsigned char> makePayload() {
   return bytes;
 }
 constexpr NTSTATUS kCloudFailure = static_cast<NTSTATUS>(0xC000CF12UL);
+struct HeldRoot;
+struct HeldAncestors;
 struct Context {
   std::vector<unsigned char> payload = makePayload();
+  const HeldRoot* root = nullptr;
+  const HeldAncestors* ancestors = nullptr;
+  const wchar_t* path = nullptr;
   unsigned callbacks = 0;
   unsigned successful = 0;
   unsigned rejected = 0;
@@ -235,7 +240,10 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
     && offset < static_cast<LONGLONG>(ctx.payload.size())
     && length <= static_cast<LONGLONG>(ctx.payload.size()) - offset
     && (length % 4096 == 0 || offset + length == static_cast<LONGLONG>(ctx.payload.size()));
-  if (identityMatches && rangeMatches) {
+  const bool physicalCustody = ctx.root && ctx.ancestors && ctx.path
+    && ctx.ancestors->samePaths() && ctx.root->samePath(ctx.path)
+    && ctx.root->registeredPolicy();
+  if (identityMatches && rangeMatches && physicalCustody) {
     transfer.TransferData.CompletionStatus = 0;
     transfer.TransferData.Buffer = ctx.payload.data() + static_cast<std::size_t>(offset);
     if (SUCCEEDED(CfExecute(&op, &transfer))) ++ctx.successful;
@@ -299,6 +307,9 @@ int wmain(int argc, wchar_t** argv) {
     || !ancestors.sameVolume(held.id) || !inspect(root, platform)) return 14;
 
   Context context;
+  context.root = &held;
+  context.ancestors = &ancestors;
+  context.path = root;
   if (streamed && !readBoundedStdin(context.payload)) return 13;
   CF_SYNC_REGISTRATION registration{};
   registration.StructSize = sizeof(registration);
