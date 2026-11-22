@@ -114,6 +114,17 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     assert.equal(strong.output.syncRootRegistered, false);
     diagnostic.stage("OWNER_NO_TRANSFER");
     assert.equal(strong.output.cloudDataBytesTransferred, 0);
+    // This native RootSession building block additionally retains the NTFS
+    // volume/ancestor/root handles without FILE_SHARE_DELETE through the
+    // same ACL inspection. It remains read-only and cannot authorize writes.
+    const rootSessionProbe = runCompiledFixture(receipt,
+      ["--native-session-inspect", strictRoot]);
+    assert.equal(rootSessionProbe.status, 0);
+    const nativeRoot = JSON.parse(rootSessionProbe.stdout.trim());
+    assert.equal(nativeRoot.aclPreflightPassed, true);
+    assert.equal(nativeRoot.nativeRootSessionHeld, true);
+    assert.equal(nativeRoot.syncRootRegistered, false);
+    assert.equal(nativeRoot.cloudDataBytesTransferred, 0);
 
     // A genuine native NTFS directory HANDLE must enumerate beyond 16,384
     // entries without JS pathname reopens or truncation. All generated empty
@@ -146,6 +157,10 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     diagnostic.stage("BROAD_REJECT");
     assert.notEqual(broad.status, 0);
     assert.equal(broad.output.aclPreflightPassed, false);
+    const broadNativeSession = runCompiledFixture(receipt,
+      ["--native-session-inspect", exposedRoot]);
+    assert.notEqual(broadNativeSession.status, 0);
+    assert.equal(JSON.parse(broadNativeSession.stdout.trim()).nativeRootSessionHeld, false);
     const unauthorizedEnumeration = runCompiledFixture(receipt, ["--enumerate", exposedRoot]);
     assert.notEqual(unauthorizedEnumeration.status, 0,
       "a broad-access root may not become a native enumeration authority");

@@ -131,8 +131,11 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
         : path.join(scratch, "inherit-only-fixture.cpp");
   const sharedPolicy = path.resolve(__dirname,
     "../../sync-client/rootark-sync-windows-cfapi-root-policy.hpp");
+  const nativeRoot = path.resolve(__dirname,
+    "../../sync-client/rootark-sync-windows-native-root-session.hpp");
   const dependencies = ["acl-preflight.exe", "inherit-only-fixture.exe", "live-fetch.exe"]
-    .includes(name) ? [sharedPolicy] : [];
+    .includes(name) ? ["acl-preflight.exe", "live-fetch.exe"].includes(name)
+      ? [sharedPolicy, nativeRoot] : [sharedPolicy] : [];
   for (const filename of [vcvars, source, ...dependencies,
     executable, objectFile, pdbFile]) {
     assert.doesNotMatch(filename, /[\r\n\x00-\x1f\x7f"%!^&|<>]/, FAIL);
@@ -185,7 +188,7 @@ function validateFixtureArgs(name, scratch, args) {
   let allowed = false;
   if (name === "acl-preflight.exe") {
     allowed = values.length === 2 && (
-      (["--inspect", "--enumerate"].includes(values[0])
+      (["--inspect", "--enumerate", "--native-session-inspect"].includes(values[0])
         && ["owner-only", "broad-access", "inherited-access", "missing", "junction"]
           .some(leaf => localTarget(values[1], leaf)))
       || (values[0] === "--register" && localTarget(values[1], "owner-only"))
