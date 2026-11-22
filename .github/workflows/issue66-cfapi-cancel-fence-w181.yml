@@ -31,11 +31,17 @@ jobs:
           $source = Join-Path $env:GITHUB_WORKSPACE 'sync-client\rootark-sync-windows-cfapi-cancel-fence-test.cpp'
           $out = Join-Path $env:RUNNER_TEMP 'rootark-cfapi-cancel-fence-w181'
           New-Item -ItemType Directory -Path $out -Force | Out-Null
-          $exe = Join-Path $out 'cancel-fence.exe'
-          $obj = Join-Path $out 'cancel-fence.obj'
-          $pdb = Join-Path $out 'cancel-fence.pdb'
-          $command = 'call "' + $vcvars + '" >nul && cl /nologo /std:c++17 /W4 /WX /EHsc /Zc:__cplusplus /O2 /Fe:"' + $exe + '" /Fo:"' + $obj + '" /Fd:"' + $pdb + '" "' + $source + '" Advapi32.lib CldApi.lib'
-          & cmd.exe /d /s /c $command
-          if ($LASTEXITCODE -ne 0) { throw 'Native MSVC /W4 /WX compile failed' }
-          & $exe --self-test
-          if ($LASTEXITCODE -ne 0) { throw 'Native cancellation adversarials failed' }
+          foreach ($mode in @('normal', 'optimized')) {
+            $flag = if ($mode -eq 'optimized') { '/O2' } else { '/Od' }
+            $exe = Join-Path $out "cancel-fence-$mode.exe"
+            $obj = Join-Path $out "cancel-fence-$mode.obj"
+            $pdb = Join-Path $out "cancel-fence-$mode.pdb"
+            $command = 'call "' + $vcvars + '" >nul && cl /nologo /std:c++17 /W4 /WX /EHsc /Zc:__cplusplus ' + $flag + ' /Fe:"' + $exe + '" /Fo:"' + $obj + '" /Fd:"' + $pdb + '" "' + $source + '" Advapi32.lib CldApi.lib'
+            & cmd.exe /d /s /c $command
+            if ($LASTEXITCODE -ne 0) { throw "MSVC $mode /W4 /WX compile failed" }
+            for ($iteration = 0; $iteration -lt 16; $iteration++) {
+              $output = & $exe --self-test
+              if ($LASTEXITCODE -ne 0) { throw "CFAPI $mode iteration $iteration failed" }
+            }
+            Write-Output "$mode /W4 /WX: 16/16 native adversarial tests passed."
+          }

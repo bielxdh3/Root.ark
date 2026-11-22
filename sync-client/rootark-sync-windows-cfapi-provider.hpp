@@ -36,6 +36,27 @@ struct Context {
   ~Context() { if (!payload.empty()) SecureZeroMemory(payload.data(), payload.size()); }
 };
 
+// Pure callback-time identity predicate. Payload and FileIdentity MUST remain
+// immutable for the lifetime of an admitted Context; only the pin and file-ID
+// atomics may change while an authorization callback is in progress.
+// This check is necessary, never sufficient, for a positive kernel transfer.
+bool matchesPinnedPlaceholder(const Context& ctx, const CF_CALLBACK_INFO* info) noexcept {
+  return info && info->FileIdentity
+    && !ctx.identity.empty() && ctx.identity.size() <= 256
+    && info->FileIdentityLength == ctx.identity.size()
+    && std::memcmp(info->FileIdentity, ctx.identity.data(), ctx.identity.size()) == 0
+    && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size())
+    && ctx.placeholderPinned.load(std::memory_order_acquire)
+    && static_cast<ULONGLONG>(info->FileId.QuadPart)
+      == ctx.placeholderFileId.load(std::memory_order_acquire);
+}
+
+bool retainsNativeCustody(const Context& ctx) {
+  return ctx.root && ctx.ancestors && ctx.path
+    && ctx.ancestors->samePaths() && ctx.root->samePath(ctx.path)
+    && ctx.root->registeredPolicy();
+}
+
 void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS* params) {
   if (!info || !params || !info->CallbackContext) return;
   auto& ctx = *static_cast<Context*>(info->CallbackContext);
@@ -59,28 +80,22 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
   // Each request must be bound to the provider's exact identity and checked
   // against the verified immutable buffer. This fixture does not certify a
   // production owner-signed object or live revocation policy.
-  const bool identityMatches = info->FileIdentity
-    && !ctx.identity.empty() && ctx.identity.size() <= 256
-    && info->FileIdentityLength == ctx.identity.size()
-    && std::memcmp(info->FileIdentity, ctx.identity.data(), ctx.identity.size()) == 0
-    && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size())
-    && ctx.placeholderPinned.load(std::memory_order_acquire)
-    && static_cast<ULONGLONG>(info->FileId.QuadPart)
-      == ctx.placeholderFileId.load(std::memory_order_relaxed);
+  const bool identityMatches = matchesPinnedPlaceholder(ctx, info);
   const bool rangeMatches = offset >= 0 && offset % 4096 == 0 && length > 0
     && offset < static_cast<LONGLONG>(ctx.payload.size())
     && length <= static_cast<LONGLONG>(ctx.payload.size()) - offset
     && (length % 4096 == 0 || offset + length == static_cast<LONGLONG>(ctx.payload.size()));
-  const bool physicalCustody = ctx.root && ctx.ancestors && ctx.path
-    && ctx.ancestors->samePaths() && ctx.root->samePath(ctx.path)
-    && ctx.root->registeredPolicy();
   const bool independentlyAdmitted = identityMatches && rangeMatches
-    && physicalCustody && !ctx.cancellations.canceled(info) && ctx.authorize
+    && !ctx.cancellations.canceled(info) && retainsNativeCustody(ctx) && ctx.authorize
     && ctx.authorize(info, ctx.authorityContext);
-  // Authorization may yield to a concurrently delivered CANCEL_FETCH_DATA;
-  // sample the exact request tombstone again immediately before CfExecute.
-  // Bytes already submitted to the kernel cannot be clawed back here.
-  if (independentlyAdmitted && !ctx.cancellations.canceled(info)) {
+  // Authorization may yield to CANCEL_FETCH_DATA, pin withdrawal or physical
+  // path replacement. Recheck all three predicates after the authority call,
+  // before offering data to the kernel. This narrows (does not eliminate) the
+  // final check -> CfExecute window: already-submitted bytes are irreversible.
+  // Pin true -> false -> true ABA requires an independent custody generation;
+  // neither this callback nor a mock can certify that external authority.
+  if (independentlyAdmitted && !ctx.cancellations.canceled(info)
+      && matchesPinnedPlaceholder(ctx, info) && retainsNativeCustody(ctx)) {
     transfer.TransferData.CompletionStatus = 0;
     transfer.TransferData.Buffer = ctx.payload.data() + static_cast<std::size_t>(offset);
     if (SUCCEEDED(CfExecute(&op, &transfer))) ++ctx.successful;

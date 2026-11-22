@@ -12,10 +12,17 @@
 #include <vector>
 
 namespace {
+void CALLBACK onCancel(const CF_CALLBACK_INFO*, const CF_CALLBACK_PARAMETERS*);
 std::atomic<unsigned> denied{0};
 std::atomic<unsigned> unsafe{0};
+CF_CALLBACK_INFO* cancelDuringCfExecute = nullptr;
 HRESULT WINAPI fakeCfExecute(const CF_OPERATION_INFO* operation,
     CF_OPERATION_PARAMETERS* params) {
+  if (cancelDuringCfExecute) {
+    CF_CALLBACK_INFO* cancelInfo = cancelDuringCfExecute;
+    cancelDuringCfExecute = nullptr;
+    onCancel(cancelInfo, nullptr);
+  }
   if (!operation || !params ||
     operation->Type != CF_OPERATION_TYPE_TRANSFER_DATA ||
     params->TransferData.Buffer != nullptr ||
@@ -82,6 +89,16 @@ bool run() {
   if (ctx.successful.load() != 0 || ctx.rejected.load() != 1
     || denied.load() != 1 || unsafe.load() != 0) return false;
 
+  // Reusing the exact canceled tuple for another claimed inode, followed by
+  // the original inode again, must never clear the cancellation tombstone.
+  CF_CALLBACK_INFO reused = canceled;
+  reused.FileId.QuadPart = 99999;
+  onFetch(&reused, &required);
+  reused.FileId = canceled.FileId;
+  onFetch(&reused, &required);
+  if (ctx.successful.load() != 0 || denied.load() != 3
+    || !ctx.cancellations.canceled(&reused)) return false;
+
   // In the absence of a production signed/AEAD verifier, merely pinning a
   // plausible FileId and identity must never produce a positive CFAPI result.
   differentRequest.FileSize = canceled.FileSize;
@@ -89,22 +106,27 @@ bool run() {
   differentRequest.FileIdentityLength = canceled.FileIdentityLength;
   differentRequest.FileId = canceled.FileId;
   onFetch(&differentRequest, &required);
-  if (ctx.successful.load() != 0 || denied.load() != 2 || unsafe.load() != 0)
+  if (ctx.successful.load() != 0 || denied.load() != 4 || unsafe.load() != 0)
     return false;
 
   // Concurrent CANCEL callbacks are keyed exactly and must not race. These
   // 160 keys + the first cancellation remain below the bounded capacity.
   std::vector<std::thread> threads;
+  std::atomic<bool> cancelAckLost{false};
   for (int shard = 0; shard < 8; ++shard) {
-    threads.emplace_back([&ctx, shard] {
+    threads.emplace_back([&ctx, &cancelAckLost, shard] {
       for (int j = 0; j < 20; ++j) {
         CF_CALLBACK_INFO info = request(ctx, 90, shard + 100,
           static_cast<LONGLONG>(j + 1000));
         onCancel(&info, nullptr);
+        // Check the happens-before boundary while other workers are mutating
+        // the table. Once onCancel returned, the exact tombstone must exist.
+        if (!ctx.cancellations.canceled(&info)) cancelAckLost.store(true);
       }
     });
   }
   for (auto& thread : threads) thread.join();
+  if (cancelAckLost.load()) return false;
   for (int shard = 0; shard < 8; ++shard) {
     for (int j = 0; j < 20; ++j) {
       CF_CALLBACK_INFO info = request(ctx, 90, shard + 100,
@@ -130,8 +152,50 @@ bool run() {
     || !ctx.cancellations.canceled(&canceled)
     || unrelatedContext.cancellations.canceled(&sameKeysElsewhere)) return false;
   onFetch(&differentRequest, &required);
-  return ctx.successful.load() == 0 && denied.load() == 3
-    && unsafe.load() == 0;
+  if (ctx.successful.load() != 0 || denied.load() != 5
+    || unsafe.load() != 0) return false;
+
+  // A CFAPI completion can reenter cancellation. Never hold the SRW fence
+  // lock across CfExecute; this failure-only mock asserts no deadlock and
+  // preserves per-Context cancellation isolation.
+  Context reentrantContext;
+  CF_CALLBACK_INFO reentrantFetch = request(reentrantContext, 16, 17, 18);
+  cancelDuringCfExecute = &reentrantFetch;
+  onFetch(&reentrantFetch, &required);
+  if (cancelDuringCfExecute ||
+    !reentrantContext.cancellations.canceled(&reentrantFetch) ||
+    reentrantContext.successful.load() != 0 || denied.load() != 6)
+    return false;
+
+  // Model a pin revoked after initial identity admission but before its
+  // authorizer returns. The final pure identity predicate must now reject.
+  // This is a gate test ONLY; no trust signature or AEAD is being fabricated.
+  Context latePin;
+  latePin.identity.assign({'p', 'i', 'n'});
+  latePin.payload.assign(4096, 0xAC);
+  latePin.placeholderFileId.store(17, std::memory_order_relaxed);
+  latePin.placeholderPinned.store(true, std::memory_order_release);
+  CF_CALLBACK_INFO pinRequest = request(latePin, 41, 42, 43);
+  pinRequest.FileIdentity = latePin.identity.data();
+  pinRequest.FileIdentityLength = static_cast<DWORD>(latePin.identity.size());
+  pinRequest.FileSize.QuadPart = static_cast<LONGLONG>(latePin.payload.size());
+  pinRequest.FileId.QuadPart = 17;
+  if (!matchesPinnedPlaceholder(latePin, &pinRequest)) return false;
+  latePin.placeholderPinned.store(false, std::memory_order_release);
+  if (matchesPinnedPlaceholder(latePin, &pinRequest)) return false;
+  latePin.placeholderPinned.store(true, std::memory_order_release);
+  latePin.placeholderFileId.store(18, std::memory_order_release);
+  if (matchesPinnedPlaceholder(latePin, &pinRequest)) return false;
+  latePin.placeholderFileId.store(17, std::memory_order_release);
+  unsigned char foreignIdentity[3] = {'b', 'a', 'd'};
+  pinRequest.FileIdentity = foreignIdentity;
+  if (matchesPinnedPlaceholder(latePin, &pinRequest)) return false;
+  pinRequest.FileIdentity = latePin.identity.data();
+  pinRequest.FileSize.QuadPart = 1;
+  if (matchesPinnedPlaceholder(latePin, &pinRequest)) return false;
+
+  return unrelatedContext.cancellations.canceled(&sameKeysElsewhere) == false
+    && reentrantContext.successful.load() == 0 && unsafe.load() == 0;
 }
 }
 
@@ -139,7 +203,9 @@ int main(int argc, char** argv) {
   if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) return 2;
   if (!run()) return 3;
   std::printf("{\"cancelFence\":true,\"concurrentKeys\":160,"
-    "\"overflowFailsClosed\":true,\"deniedTransfers\":%u,"
+    "\"overflowFailsClosed\":true,\"pinRevalidation\":true,"
+    "\"reusedKeyDenied\":true,\"reentrantCancel\":true,"
+    "\"deniedTransfers\":%u,"
     "\"successfulTransfers\":0,\"syncRootRegistered\":false}\n",
     denied.load());
   return 0;
