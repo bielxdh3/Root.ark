@@ -132,3 +132,22 @@ test("canonical Windows preserves bounded safe diagnostics after twelve failures
   assert.match(output, /FAIL detail index=23 .*locationLine=451 assertionLine=957 .*operator=strictEqual/);
   assert.doesNotMatch(output, /secret private fixture token|D:\\private/);
 });
+
+test("canonical Windows does not invent an assertion line from YAML location or a foreign stack frame", () => {
+  const messages = [];
+  const tracker = createTapProgressRecorder((line) => messages.push(line));
+  for (const line of [
+    "not ok 1 - private fixture without a trusted assertion frame",
+    "  ---",
+    "  location: 'D:\\private\\test\\file-read-handle-security.test.js:451:10'",
+    "  failureType: 'testCodeFailure'",
+    "  code: 'ERR_ASSERTION'",
+    "    at TestContext.<anonymous> (D:\\foreign\\test\\untrusted.test.js:900:12)",
+    "  ...",
+  ]) tracker.accept(line);
+  tracker.finish();
+  assert.equal(tracker.state.failures, 1);
+  const output = messages.join("\n");
+  assert.match(output, /FAIL detail index=1 .*locationLine=451/);
+  assert.doesNotMatch(output, /assertionLine=|untrusted\.test\.js|D:\\private|D:\\foreign/);
+});

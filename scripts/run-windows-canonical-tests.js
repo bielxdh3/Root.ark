@@ -232,7 +232,13 @@ function createTapProgressRecorder(write) {
           if (operator && ["strictEqual", "deepStrictEqual", "throws", "rejects", "match", "ok", "notStrictEqual"].includes(operator[1])) pending.operator = operator[1];
           // Never log or retain a stack trace. Only its first numeric line
           // in the already verified test file is actionable and non-secret.
-          if (pending.pathHash !== "none" && pending.assertionLine === null) {
+          // The YAML `location:` field identifies the test declaration, not
+          // the assertion that failed. Only a verified stack frame may supply
+          // assertionLine; otherwise a genuine later frame is shadowed by
+          // the earlier location (and the hosted diagnostic points to the
+          // wrong statement).
+          if (pending.pathHash !== "none" && pending.assertionLine === null
+            && /^\s{2,}at\s/.test(line)) {
             const frame = /(?:^|[\\/])test[\\/]([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}/.exec(line);
             if (frame && hash(`test/${frame[1]}`) === pending.pathHash)
               pending.assertionLine = Number(frame[2]);
