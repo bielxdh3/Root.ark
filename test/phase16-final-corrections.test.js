@@ -202,7 +202,12 @@ test("sync object history retains encrypted versions and tombstones across resta
     const reopened = await new SyncObjectStore(filePath).open();
     assert.equal(reopened.history("alice", "history-object").length, 3);
     await reopened.transact((next) => { delete next.users.alice.seen["history-op-1"]; });
-    assert.ok(["stale", "conflict"].includes((await reopened.put("alice", first)).kind));
+    // Clearing the operation-id replay marker must not permit reuse of a
+    // historical version ID. Every retained revision remains immutable.
+    assert.equal((await reopened.put("alice", first)).kind, "version_conflict");
+    assert.deepEqual(reopened.history("alice", "history-object").map((entry) => entry.versionId),
+      ["history-v1", "history-v2", "history-v3"]);
+    assert.equal(reopened.list("alice")[0].tombstone, true);
     if (process.platform === "win32") {
       const committedState = await fsp.readFile(filePath, "utf8");
       const callsBeforePermanentFailure = renameCalls.length;
