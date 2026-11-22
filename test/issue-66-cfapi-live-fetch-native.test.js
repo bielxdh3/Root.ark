@@ -54,6 +54,8 @@ test("#66 live Windows CFAPI kernel FETCH_DATA completes and unregisters the dis
       "native real callback must hydrate the final unaligned EOF byte");
     assert.equal(evidence.unregistered, true);
     assert.equal(evidence.finalRootIdentity, true);
+    assert.equal(evidence.finalAncestorsHeld, true,
+      "every ordinary NTFS ancestor remains retained during the CFAPI callback");
     assert.equal(evidence.finalRootPolicy, true);
     assert.equal(evidence.finalOwnerAcl, true);
     assert.equal(evidence.finalCloudReparse, true);
@@ -120,6 +122,7 @@ test("#66 signed Ed25519/AES-GCM Sync v2 bytes hydrate through a real native CFA
     assert.equal(evidence.rejectedTransfers, 0);
     assert.equal(evidence.unregistered, true);
     assert.equal(evidence.finalRootIdentity, true);
+    assert.equal(evidence.finalAncestorsHeld, true);
     assert.equal(evidence.finalRootPolicy, true);
     assert.equal(evidence.finalCloudReparse, true);
   });

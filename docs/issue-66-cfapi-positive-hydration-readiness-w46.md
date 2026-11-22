@@ -98,13 +98,15 @@ environment variables, or a staging file. The Node Windows test additionally
 constructs, verifies and decrypts a synthetic Ed25519/AES-GCM Sync v2 operation
 before the native stdin transfer; it requires hosted/local Node22 execution.
 
-The root now retains a real NTFS HANDLE without share-delete and must pass
+The root and its lexical fixed-NTFS ancestor chain now retain real directory
+HANDLEs without share-delete and the root must pass
 the reusable native owner/DACL policy **before registration**. The kernel
 converts the registered root to Cloud Files reparse tag `0x9000101A` during
 hydration; the post-registration check accepts only that documented tag family,
 the original held file identity, NTFS and the original owner-only ACL. A broad
 DACL was rejected with no placeholder or registration, and the real positive
-root returned `finalRootIdentity=true`, `finalRootPolicy=true`,
+root returned `finalRootIdentity=true`, `finalAncestorsHeld=true`,
+`finalRootPolicy=true`,
 `positiveReadVerified=true`, `unregistered=true`. All tests use synthetic data.
 
 **No product authorization follows.** The signed operation and device pin in

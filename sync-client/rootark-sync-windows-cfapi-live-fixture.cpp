@@ -11,6 +11,8 @@
 #include <cstring>
 #include <array>
 #include <vector>
+#include <string>
+#include <memory>
 #include "rootark-sync-windows-cfapi-root-policy.hpp"
 
 namespace {
@@ -87,6 +89,90 @@ struct HeldRoot {
       OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
       &owner, nullptr, &dacl, nullptr, &descriptor.value) == ERROR_SUCCESS
       && trustedDacl(descriptor.value, dacl, owner, sid);
+  }
+};
+
+// Retain every ancestor from the physical fixed NTFS volume root through the
+// independently opened parent while a callback is live. A same-SID process
+// cannot perform ordinary directory rename of those retained objects without
+// FILE_SHARE_DELETE. This only pins identity AFTER acquisition; it is NOT an
+// operator-issued original-A enrollment or a cold-restart authority.
+struct HeldAncestors {
+  struct Entry {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    std::wstring path;
+    FILE_ID_INFO id{};
+    ~Entry() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+  };
+  std::vector<std::unique_ptr<Entry>> entries;
+  bool captureOne(const std::wstring& segment) {
+    auto next = std::make_unique<Entry>();
+    next->path = segment;
+    next->handle = CreateFileW(segment.c_str(), FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (next->handle == INVALID_HANDLE_VALUE) return false;
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    if (!GetFileInformationByHandleEx(next->handle, FileAttributeTagInfo,
+        &tag, sizeof(tag)) || !(tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+      || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+      || !GetFileInformationByHandleEx(next->handle, FileIdInfo,
+        &next->id, sizeof(next->id))) return false;
+    if (!entries.empty() && next->id.VolumeSerialNumber
+        != entries.front()->id.VolumeSerialNumber) return false;
+    entries.push_back(std::move(next));
+    return true;
+  }
+  bool capture(const wchar_t* root) {
+    const std::wstring path(root);
+    const auto last = path.find_last_of(L'\\');
+    if (last == std::wstring::npos || last <= 3 || path.size() > 4096
+      || path[1] != L':' || path[2] != L'\\') return false;
+    const std::wstring parent = path.substr(0, last);
+    const std::wstring drive = path.substr(0, 3);
+    if (GetDriveTypeW(drive.c_str()) != DRIVE_FIXED || !captureOne(drive)) return false;
+    wchar_t filesystem[64]{};
+    if (!GetVolumeInformationByHandleW(entries.front()->handle, nullptr, 0,
+      nullptr, nullptr, nullptr, filesystem, 64)
+      || _wcsicmp(filesystem, L"NTFS") != 0) return false;
+    for (std::size_t at = 3; at < parent.size();) {
+      if (entries.size() >= 64) return false;
+      const auto slash = parent.find(L'\\', at);
+      const auto end = slash == std::wstring::npos ? parent.size() : slash;
+      const auto name = parent.substr(at, end - at);
+      if (name.empty() || name == L"." || name == L".."
+        || !captureOne(parent.substr(0, end))) return false;
+      if (slash == std::wstring::npos) break;
+      at = slash + 1;
+    }
+    return samePaths();
+  }
+  bool samePaths() const {
+    if (entries.empty()) return false;
+    for (const auto& entry : entries) {
+      HANDLE reopened = CreateFileW(entry->path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+      if (reopened == INVALID_HANDLE_VALUE) return false;
+      FILE_ID_INFO current{};
+      FILE_ATTRIBUTE_TAG_INFO tag{};
+      const bool same = GetFileInformationByHandleEx(reopened, FileIdInfo,
+        &current, sizeof(current))
+        && GetFileInformationByHandleEx(reopened, FileAttributeTagInfo,
+          &tag, sizeof(tag))
+        && (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        && !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        && current.VolumeSerialNumber == entry->id.VolumeSerialNumber
+        && std::memcmp(&current.FileId, &entry->id.FileId,
+          sizeof(entry->id.FileId)) == 0;
+      CloseHandle(reopened);
+      if (!same) return false;
+    }
+    return true;
+  }
+  bool sameVolume(const FILE_ID_INFO& rootId) const {
+    return !entries.empty()
+      && entries.front()->id.VolumeSerialNumber == rootId.VolumeSerialNumber;
   }
 };
 
@@ -205,9 +291,12 @@ int wmain(int argc, wchar_t** argv) {
     if (nonempty) return 5;
   } else if (GetLastError() != ERROR_FILE_NOT_FOUND) return 6;
 
+  HeldAncestors ancestors;
+  if (!ancestors.capture(root)) return 15;
   HeldRoot held;
   DWORD platform = 0;
-  if (!held.open(root) || !held.samePath(root) || !inspect(root, platform)) return 14;
+  if (!held.open(root) || !held.samePath(root) || !ancestors.samePaths()
+    || !ancestors.sameVolume(held.id) || !inspect(root, platform)) return 14;
 
   Context context;
   if (streamed && !readBoundedStdin(context.payload)) return 13;
@@ -226,13 +315,15 @@ int wmain(int argc, wchar_t** argv) {
   CF_CONNECTION_KEY connection{};
   bool connected = false;
   bool finalIdentity = false;
+  bool finalAncestors = false;
   bool finalPolicy = false;
   bool finalCloudReparse = false;
   bool finalOwnerAcl = false;
   DWORD finalTag = 0;
   int exitCode = 8;
   do {
-    if (!held.samePath(root) || !inspect(root, platform)) break;
+    if (!ancestors.samePaths() || !held.samePath(root)
+        || !inspect(root, platform)) break;
     result = CfConnectSyncRoot(root, kCallbacks, &context, CF_CONNECT_FLAG_NONE, &connection);
     if (FAILED(result)) break;
     connected = true;
@@ -256,6 +347,7 @@ int wmain(int argc, wchar_t** argv) {
       static_cast<DWORD>(received.size()), &got, nullptr);
     CloseHandle(handle);
     finalIdentity = held.samePath(root);
+    finalAncestors = ancestors.samePaths();
     finalPolicy = held.registeredPolicy();
     FILE_ATTRIBUTE_TAG_INFO tags{};
     finalCloudReparse = GetFileInformationByHandleEx(held.handle, FileAttributeTagInfo,
@@ -271,7 +363,7 @@ int wmain(int argc, wchar_t** argv) {
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         &owner, nullptr, &dacl, nullptr, &descriptor.value) == ERROR_SUCCESS
       && trustedDacl(descriptor.value, dacl, owner, sid);
-    if (!read || !finalIdentity || !finalPolicy
+    if (!read || !finalIdentity || !finalAncestors || !finalPolicy
         || got != context.payload.size()
         || std::memcmp(received.data(), context.payload.data(), context.payload.size()) != 0
         || context.callbacks == 0 || context.successful == 0) break;
@@ -283,12 +375,13 @@ int wmain(int argc, wchar_t** argv) {
   if (FAILED(unregisterResult)) exitCode = 9;
   std::printf("{\"liveKernelCallbackCount\":%u,\"successfulTransfers\":%u,"
     "\"rejectedTransfers\":%u,\"verifiedBytes\":%zu,"
-    "\"finalRootIdentity\":%s,\"finalRootPolicy\":%s,"
+    "\"finalRootIdentity\":%s,\"finalAncestorsHeld\":%s,\"finalRootPolicy\":%s,"
     "\"finalCloudReparse\":%s,\"finalOwnerAcl\":%s,"
     "\"finalReparseTag\":%lu,"
     "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
     context.callbacks, context.successful, context.rejected, context.payload.size(),
-    finalIdentity ? "true" : "false", finalPolicy ? "true" : "false",
+    finalIdentity ? "true" : "false", finalAncestors ? "true" : "false",
+    finalPolicy ? "true" : "false",
     finalCloudReparse ? "true" : "false", finalOwnerAcl ? "true" : "false",
     finalTag,
     SUCCEEDED(unregisterResult) ? "true" : "false",
