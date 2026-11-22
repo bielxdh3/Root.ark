@@ -10,23 +10,53 @@
 #include <cwchar>
 #include <cstring>
 #include <array>
+#include <vector>
 
 namespace {
 constexpr std::size_t kPayloadLength = 4097;
 constexpr char kIdentity[] = "rootark-cfapi-test-v1";
-std::array<unsigned char, kPayloadLength> makePayload() {
-  std::array<unsigned char, kPayloadLength> bytes{};
+std::vector<unsigned char> makePayload() {
+  std::vector<unsigned char> bytes(kPayloadLength);
   for (std::size_t i = 0; i < bytes.size(); ++i)
     bytes[i] = static_cast<unsigned char>((i * 19 + 7) % 251);
   return bytes;
 }
 constexpr NTSTATUS kCloudFailure = static_cast<NTSTATUS>(0xC000CF12UL);
 struct Context {
-  std::array<unsigned char, kPayloadLength> payload = makePayload();
+  std::vector<unsigned char> payload = makePayload();
   unsigned callbacks = 0;
   unsigned successful = 0;
   unsigned rejected = 0;
+  ~Context() { if (!payload.empty()) SecureZeroMemory(payload.data(), payload.size()); }
 };
+
+bool readBoundedStdin(std::vector<unsigned char>& payload) {
+  HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+  if (!input || input == INVALID_HANDLE_VALUE) return false;
+  constexpr std::size_t maximum = 1024 * 1024;
+  std::vector<unsigned char> result;
+  unsigned char chunk[8192]{};
+  DWORD read = 0;
+  for (;;) {
+    if (!ReadFile(input, chunk, sizeof(chunk), &read, nullptr)) {
+      if (GetLastError() == ERROR_BROKEN_PIPE) break;
+      SecureZeroMemory(chunk, sizeof(chunk));
+      if (!result.empty()) SecureZeroMemory(result.data(), result.size());
+      return false;
+    }
+    if (!read) break;
+    if (result.size() > maximum - read) {
+      SecureZeroMemory(chunk, sizeof(chunk));
+      if (!result.empty()) SecureZeroMemory(result.data(), result.size());
+      return false;
+    }
+    result.insert(result.end(), chunk, chunk + read);
+  }
+  SecureZeroMemory(chunk, sizeof(chunk));
+  if (result.empty()) return false;
+  payload.swap(result);
+  return true;
+}
 
 void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS* params) {
   if (!info || !params || !info->CallbackContext) return;
@@ -54,10 +84,11 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
   const bool identityMatches = info->FileIdentity
     && info->FileIdentityLength == sizeof(kIdentity) - 1
     && std::memcmp(info->FileIdentity, kIdentity, sizeof(kIdentity) - 1) == 0
-    && info->FileSize.QuadPart == static_cast<LONGLONG>(kPayloadLength);
+    && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size());
   const bool rangeMatches = offset >= 0 && offset % 4096 == 0 && length > 0
-    && length <= static_cast<LONGLONG>(kPayloadLength) - offset
-    && (length % 4096 == 0 || offset + length == static_cast<LONGLONG>(kPayloadLength));
+    && offset < static_cast<LONGLONG>(ctx.payload.size())
+    && length <= static_cast<LONGLONG>(ctx.payload.size()) - offset
+    && (length % 4096 == 0 || offset + length == static_cast<LONGLONG>(ctx.payload.size()));
   if (identityMatches && rangeMatches) {
     transfer.TransferData.CompletionStatus = 0;
     transfer.TransferData.Buffer = ctx.payload.data() + static_cast<std::size_t>(offset);
@@ -77,7 +108,9 @@ constexpr CF_CALLBACK_REGISTRATION kCallbacks[] = {
 }
 
 int wmain(int argc, wchar_t** argv) {
-  if (argc != 3 || std::wcscmp(argv[1], L"--disposable-live") != 0) return 2;
+  if (argc != 3 || (std::wcscmp(argv[1], L"--disposable-live") != 0
+      && std::wcscmp(argv[1], L"--disposable-live-stdin") != 0)) return 2;
+  const bool streamed = std::wcscmp(argv[1], L"--disposable-live-stdin") == 0;
   const wchar_t* root = argv[2];
   if (!root || std::wcslen(root) < 8 || std::wcslen(root) > 4096
       || root[1] != L':' || root[2] != L'\\') return 3;
@@ -108,6 +141,8 @@ int wmain(int argc, wchar_t** argv) {
     if (nonempty) return 5;
   } else if (GetLastError() != ERROR_FILE_NOT_FOUND) return 6;
 
+  Context context;
+  if (streamed && !readBoundedStdin(context.payload)) return 13;
   CF_SYNC_REGISTRATION registration{};
   registration.StructSize = sizeof(registration);
   registration.ProviderName = L"Rootark disposable CFAPI fixture";
@@ -120,7 +155,6 @@ int wmain(int argc, wchar_t** argv) {
   policies.Population.Primary = CF_POPULATION_POLICY_PARTIAL;
   HRESULT result = CfRegisterSyncRoot(root, &registration, &policies, CF_REGISTER_FLAG_NONE);
   if (FAILED(result)) { std::printf("register=0x%08lx\n", static_cast<unsigned long>(result)); return 7; }
-  Context context;
   CF_CONNECTION_KEY connection{};
   bool connected = false;
   int exitCode = 8;
@@ -130,7 +164,7 @@ int wmain(int argc, wchar_t** argv) {
     connected = true;
     CF_PLACEHOLDER_CREATE_INFO item{};
     item.RelativeFileName = L"payload.bin";
-    item.FsMetadata.FileSize.QuadPart = kPayloadLength;
+    item.FsMetadata.FileSize.QuadPart = static_cast<LONGLONG>(context.payload.size());
     item.FsMetadata.BasicInfo.FileAttributes = FILE_ATTRIBUTE_NORMAL;
     item.FileIdentity = kIdentity;
     item.FileIdentityLength = sizeof(kIdentity) - 1;
@@ -142,13 +176,13 @@ int wmain(int argc, wchar_t** argv) {
     HANDLE handle = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, nullptr,
       OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (handle == INVALID_HANDLE_VALUE) break;
-    std::array<unsigned char, kPayloadLength> received{};
+    std::vector<unsigned char> received(context.payload.size());
     DWORD got = 0;
     const BOOL read = ReadFile(handle, received.data(),
       static_cast<DWORD>(received.size()), &got, nullptr);
     CloseHandle(handle);
-    if (!read || got != kPayloadLength
-        || std::memcmp(received.data(), context.payload.data(), kPayloadLength) != 0
+    if (!read || got != context.payload.size()
+        || std::memcmp(received.data(), context.payload.data(), context.payload.size()) != 0
         || context.callbacks == 0 || context.successful == 0) break;
     exitCode = 0;
   } while (false);
@@ -159,7 +193,7 @@ int wmain(int argc, wchar_t** argv) {
   std::printf("{\"liveKernelCallbackCount\":%u,\"successfulTransfers\":%u,"
     "\"rejectedTransfers\":%u,\"verifiedBytes\":%zu,"
     "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
-    context.callbacks, context.successful, context.rejected, kPayloadLength,
+    context.callbacks, context.successful, context.rejected, context.payload.size(),
     SUCCEEDED(unregisterResult) ? "true" : "false",
     exitCode == 0 ? "true" : "false");
   return exitCode;

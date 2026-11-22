@@ -195,18 +195,27 @@ function validateFixtureArgs(name, scratch, args) {
       || (values.length === 1 && values[0] === "--self-test")
       || (["--connect", "--register", "--hydrate"].includes(values[0]) && scope());
   } else if (name === "live-fetch.exe") {
-    allowed = values.length === 2 && values[0] === "--disposable-live"
+    allowed = values.length === 2
+      && ["--disposable-live", "--disposable-live-stdin"].includes(values[0])
       && comparable(values[1]) === comparable(`${scratch}-root`);
   }
   assert.ok(allowed, FAIL);
   return values;
 }
 
-function runCompiledFixture(receipt, args, timeout = 10000) {
+function runCompiledFixture(receipt, args, timeout = 10000, input = undefined) {
   const previous = RECEIPTS.get(receipt);
   assert.ok(previous, FAIL);
   const name = path.basename(previous.executable);
   const vettedArgs = validateFixtureArgs(name, previous.scratch, args);
+  if (input !== undefined) {
+    assert.equal(name, "live-fetch.exe", FAIL);
+    assert.equal(vettedArgs[0], "--disposable-live-stdin", FAIL);
+    assert.ok(Buffer.isBuffer(input) && input.length >= 1
+      && input.length <= 1024 * 1024, FAIL);
+  } else if (name === "live-fetch.exe") {
+    assert.notEqual(vettedArgs[0], "--disposable-live-stdin", FAIL);
+  }
   const next = inspect(previous.scratch, name);
   assert.ok(next.rootDev === previous.rootDev && next.rootIno === previous.rootIno
     && next.dev === previous.dev && next.ino === previous.ino
@@ -216,6 +225,7 @@ function runCompiledFixture(receipt, args, timeout = 10000) {
   // No production or release authorization may be derived from this runner.
   return spawnSync(previous.executable, vettedArgs, {
     cwd: previous.scratch, encoding: "utf8", timeout, windowsHide: true,
+    input,
   });
 }
 

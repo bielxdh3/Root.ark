@@ -4,6 +4,7 @@
 // entire content live under disposable TEMP paths; the production gate remains
 // closed until native RootSession custody and signed authority are proven.
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
@@ -11,6 +12,9 @@ const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 const { buildCompiledFixture, runCompiledFixture } =
   require("./support/issue-66-cfapi-built-artifact");
+const protocol = require("../sync-client/rootark-sync-protocol");
+const { createAuthorizationProof, verifyAuthorizationProof } =
+  require("../sync-client/rootark-sync-authorization");
 
 test("#66 live Windows CFAPI kernel FETCH_DATA completes and unregisters the disposable root",
   { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
@@ -40,4 +44,58 @@ test("#66 live Windows CFAPI kernel FETCH_DATA completes and unregisters the dis
       "native real callback must hydrate the final unaligned EOF byte");
     assert.equal(evidence.unregistered, true);
     assert.equal(evidence.positiveReadVerified, true);
+  });
+
+test("#66 signed Ed25519/AES-GCM Sync v2 bytes hydrate through a real native CFAPI kernel callback",
+  { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
+    const where = spawnSync("C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe",
+      ["-all", "-products", "*", "-prerelease", "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"],
+      { encoding: "utf8", timeout: 6000, windowsHide: true });
+    const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
+    if (!vcvars) { t.skip("MSVC x64 unavailable"); return; }
+    const plaintext = Buffer.alloc(4097);
+    for (let i = 0; i < plaintext.length; ++i) plaintext[i] = (i * 23 + 11) % 251;
+    const owner = crypto.generateKeyPairSync("ed25519");
+    const publicKey = owner.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+    const fileKey = crypto.randomBytes(32);
+    const op = protocol.createOperation({
+      operation: "create", objectId: "cfapi-signed-native", fileId: "cfapi-signed-file",
+      versionId: crypto.randomUUID(), operationId: crypto.randomUUID(),
+      deviceId: "device-1", keyEpoch: "epoch-1", compartmentId: "private",
+      revision: { counter: 1, deviceId: "device-1" },
+      metadata: { path: "docs/native.bin", size: plaintext.length },
+      plaintext, fileKey,
+    });
+    op.authorization = await createAuthorizationProof(op, {
+      username: "alice", publicKey, privateKey: owner.privateKey,
+      expiresAt: Date.now() + 60_000,
+    });
+    const trusted = { username: "alice",
+      trustedDevicePublicKeys: { "device-1": publicKey }, revokedDeviceIds: [] };
+    assert.equal(await verifyAuthorizationProof(op.authorization, op, trusted), true);
+    const decrypted = protocol.decryptPayload(op, fileKey);
+    assert.deepEqual(decrypted, plaintext, "native source is exact authenticated AEAD plaintext");
+
+    const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-live-"));
+    const root = `${scratch}-root`;
+    t.after(async () => {
+      decrypted.fill(0);
+      fileKey.fill(0);
+      plaintext.fill(0);
+      await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      await fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    });
+    await fs.mkdir(root);
+    const { receipt } = buildCompiledFixture(scratch, "live-fetch.exe", vcvars);
+    assert.throws(() => runCompiledFixture(receipt, ["--disposable-live-stdin", root]),
+      /UNTRUSTED_EXECUTABLE/, "native stdin mode requires a bounded binary buffer");
+    const result = runCompiledFixture(receipt, ["--disposable-live-stdin", root], 20000, decrypted);
+    assert.equal(result.status, 0, `signed live hydration failed: ${result.stdout}\n${result.stderr}`);
+    const evidence = JSON.parse(result.stdout.trim());
+    assert.equal(evidence.positiveReadVerified, true);
+    assert.equal(evidence.verifiedBytes, plaintext.length);
+    assert.ok(evidence.liveKernelCallbackCount >= 1);
+    assert.ok(evidence.successfulTransfers >= 1);
+    assert.equal(evidence.rejectedTransfers, 0);
+    assert.equal(evidence.unregistered, true);
   });
