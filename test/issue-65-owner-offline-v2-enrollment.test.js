@@ -819,7 +819,10 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       const result = await realHpkeOpen(...args);
       if (expireOnOpen) {
         hpkeFinishedBeforeExpiry = true;
-        openClock.advanceTo((exactExpiry + 1) * 1000);
+        // The lease expires at the first millisecond of this exact second.
+        // A strict > check would incorrectly release a plaintext-equivalent
+        // CEK for the entire expiry second.
+        openClock.advanceTo(exactExpiry * 1000);
       }
       return result;
     } });
