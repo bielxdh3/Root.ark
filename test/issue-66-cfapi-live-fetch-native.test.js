@@ -62,6 +62,9 @@ test("#66 live Windows CFAPI kernel FETCH_DATA completes and unregisters the dis
     assert.equal(evidence.nativeRelativeOpen, true,
       "the original placeholder must be opened from the retained NTFS root HANDLE");
     assert.equal(evidence.positiveReadVerified, true);
+    assert.equal(evidence.nativePayloadMatch, true);
+    assert.equal(evidence.successfulCallbackSettled, true,
+      "exact bytes do not suffice until the same kernel callback has completed successfully");
   });
 
 test("#66 signed Ed25519/AES-GCM Sync v2 bytes hydrate through a real native CFAPI kernel callback",
@@ -118,6 +121,8 @@ test("#66 signed Ed25519/AES-GCM Sync v2 bytes hydrate through a real native CFA
     assert.equal(result.status, 0, `signed live hydration failed: ${result.stdout}\n${result.stderr}`);
     const evidence = JSON.parse(result.stdout.trim());
     assert.equal(evidence.positiveReadVerified, true);
+    assert.equal(evidence.nativePayloadMatch, true);
+    assert.equal(evidence.successfulCallbackSettled, true);
     assert.equal(evidence.verifiedBytes, plaintext.length);
     assert.ok(evidence.liveKernelCallbackCount >= 1);
     assert.ok(evidence.successfulTransfers >= 1);
@@ -319,6 +324,8 @@ for (const length of [1, 65537]) {
         `native short EOF/multirange physical hydration: ${outcome.stdout}\n${outcome.stderr}`);
       const evidence = JSON.parse(outcome.stdout.trim());
       assert.equal(evidence.positiveReadVerified, true);
+      assert.equal(evidence.nativePayloadMatch, true);
+      assert.equal(evidence.successfulCallbackSettled, true);
       assert.equal(evidence.verifiedBytes, length);
       assert.ok(evidence.liveKernelCallbackCount >= 1);
       assert.ok(evidence.successfulTransfers >= 1);

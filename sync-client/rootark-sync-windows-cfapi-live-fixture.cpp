@@ -174,6 +174,8 @@ int wmain(int argc, wchar_t** argv) {
   bool nativePayloadMatch = false;
   DWORD nativeReadError = 0;
   DWORD nativeBytesRead = 0;
+  unsigned successfulAtConsumerRead = 0;
+  bool successfulCallbackSettled = false;
   DWORD finalTag = 0;
   int exitCode = 8;
   do {
@@ -256,8 +258,23 @@ int wmain(int argc, wchar_t** argv) {
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         &owner, nullptr, &dacl, nullptr, &descriptor.value) == ERROR_SUCCESS
       && trustedDacl(descriptor.value, dacl, owner, sid);
+    // The kernel may release this consumer ReadFile after CfExecute has
+    // supplied all authenticated bytes but BEFORE onFetch increments its
+    // callback-success counter. The Windows hosted runner exposed this exact
+    // scheduling race: byte-for-byte match with successful==0 at this check,
+    // then successful==1 by final JSON output. Wait only for that already
+    // submitted callback to settle. This cannot authorize an absent callback
+    // or repair a wrong/partial read: the byte match and native custody
+    // checks remain mandatory and the deadline fails closed.
+    successfulAtConsumerRead = context.successful.load(std::memory_order_acquire);
+    if (nativePayloadMatch && context.callbacks.load(std::memory_order_acquire) != 0) {
+      const ULONGLONG deadline = GetTickCount64() + 2000;
+      while (context.successful.load(std::memory_order_acquire) == 0
+          && GetTickCount64() < deadline) Sleep(1);
+    }
+    successfulCallbackSettled = context.successful.load(std::memory_order_acquire) != 0;
     if (!nativePayloadMatch || !finalIdentity || !finalAncestors || !finalPolicy
-        || context.callbacks == 0 || context.successful == 0) break;
+        || context.callbacks == 0 || !successfulCallbackSettled) break;
     positiveReadVerified = true;
     if (aliasMode) {
       // Reuse the exact same caller-visible FileIdentity but plant a second
@@ -342,7 +359,8 @@ int wmain(int argc, wchar_t** argv) {
     "\"finalReparseTag\":%lu,"
     "\"unregistered\":%s,\"positiveReadVerified\":%s,"
     "\"nativeReadSuccess\":%s,\"nativeBytesRead\":%lu,"
-    "\"nativeReadError\":%lu,\"nativePayloadMatch\":%s}\n",
+    "\"nativeReadError\":%lu,\"nativePayloadMatch\":%s,"
+    "\"successfulAtConsumerRead\":%u,\"successfulCallbackSettled\":%s}\n",
     context.callbacks.load(), context.successful.load(), context.rejected.load(),
     context.payload.size(),
     finalIdentity ? "true" : "false", finalAncestors ? "true" : "false",
@@ -354,6 +372,7 @@ int wmain(int argc, wchar_t** argv) {
     SUCCEEDED(unregisterResult) ? "true" : "false",
     positiveReadVerified && exitCode == 0 ? "true" : "false",
     nativeReadSuccess ? "true" : "false", nativeBytesRead, nativeReadError,
-    nativePayloadMatch ? "true" : "false");
+    nativePayloadMatch ? "true" : "false", successfulAtConsumerRead,
+    successfulCallbackSettled ? "true" : "false");
   return exitCode;
 }
