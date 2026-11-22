@@ -2859,10 +2859,15 @@ function getShareAccessCookieRequired(link, countDownloadOncePerViewer = false) 
 }
 
 // Test-only pause points (NODE_ENV=test) used to race a permission change against an in-flight request.
-async function pauseShareAccessForTest(point) {
+async function pauseShareAccessForTest(point, operation = null) {
   if (process.env.NODE_ENV !== "test" || process.env.ROOTARK_TEST_SHARE_PAUSE_POINT !== point) return;
-  if (point === "exchange-commit" && process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER) {
-    fs.writeFileSync(process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER, "snapshot-read-before-admission");
+  // The deterministic descriptor-substitution barrier belongs only to the
+  // download being attacked. Its preceding viewer POST must remain available.
+  if (point === "reserve" && process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER
+    && operation !== "download") return;
+  if ((point === "exchange-commit" || point === "reserve") && process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER) {
+    fs.writeFileSync(process.env.ROOTARK_TEST_SHARE_PAUSE_MARKER,
+      point === "exchange-commit" ? "snapshot-read-before-admission" : "before-descriptor-open");
     if (process.env.ROOTARK_TEST_SHARE_PAUSE_RELEASE) {
       const release = process.env.ROOTARK_TEST_SHARE_PAUSE_RELEASE;
       const deadline = Date.now() + 15_000;
@@ -3147,7 +3152,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
     if (failure) return failure;
   }
 
-  await pauseShareAccessForTest("reserve");
+  await pauseShareAccessForTest("reserve", options.operation);
   return {
     link: currentLink,
     fileInfo,

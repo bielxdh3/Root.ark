@@ -107,7 +107,7 @@ async function startFixture(t, mode, extraEnv = {}, options = {}) {
   const pauseRelease = path.join(sandbox, "share-exchange-read-release.marker");
   const env = { ...process.env, ...dbEnv, ...extraEnv,
     ROOTARK_PRIVATE_SHARE_SNAPSHOT_DIRECTORY: snapshotDirectory,
-    ...(extraEnv.ROOTARK_TEST_SHARE_PAUSE_POINT === "exchange-commit"
+    ...(["exchange-commit", "reserve"].includes(extraEnv.ROOTARK_TEST_SHARE_PAUSE_POINT)
       ? { ROOTARK_TEST_SHARE_PAUSE_MARKER: pauseMarker,
         ROOTARK_TEST_SHARE_PAUSE_RELEASE: pauseRelease } : {}),
     NODE_ENV: options.nodeEnv || "test", UPLOAD_SCAN_ENABLED: "true",
@@ -248,6 +248,15 @@ async function startFixture(t, mode, extraEnv = {}, options = {}) {
   return { port, origin, authed, publicPost, exchangeCapability, legacyToken, dataDir, snapshotDirectory,
     password, pauseMarker, pauseRelease,
     getChildOutput: () => childOutput };
+}
+
+async function waitForPauseMarker(markerPath) {
+  const deadline = Date.now() + 12_000;
+  while (!fs.existsSync(markerPath) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(fs.existsSync(markerPath), true,
+    "the disposable server must reach its actual pause before the attack is released");
 }
 
 test("P2 SQLite WebDAV Basic: case-distinct users authenticate against their exact stored account", {
@@ -710,7 +719,7 @@ for (const mode of ["json", "sqlite"]) {
 
 for (const mode of ["json", "sqlite"]) {
   test(`download checks the actual opened descriptor before stream (${mode})`, { timeout: 60_000 }, async (t) => {
-    const { authed, publicPost, dataDir } = await startFixture(t, mode, {
+    const { authed, publicPost, dataDir, pauseMarker, pauseRelease } = await startFixture(t, mode, {
       ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve",
       ROOTARK_TEST_SHARE_PAUSE_MS: "1800",
       ROOTARK_TEST_SHARE_SWAP_AFTER_OPEN: "1",
@@ -726,7 +735,7 @@ for (const mode of ["json", "sqlite"]) {
     assert.equal(viewer.status, 200, viewer.body);
 
     const pending = publicPost(token, "download", viewerCookieFrom(viewer));
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await waitForPauseMarker(pauseMarker);
 
     const originalPath = path.join(path.dirname(dataDir), "uploads", FILE_NAME);
     const grantedPath = `${originalPath}.granted`;
@@ -734,6 +743,7 @@ for (const mode of ["json", "sqlite"]) {
     fs.writeFileSync(originalPath, "FORBIDDEN_AFTER_OPEN_BYTES\n");
     const marker = path.join(path.dirname(dataDir), "swap-after-open.marker");
     fs.writeFileSync(marker, "swap once after verified open");
+    fs.writeFileSync(pauseRelease, "resume after substitution");
 
     const response = await pending;
     assert.equal(fs.existsSync(marker), false, "hook must have restored the pathname after fd open");
@@ -767,7 +777,7 @@ for (const mode of ["json", "sqlite"]) {
 for (const mode of ["json", "sqlite"]) {
   test(`download rejects foreign descriptor even when original pathname identity is unchanged (${mode})`,
     { timeout: 60_000 }, async (t) => {
-      const { authed, publicPost, dataDir } = await startFixture(t, mode, {
+      const { authed, publicPost, dataDir, pauseMarker, pauseRelease } = await startFixture(t, mode, {
         ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve",
         ROOTARK_TEST_SHARE_PAUSE_MS: "1800",
         ROOTARK_TEST_SHARE_SWAP_AFTER_OPEN: "1",
@@ -785,9 +795,10 @@ for (const mode of ["json", "sqlite"]) {
       const originalPath = path.join(path.dirname(dataDir), "uploads", FILE_NAME);
       const before = fs.statSync(originalPath);
       const pending = publicPost(token, "download", viewerCookieFrom(viewer));
-      await new Promise((resolve) => setTimeout(resolve, 400));
+      await waitForPauseMarker(pauseMarker);
       const marker = path.join(path.dirname(dataDir), "swap-after-open.marker");
       fs.writeFileSync(marker, "substitute only the opened file descriptor");
+      fs.writeFileSync(pauseRelease, "resume after substitution");
       const refused = await pending;
       assert.equal(fs.existsSync(marker), false,
         "test must reach the actual already-verified-open handle substitution");
