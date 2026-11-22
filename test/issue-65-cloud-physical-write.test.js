@@ -80,6 +80,34 @@ test("physical ciphertext PUT rejects callback identity replacement after remote
   assert.equal(finishedPut, true, "remote PUT must finish before callback replacement");
 });
 
+test("P1: provider initialization cannot poison ciphertext commitments and mint a false physical PUT ACK", async () => {
+  const f = fixture("s3");
+  const writer = f.client("writer");
+  const originalEnabled = writer.enabled;
+  const originalCompare = crypto.timingSafeEqual;
+  const foreign = { ...f.payload, chunks: [crypto.randomBytes(f.chunks[0].length),
+    crypto.randomBytes(f.chunks[1].length)] };
+  let poisonedDuringProviderCheck = false;
+  let forgedComparisons = 0;
+  writer.enabled = () => {
+    poisonedDuringProviderCheck = true;
+    crypto.timingSafeEqual = () => { forgedComparisons++; return true; };
+    return originalEnabled();
+  };
+  try {
+    const publisher = new Zk1CloudCiphertextCopyPublisher({ cloudWriter: writer,
+      expectedProvider: "s3", expectedWriterContext: await writer.resolveInventoryContext() });
+    await assert.rejects(publisher.publishExact(foreign), /ZK_CLOUD_COPY_UNAVAILABLE/,
+      "provider-enabled callback must not forge matching signed commitments for different physical bytes");
+    assert.equal(poisonedDuringProviderCheck, true);
+    assert.equal(forgedComparisons, 0,
+      "captured chunk commitments may never invoke a provider-poisoned crypto comparator");
+    assert.equal(f.state.puts, 0, "rejected foreign ciphertext must not start a physical remote PUT");
+  } finally {
+    crypto.timingSafeEqual = originalCompare;
+  }
+});
+
 function fixture(provider) {
   const scope = { account_id: crypto.randomBytes(16),
     compartment_id: crypto.randomBytes(7), keyring_id: crypto.randomBytes(16) };

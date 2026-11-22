@@ -165,6 +165,72 @@ test("ciphertext physical GET must reject late cloud adapter revocation and call
   }
 });
 
+test("P1: S3 physical GET cannot forge signed ciphertext match by poisoning timingSafeEqual after transfer", async () => {
+  const f = fixture("s3");
+  const context = await f.reader.resolveInventoryContext();
+  // Preserve the correct byte count and object address, but corrupt the
+  // physical object. Without primitive poisoning the signed digest rejects it.
+  f.changePayload(Buffer.from(f.original).fill(0x73));
+  const verifier = new Zk1CloudCiphertextReadbackVerifier({
+    cloudReader: f.reader, expectedProvider: "s3", expectedReaderContext: context,
+  });
+  await assert.rejects(verifier.verifyExact(f.input), /ZK_CLOUD_READBACK_UNAVAILABLE/);
+  const realRead = f.reader.download.bind(f.reader);
+  const nativeCompare = crypto.timingSafeEqual;
+  let completedPhysicalGet = false;
+  let forgedComparisons = 0;
+  f.reader.download = async (...args) => {
+    const result = await realRead(...args);
+    completedPhysicalGet = true;
+    crypto.timingSafeEqual = () => { forgedComparisons++; return true; };
+    return result;
+  };
+  const compromised = new Zk1CloudCiphertextReadbackVerifier({
+    cloudReader: f.reader, expectedProvider: "s3", expectedReaderContext: context,
+  });
+  try {
+    await assert.rejects(compromised.verifyExact(f.input), /ZK_CLOUD_READBACK_UNAVAILABLE/,
+      "a provider callback cannot forge physical match by replacing node:crypto comparison");
+    assert.equal(completedPhysicalGet, true,
+      "test must exercise S3's bounded physical GET, not stop on an earlier guard");
+    assert.equal(forgedComparisons, 0,
+      "post-GET commitment comparison must never invoke provider-poisoned crypto primitive");
+  } finally {
+    crypto.timingSafeEqual = nativeCompare;
+  }
+});
+
+test("P1: S3 physical GET cannot forge both ciphertext commitments via poisoned Hash.digest", async () => {
+  const f = fixture("s3");
+  const context = await f.reader.resolveInventoryContext();
+  f.changePayload(Buffer.from(f.original).fill(0x44));
+  const read = f.reader.download.bind(f.reader);
+  const hashPrototype = Object.getPrototypeOf(crypto.createHash("sha256"));
+  const nativeDigest = hashPrototype.digest;
+  let received = false;
+  let poisonedDigests = 0;
+  f.reader.download = async (...args) => {
+    const value = await read(...args);
+    received = true;
+    hashPrototype.digest = function (...args) {
+      const sequence = ++poisonedDigests;
+      if (sequence === 1) return Buffer.from(f.input.ciphertextSha256);
+      if (sequence === 4) return Buffer.from(f.input.expectedRootHash);
+      return Reflect.apply(nativeDigest, this, args);
+    };
+    return value;
+  };
+  const verifier = new Zk1CloudCiphertextReadbackVerifier({
+    cloudReader: f.reader, expectedProvider: "s3", expectedReaderContext: context,
+  });
+  try {
+    await assert.rejects(verifier.verifyExact(f.input), /ZK_CLOUD_READBACK_UNAVAILABLE/,
+      "native hash methods cannot be replaced to forge both correct signed digests");
+    assert.equal(received, true, "mutator must run after actual S3 physical read");
+    assert.equal(poisonedDigests, 0, "post-GET proof must not call a swapped digest intrinsic");
+  } finally { hashPrototype.digest = nativeDigest; }
+});
+
 test("cloud physical verifier rejects unsafe length/commitment inputs before provider reads", async () => {
   const f = fixture("s3");
   const pinned = await f.reader.resolveInventoryContext();

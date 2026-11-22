@@ -11,6 +11,14 @@ const path = require("node:path");
 const inventory = require("../crypto/rootark-zk-content-inventory-v1");
 const { computeZk1CiphertextRoot } = require("../crypto/rootark-zk-chunk-root-v1");
 
+// Provider download/identity callbacks execute arbitrary JS while the physical
+// proof is pending. Never use a comparator that those callbacks can replace.
+const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
+const nativeCreateHash = crypto.createHash;
+const nativeHashPrototype = Object.getPrototypeOf(nativeCreateHash("sha256"));
+const nativeHashUpdate = nativeHashPrototype.update;
+const nativeHashDigest = nativeHashPrototype.digest;
+
 const DOMAIN = Buffer.from("Root.ark/zk-1/cloud-physical-copy/v1\0");
 const MAX_BYTES = 16 * 1024 * 1024;
 const CONTEXT = /^[a-f0-9]{64}$/;
@@ -42,7 +50,7 @@ function bytes(input, length) {
   return Buffer.from(input);
 }
 function equal(left, right) {
-  return left.length === right.length && crypto.timingSafeEqual(left, right);
+  return left.length === right.length && nativeTimingSafeEqual(left, right);
 }
 async function boundedIdentityRead(action) {
   let timeout;
@@ -122,6 +130,9 @@ class Zk1CloudCiphertextReadbackVerifier {
     // while an awaited GET was active.
     if (Object.entries(this.#readerCallbacks).some(([name, callback]) =>
       this.#reader[name] !== callback)
+      || crypto.createHash !== nativeCreateHash
+      || nativeHashPrototype.update !== nativeHashUpdate
+      || nativeHashPrototype.digest !== nativeHashDigest
       || this.#reader.enabled() !== true
       || this.#reader.status()?.provider !== this.#expectedProvider
       || (typeof this.#reader.zk1StorageNamespace === "function"

@@ -15,6 +15,16 @@ const { Zk1ExternallyPinnedProviderDomains } =
 const { createZk1ProviderDeadline, isZk1ProviderDeadline } =
   require("./zk1ProviderDeadline");
 
+// Remote provider callbacks may run before the final signed-wire comparison.
+// Pin crypto primitives at module initialization, not after a provider GET.
+const nativeCreateHash = crypto.createHash.bind(crypto);
+const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
+const nativeCreateHashReference = crypto.createHash;
+const nativeVerify = crypto.verify;
+const nativeHashPrototype = Object.getPrototypeOf(nativeCreateHash("sha256"));
+const nativeHashUpdate = nativeHashPrototype.update;
+const nativeHashDigest = nativeHashPrototype.digest;
+
 const FORMAT = "rootark-zk1-signed-catalog-sidecar/v1";
 const DOMAIN = Buffer.from("Root.ark/zk-1/catalog-sidecar-operation/v1\0");
 const MAX = Math.min(4 * 1024 * 1024, inventory.MAX_SNAPSHOT_BYTES + 200000);
@@ -62,12 +72,16 @@ function pinnedDomains(providerDomainPinset, scope, pinned) {
   } catch (_) { deny(); }
 }
 function copyAddress(scope, operationId) {
-  const id = crypto.createHash("sha256").update(DOMAIN)
+  const id = nativeCreateHash("sha256").update(DOMAIN)
     .update(bytes(operationId, 16)).digest().subarray(0, 16);
   return zk1CloudCopyAddress({ scope: inventory.normalizeScope(scope), operationId: id });
 }
 function adapterLocallyPinned(target, address, expectedKey) {
-  return Object.entries(target.callbacks).every(([name, callback]) =>
+  return crypto.createHash === nativeCreateHashReference
+    && crypto.verify === nativeVerify
+    && nativeHashPrototype.update === nativeHashUpdate
+    && nativeHashPrototype.digest === nativeHashDigest
+    && Object.entries(target.callbacks).every(([name, callback]) =>
     target.adapter[name] === callback)
     && target.adapter.enabled?.() === true
     && target.adapter.status?.()?.provider === target.provider
@@ -166,7 +180,7 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
       if (!adapterLocallyPinned(target, address, expectedKey)) deny();
       const result = await target.adapter.upload(staged, address.folder, address.name,
         "uploads", { zk1BoundedBytes: payload.length,
-          ...(target.provider === "webdav" ? { zk1ExpectedSha256: crypto.createHash("sha256").update(payload).digest("hex") } : {}),
+          ...(target.provider === "webdav" ? { zk1ExpectedSha256: nativeCreateHash("sha256").update(payload).digest("hex") } : {}),
           ...(target.driveFileId === null ? {} : { providerFileId: target.driveFileId }) });
       if (!adapterLocallyPinned(target, address, expectedKey)
         || !result || result.provider !== target.provider || result.key !== expectedKey
@@ -258,8 +272,8 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
           || now.dev !== opened.dev || now.nlink !== 1n || now.isSymbolicLink()) deny();
       } finally { fs.closeSync(fd); }
       const parsed = parseCatalog(data, operationId);
-      if (expectedDigest && !crypto.timingSafeEqual(
-        crypto.createHash("sha256").update(data).digest(), expectedDigest)) deny();
+      if (expectedDigest && !nativeTimingSafeEqual(
+        nativeCreateHash("sha256").update(data).digest(), expectedDigest)) deny();
       recovered.push({ data, parsed, provider: target.provider });
       const matching = recovered.filter((item) => item.data.equals(data));
       if (matching.length >= minimumMatchingProviders) break;
@@ -271,7 +285,7 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   }
   const groups = new Map();
   for (const item of recovered) {
-    const hash = crypto.createHash("sha256").update(item.data).digest("hex");
+    const hash = nativeCreateHash("sha256").update(item.data).digest("hex");
     if (!groups.has(hash)) groups.set(hash, []);
     groups.get(hash).push(item);
   }
@@ -317,7 +331,7 @@ async function verifyPublishedSignedCatalogSidecars({ scope, operationId, signed
     // Capture the exact expected wire before any provider await, so callers
     // cannot swap a mutable input after the first read and authorize a replay.
     const expected = encodeCatalog({ ...signedCatalog, operationId });
-    const digest = crypto.createHash("sha256").update(expected).digest();
+    const digest = nativeCreateHash("sha256").update(expected).digest();
     const result = await recoverSignedCatalogSidecar({ scope, operationId,
       readers, minimumMatchingProviders, providerDomainPinset, deadlineMs,
       abortSignal, expectedCatalogSha256: digest, observationOnly });

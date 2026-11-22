@@ -12,6 +12,15 @@ const { computeZk1CiphertextRoot } = require("../crypto/rootark-zk-chunk-root-v1
 const { zk1CloudCopyAddress } = require("./zk1CloudCiphertextReadbackVerifier");
 const WEBDAV_ETAG = /^"[A-Za-z0-9_.:-]{1,128}"$/;
 
+// A provider callback may run as early as constructor validation. Capture the
+// native commitment comparator before invoking provider methods; otherwise a
+// poisoned global crypto.timingSafeEqual can approve unrelated ciphertext.
+const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
+const nativeCreateHash = crypto.createHash;
+const nativeHashPrototype = Object.getPrototypeOf(nativeCreateHash("sha256"));
+const nativeHashUpdate = nativeHashPrototype.update;
+const nativeHashDigest = nativeHashPrototype.digest;
+
 function fail() {
   const error = new Error("ZK_CLOUD_COPY_UNAVAILABLE");
   error.code = error.message;
@@ -37,7 +46,7 @@ function bytes(value, length) {
   return Buffer.from(value);
 }
 function same(a, b) {
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  return a.length === b.length && nativeTimingSafeEqual(a, b);
 }
 async function boundedIdentity(action) {
   let timer;
@@ -49,6 +58,11 @@ async function boundedIdentity(action) {
   } finally { clearTimeout(timer); }
 }
 function capturedChunks(values, expectedSha, expectedRoot) {
+  // The root builder also consults node:crypto dynamically. Do not execute
+  // it under a rebound hash constructor installed by a provider callback.
+  if (crypto.createHash !== nativeCreateHash
+    || nativeHashPrototype.update !== nativeHashUpdate
+    || nativeHashPrototype.digest !== nativeHashDigest) fail();
   if (!Array.isArray(values) || values.length < 1 || values.length > 16
     || Reflect.ownKeys(values).length !== values.length + 1) fail();
   const snapshots = [];
@@ -69,6 +83,9 @@ function capturedChunks(values, expectedSha, expectedRoot) {
   for (const chunk of snapshots) hash.update(chunk);
   if (!same(hash.digest(), expectedSha)
     || !same(computeZk1CiphertextRoot(snapshots), expectedRoot)) fail();
+  if (crypto.createHash !== nativeCreateHash
+    || nativeHashPrototype.update !== nativeHashUpdate
+    || nativeHashPrototype.digest !== nativeHashDigest) fail();
   return { chunks: snapshots, size: total };
 }
 

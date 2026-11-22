@@ -161,6 +161,41 @@ test("readback is bound to the exact sidecar across process restart, provider co
   "missing remote ciphertext cannot satisfy the configured three-provider quorum");
 });
 
+test("P1: a cloud GET callback cannot turn a different signed sidecar into exact readback by swapping crypto comparator", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-poisoned-proof-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  const altered = { ...fixture.signedCatalog,
+    signedSnapshot: crypto.randomBytes(fixture.signedCatalog.signedSnapshot.length) };
+  await publishSignedCatalogSidecars({ ...fixture.publication,
+    signedCatalog: altered, writers: fixture.publication.writers.slice(0, 2) });
+  const verification = { ...fixture.verification, readers: fixture.readers.slice(0, 2) };
+  await assert.rejects(verifyPublishedSignedCatalogSidecars(verification),
+    /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+    "control: both physical providers contain a different otherwise-valid sidecar");
+  const first = fixture.readers[0].cloudReader;
+  const realDownload = first.download;
+  const nativeCompare = crypto.timingSafeEqual;
+  let gotPhysicalObject = false;
+  let poisonedComparisons = 0;
+  first.download = async function (...args) {
+    const result = await realDownload.apply(this, args);
+    gotPhysicalObject = true;
+    crypto.timingSafeEqual = () => { poisonedComparisons++; return true; };
+    return result;
+  };
+  try {
+    await assert.rejects(verifyPublishedSignedCatalogSidecars(verification),
+      /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+      "exact expected signed-catalog digest may not trust a callback-replaced crypto comparator");
+    assert.equal(gotPhysicalObject, true, "attack must occur after successful remote sidecar GET");
+    assert.equal(poisonedComparisons, 0,
+      "the signed-wire comparison cannot call a cloud-provider-poisoned native comparator");
+  } finally {
+    crypto.timingSafeEqual = nativeCompare;
+  }
+});
+
 test("sidecar PUT does not acknowledge an earlier S3 principal revoked during later Drive upload", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-stale-put-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
