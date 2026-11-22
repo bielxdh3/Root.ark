@@ -5,6 +5,8 @@ on:
     branches:
       - agent/pr286-picker-integration-w181-20261122
       - agent/pr292-move-picker-w181-20261122
+      - agent/mission-20261122-pr292-ci-prime-r1
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,6 +25,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
+      # The real FOD and signed MOVE cases import HPKE and native dependencies.
+      # A clean hosted checkout never includes node_modules. Install exactly
+      # the lockfile graph before running the same complete test selection.
+      - name: Install pinned dependencies
+        run: npm ci
       - name: Verify all issue 66 picker, signed pin, MOVE and hydration contracts
         shell: bash
         run: |
