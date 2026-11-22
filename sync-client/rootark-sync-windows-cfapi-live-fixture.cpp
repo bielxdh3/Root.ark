@@ -32,6 +32,10 @@ struct Context {
   const HeldRoot* root = nullptr;
   const HeldAncestors* ancestors = nullptr;
   const wchar_t* path = nullptr;
+  // Bind the callback to the exact native placeholder inode, independently
+  // of user-controlled FileIdentity or a reopened mutable pathname.
+  ULONGLONG placeholderFileId = 0;
+  bool placeholderPinned = false;
   unsigned callbacks = 0;
   unsigned successful = 0;
   unsigned rejected = 0;
@@ -235,7 +239,9 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
   const bool identityMatches = info->FileIdentity
     && info->FileIdentityLength == sizeof(kIdentity) - 1
     && std::memcmp(info->FileIdentity, kIdentity, sizeof(kIdentity) - 1) == 0
-    && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size());
+    && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size())
+    && ctx.placeholderPinned
+    && static_cast<ULONGLONG>(info->FileId.QuadPart) == ctx.placeholderFileId;
   const bool rangeMatches = offset >= 0 && offset % 4096 == 0 && length > 0
     && offset < static_cast<LONGLONG>(ctx.payload.size())
     && length <= static_cast<LONGLONG>(ctx.payload.size()) - offset
@@ -263,8 +269,10 @@ constexpr CF_CALLBACK_REGISTRATION kCallbacks[] = {
 
 int wmain(int argc, wchar_t** argv) {
   if (argc != 3 || (std::wcscmp(argv[1], L"--disposable-live") != 0
-      && std::wcscmp(argv[1], L"--disposable-live-stdin") != 0)) return 2;
+      && std::wcscmp(argv[1], L"--disposable-live-stdin") != 0
+      && std::wcscmp(argv[1], L"--disposable-live-alias") != 0)) return 2;
   const bool streamed = std::wcscmp(argv[1], L"--disposable-live-stdin") == 0;
+  const bool aliasMode = std::wcscmp(argv[1], L"--disposable-live-alias") == 0;
   const wchar_t* root = argv[2];
   if (!root || std::wcslen(root) < 8 || std::wcslen(root) > 4096
       || root[1] != L':' || root[2] != L'\\') return 3;
@@ -330,6 +338,7 @@ int wmain(int argc, wchar_t** argv) {
   bool finalPolicy = false;
   bool finalCloudReparse = false;
   bool finalOwnerAcl = false;
+  bool alienAliasDenied = false;
   DWORD finalTag = 0;
   int exitCode = 8;
   do {
@@ -349,6 +358,17 @@ int wmain(int argc, wchar_t** argv) {
     if (FAILED(result) || processed != 1 || FAILED(item.Result)) break;
     wchar_t file[4096]{};
     if (swprintf_s(file, L"%ls\\payload.bin", root) < 0) break;
+    ScopedHandle original(CreateFileW(file, FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (original.value == INVALID_HANDLE_VALUE) break;
+    BY_HANDLE_FILE_INFORMATION physical{};
+    if (!GetFileInformationByHandle(original.value, &physical)
+        || physical.nNumberOfLinks != 1
+        || !(physical.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) break;
+    context.placeholderFileId =
+      (static_cast<ULONGLONG>(physical.nFileIndexHigh) << 32) | physical.nFileIndexLow;
+    context.placeholderPinned = true;
     HANDLE handle = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, nullptr,
       OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (handle == INVALID_HANDLE_VALUE) break;
@@ -378,6 +398,32 @@ int wmain(int argc, wchar_t** argv) {
         || got != context.payload.size()
         || std::memcmp(received.data(), context.payload.data(), context.payload.size()) != 0
         || context.callbacks == 0 || context.successful == 0) break;
+    if (aliasMode) {
+      // Reuse the exact same caller-visible FileIdentity but plant a second
+      // real NTFS placeholder. A provider relying on FileIdentity alone would
+      // leak the original object's payload to this unrelated physical inode.
+      CF_PLACEHOLDER_CREATE_INFO alien = item;
+      alien.RelativeFileName = L"alien.bin";
+      processed = 0;
+      result = CfCreatePlaceholders(root, &alien, 1, CF_CREATE_FLAG_NONE, &processed);
+      if (FAILED(result) || processed != 1 || FAILED(alien.Result)) break;
+      wchar_t alienPath[4096]{};
+      if (swprintf_s(alienPath, L"%ls\\alien.bin", root) < 0) break;
+      HANDLE alienFile = CreateFileW(alienPath, GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+      if (alienFile == INVALID_HANDLE_VALUE) break;
+      const auto previousFailures = context.rejected;
+      const auto previousSuccesses = context.successful;
+      DWORD alienBytes = 0;
+      std::vector<unsigned char> alienBuffer(context.payload.size());
+      const BOOL alienRead = ReadFile(alienFile, alienBuffer.data(),
+        static_cast<DWORD>(alienBuffer.size()), &alienBytes, nullptr);
+      CloseHandle(alienFile);
+      alienAliasDenied = !alienRead && alienBytes == 0
+        && context.rejected > previousFailures
+        && context.successful == previousSuccesses;
+      if (!alienAliasDenied) break;
+    }
     exitCode = 0;
   } while (false);
   if (connected) CfDisconnectSyncRoot(connection);
@@ -387,14 +433,14 @@ int wmain(int argc, wchar_t** argv) {
   std::printf("{\"liveKernelCallbackCount\":%u,\"successfulTransfers\":%u,"
     "\"rejectedTransfers\":%u,\"verifiedBytes\":%zu,"
     "\"finalRootIdentity\":%s,\"finalAncestorsHeld\":%s,\"finalRootPolicy\":%s,"
-    "\"finalCloudReparse\":%s,\"finalOwnerAcl\":%s,"
+    "\"finalCloudReparse\":%s,\"finalOwnerAcl\":%s,\"alienAliasDenied\":%s,"
     "\"finalReparseTag\":%lu,"
     "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
     context.callbacks, context.successful, context.rejected, context.payload.size(),
     finalIdentity ? "true" : "false", finalAncestors ? "true" : "false",
     finalPolicy ? "true" : "false",
     finalCloudReparse ? "true" : "false", finalOwnerAcl ? "true" : "false",
-    finalTag,
+    alienAliasDenied ? "true" : "false", finalTag,
     SUCCEEDED(unregisterResult) ? "true" : "false",
     exitCode == 0 ? "true" : "false");
   return exitCode;
