@@ -59,6 +59,8 @@ test("#66 live Windows CFAPI kernel FETCH_DATA completes and unregisters the dis
     assert.equal(evidence.finalRootPolicy, true);
     assert.equal(evidence.finalOwnerAcl, true);
     assert.equal(evidence.finalCloudReparse, true);
+    assert.equal(evidence.nativeRelativeOpen, true,
+      "the original placeholder must be opened from the retained NTFS root HANDLE");
     assert.equal(evidence.positiveReadVerified, true);
   });
 
@@ -125,6 +127,7 @@ test("#66 signed Ed25519/AES-GCM Sync v2 bytes hydrate through a real native CFA
     assert.equal(evidence.finalAncestorsHeld, true);
     assert.equal(evidence.finalRootPolicy, true);
     assert.equal(evidence.finalCloudReparse, true);
+    assert.equal(evidence.nativeRelativeOpen, true);
   });
 
 test("#66 native CFAPI registration rejects a broad DACL before creating any placeholder",
@@ -171,6 +174,7 @@ test("#66 real CFAPI callback refuses second physical placeholder with copied Fi
     const evidence = JSON.parse(result.stdout.trim());
     assert.equal(evidence.positiveReadVerified, true);
     assert.equal(evidence.alienAliasDenied, true);
+    assert.equal(evidence.nativeRelativeOpen, true);
     assert.ok(evidence.rejectedTransfers >= 1);
     assert.ok(evidence.successfulTransfers >= 1,
       "genuine original placeholder must still hydrate successfully");
@@ -210,6 +214,7 @@ for (const length of [1, 65537]) {
       assert.equal(evidence.finalRootIdentity, true);
       assert.equal(evidence.finalAncestorsHeld, true);
       assert.equal(evidence.finalRootPolicy, true);
+      assert.equal(evidence.nativeRelativeOpen, true);
       assert.equal(evidence.unregistered, true);
     });
 }

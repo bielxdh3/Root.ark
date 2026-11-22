@@ -152,4 +152,63 @@ struct HeldAncestors {
   }
 };
 
+// Open an exact child of the retained native directory HANDLE. Never
+// construct a new pathname or follow a directory alias from this operation.
+// The caller retains both parent and returned child handles across its I/O.
+// This is a read-only RootSession primitive: no signed object or write trust
+// is inferred from a successful open alone.
+bool openNativeCloudChild(HANDLE parent, const wchar_t* exactName, HANDLE& child) {
+  child = INVALID_HANDLE_VALUE;
+  if (!parent || parent == INVALID_HANDLE_VALUE || !exactName) return false;
+  const std::size_t count = std::wcslen(exactName);
+  if (!count || count > 255 || exactName[0] == L'.'
+    || exactName[count - 1] == L'.' || exactName[count - 1] == L' ') return false;
+  for (std::size_t i = 0; i < count; ++i) {
+    if (exactName[i] == L'\\' || exactName[i] == L'/' || exactName[i] == L':'
+      || exactName[i] < 0x20) return false;
+  }
+  FILE_ID_INFO parentId{};
+  if (!GetFileInformationByHandleEx(parent, FileIdInfo, &parentId, sizeof(parentId))) return false;
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  if (!ntdll) return false;
+  using NtCreateFileFn = NTSTATUS (NTAPI *)(PHANDLE, ACCESS_MASK,
+    POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG,
+    ULONG, PVOID, ULONG);
+  auto ntCreateFile = reinterpret_cast<NtCreateFileFn>(GetProcAddress(ntdll, "NtCreateFile"));
+  if (!ntCreateFile) return false;
+  UNICODE_STRING name{};
+  name.Buffer = const_cast<PWSTR>(exactName);
+  name.Length = static_cast<USHORT>(count * sizeof(wchar_t));
+  name.MaximumLength = name.Length;
+  OBJECT_ATTRIBUTES attrs{};
+  attrs.Length = sizeof(attrs);
+  attrs.RootDirectory = parent;
+  attrs.ObjectName = &name;
+  attrs.Attributes = 0x00001000UL; // OBJ_DONT_REPARSE: do not traverse child aliases
+  IO_STATUS_BLOCK io{};
+  HANDLE opened = INVALID_HANDLE_VALUE;
+  const NTSTATUS result = ntCreateFile(&opened, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+    &attrs, &io, nullptr, FILE_ATTRIBUTE_NORMAL,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+    FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+    nullptr, 0);
+  if (result < 0 || !opened || opened == INVALID_HANDLE_VALUE) return false;
+  FILE_ID_INFO childId{};
+  FILE_ATTRIBUTE_TAG_INFO tags{};
+  BY_HANDLE_FILE_INFORMATION fileInfo{};
+  const bool trusted = GetFileInformationByHandleEx(opened, FileIdInfo,
+      &childId, sizeof(childId))
+    && GetFileInformationByHandleEx(opened, FileAttributeTagInfo,
+      &tags, sizeof(tags))
+    && GetFileInformationByHandle(opened, &fileInfo)
+    && parentId.VolumeSerialNumber == childId.VolumeSerialNumber
+    && !(tags.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+    && (tags.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+    && (tags.ReparseTag & 0xFFFF0FFFUL) == IO_REPARSE_TAG_CLOUD
+    && fileInfo.nNumberOfLinks == 1;
+  if (!trusted) { CloseHandle(opened); return false; }
+  child = opened;
+  return true;
+}
+
 } // namespace

@@ -194,6 +194,7 @@ int wmain(int argc, wchar_t** argv) {
   bool finalCloudReparse = false;
   bool finalOwnerAcl = false;
   bool alienAliasDenied = false;
+  bool nativeRelativeOpen = false;
   DWORD finalTag = 0;
   int exitCode = 8;
   do {
@@ -213,10 +214,11 @@ int wmain(int argc, wchar_t** argv) {
     if (FAILED(result) || processed != 1 || FAILED(item.Result)) break;
     wchar_t file[4096]{};
     if (swprintf_s(file, L"%ls\\payload.bin", root) < 0) break;
-    ScopedHandle original(CreateFileW(file, FILE_READ_ATTRIBUTES,
-      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-      FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-    if (original.value == INVALID_HANDLE_VALUE) break;
+    // Identity authority comes from the already retained native root HANDLE.
+    // A new pathname open at this boundary would reintroduce parent aliasing.
+    ScopedHandle original(INVALID_HANDLE_VALUE);
+    if (!openNativeCloudChild(held.handle, L"payload.bin", original.value)) break;
+    nativeRelativeOpen = true;
     BY_HANDLE_FILE_INFORMATION physical{};
     if (!GetFileInformationByHandle(original.value, &physical)
         || physical.nNumberOfLinks != 1
@@ -289,13 +291,15 @@ int wmain(int argc, wchar_t** argv) {
     "\"rejectedTransfers\":%u,\"verifiedBytes\":%zu,"
     "\"finalRootIdentity\":%s,\"finalAncestorsHeld\":%s,\"finalRootPolicy\":%s,"
     "\"finalCloudReparse\":%s,\"finalOwnerAcl\":%s,\"alienAliasDenied\":%s,"
+    "\"nativeRelativeOpen\":%s,"
     "\"finalReparseTag\":%lu,"
     "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
     context.callbacks, context.successful, context.rejected, context.payload.size(),
     finalIdentity ? "true" : "false", finalAncestors ? "true" : "false",
     finalPolicy ? "true" : "false",
     finalCloudReparse ? "true" : "false", finalOwnerAcl ? "true" : "false",
-    alienAliasDenied ? "true" : "false", finalTag,
+    alienAliasDenied ? "true" : "false",
+    nativeRelativeOpen ? "true" : "false", finalTag,
     SUCCEEDED(unregisterResult) ? "true" : "false",
     exitCode == 0 ? "true" : "false");
   return exitCode;
