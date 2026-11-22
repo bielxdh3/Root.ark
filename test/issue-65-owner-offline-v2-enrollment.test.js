@@ -1522,11 +1522,25 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     const actualFixtureDateNow = Date.now;
     const actualFixtureApply = Reflect.apply;
     const actualFixtureFloor = Math.floor;
+    const actualFixtureMax = Math.max;
+    // This fixture earlier committed signed grants and a server CAS at
+    // `now + 9`. On a fast hosted runner fewer than nine real seconds may
+    // have elapsed, so switching directly to wall time moves the authority
+    // clock backwards and wrongly rejects genuine HTTP/HPKE redemption.
+    // Keep the signed fixture watermark monotonic, without freezing later
+    // requests at that watermark when the real wall clock advances past it.
+    const fixtureAdmissionFloor = now + 9;
+    const monotonicFixtureSeconds = (actualSeconds) =>
+      actualFixtureMax(fixtureAdmissionFloor, actualSeconds);
+    assert.equal(monotonicFixtureSeconds(now), fixtureAdmissionFloor,
+      "a fast runner must never rewind the already-signed fixture CAS clock");
+    assert.equal(monotonicFixtureSeconds(now + 90), now + 90,
+      "a slow runner must continue using its live authority clock");
     // Hostile recipient callbacks later replace global Date.now to prove a
     // fail-closed client clock. That synthetic clock must NEVER advance the
     // independently clocked disposable HTTP server's durable CAS watermark.
-    const testWallSeconds = () => actualFixtureFloor(
-      actualFixtureApply(actualFixtureDateNow, Date, []) / 1000);
+    const testWallSeconds = () => monotonicFixtureSeconds(actualFixtureFloor(
+      actualFixtureApply(actualFixtureDateNow, Date, []) / 1000));
     // The recipient's independently signed HTTP operations also require a
     // fresh request clock. Worker-isolated real HPKE can add several seconds
     // to the fixture; using the initial (now + 9) exceeds the strict 30s
@@ -1708,8 +1722,14 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal((await protectedClient.postProtectedCiphertextPut({
       origin, request: secondPut, fetchImpl })).revision, 1);
     const bundleSecondDigest = crypto.createHash("sha256").update(bundleSecondCipher).digest();
+    // This is a separate, real owner-authorized HTTP grant issued after the
+    // first recipient's HPKE/CLI/restart work. Reusing the first operation's
+    // short-lived signed clock would make the second positive control expire
+    // under a slow Windows/WSL runner, even though the owner still approves it.
+    const secondGrantNow = testWallSeconds();
     const bundleSecondAuth = { ...shareAuthorization, object_id: bundleSecondMeta.object_id,
-      ciphertext_digest: bundleSecondDigest, nonce: crypto.randomBytes(32) };
+      ciphertext_digest: bundleSecondDigest, nonce: crypto.randomBytes(32),
+      issued_at: secondGrantNow, expires_at: secondGrantNow + 39 };
     const bundleSecondGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
       authorization: bundleSecondAuth };
     const bundleSecondMessage = await shareGrantMessageV1(bundleSecondGrantInput);
