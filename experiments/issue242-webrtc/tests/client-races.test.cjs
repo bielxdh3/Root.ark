@@ -152,6 +152,100 @@ test('P2: leaving retires an old file-hash lock without clearing a newer room se
     'the new room send must complete after its own hash resolves');
 });
 
+test('P2: a retired outgoing cancel callback cannot abort a later transfer to the same peer', async () => {
+  const f = clientFixture();
+  f.joinRoom('room', 'invitation');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'host', peerId: 'host' });
+  await f.incoming(f.sockets[0], { type: 'peer-accepted', peerId: 'peer-A' });
+  const channel = f.testChannel(0);
+  const sent = [];
+  channel.send = data => sent.push(JSON.parse(data));
+  const file = name => ({ name, size: 2,
+    arrayBuffer: async () => new Uint8Array([1, 2]).buffer });
+
+  await f.sendFile(file('old.bin'));
+  const retiredCancel = f.elements.get('transfers').children[0].children[1].onclick;
+  const firstOffer = sent.find(message => message.type === 'offer-file');
+  assert.ok(firstOffer);
+  await channel.onmessage({ data: JSON.stringify({ type: 'decline-file', id: firstOffer.id }) });
+  assert.equal(f.snapshot().peers[0].outgoingPhase, null);
+
+  await f.sendFile(file('current.bin'));
+  const currentOffer = sent.filter(message => message.type === 'offer-file').at(-1);
+  assert.notEqual(currentOffer.id, firstOffer.id);
+  assert.equal(f.snapshot().peers[0].outgoingPhase, 'offered');
+  retiredCancel(); // A previously queued click from a now-removed control.
+  assert.equal(f.snapshot().peers[0].outgoingPhase, 'offered',
+    'an obsolete cancel callback must not release the new transfer');
+  assert.equal(sent.some(message => message.type === 'cancel-file' && message.id === currentOffer.id), false);
+
+  f.elements.get('transfers').children[1].children[1].onclick();
+  assert.equal(f.snapshot().peers[0].outgoingPhase, null);
+  assert.equal(sent.some(message => message.type === 'cancel-file' && message.id === currentOffer.id), true,
+    'the current transfer must still be cancellable');
+});
+
+test('P2: a retired offer consent callback cannot accept or decline a replacement with a reused ID', async () => {
+  const f = clientFixture();
+  f.joinRoom('room', 'invitation');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+  await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+  const channel = makeChannel();
+  const sent = [];
+  channel.send = data => sent.push(JSON.parse(data));
+  f.peerConnections[0].ondatachannel({ channel });
+  const offer = { type: 'offer-file', id: 'a'.repeat(32), name: 'old.bin',
+    size: 2, digest: 'b'.repeat(64) };
+  await channel.onmessage({ data: JSON.stringify(offer) });
+  const oldUi = f.elements.get('incoming').children[0];
+  const oldAccept = oldUi.children[0].onclick;
+  const oldDecline = oldUi.children[1].onclick;
+  oldDecline();
+  assert.equal(f.snapshot().peers[0].pendingOffer, false);
+
+  await channel.onmessage({ data: JSON.stringify({ ...offer, name: 'new.bin' }) });
+  assert.equal(f.snapshot().peers[0].pendingOffer, true);
+  const sentBeforeStale = sent.length;
+  oldAccept();
+  oldDecline();
+  assert.equal(sent.length, sentBeforeStale,
+    'stale consent must neither accept nor decline a different offer with the same ID');
+  assert.equal(f.snapshot().peers[0].pendingOffer, true,
+    'replacement offer must retain its own consent');
+
+  const currentAccept = f.elements.get('incoming').children[1].children[0].onclick;
+  currentAccept();
+  assert.equal(f.snapshot().peers[0].pendingOffer, false);
+  assert.equal(sent.filter(message => message.type === 'accept-file' && message.id === offer.id).length, 1,
+    'the current consent button must still accept the replacement');
+});
+
+test('P2: an old incoming cancel callback cannot cancel a replacement receiving the same ID', async () => {
+  const f = clientFixture();
+  f.joinRoom('room', 'invitation');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+  await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+  const channel = makeChannel();
+  const sent = [];
+  channel.send = data => sent.push(JSON.parse(data));
+  f.peerConnections[0].ondatachannel({ channel });
+  const offer = { type: 'offer-file', id: 'c'.repeat(32), name: 'old.bin',
+    size: 2, digest: 'd'.repeat(64) };
+  await channel.onmessage({ data: JSON.stringify(offer) });
+  f.elements.get('incoming').children[0].children[0].onclick();
+  const oldCancel = f.elements.get('transfers').children[0].children[1].onclick;
+  await channel.onmessage({ data: JSON.stringify({ type: 'cancel-file', id: offer.id }) });
+
+  await channel.onmessage({ data: JSON.stringify({ ...offer, name: 'current.bin' }) });
+  f.elements.get('incoming').children[1].children[0].onclick();
+  oldCancel();
+  assert.equal(sent.filter(message => message.type === 'cancel-file').length, 0,
+    'the obsolete cancel handler must not clear the new transfer');
+  f.elements.get('transfers').children[1].children[1].onclick();
+  assert.equal(sent.filter(message => message.type === 'cancel-file').length, 1,
+    'the current incoming cancellation must still notify the peer');
+});
+
 test('P2: empty offer IDs cannot create unbounded consent panels; valid offer still works', async () => {
   const f = clientFixture();
   f.joinRoom('room', 'invitation');

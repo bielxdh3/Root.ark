@@ -57,7 +57,7 @@ function browser({ fetch, digest = async () => new Uint8Array(32).buffer }) {
     peerConnections.at(-1).ondatachannel({ channel: dc });
     return dc;
   };
-  return { window, sockets, peerConnections, joined, channel };
+  return { window, sockets, peerConnections, elements, joined, channel };
 }
 
 function smallFile() {
@@ -182,6 +182,39 @@ test('pending unbound create cannot overlap a protected create or downgrade it l
   assert.equal(b.sockets.length, 2, 'stale callbacks must not open another WebSocket');
   assert.equal(protectedSocket.readyState, 1, 'obsolete response closed protected WebSocket');
   assert.equal(b.window.__poc.snapshot().roomId, 'protected');
+  assert.equal(b.window.__poc.snapshot().boundObject.sha256, boundObject.sha256);
+});
+
+test('leaving a pending creation allows a new room while stale HTTP completion stays fenced', async () => {
+  const requests = [];
+  const b = browser({ fetch: (_url, options) => new Promise(resolve =>
+    requests.push({ resolve, signal: options.signal })) });
+  const oldCreate = b.window.__poc.createRoom({ folderId: 'root', fileName: 'old.bin' });
+  assert.equal(requests.length, 1);
+  assert.equal(b.elements.get('leave').disabled, false,
+    'a pending room creation must expose a way to cancel it');
+  assert.equal(b.elements.get('leave').textContent, 'Cancelar criação');
+  b.elements.get('leave').onclick();
+  assert.equal(requests[0].signal.aborted, true);
+  assert.equal(b.window.__poc.snapshot().roomId, null);
+
+  const newCreate = b.window.__poc.createRoom({ folderId: 'root', fileName: 'new.bin' });
+  assert.equal(requests.length, 2,
+    'the old server/response must not hold the creation lock after leave');
+  requests[0].resolve({ ok: true, json: async () => ({ roomId: 'stale', hostKey: 'old' }) });
+  assert.equal(await oldCreate, false, 'a canceled response must not reconnect');
+  assert.equal(await b.window.__poc.createRoom(), false,
+    'stale completion must not unlock the second pending creation');
+  assert.equal(requests.length, 2);
+  assert.equal(b.elements.get('leave').disabled, false,
+    'the active creation must retain its cancel control');
+
+  requests[1].resolve({ ok: true, json: async () =>
+    ({ roomId: 'current', hostKey: 'new', boundObject }) });
+  assert.equal(await newCreate, true);
+  assert.equal(b.sockets.length, 1);
+  b.joined(b.sockets[0], boundObject);
+  assert.equal(b.window.__poc.snapshot().roomId, 'current');
   assert.equal(b.window.__poc.snapshot().boundObject.sha256, boundObject.sha256);
 });
 

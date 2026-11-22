@@ -68,10 +68,16 @@
     ++roomIntent;
     const pending = pendingCreateController;
     pendingCreateController = null;
-    if (pending) pending.abort();
+    if (pending) {
+      // A canceled request may still have a pending response/body promise.
+      // It must not hold the creation lock for a later user intent.
+      creatingRoom = false;
+      pending.abort();
+    }
   }
   function leaveRoom() {
-    if (!ws) return false;
+    const creating = Boolean(pendingCreateController);
+    if (!ws && !creating) return false;
     const previousRole = role;
     invalidateRoomIntent(); // A pending create must not restore this room.
     retireRoom();
@@ -79,7 +85,8 @@
     hostKey = null;
     protectedRoomRequired = false;
     $('room').textContent = '';
-    log(previousRole === 'host' ? 'Sala encerrada' : 'Você saiu da sala');
+    log(creating && !previousRole ? 'Criação de sala cancelada' :
+      previousRole === 'host' ? 'Sala encerrada' : 'Você saiu da sala');
     return true;
   }
   function connect(credentials) {
@@ -453,18 +460,20 @@
         const div = document.createElement('div');
         div.className = 'entry';
         div.textContent = 'Arquivo ' + m.name + ' (' + m.size + ' bytes) ';
-        p.pendingOffer = { id: m.id, element: div };
+        const pendingOffer = { id: m.id, element: div };
+        p.pendingOffer = pendingOffer;
         const button = document.createElement('button');
         button.textContent = 'Aceitar arquivo';
         button.dataset.testid = 'accept-file';
         button.addEventListener('click', () => {
           if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc ||
-            p.pendingOffer?.id !== m.id || dc.readyState !== 'open') return;
+            p.pendingOffer !== pendingOffer || dc.readyState !== 'open') return;
           clearPending(p);
-          p.incoming = { ...m, chunksSize: 0, chunks: [], phase: 'receiving' };
+          const incoming = { ...m, chunksSize: 0, chunks: [], phase: 'receiving' };
+          p.incoming = incoming;
           p.incomingUi = transferUi(p, 'Recebendo ' + m.name, 'incoming', () => {
             if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc
-              || p.incoming?.id !== m.id) return;
+              || p.incoming !== incoming) return;
             clearIncoming(p);
             sendControl(p, { type: 'cancel-file', id: m.id });
             log('Recebimento cancelado');
@@ -475,7 +484,7 @@
         decline.textContent = 'Recusar arquivo';
         decline.addEventListener('click', () => {
           if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc ||
-            p.pendingOffer?.id !== m.id) return;
+            p.pendingOffer !== pendingOffer) return;
           clearPending(p);
           sendControl(p, { type: 'decline-file', id: m.id });
         });
@@ -609,7 +618,7 @@
           abort: new AbortController(), timer: null };
         p.outgoing = tx;
         p.outgoingUi = transferUi(p, 'Aguardando aceite de ' + p.id.slice(0, 5), 'outgoing',
-          () => cancelOutgoing(p, true));
+          () => { if (p.outgoing === tx) cancelOutgoing(p, true); });
         sendControl(p, { type: 'offer-file', id, name, size: file.size, digest });
         if (p.outgoing !== tx) continue;
         tx.timer = setTimeout(() => {
@@ -664,6 +673,11 @@
     }
     const controller = new AbortController();
     pendingCreateController = controller;
+    if (!ws) {
+      $('leave').disabled = false;
+      $('leave').textContent = 'Cancelar criação';
+      $('leave').setAttribute('aria-label', 'Cancelar criação');
+    }
     try {
       const headers = {};
       if (inRootark) {
@@ -696,10 +710,18 @@
       }
       throw error;
     } finally {
-      if (pendingCreateController === controller) pendingCreateController = null;
-      creatingRoom = false;
-      if (!ws || (ws.readyState !== WebSocket.CONNECTING
-        && ws.readyState !== WebSocket.CLOSING)) setCreateButtonsDisabled(false);
+      // A stale HTTP response must never unlock or alter a newer creation.
+      if (pendingCreateController === controller) {
+        pendingCreateController = null;
+        creatingRoom = false;
+        if (!ws) {
+          $('leave').disabled = true;
+          $('leave').textContent = 'Sair da sala';
+          $('leave').setAttribute('aria-label', 'Sair da sala');
+        }
+        if (!ws || (ws.readyState !== WebSocket.CONNECTING
+          && ws.readyState !== WebSocket.CLOSING)) setCreateButtonsDisabled(false);
+      }
     }
   }
   function joinRoom(room, invitation) {
