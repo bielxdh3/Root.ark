@@ -86,7 +86,7 @@ for (const mode of ["json", "sqlite"]) {
     });
 }
 
-async function startFixture(t, mode, extraEnv = {}) {
+async function startFixture(t, mode, extraEnv = {}, options = {}) {
   const sandbox = createPrivateAuthorityFixture(`rootark-share-permissions-${mode}-`);
   const dataDir = path.join(sandbox, "data");
   fs.mkdirSync(dataDir, { recursive: true });
