@@ -14,6 +14,7 @@ const { buildCompiledFixture, runCompiledFixture } =
   require("./support/issue-66-cfapi-built-artifact");
 
 const source = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfapi-acl-preflight.cpp");
+const rootPolicy = path.resolve(__dirname, "../sync-client/rootark-sync-windows-cfapi-root-policy.hpp");
 const aclScript = path.join(__dirname, "support/issue-66-cfapi-acl-fixture.ps1");
 
 // Keep a distinct, literal executable at each process creation site. A
@@ -31,7 +32,8 @@ function runFixturePowershell(args, cwd, timeout = 10000) {
 }
 
 test("#66 native ACL preflight has no sync-root registration or file-content operations", async () => {
-  const code = await fs.readFile(source, "utf8");
+  const code = (await Promise.all([fs.readFile(source, "utf8"),
+    fs.readFile(rootPolicy, "utf8")])).join("\n");
   for (const unsafe of [/\bCfRegisterSyncRoot\s*\(/, /\bCfConnectSyncRoot\s*\(/,
     /\bCfCreatePlaceholders\s*\(/, /\bCfExecute\s*\(/,
     /\bSetNamedSecurityInfoW\s*\(/, /\bSetSecurityInfo\s*\(/,

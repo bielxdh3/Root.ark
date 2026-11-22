@@ -129,10 +129,15 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
         : name === "live-fetch.exe"
           ? path.resolve(__dirname, "../../sync-client/rootark-sync-windows-cfapi-live-fixture.cpp")
         : path.join(scratch, "inherit-only-fixture.cpp");
-  for (const filename of [vcvars, source, executable, objectFile, pdbFile]) {
+  const sharedPolicy = path.resolve(__dirname,
+    "../../sync-client/rootark-sync-windows-cfapi-root-policy.hpp");
+  const dependencies = ["acl-preflight.exe", "inherit-only-fixture.exe", "live-fetch.exe"]
+    .includes(name) ? [sharedPolicy] : [];
+  for (const filename of [vcvars, source, ...dependencies,
+    executable, objectFile, pdbFile]) {
     assert.doesNotMatch(filename, /[\r\n\x00-\x1f\x7f"%!^&|<>]/, FAIL);
   }
-  for (const filename of [vcvars, source]) {
+  for (const filename of [vcvars, source, ...dependencies]) {
     assert.equal(comparable(fs.realpathSync.native(filename)), comparable(filename), FAIL);
     const stat = fs.lstatSync(filename, { bigint: true });
     assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n, FAIL);
@@ -197,7 +202,7 @@ function validateFixtureArgs(name, scratch, args) {
   } else if (name === "live-fetch.exe") {
     allowed = values.length === 2
       && ["--disposable-live", "--disposable-live-stdin"].includes(values[0])
-      && comparable(values[1]) === comparable(`${scratch}-root`);
+      && comparable(values[1]) === comparable(path.join(scratch, "owner-only"));
   }
   assert.ok(allowed, FAIL);
   return values;

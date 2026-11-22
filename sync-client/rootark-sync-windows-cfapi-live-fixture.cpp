@@ -11,6 +11,7 @@
 #include <cstring>
 #include <array>
 #include <vector>
+#include "rootark-sync-windows-cfapi-root-policy.hpp"
 
 namespace {
 constexpr std::size_t kPayloadLength = 4097;
@@ -28,6 +29,65 @@ struct Context {
   unsigned successful = 0;
   unsigned rejected = 0;
   ~Context() { if (!payload.empty()) SecureZeroMemory(payload.data(), payload.size()); }
+};
+
+struct HeldRoot {
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  FILE_ID_INFO id{};
+  ~HeldRoot() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+  bool open(const wchar_t* root) {
+    // A retained handle without FILE_SHARE_DELETE prevents ordinary rename
+    // of this root while a disposable callback is connected. Full RootSession
+    // still needs independently enrolled ancestors and anti-rollback custody.
+    handle = CreateFileW(root, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | READ_CONTROL,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    FILE_ATTRIBUTE_TAG_INFO attributes{};
+    if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo, &attributes,
+        sizeof(attributes)) || !(attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+      || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+      || !GetFileInformationByHandleEx(handle, FileIdInfo, &id, sizeof(id))) return false;
+    wchar_t filesystem[64]{};
+    return GetVolumeInformationByHandleW(handle, nullptr, 0, nullptr, nullptr,
+      nullptr, filesystem, 64) && _wcsicmp(filesystem, L"NTFS") == 0;
+  }
+  bool samePath(const wchar_t* root) const {
+    HANDLE reopened = CreateFileW(root, FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (reopened == INVALID_HANDLE_VALUE) return false;
+    FILE_ID_INFO current{};
+    const bool exact = GetFileInformationByHandleEx(reopened, FileIdInfo,
+      &current, sizeof(current))
+      && current.VolumeSerialNumber == id.VolumeSerialNumber
+      && std::memcmp(&current.FileId, &id.FileId, sizeof(id.FileId)) == 0;
+    CloseHandle(reopened);
+    return exact;
+  }
+  bool registeredPolicy() const {
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    FILE_ATTRIBUTE_TAG_INFO tags{};
+    if (!GetFileInformationByHandleEx(handle, FileAttributeTagInfo,
+      &tags, sizeof(tags)) || !(tags.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+      || !(tags.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+      // Registration converts this exact native root into a Cloud Files
+      // reparse point. Accept only the documented CLOUD tag family; reject
+      // junctions, symlinks, mount points and arbitrary provider aliases.
+      || (tags.ReparseTag & 0xFFFF0FFFUL) != IO_REPARSE_TAG_CLOUD) return false;
+    wchar_t filesystem[64]{};
+    if (!GetVolumeInformationByHandleW(handle, nullptr, 0, nullptr, nullptr,
+      nullptr, filesystem, 64) || _wcsicmp(filesystem, L"NTFS") != 0) return false;
+    std::vector<unsigned char> sid;
+    if (!currentUserSid(sid)) return false;
+    ScopedDescriptor descriptor;
+    PSID owner = nullptr;
+    PACL dacl = nullptr;
+    return GetSecurityInfo(handle, SE_FILE_OBJECT,
+      OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+      &owner, nullptr, &dacl, nullptr, &descriptor.value) == ERROR_SUCCESS
+      && trustedDacl(descriptor.value, dacl, owner, sid);
+  }
 };
 
 bool readBoundedStdin(std::vector<unsigned char>& payload) {
@@ -120,9 +180,13 @@ int wmain(int argc, wchar_t** argv) {
       || _wcsnicmp(root, temp, tempLength) != 0) return 10;
   const wchar_t* leaf = root + tempLength;
   constexpr wchar_t prefix[] = L"rootark-cfapi-live-";
-  if (std::wcsncmp(leaf, prefix, (sizeof(prefix) / sizeof(wchar_t)) - 1) != 0
-      || !leaf[sizeof(prefix) / sizeof(wchar_t) - 1]
-      || std::wcschr(leaf, L'\\') || std::wcschr(leaf, L'/')) return 11;
+  const wchar_t* separator = std::wcschr(leaf, L'\\');
+  if (!separator || std::wcsncmp(leaf, prefix,
+      (sizeof(prefix) / sizeof(wchar_t)) - 1) != 0
+      || separator - leaf < static_cast<std::ptrdiff_t>(
+        sizeof(prefix) / sizeof(wchar_t) - 1 + 6)
+      || std::wcscmp(separator, L"\\owner-only") != 0
+      || std::wcschr(leaf, L'/')) return 11;
   const DWORD attributes = GetFileAttributesW(root);
   if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)
       || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return 12;
@@ -141,6 +205,10 @@ int wmain(int argc, wchar_t** argv) {
     if (nonempty) return 5;
   } else if (GetLastError() != ERROR_FILE_NOT_FOUND) return 6;
 
+  HeldRoot held;
+  DWORD platform = 0;
+  if (!held.open(root) || !held.samePath(root) || !inspect(root, platform)) return 14;
+
   Context context;
   if (streamed && !readBoundedStdin(context.payload)) return 13;
   CF_SYNC_REGISTRATION registration{};
@@ -157,8 +225,14 @@ int wmain(int argc, wchar_t** argv) {
   if (FAILED(result)) { std::printf("register=0x%08lx\n", static_cast<unsigned long>(result)); return 7; }
   CF_CONNECTION_KEY connection{};
   bool connected = false;
+  bool finalIdentity = false;
+  bool finalPolicy = false;
+  bool finalCloudReparse = false;
+  bool finalOwnerAcl = false;
+  DWORD finalTag = 0;
   int exitCode = 8;
   do {
+    if (!held.samePath(root) || !inspect(root, platform)) break;
     result = CfConnectSyncRoot(root, kCallbacks, &context, CF_CONNECT_FLAG_NONE, &connection);
     if (FAILED(result)) break;
     connected = true;
@@ -181,7 +255,24 @@ int wmain(int argc, wchar_t** argv) {
     const BOOL read = ReadFile(handle, received.data(),
       static_cast<DWORD>(received.size()), &got, nullptr);
     CloseHandle(handle);
-    if (!read || got != context.payload.size()
+    finalIdentity = held.samePath(root);
+    finalPolicy = held.registeredPolicy();
+    FILE_ATTRIBUTE_TAG_INFO tags{};
+    finalCloudReparse = GetFileInformationByHandleEx(held.handle, FileAttributeTagInfo,
+      &tags, sizeof(tags)) && (tags.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+      && (tags.ReparseTag & 0xFFFF0FFFUL) == IO_REPARSE_TAG_CLOUD;
+    finalTag = tags.ReparseTag;
+    std::vector<unsigned char> sid;
+    ScopedDescriptor descriptor;
+    PSID owner = nullptr;
+    PACL dacl = nullptr;
+    finalOwnerAcl = currentUserSid(sid)
+      && GetSecurityInfo(held.handle, SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner, nullptr, &dacl, nullptr, &descriptor.value) == ERROR_SUCCESS
+      && trustedDacl(descriptor.value, dacl, owner, sid);
+    if (!read || !finalIdentity || !finalPolicy
+        || got != context.payload.size()
         || std::memcmp(received.data(), context.payload.data(), context.payload.size()) != 0
         || context.callbacks == 0 || context.successful == 0) break;
     exitCode = 0;
@@ -192,8 +283,14 @@ int wmain(int argc, wchar_t** argv) {
   if (FAILED(unregisterResult)) exitCode = 9;
   std::printf("{\"liveKernelCallbackCount\":%u,\"successfulTransfers\":%u,"
     "\"rejectedTransfers\":%u,\"verifiedBytes\":%zu,"
+    "\"finalRootIdentity\":%s,\"finalRootPolicy\":%s,"
+    "\"finalCloudReparse\":%s,\"finalOwnerAcl\":%s,"
+    "\"finalReparseTag\":%lu,"
     "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
     context.callbacks, context.successful, context.rejected, context.payload.size(),
+    finalIdentity ? "true" : "false", finalPolicy ? "true" : "false",
+    finalCloudReparse ? "true" : "false", finalOwnerAcl ? "true" : "false",
+    finalTag,
     SUCCEEDED(unregisterResult) ? "true" : "false",
     exitCode == 0 ? "true" : "false");
   return exitCode;

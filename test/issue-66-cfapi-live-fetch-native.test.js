@@ -16,6 +16,15 @@ const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } =
   require("../sync-client/rootark-sync-authorization");
 
+const aclScript = path.join(__dirname, "support/issue-66-cfapi-acl-fixture.ps1");
+function protectDisposableRoot(root, cwd, expose = "0") {
+  const outcome = spawnSync("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+      "-File", aclScript, root, expose],
+    { cwd, encoding: "utf8", timeout: 10000, windowsHide: true });
+  assert.equal(outcome.status, 0, "disposable owner-only root ACL must be established");
+}
+
 test("#66 live Windows CFAPI kernel FETCH_DATA completes and unregisters the disposable root",
   { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
     const where = spawnSync("C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe",
@@ -24,12 +33,13 @@ test("#66 live Windows CFAPI kernel FETCH_DATA completes and unregisters the dis
     const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
     if (!vcvars) { t.skip("MSVC x64 unavailable"); return; }
     const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-live-"));
-    const root = `${scratch}-root`;
+    const root = path.join(scratch, "owner-only");
     t.after(async () => {
       await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       await fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
     await fs.mkdir(root);
+    protectDisposableRoot(root, scratch);
     const { receipt, buildResult } = buildCompiledFixture(scratch, "live-fetch.exe", vcvars);
     assert.equal(buildResult.status, 0);
     assert.throws(() => runCompiledFixture(receipt, ["--disposable-live", scratch]),
@@ -43,6 +53,10 @@ test("#66 live Windows CFAPI kernel FETCH_DATA completes and unregisters the dis
     assert.equal(evidence.verifiedBytes, 4097,
       "native real callback must hydrate the final unaligned EOF byte");
     assert.equal(evidence.unregistered, true);
+    assert.equal(evidence.finalRootIdentity, true);
+    assert.equal(evidence.finalRootPolicy, true);
+    assert.equal(evidence.finalOwnerAcl, true);
+    assert.equal(evidence.finalCloudReparse, true);
     assert.equal(evidence.positiveReadVerified, true);
   });
 
@@ -73,11 +87,17 @@ test("#66 signed Ed25519/AES-GCM Sync v2 bytes hydrate through a real native CFA
     const trusted = { username: "alice",
       trustedDevicePublicKeys: { "device-1": publicKey }, revokedDeviceIds: [] };
     assert.equal(await verifyAuthorizationProof(op.authorization, op, trusted), true);
+    const revoked = { ...trusted, revokedDeviceIds: ["device-1"] };
+    await assert.rejects(verifyAuthorizationProof(op.authorization, op, revoked),
+      { code: "authorization_device_revoked" },
+      "revoked device proof cannot become native materialization authority");
+    assert.throws(() => protocol.decryptPayload(op, crypto.randomBytes(32)),
+      "wrong AEAD key must fail before starting the native provider");
     const decrypted = protocol.decryptPayload(op, fileKey);
     assert.deepEqual(decrypted, plaintext, "native source is exact authenticated AEAD plaintext");
 
     const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-live-"));
-    const root = `${scratch}-root`;
+    const root = path.join(scratch, "owner-only");
     t.after(async () => {
       decrypted.fill(0);
       fileKey.fill(0);
@@ -86,6 +106,7 @@ test("#66 signed Ed25519/AES-GCM Sync v2 bytes hydrate through a real native CFA
       await fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     });
     await fs.mkdir(root);
+    protectDisposableRoot(root, scratch);
     const { receipt } = buildCompiledFixture(scratch, "live-fetch.exe", vcvars);
     assert.throws(() => runCompiledFixture(receipt, ["--disposable-live-stdin", root]),
       /UNTRUSTED_EXECUTABLE/, "native stdin mode requires a bounded binary buffer");
@@ -98,4 +119,29 @@ test("#66 signed Ed25519/AES-GCM Sync v2 bytes hydrate through a real native CFA
     assert.ok(evidence.successfulTransfers >= 1);
     assert.equal(evidence.rejectedTransfers, 0);
     assert.equal(evidence.unregistered, true);
+    assert.equal(evidence.finalRootIdentity, true);
+    assert.equal(evidence.finalRootPolicy, true);
+    assert.equal(evidence.finalCloudReparse, true);
+  });
+
+test("#66 native CFAPI registration rejects a broad DACL before creating any placeholder",
+  { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
+    const where = spawnSync("C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe",
+      ["-all", "-products", "*", "-prerelease", "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"],
+      { encoding: "utf8", timeout: 6000, windowsHide: true });
+    const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
+    if (!vcvars) { t.skip("MSVC x64 unavailable"); return; }
+    const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-live-"));
+    const root = path.join(scratch, "owner-only");
+    t.after(async () => {
+      await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      await fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    });
+    await fs.mkdir(root);
+    protectDisposableRoot(root, scratch, "1");
+    const { receipt } = buildCompiledFixture(scratch, "live-fetch.exe", vcvars);
+    const result = runCompiledFixture(receipt, ["--disposable-live", root], 10000);
+    assert.equal(result.status, 14,
+      "broad ACL must fail the held-root preflight before any native registration");
+    assert.deepEqual(await fs.readdir(root), [], "denied root remains unmodified");
   });

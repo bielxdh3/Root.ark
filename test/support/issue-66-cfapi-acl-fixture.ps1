@@ -8,7 +8,7 @@ try {
   $targetInfo = [System.IO.DirectoryInfo]::new($Target)
   $parent = $targetInfo.Parent
   if (-not $parent -or
-      $parent.Name -notmatch '^rootark-cfapi-(acl|privilege|phase)-test-[A-Za-z0-9_-]{6,}$' -or
+      $parent.Name -notmatch '^(rootark-cfapi-(acl|privilege|phase)-test-|rootark-cfapi-live-)[A-Za-z0-9_-]{6,}$' -or
       $targetInfo.Name -notin @('owner-only', 'broad-access', 'inherited-access') -or
       ($parent.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
       ($targetInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
