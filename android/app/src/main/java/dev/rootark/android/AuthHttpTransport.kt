@@ -11,14 +11,12 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.math.BigDecimal
 import java.math.BigInteger
-import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLConnection
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import javax.net.ssl.HttpsURLConnection
-import org.json.JSONException
 import org.json.JSONObject
 
 /** Listing-only failures do not alter the HTTP or core API contract. */
@@ -29,9 +27,14 @@ internal class SyncListingValidationException(message: String, cause: Throwable?
 /** HTTP adapter for canonical login/TOTP and the bounded, read-only sync listing. */
 internal class AuthHttpTransport(
     private val clockNanos: () -> Long = System::nanoTime,
+    private val openAuthConnection: (URL) -> URLConnection = { it.openConnection() },
     private val openInventoryConnection: (URL) -> URLConnection = { it.openConnection() },
 ) {
-    companion object { const val INVENTORY_READ_DEADLINE_NANOS = 30_000_000_000L }
+    companion object {
+        const val INVENTORY_READ_DEADLINE_NANOS = 30_000_000_000L
+        const val AUTH_READ_DEADLINE_NANOS = 30_000_000_000L
+        private const val AUTH_MAX_RESPONSE_BYTES = 16 * 1024
+    }
 
     fun login(origin: ServerOrigin, username: String, password: String): LoginOutcome {
         val (status, json) = post(origin.loginUrl(), JSONObject().put("username", username).put("password", password))
@@ -325,7 +328,8 @@ internal class AuthHttpTransport(
         parsePositiveInt(json.opt(name)) ?: throw IOException("Unexpected authentication response")
 
     private fun post(url: java.net.URL, body: JSONObject): Pair<Int, JSONObject> {
-        val connection = url.openConnection() as HttpURLConnection
+        val connection = openAuthConnection(url) as? HttpsURLConnection
+            ?: throw IOException("TLS authentication transport unavailable")
         try {
             connection.requestMethod = "POST"
             connection.instanceFollowRedirects = false
@@ -337,8 +341,18 @@ internal class AuthHttpTransport(
             connection.setRequestProperty("Cache-Control", "no-store")
             connection.doOutput = true
             connection.outputStream.use { it.write(body.toString().toByteArray(StandardCharsets.UTF_8)) }
+            val requestStartedAt = clockNanos()
             val status = connection.responseCode
             if (status != 200 && status != 403) throw RootArkApiException(status)
+            val mime = connection.contentType?.substringBefore(';')?.trim()
+            if (!"application/json".equals(mime, ignoreCase = true) ||
+                (connection.contentEncoding != null &&
+                    !"identity".equals(connection.contentEncoding, ignoreCase = true))) {
+                throw IOException("Invalid authentication response encoding")
+            }
+            if (connection.contentLengthLong > AUTH_MAX_RESPONSE_BYTES) {
+                throw IOException("Authentication response exceeds declared size limit")
+            }
             val stream = (if (status == 200) connection.inputStream else connection.errorStream)
                 ?: throw IOException("Missing authentication response")
             val json = stream.use { input ->
@@ -346,15 +360,28 @@ internal class AuthHttpTransport(
                 val chunk = ByteArray(4096)
                 var total = 0
                 while (true) {
+                    if (clockNanos() - requestStartedAt >= AUTH_READ_DEADLINE_NANOS) {
+                        throw IOException("Authentication response exceeded read deadline")
+                    }
                     val count = input.read(chunk)
+                    if (clockNanos() - requestStartedAt >= AUTH_READ_DEADLINE_NANOS) {
+                        throw IOException("Authentication response exceeded read deadline")
+                    }
                     if (count < 0) break
+                    if (count > AUTH_MAX_RESPONSE_BYTES - total) {
+                        throw IOException("Authentication response exceeds limit")
+                    }
                     total += count
-                    if (total > 16 * 1024) throw IOException("Authentication response exceeds limit")
                     output.write(chunk, 0, count)
                 }
                 try {
-                    JSONObject(String(output.toByteArray(), StandardCharsets.UTF_8))
-                } catch (e: JSONException) {
+                    val text = StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .decode(ByteBuffer.wrap(output.toByteArray())).toString()
+                    StrictRfc8259Json.validate(text)
+                    JSONObject(text)
+                } catch (e: Exception) {
                     throw IOException("Malformed JSON in authentication response", e)
                 }
             }
