@@ -21,11 +21,14 @@
   const BUFFER_HIGH = 256 * 1024;
   let preparingFile = false;
   let ws, roomId, hostKey, selfId, role;
+  // Distinguish a pending HTTP room creation from a newer explicit room intent.
+  let roomGeneration = 0;
   const peers = new Map(), invites = new Map();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
 
   function connect(credentials) {
+    roomGeneration++;
     const oldSocket = ws;
     ws = null; // old callbacks must not retain authority over the new room.
     if (oldSocket && oldSocket.readyState < 2) oldSocket.close();
@@ -486,9 +489,12 @@
     log('Texto enviado a ' + count + ' destinatário(s)');
   }
   async function createRoom() {
+    const generation = ++roomGeneration;
     const response = await fetch('/rooms', { method: 'POST' });
+    if (generation !== roomGeneration) return;
     if (!response.ok) throw new Error('room creation failed');
     const result = await response.json();
+    if (generation !== roomGeneration) return;
     ({ roomId, hostKey } = result);
     $('room').textContent = roomId;
     connect({ hostKey });

@@ -330,3 +330,21 @@ test('P2: attachChannel strictly rejects data channels with missing or invalid l
     assert.ok(f.snapshot().diagnostics.rejected.includes('INVALID_CHANNEL'));
   }
 });
+
+test('P2 RED: late room creation response cannot hijack a newer signed room join', async () => {
+  let releaseFirst, calls = 0;
+  const f = clientFixture({ fetchImpl: async () => {
+    calls++;
+    if (calls === 1) await new Promise(resolve => { releaseFirst = resolve; });
+    return { ok: true, json: async () => ({ roomId: 'stale-created-A', hostKey: 'secret-A' }) };
+  } });
+  const pending = f.createRoom();
+  assert.equal(typeof releaseFirst, 'function', 'test must really hold the HTTP response');
+  f.joinRoom('chosen-B', 'invite-B');
+  assert.equal(f.snapshot().roomId, 'chosen-B');
+  releaseFirst();
+  await pending;
+  assert.equal(f.snapshot().roomId, 'chosen-B',
+    'obsolete HTTP creation response must not replace the newer room intent');
+  assert.equal(f.sockets.length, 1, 'no stale WebSocket should be created');
+});
