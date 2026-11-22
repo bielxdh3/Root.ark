@@ -124,6 +124,22 @@ async function runPicker(t, mode, selectedPath = "docs/verified.txt", options = 
     launch: await fs.readFile(launch, "utf8").then(JSON.parse, () => null) };
 }
 
+async function assertExplorerRevealsFile(launch, expectedFile) {
+  assert.ok(launch, "Explorer must be launched after verified hydration");
+  assert.equal(launch.process.toLowerCase().endsWith("explorer.exe"), true);
+  assert.equal(launch.arguments.length, 1, "Explorer must receive exactly one selection argument");
+  const selection = /^\/select,"([^"]+)"$/i.exec(launch.arguments[0]);
+  assert.ok(selection, "Explorer must receive a quoted, single-file /select argument");
+  // Windows PowerShell's GetFullPath expands NTFS 8.3 components while Node's
+  // os.tmpdir() can report RUNNER~1. Compare the actual on-disk destination;
+  // different names, symlinks, or sibling files must never satisfy this check.
+  const [actualCanonical, expectedCanonical] = await Promise.all([
+    fs.realpath(selection[1]), fs.realpath(expectedFile),
+  ]);
+  assert.equal(actualCanonical.toLowerCase(), expectedCanonical.toLowerCase(),
+    "Explorer must reveal the exact verified local file");
+}
+
 for (const [mode, message] of [
   ["missing-Out-GridView", "Out-GridView requires Windows PowerShell with the GraphicalTools feature."],
   ["missing-node", "Node.js is required to run the Root.ark Windows picker. Ensure node is available on PATH."],
@@ -145,8 +161,7 @@ test("issue 66 Windows: Explorer picker pages metadata then reveals only a verif
   assert.equal(trace.split(/\r?\n/).filter((line) => line.includes("|browse|")).length, 2);
   assert.equal(trace.split(/\r?\n/).filter((line) => line.includes("|hydrate|")).length, 1);
   assert.match(trace, /--path=docs\/verified\.txt/);
-  assert.equal(launch.process.toLowerCase().endsWith("explorer.exe"), true);
-  assert.deepEqual(launch.arguments, [`/select,"${path.join(local, "docs", "verified.txt")}"`]);
+  await assertExplorerRevealsFile(launch, path.join(local, "docs", "verified.txt"));
   assert.equal(await fs.readFile(path.join(local, "docs", "verified.txt"), "utf8"), "unchanged local bytes");
 });
 
@@ -154,7 +169,7 @@ test("issue 66 Windows: relative config argument uses PowerShell provider locati
   const { result, local, trace, launch } = await runPicker(t, "ok", "docs/verified.txt", { relativeConfig: true });
   assert.equal(result.status, 0, `${result.stdout} ${result.stderr}`);
   assert.match(trace, /\|browse\|/);
-  assert.deepEqual(launch.arguments, [`/select,"${path.join(local, "docs", "verified.txt")}"`]);
+  await assertExplorerRevealsFile(launch, path.join(local, "docs", "verified.txt"));
 });
 
 for (const folderMode of ["relative", "drive-relative", "root-relative"]) {
@@ -164,7 +179,7 @@ for (const folderMode of ["relative", "drive-relative", "root-relative"]) {
     });
     assert.equal(result.status, 0, `${result.stdout} ${result.stderr}`);
     assert.match(trace, /\|hydrate\|/);
-    assert.deepEqual(launch.arguments, [`/select,"${path.join(local, "docs", "verified.txt")}"`]);
+    await assertExplorerRevealsFile(launch, path.join(local, "docs", "verified.txt"));
   });
 }
 
