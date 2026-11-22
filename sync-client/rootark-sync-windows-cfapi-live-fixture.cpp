@@ -61,6 +61,18 @@ bool disposableLabAuthorize(const CF_CALLBACK_INFO* info, void* opaque) noexcept
     static_cast<const Context*>(opaque)->root != nullptr;
 }
 
+// Disposable race injector: the owner withdraws the physical pin and then
+// publishes the SAME NTFS inode while FETCH_DATA awaits its authority result.
+// The in-flight callback must never borrow the newly issued pin.
+bool disposableRePinAuthorize(const CF_CALLBACK_INFO* info, void* opaque) noexcept {
+  if (!info || !opaque) return false;
+  auto& ctx = *static_cast<Context*>(opaque);
+  const auto originalFileId = ctx.pinnedFileId();
+  ctx.revokePlaceholder();
+  ctx.publishPlaceholder(originalFileId);
+  return matchesPinnedPlaceholder(ctx, info);
+}
+
 
 }
 
@@ -70,12 +82,14 @@ int wmain(int argc, wchar_t** argv) {
       && std::wcscmp(argv[1], L"--disposable-live-alias") != 0
       && std::wcscmp(argv[1], L"--disposable-concurrent-alias") != 0
       && std::wcscmp(argv[1], L"--disposable-no-authority") != 0
+      && std::wcscmp(argv[1], L"--disposable-repin-during-authority") != 0
       && std::wcscmp(argv[1], L"--disposable-native-names") != 0)) return 2;
   const bool streamed = std::wcscmp(argv[1], L"--disposable-live-stdin") == 0;
   const bool aliasMode = std::wcscmp(argv[1], L"--disposable-live-alias") == 0;
   const bool concurrentMode = std::wcscmp(argv[1], L"--disposable-concurrent-alias") == 0;
   const bool nameMode = std::wcscmp(argv[1], L"--disposable-native-names") == 0;
   const bool denyAuthority = std::wcscmp(argv[1], L"--disposable-no-authority") == 0;
+  const bool repinDuringAuthority = std::wcscmp(argv[1], L"--disposable-repin-during-authority") == 0;
   const wchar_t* root = argv[2];
   if (!root || std::wcslen(root) < 8 || std::wcslen(root) > 4096
       || root[1] != L':' || root[2] != L'\\') return 3;
@@ -121,7 +135,8 @@ int wmain(int argc, wchar_t** argv) {
   context.payload = makePayload();
   context.identity.assign(kIdentity, kIdentity + sizeof(kIdentity) - 1);
   if (!denyAuthority) {
-    context.authorize = disposableLabAuthorize;
+    context.authorize = repinDuringAuthority ? disposableRePinAuthorize
+      : disposableLabAuthorize;
     context.authorityContext = &context;
   }
   context.root = &held;
@@ -196,10 +211,8 @@ int wmain(int argc, wchar_t** argv) {
     if (!GetFileInformationByHandle(original.value, &physical)
         || physical.nNumberOfLinks != 1
         || !(physical.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) break;
-    context.placeholderFileId.store(
-      (static_cast<ULONGLONG>(physical.nFileIndexHigh) << 32) | physical.nFileIndexLow,
-      std::memory_order_relaxed);
-    context.placeholderPinned.store(true, std::memory_order_release);
+    context.publishPlaceholder(
+      (static_cast<ULONGLONG>(physical.nFileIndexHigh) << 32) | physical.nFileIndexLow);
     HANDLE handle = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, nullptr,
       OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (handle == INVALID_HANDLE_VALUE) break;
@@ -208,7 +221,7 @@ int wmain(int argc, wchar_t** argv) {
     const BOOL read = ReadFile(handle, received.data(),
       static_cast<DWORD>(received.size()), &got, nullptr);
     CloseHandle(handle);
-    if (denyAuthority) {
+    if (denyAuthority || repinDuringAuthority) {
       if (read || got != 0 || context.successful.load() != 0
           || context.rejected.load() == 0) break;
       exitCode = 0;

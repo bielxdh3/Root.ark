@@ -55,8 +55,7 @@ bool run() {
   Context ctx;
   ctx.identity.assign({'c', 'f', 'a', 'p', 'i'});
   ctx.payload.assign(4097, 0xA5);
-  ctx.placeholderFileId.store(12345, std::memory_order_relaxed);
-  ctx.placeholderPinned.store(true, std::memory_order_release);
+  ctx.publishPlaceholder(12345);
   CF_CALLBACK_INFO canceled = request(ctx, 11, 22, 33);
   canceled.FileSize.QuadPart = static_cast<LONGLONG>(ctx.payload.size());
   canceled.FileIdentity = ctx.identity.data();
@@ -173,20 +172,26 @@ bool run() {
   Context latePin;
   latePin.identity.assign({'p', 'i', 'n'});
   latePin.payload.assign(4096, 0xAC);
-  latePin.placeholderFileId.store(17, std::memory_order_relaxed);
-  latePin.placeholderPinned.store(true, std::memory_order_release);
+  latePin.publishPlaceholder(17);
   CF_CALLBACK_INFO pinRequest = request(latePin, 41, 42, 43);
   pinRequest.FileIdentity = latePin.identity.data();
   pinRequest.FileIdentityLength = static_cast<DWORD>(latePin.identity.size());
   pinRequest.FileSize.QuadPart = static_cast<LONGLONG>(latePin.payload.size());
   pinRequest.FileId.QuadPart = 17;
   if (!matchesPinnedPlaceholder(latePin, &pinRequest)) return false;
-  latePin.placeholderPinned.store(false, std::memory_order_release);
+  latePin.revokePlaceholder();
   if (matchesPinnedPlaceholder(latePin, &pinRequest)) return false;
-  latePin.placeholderPinned.store(true, std::memory_order_release);
-  latePin.placeholderFileId.store(18, std::memory_order_release);
+  latePin.publishPlaceholder(18);
   if (matchesPinnedPlaceholder(latePin, &pinRequest)) return false;
-  latePin.placeholderFileId.store(17, std::memory_order_release);
+  latePin.publishPlaceholder(17);
+  // A callback can yield to native unpin/re-pin while a separate authority
+  // check is running. Reusing the very same physical inode must not make
+  // that new pin silently authorize an OLD in-flight request.
+  const auto beforeAba = latePin.pinGeneration();
+  latePin.revokePlaceholder();
+  latePin.publishPlaceholder(17);
+  if (!matchesPinnedPlaceholder(latePin, &pinRequest)
+      || latePin.pinGeneration() == beforeAba) return false;
   unsigned char foreignIdentity[3] = {'b', 'a', 'd'};
   pinRequest.FileIdentity = foreignIdentity;
   if (matchesPinnedPlaceholder(latePin, &pinRequest)) return false;

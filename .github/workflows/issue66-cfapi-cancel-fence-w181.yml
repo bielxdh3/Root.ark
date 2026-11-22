@@ -4,11 +4,14 @@ on:
   push:
     branches:
       - agent/pr300-cfapi-native-w181-20261122
+      - agent/pr300-fetch-positive-w190-20261122
     paths:
       - '.github/workflows/issue66-cfapi-cancel-fence-w181.yml'
       - 'sync-client/rootark-sync-windows-cfapi-cancel-fence.hpp'
       - 'sync-client/rootark-sync-windows-cfapi-cancel-fence-test.cpp'
       - 'sync-client/rootark-sync-windows-cfapi-provider.hpp'
+      - 'sync-client/rootark-sync-windows-cfapi-live-fixture.cpp'
+      - 'test/issue-66-cfapi-live-fetch-native.test.js'
 
 permissions:
   contents: read
@@ -44,4 +47,21 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw "CFAPI $mode iteration $iteration failed" }
             }
             Write-Output "$mode /W4 /WX: 16/16 native adversarial tests passed."
+  native-kernel-pin-generation:
+    name: Windows NTFS CFAPI positive FETCH_DATA and pin-reissue denial
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install exact native fixture dependencies
+        run: npm ci
+      - name: Validate live CFAPI register/connect, signed hydration and same-inode repin denial
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --test test/issue-66-cfapi-live-fetch-native.test.js
           }

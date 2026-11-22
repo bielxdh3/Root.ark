@@ -264,6 +264,35 @@ test("#66 native CFAPI provider cannot transfer bytes without an explicit callba
     assert.equal(evidence.unregistered, true);
   });
 
+test("#66 kernel FETCH_DATA denies pin revoked and reissued for the same NTFS inode during authority",
+  { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
+    const where = spawnSync("C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe",
+      ["-all", "-products", "*", "-prerelease", "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"],
+      { encoding: "utf8", timeout: 6000, windowsHide: true });
+    const vcvars = where.status === 0 ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
+    if (!vcvars) { t.skip("MSVC x64 unavailable"); return; }
+    const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-live-"));
+    const root = path.join(scratch, "owner-only");
+    t.after(async () => {
+      await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      await fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    });
+    await fs.mkdir(root);
+    protectDisposableRoot(root, scratch);
+    const { receipt } = buildCompiledFixture(scratch, "live-fetch.exe", vcvars);
+    const outcome = runCompiledFixture(receipt,
+      ["--disposable-repin-during-authority", root], 20000);
+    assert.equal(outcome.status, 0,
+      `reissued pin must not authorize an in-flight native transfer: ${outcome.stdout}\n${outcome.stderr}`);
+    const evidence = JSON.parse(outcome.stdout.trim());
+    assert.ok(evidence.liveKernelCallbackCount >= 1, "real kernel FETCH_DATA must be exercised");
+    assert.ok(evidence.rejectedTransfers >= 1);
+    assert.equal(evidence.successfulTransfers, 0, "reissued native pin cannot resurrect the old callback");
+    assert.equal(evidence.positiveReadVerified, false);
+    assert.equal(evidence.nativeRelativeOpen, true);
+    assert.equal(evidence.unregistered, true);
+  });
+
 for (const length of [1, 65537]) {
   test(`#66 native kernel CFAPI hydrates ${length} binary bytes across aligned EOF ranges`,
     { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {

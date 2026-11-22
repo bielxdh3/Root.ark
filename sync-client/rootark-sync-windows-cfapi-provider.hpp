@@ -8,6 +8,7 @@
 #include <vector>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include "rootark-sync-windows-cfapi-cancel-fence.hpp"
 #include "rootark-sync-windows-native-root-session.hpp"
@@ -25,10 +26,34 @@ struct Context {
   const HeldRoot* root = nullptr;
   const HeldAncestors* ancestors = nullptr;
   const wchar_t* path = nullptr;
-  // Bind the callback to the exact native placeholder inode, independently
-  // of user-controlled FileIdentity or a reopened mutable pathname.
+private:
+  // Native pin state can be withdrawn while a callback is authorizing a
+  // transfer. Keep the mutation surface private: every new pin or revocation
+  // advances one monotonically increasing admission generation, including a
+  // revoke/re-pin of the SAME physical NTFS inode.
   std::atomic<ULONGLONG> placeholderFileId{0};
   std::atomic<bool> placeholderPinned{false};
+  std::atomic<std::uint64_t> placeholderGeneration{0};
+public:
+  void publishPlaceholder(ULONGLONG fileId) noexcept {
+    placeholderPinned.store(false, std::memory_order_release);
+    placeholderFileId.store(fileId, std::memory_order_release);
+    placeholderGeneration.fetch_add(1, std::memory_order_acq_rel);
+    placeholderPinned.store(true, std::memory_order_release);
+  }
+  void revokePlaceholder() noexcept {
+    placeholderPinned.store(false, std::memory_order_release);
+    placeholderGeneration.fetch_add(1, std::memory_order_acq_rel);
+  }
+  std::uint64_t pinGeneration() const noexcept {
+    return placeholderGeneration.load(std::memory_order_acquire);
+  }
+  ULONGLONG pinnedFileId() const noexcept {
+    return placeholderFileId.load(std::memory_order_acquire);
+  }
+  bool isPlaceholderPinned() const noexcept {
+    return placeholderPinned.load(std::memory_order_acquire);
+  }
   std::atomic<unsigned> callbacks{0};
   std::atomic<unsigned> successful{0};
   std::atomic<unsigned> rejected{0};
@@ -46,9 +71,9 @@ bool matchesPinnedPlaceholder(const Context& ctx, const CF_CALLBACK_INFO* info) 
     && info->FileIdentityLength == ctx.identity.size()
     && std::memcmp(info->FileIdentity, ctx.identity.data(), ctx.identity.size()) == 0
     && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size())
-    && ctx.placeholderPinned.load(std::memory_order_acquire)
+    && ctx.isPlaceholderPinned()
     && static_cast<ULONGLONG>(info->FileId.QuadPart)
-      == ctx.placeholderFileId.load(std::memory_order_acquire);
+      == ctx.pinnedFileId();
 }
 
 bool retainsNativeCustody(const Context& ctx) {
@@ -80,6 +105,7 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
   // Each request must be bound to the provider's exact identity and checked
   // against the verified immutable buffer. This fixture does not certify a
   // production owner-signed object or live revocation policy.
+  const auto admittedPinGeneration = ctx.pinGeneration();
   const bool identityMatches = matchesPinnedPlaceholder(ctx, info);
   const bool rangeMatches = offset >= 0 && offset % 4096 == 0 && length > 0
     && offset < static_cast<LONGLONG>(ctx.payload.size())
@@ -92,9 +118,11 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
   // path replacement. Recheck all three predicates after the authority call,
   // before offering data to the kernel. This narrows (does not eliminate) the
   // final check -> CfExecute window: already-submitted bytes are irreversible.
-  // Pin true -> false -> true ABA requires an independent custody generation;
-  // neither this callback nor a mock can certify that external authority.
+  // The local monotonic generation blocks same-inode pin ABA across the
+  // authorizer. Independent owner-signed/root custody is still required; a
+  // mock's positive callback alone cannot confer that authority.
   if (independentlyAdmitted && !ctx.cancellations.canceled(info)
+      && ctx.pinGeneration() == admittedPinGeneration
       && matchesPinnedPlaceholder(ctx, info) && retainsNativeCustody(ctx)) {
     transfer.TransferData.CompletionStatus = 0;
     transfer.TransferData.Buffer = ctx.payload.data() + static_cast<std::size_t>(offset);
