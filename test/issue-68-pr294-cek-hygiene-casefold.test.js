@@ -242,10 +242,12 @@ test("P1: recipient CEK and authenticated plaintext teardown ignore poisoned .fi
 test("P2: Windows CLI rejects case-insensitive aliases before private I/O", () => {
   const property = Object.getOwnPropertyDescriptor(process, "platform");
   assert.equal(property?.configurable, true, "must exercise actual Windows parse branch");
-  const acceptedLinux = cli.parse(["redeem", "--owned-dir", "/safe-root",
-    "--context-module", "trust.js", "--offer", "ITEM.JSON", "--output", "item.json"]);
-  assert.equal(acceptedLinux.opts["--offer"], "ITEM.JSON");
   try {
+    // Run both OS-specific parser paths regardless of the CI runner's host.
+    Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+    const acceptedLinux = cli.parse(["redeem", "--owned-dir", "/safe-root",
+      "--context-module", "trust.js", "--offer", "ITEM.JSON", "--output", "item.json"]);
+    assert.equal(acceptedLinux.opts["--offer"], "ITEM.JSON");
     Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
     for (const args of [
       ["redeem", "--owned-dir", "E:\\safe-root", "--context-module", "trust.js",
