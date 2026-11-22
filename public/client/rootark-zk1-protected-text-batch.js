@@ -106,15 +106,27 @@
       // Capture the session authority before a checked GET or CEK provider can
       // await and replace the mutable caller-owned assertLive property.
       const assertLive = input.assertLive.bind(input);
+      // Signed GET is a custody boundary too: an awaited callback must not
+      // replace the reader for the next protected revision.
+      const getChecked = input.getChecked.bind(input);
+      // Retain the exact owner-held CEK reader and optional encrypted-index
+      // writer before any async GET. In particular, a callback cannot turn
+      // readCek off to bypass its mandatory finally-zeroization.
+      const readCek = input.readCek?.bind(input) || null;
+      const onVerifiedBatch = input.onVerifiedBatch?.bind(input) || null;
+      const onProgress = input.onProgress?.bind(input) || null;
+      const isCancelled = input.isCancelled?.bind(input) || null;
       const match = checkedMatcher(input);
-      const items = checkedItems(input);
+      // Pin the validated membership before the first await. A later signed
+      // GET must not append extra ciphertexts into another search window.
+      const items = checkedItems(input).slice();
       const matches = [];
       // The optional encrypted revision index only receives a complete batch.
       // Never commit an earlier window if a later signed GET/CEK fails.
-      const indexRows = input.onVerifiedBatch ? [] : null;
+      const indexRows = onVerifiedBatch ? [] : null;
       const live = () => {
         const current = assertLive();
-        const cancelled = input.isCancelled?.();
+        const cancelled = isCancelled?.();
         if (current === false || current && typeof current.then === "function"
           || cancelled !== undefined && cancelled !== false) deny();
       };
@@ -125,12 +137,12 @@
         for (const item of items.slice(offset, offset + WINDOW)) {
           live();
           // This callback performs fresh signed LIST/HEAD/GET. Never pass query/CEK.
-          const checked = await input.getChecked(
+          const checked = await getChecked(
             item.selected.objectId, item.selected.revision);
           live();
           let rawCek = null;
           try {
-            rawCek = input.readCek ? await input.readCek(item.cekFile) : item.rawCek;
+            rawCek = readCek ? await readCek(item.cekFile) : item.rawCek;
             live();
             if (!(rawCek instanceof Uint8Array) || rawCek.length !== 32) deny();
             const opened = await preview.open({
@@ -162,11 +174,11 @@
                 excerpt: normalized.slice(begin, begin + MAX_EXCERPT),
               }));
             }
-          } finally { if (input.readCek) rawCek?.fill(0); }
+          } finally { if (readCek) rawCek?.fill(0); }
         }
         live();
-        if (input.onProgress) {
-          const reported = input.onProgress(Object.freeze({
+        if (onProgress) {
+          const reported = onProgress(Object.freeze({
             completed: Math.min(offset + WINDOW, items.length), total: items.length,
           }));
           if (reported && typeof reported.then === "function") deny();
@@ -177,7 +189,7 @@
       // No partial plaintext is persisted if any verification or cancellation fails.
       let indexChange = null;
       if (indexRows) {
-        const indexed = await input.onVerifiedBatch(Object.freeze(indexRows));
+        const indexed = await onVerifiedBatch(Object.freeze(indexRows));
         live();
         if (indexed?.persistedIndex !== true
           || indexed.indexedCount < indexRows.length
