@@ -48,6 +48,35 @@ function releaseClockTransfer({ hpkeOpen } = {}) {
     },
   };
 }
+// Inject an observer BEFORE the isolated file-content module captures native
+// WebCrypto methods. This still exercises real AES-GCM and HPKE; it does not
+// reopen mutable WebCrypto lookups to caller callbacks in production code.
+function cryptoObservedModules(decrypt) {
+  const ids = [
+    "../public/client/rootark-zk1-file-content",
+    "../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer",
+    "../src/crypto/rootark-zk1-recipient-share-cek",
+    "../scripts/zk1-recipient-offer-local",
+  ].map((name) => require.resolve(name));
+  const saved = ids.map((id) => require.cache[id]);
+  const subtle = crypto.webcrypto.subtle;
+  const existingOwnDecrypt = Object.getOwnPropertyDescriptor(subtle, "decrypt");
+  try {
+    subtle.decrypt = decrypt;
+    for (const id of ids) delete require.cache[id];
+    const transfer = require("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer");
+    const share = require("../src/crypto/rootark-zk1-recipient-share-cek");
+    const cli = require("../scripts/zk1-recipient-offer-local");
+    return { transfer, share, cli };
+  } finally {
+    if (existingOwnDecrypt) Object.defineProperty(subtle, "decrypt", existingOwnDecrypt);
+    else delete subtle.decrypt;
+    for (let i = 0; i < ids.length; i++) {
+      if (saved[i]) require.cache[ids[i]] = saved[i];
+      else delete require.cache[ids[i]];
+    }
+  }
+}
 const cekBatch = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-versioned-cek-batch"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
@@ -623,21 +652,21 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       attackerHpke.publicKey));
     const realDecrypt = subtle.decrypt;
     let mutatedAfterVerification = false;
-    subtle.decrypt = async function (...args) {
+    const observedRace = cryptoObservedModules(async function (...args) {
       // Preserve the native AES-GCM operation; mutate only after it finishes.
       const result = await realDecrypt.apply(this, args);
       racedAuthority.request.hpke_public_key = maliciousRecipient;
       mutatedAfterVerification = true;
       return result;
-    };
+    });
     let racedEnvelope;
-    try {
-      racedEnvelope = await cekTransfer.sealOwnerAuthorizedFileCek({
+    {
+      racedEnvelope = await observedRace.transfer.sealOwnerAuthorizedFileCek({
         ownerPrivateKey: owner.privateKey, ownerHeldCek, metadata,
         objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
         authority: racedAuthority,
       });
-    } finally { delete subtle.decrypt; }
+    }
     assert.equal(mutatedAfterVerification, true,
       "attack exercised the real asynchronous file AEAD boundary");
     assert.equal(racedEnvelope.core.hpke_public_key, fresh.request.hpke_public_key,
@@ -666,6 +695,37 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "genuine approved B still unwraps the owner CEK after caller mutation");
     bOpenedRaced.fill(0);
 
+    // The owner CEK primitive may also be called directly, without the
+    // recipient-share bridge. The authenticated file AEAD awaits an external
+    // callback; a replaced global clock must fail closed, while a poisoned
+    // Math.min must never extend an owner-approved HPKE lease.
+    const trustedClock = Date.now;
+    const trustedFloor = Math.floor;
+    const trustedMin = Math.min;
+    let releaseClockPoisoned = false;
+    const observedReleaseClock = cryptoObservedModules(async function (...args) {
+      const decrypted = await realDecrypt.apply(this, args);
+      releaseClockPoisoned = true;
+      Date.now = () => 0;
+      Math.floor = () => 0;
+      Math.min = () => Number.MAX_SAFE_INTEGER;
+      return decrypted;
+    });
+    try {
+      await assert.rejects(observedReleaseClock.transfer.sealOwnerAuthorizedFileCek({
+        ownerPrivateKey: owner.privateKey, ownerHeldCek,
+        metadata, objectRevision: 1, ciphertext: sealed,
+        ciphertextRoot: root, authority: publicAuthority,
+      }), /ZK_OWNER_FILE_CEK_DENIED/,
+      "a replaced release-time clock must fail closed after real AEAD");
+    } finally {
+      Date.now = trustedClock;
+      Math.floor = trustedFloor;
+      Math.min = trustedMin;
+    }
+    assert.equal(releaseClockPoisoned, true,
+      "the direct CEK path must cross a real asynchronous authenticated-file boundary");
+
     for (const label of ["metadata", "ciphertext", "head", "root"]) {
       const otherMeta = { ...metadata };
       const otherCipher = Buffer.from(sealed);
@@ -674,7 +734,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
         digest: Buffer.from(publicAuthority.currentHead.digest) };
       const otherAuthority = { ...publicAuthority, currentHead: otherHead };
       let mutated = false;
-      subtle.decrypt = async function (...args) {
+      const observedMutation = cryptoObservedModules(async function (...args) {
         const result = await realDecrypt.apply(this, args);
         if (label === "metadata") otherMeta.object_id = b64(crypto.randomBytes(16));
         if (label === "ciphertext") otherCipher[otherCipher.length - 1] ^= 1;
@@ -682,16 +742,16 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
         if (label === "root") otherRoot[0] ^= 1;
         mutated = true;
         return result;
-      };
+      });
       let safe;
-      try {
-        safe = await cekTransfer.sealOwnerAuthorizedFileCek({
+      {
+        safe = await observedMutation.transfer.sealOwnerAuthorizedFileCek({
           ownerPrivateKey: owner.privateKey, ownerHeldCek,
           metadata: otherMeta, objectRevision: 1,
           ciphertext: otherCipher, ciphertextRoot: otherRoot,
           authority: otherAuthority,
         });
-      } finally { delete subtle.decrypt; }
+      }
       assert.equal(mutated, true, `${label}: mutation ran after real AEAD decrypt`);
       assert.equal(safe.core.object_id, metadata.object_id,
         `${label}: original object identity was pinned before await`);
@@ -702,26 +762,25 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.equal(safe.core.owner_digest, committed.digest,
         `${label}: signed owner head pinned before await`);
     }
-    // The owner also must not create a fresh CEK grant after the signed
-    // approval expires while the real file AEAD open is pending.
+    // A caller callback cannot forge global wall-clock passage after a real
+    // file AEAD to release a CEK. A replaced clock fails closed.
     const originalWallClock = Date.now;
     let ownerDecryptFinished = false;
-    subtle.decrypt = async function (...args) {
+    const observedExpiredClock = cryptoObservedModules(async function (...args) {
       const result = await realDecrypt.apply(this, args);
       ownerDecryptFinished = true;
       Date.now = () => (signedCommittedHead.expires_at + 2) * 1000;
       return result;
-    };
+    });
     try {
-      await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
+      await assert.rejects(observedExpiredClock.transfer.sealOwnerAuthorizedFileCek({
         ownerPrivateKey: owner.privateKey, ownerHeldCek,
         metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
         authority: publicAuthority,
       }), /ZK_OWNER_FILE_CEK_DENIED/,
-      "A must refuse CEK rewrap after authorization expires during real file AEAD open");
+      "post-AEAD forged clock must fail closed before the CEK is released");
     } finally {
       Date.now = originalWallClock;
-      delete subtle.decrypt;
     }
     assert.equal(ownerDecryptFinished, true,
       "test must reach the genuine file AEAD before expiring the grant");
@@ -739,16 +798,16 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       nowSeconds: simulatedOwnerExpiry - 1 };
     let ownerFloorPoisonReached = false;
     Date.now = stableOwnerClock;
-    subtle.decrypt = async function (...args) {
+    const observedStableClock = cryptoObservedModules(async function (...args) {
       const result = await realDecrypt.apply(this, args);
       simulatedOwnerMilliseconds = (simulatedOwnerExpiry + 2) * 1000;
       Math.floor = () => 0;
       Math.min = () => Number.MAX_SAFE_INTEGER;
       ownerFloorPoisonReached = true;
       return result;
-    };
+    });
     try {
-      await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
+      await assert.rejects(observedStableClock.transfer.sealOwnerAuthorizedFileCek({
         ownerPrivateKey: owner.privateKey, ownerHeldCek, metadata,
         objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
         authority: ownerClockAuthority,
@@ -758,7 +817,6 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       Date.now = originalStableClock;
       Math.floor = originalMathFloor;
       Math.min = originalMathMin;
-      delete subtle.decrypt;
     }
     assert.equal(ownerFloorPoisonReached, true,
       "test must poison Math.floor only after the genuine AEAD await");
@@ -824,7 +882,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       const result = await realHpkeOpen(...args);
       if (expireOnOpen) {
         hpkeFinishedBeforeExpiry = true;
-        openClock.advanceTo((exactExpiry + 1) * 1000);
+        openClock.advanceTo(exactExpiry * 1000);
       }
       return result;
     } });
@@ -843,7 +901,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     await assert.rejects(openClock.withClock(
       () => openClock.transfer.openOwnerAuthorizedFileCek(validOpenInput)),
     /ZK_OWNER_FILE_CEK_DENIED/,
-    "B must reject at the final release fence after genuine HPKE decrypt and lease expiry");
+    "B must reject at the exact expiry second after genuine HPKE decrypt");
     assert.equal(hpkeFinishedBeforeExpiry, true,
       "test must complete actual HPKE decrypt before the protected clock expires");
     const bCek = await open();
@@ -851,7 +909,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(
       envelope.core.expires_at, issued.approval.expires_at,
       signedCommittedHead.expires_at),
-    "release expiry must be computed from signed owner-approved trust material");
+    "owner CEK opener must return the verified minimum expiry of the signed owner, approval and witness");
     const decrypted = await content.decryptFile({
       cek: await content.importFileCek(bCek.cek), metadata,
       envelopeBytes: recoveredCiphertext,
@@ -944,6 +1002,234 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       metadata, objectRevision: 1, ciphertext: Buffer.from(sealed),
       ciphertextRoot: Buffer.from(root), authority: publicAuthority,
       nowSeconds: now + 9 };
+    // A separately supplied independent-authority callback is executable
+    // after the owner CEK has been copied. It must not intercept the final
+    // scrub of that exact CEK through mutable Buffer.prototype.fill.
+    const originalSecretFill = Buffer.prototype.fill;
+    const originalTypedSecretFill = Uint8Array.prototype.fill;
+    let poisonedFillAfterAuthority = false;
+    let copiedOwnerCekObserved = false;
+    let copiedTypedCekObserved = false;
+    let sawOwnerAuthorityRead = false;
+    try {
+      const guardedOffer = await createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          sawOwnerAuthorityRead = true;
+          Buffer.prototype.fill = function (...args) {
+            poisonedFillAfterAuthority = true;
+            if (Buffer.isBuffer(this) && this.length === ownerHeldCek.length
+              && crypto.timingSafeEqual(this, ownerHeldCek)) copiedOwnerCekObserved = true;
+            return Reflect.apply(originalSecretFill, this, args);
+          };
+          Uint8Array.prototype.fill = function (...args) {
+            if (this.length === ownerHeldCek.length
+              && crypto.timingSafeEqual(Buffer.from(this), ownerHeldCek)) {
+              copiedTypedCekObserved = true;
+            }
+            return Reflect.apply(originalTypedSecretFill, this, args);
+          };
+          return current;
+        },
+      });
+      assert.equal(guardedOffer.schema, "rootark-zk1-recipient-share-offer-dev/v1",
+        "the adversarial callback must follow a real signed owner offer");
+    } finally {
+      Buffer.prototype.fill = originalSecretFill;
+      Uint8Array.prototype.fill = originalTypedSecretFill;
+    }
+    assert.equal(sawOwnerAuthorityRead, true,
+      "the attacker-controlled authority callback must execute after CEK copy");
+    assert.equal(poisonedFillAfterAuthority, false,
+      "the owner CEK cleanup must never invoke a callback-mutated Buffer.fill");
+    assert.equal(copiedOwnerCekObserved, false,
+      "the owner-held file CEK must never be exposed to the malicious fill method");
+    assert.equal(copiedTypedCekObserved, false,
+      "file AEAD CEK import must not send the raw CEK through a callback-mutated typed fill");
+    // A passed owner authority callback runs before genuine AES-GCM key import
+    // and before AEAD plaintext parsing. An untrusted callback must not be
+    // able to replace WebCrypto, a CEK byte iterator, or TextDecoder to spy
+    // on this specific valid owner-held key or file content.
+    const realFileImport = subtle.importKey;
+    const realFileDecode = TextDecoder.prototype.decode;
+    const realCekIterator = Buffer.prototype[Symbol.iterator];
+    const realStringReplace = String.prototype.replace;
+    const realStringPadEnd = String.prototype.padEnd;
+    const realGetPrototype = Object.getPrototypeOf;
+    const realRegexpReplace = RegExp.prototype[Symbol.replace];
+    const realRegexpExec = RegExp.prototype.exec;
+    const originalTypedLengthDescriptor = Object.getOwnPropertyDescriptor(
+      Uint8Array.prototype, "length");
+    const trueTypedLength = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(Uint8Array.prototype), "length").get;
+    const trueTypedSet = Uint8Array.prototype.set;
+    const originalUint8HasInstance = Object.getOwnPropertyDescriptor(
+      Uint8Array, Symbol.hasInstance);
+    const trueHasInstance = Function.prototype[Symbol.hasInstance];
+    const trueTypedByteLength = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(Uint8Array.prototype), "byteLength").get;
+    let reachedFilePoison = false;
+    let rawCekImportObserved = false;
+    let rawCekIteratorObserved = false;
+    let plaintextDecoderObserved = false;
+    let plaintextStringObserved = false;
+    let privatePayloadReflectionObserved = false;
+    let plaintextRegexpObserved = false;
+    let rawCekLengthObserved = false;
+    let rawCekHasInstanceObserved = false;
+    let rawCekHasInstanceLocation = "";
+    const expectedPrivateB64 = b64(bytes);
+    const originalCekSize = ownerHeldCek.length;
+    const isExactOriginalCek = (view) => {
+      if (!ArrayBuffer.isView(view)) return false;
+      let size;
+      try { size = Reflect.apply(trueTypedByteLength, view, []); }
+      catch (_) { return false; }
+      if (size !== originalCekSize) return false;
+      const copy = new Uint8Array(size);
+      Reflect.apply(trueTypedSet, copy, [view]);
+      let mismatch = 0;
+      for (let i = 0; i < size; i++) mismatch |= copy[i] ^ ownerHeldCek[i];
+      return mismatch === 0;
+    };
+    try {
+      const signedOffer = await createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          reachedFilePoison = true;
+          subtle.importKey = function (format, value, ...args) {
+            if (format === "raw" && isExactOriginalCek(value)) {
+              rawCekImportObserved = true;
+            }
+            return Reflect.apply(realFileImport, this, [format, value, ...args]);
+          };
+          Buffer.prototype[Symbol.iterator] = function (...args) {
+            if (isExactOriginalCek(this)) {
+              rawCekIteratorObserved = true;
+            }
+            return Reflect.apply(realCekIterator, this, args);
+          };
+          TextDecoder.prototype.decode = function (view, ...args) {
+            const decoded = Reflect.apply(realFileDecode, this, [view, ...args]);
+            if (decoded.includes('"content":') && decoded.includes('"name":')) {
+              plaintextDecoderObserved = true;
+            }
+            return decoded;
+          };
+          String.prototype.replace = function (...args) {
+            if (expectedPrivateB64.length > 0 && String(this) === expectedPrivateB64) {
+              plaintextStringObserved = true;
+            }
+            return Reflect.apply(realStringReplace, this, args);
+          };
+          String.prototype.padEnd = function (...args) {
+            if (expectedPrivateB64.length > 0 && String(this) === expectedPrivateB64) {
+              plaintextStringObserved = true;
+            }
+            return Reflect.apply(realStringPadEnd, this, args);
+          };
+          Object.getPrototypeOf = function (value) {
+            if (value && typeof value === "object"
+              && Object.prototype.hasOwnProperty.call(value, "content")
+              && value.content === expectedPrivateB64) {
+              privatePayloadReflectionObserved = true;
+            }
+            return Reflect.apply(realGetPrototype, Object, [value]);
+          };
+          RegExp.prototype[Symbol.replace] = function (value, replacement) {
+            if (expectedPrivateB64.length > 0 && value === expectedPrivateB64) {
+              plaintextRegexpObserved = true;
+            }
+            return Reflect.apply(realRegexpReplace, this, [value, replacement]);
+          };
+          RegExp.prototype.exec = function (value) {
+            if (expectedPrivateB64.length > 0 && value === expectedPrivateB64) {
+              plaintextRegexpObserved = true;
+            }
+            return Reflect.apply(realRegexpExec, this, [value]);
+          };
+          return current;
+        },
+      });
+      assert.equal(signedOffer.schema, "rootark-zk1-recipient-share-offer-dev/v1",
+        "the poisoned module methods must be tested after a genuine owner-signed HPKE offer");
+    } finally {
+      delete subtle.importKey;
+      Buffer.prototype[Symbol.iterator] = realCekIterator;
+      TextDecoder.prototype.decode = realFileDecode;
+      String.prototype.replace = realStringReplace;
+      String.prototype.padEnd = realStringPadEnd;
+      Object.getPrototypeOf = realGetPrototype;
+      RegExp.prototype[Symbol.replace] = realRegexpReplace;
+      RegExp.prototype.exec = realRegexpExec;
+    }
+    assert.equal(reachedFilePoison, true,
+      "independent authority callback must run before real CEK import and file decryption");
+    assert.equal(rawCekImportObserved, false,
+      "a callback-replaced WebCrypto.importKey may never see raw approved owner CEK");
+    assert.equal(rawCekIteratorObserved, false,
+      "a callback-replaced Buffer iterator may never see raw approved owner CEK");
+    assert.equal(plaintextDecoderObserved, false,
+      "a callback-replaced TextDecoder may never see authenticated plaintext");
+    assert.equal(plaintextStringObserved, false,
+      "a callback-replaced String.replace/padEnd may never see private decoded base64");
+    assert.equal(privatePayloadReflectionObserved, false,
+      "a callback-replaced Object.getPrototypeOf may never see the decrypted JSON payload");
+    assert.equal(plaintextRegexpObserved, false,
+      "a callback-replaced RegExp @@replace or exec may never see private decoded base64");
+    // Separate oracle: @@hasInstance/length poisoning may make the third-party
+    // CBOR implementation fail closed. The CEK must remain confidential even
+    // if a legitimate signed offer is denied after the first authority read.
+    let reachedTypePoison = false, typePoisonDenial = false, typedOffer;
+    try {
+      typedOffer = await createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          reachedTypePoison = true;
+          Object.defineProperty(Uint8Array.prototype, "length", {
+            configurable: true, get() {
+              const size = Reflect.apply(trueTypedLength, this, []);
+              if (size === originalCekSize && isExactOriginalCek(this)) {
+                rawCekLengthObserved = true;
+              }
+              return size;
+            },
+          });
+          Object.defineProperty(Uint8Array, Symbol.hasInstance, {
+            configurable: true, value(value) {
+              if (isExactOriginalCek(value)) {
+                rawCekHasInstanceObserved = true;
+                if (!rawCekHasInstanceLocation) {
+                  rawCekHasInstanceLocation = new Error("RAW_CEK_CONSTRUCTOR_DISPATCH").stack;
+                }
+              }
+              return Reflect.apply(trueHasInstance, Uint8Array, [value]);
+            },
+          });
+          return current;
+        },
+      });
+    } catch (error) {
+      assert.match(String(error?.message), /ZK_SHARE_OFFER_DENIED/,
+        "only the documented fail-closed response is allowed under constructor poisoning");
+      typePoisonDenial = true;
+    } finally {
+      if (originalTypedLengthDescriptor) {
+        Object.defineProperty(Uint8Array.prototype, "length", originalTypedLengthDescriptor);
+      } else delete Uint8Array.prototype.length;
+      if (originalUint8HasInstance) {
+        Object.defineProperty(Uint8Array, Symbol.hasInstance, originalUint8HasInstance);
+      } else delete Uint8Array[Symbol.hasInstance];
+    }
+    assert.equal(reachedTypePoison, true,
+      "type attack must run inside a genuine independently verified owner grant");
+    assert.ok(typePoisonDenial || typedOffer?.schema === "rootark-zk1-recipient-share-offer-dev/v1",
+      "the poisoned constructor must either fail closed or create an authentic offer");
+    assert.equal(rawCekLengthObserved, false,
+      "a callback-replaced typed-array length getter may never see raw approved CEK bytes");
+    assert.equal(rawCekHasInstanceObserved, false,
+      "a callback-replaced Uint8Array Symbol.hasInstance may never see raw approved CEK bytes\n"
+        + rawCekHasInstanceLocation);
     const originalShareMathCeil = Math.ceil;
     const originalShareMathMax = Math.max;
     const originalShareAuthorityRead = ownerOfferArgs.readIndependentAuthority;
@@ -1034,6 +1320,12 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     let withoutIssuerPin = false;
     let withoutRecipientSession = false;
     let poisonRecipientOutputLength = false;
+    let poisonBatchFill = false;
+    let batchFillReadCount = 0;
+    let batchFileDecryptCount = 0;
+    let batchHostileFillObserved = false;
+    const originalBatchTypedFill = Uint8Array.prototype.fill;
+    const originalBatchBufferFill = Buffer.prototype.fill;
     let recipientFinalAuthorityReads = 0;
     let poisonedActualRecipientAuthority = false;
     let genuineRecipientDecrypts = 0;
@@ -1078,6 +1370,19 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
               poisonedActualRecipientAuthority = true;
             }
             return current;
+          } : poisonBatchFill ? async (...args) => {
+            const current = await readIndependentAuthority(...args);
+            if (++batchFillReadCount === 3) {
+              assert.ok(batchFileDecryptCount > 0,
+                "batch final authority callback must follow authenticated file AEAD");
+              const observeFill = (nativeFill) => function (...fillArgs) {
+                batchHostileFillObserved = true;
+                return Reflect.apply(nativeFill, this, fillArgs);
+              };
+              Uint8Array.prototype.fill = observeFill(originalBatchTypedFill);
+              Buffer.prototype.fill = observeFill(originalBatchBufferFill);
+            }
+            return current;
           } : readIndependentAuthority,
           fetchImpl: withoutRecipientSession ? fetch
             : swapHttpObject ? async (url, options) => {
@@ -1105,7 +1410,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "export", "--owned-dir", dir, "--context-module", "trusted-share.js",
       "--grant", grantFile, "--offer", outputFile,
     ]);
-    const runRecipientRedeem = (offerFile, outputFile) => portableCli.run([
+    const runRecipientRedeem = (offerFile, outputFile, runner = portableCli) => runner.run([
       "redeem", "--owned-dir", dir, "--context-module", "trusted-share.js",
       "--offer", offerFile, "--output", outputFile,
     ]);
@@ -1194,11 +1499,11 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     bundleSecondCek.fill(0);
     fs.writeFileSync(path.join(dir, "second-offer.json"), JSON.stringify(bundleSecondOffer),
       { mode: 0o600, flag: "wx" });
-    const batch = (filename, entries) => {
+    const batch = (filename, entries, runner = portableCli) => {
       fs.writeFileSync(path.join(dir, filename), JSON.stringify({
         schema: "rootark-zk1-recipient-object-set-dev/v1", entries,
       }), { mode: 0o600, flag: "wx" });
-      return portableCli.run(["redeem-batch", "--owned-dir", dir,
+      return runner.run(["redeem-batch", "--owned-dir", dir,
         "--context-module", "trusted-share.js", "--manifest", filename]);
     };
     assert.equal(await batch("two-objects.json", [
@@ -1208,6 +1513,33 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(fs.readFileSync(path.join(dir, "batch-first.bin")), bytes);
     assert.deepEqual(fs.readFileSync(path.join(dir, "batch-second.bin")), bundleSecondBytes);
     assert.ok(realShareReads >= 4, "each offered object caused a signed HTTP GET");
+    // RED on the inherited batch path: the third independent authority read
+    // occurs after actual HPKE and file AEAD. A poisoned view prototype must
+    // not observe plaintext while the CLI scrubs its completed batch item.
+    const batchAeadDecrypt = subtle.decrypt;
+    try {
+      poisonBatchFill = true;
+      batchFileDecryptCount = 0;
+      batchFillReadCount = 0;
+      batchHostileFillObserved = false;
+      const observedBatch = cryptoObservedModules(async function (...args) {
+        const result = await batchAeadDecrypt.apply(this, args);
+        if (args[0]?.name === "AES-GCM") batchFileDecryptCount++;
+        return result;
+      });
+      assert.equal(await batch("poison-batch-fill.json", [
+        { offer: "portable-offer.json", output: "poison-batch-output.bin" },
+      ], observedBatch.cli), "ZK_RECIPIENT_BATCH_REDEEMED_1_OF_1");
+    } finally {
+      poisonBatchFill = false;
+      Uint8Array.prototype.fill = originalBatchTypedFill;
+      Buffer.prototype.fill = originalBatchBufferFill;
+    }
+    assert.equal(batchFillReadCount, 3, "batch must reach the post-AEAD authority callback");
+    assert.ok(batchFileDecryptCount > 0, "batch must complete genuine file decryption");
+    assert.equal(batchHostileFillObserved, false,
+      "batch plaintext cleanup must never dispatch a mutated typed-array or Buffer.fill");
+    assert.deepEqual(fs.readFileSync(path.join(dir, "poison-batch-output.bin")), bytes);
     for (const [name, entries] of [
       ["duplicate-object.json", [
         { offer: "portable-offer.json", output: "dup-a.bin" },
@@ -1263,13 +1595,13 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     poisonRecipientOutputLength = true;
     recipientFinalAuthorityReads = 0;
     genuineRecipientDecrypts = 0;
-    subtle.decrypt = async function (...args) {
+    const observedRecipientOutput = cryptoObservedModules(async function (...args) {
       const result = await realAeadDecrypt.apply(this, args);
       if (poisonRecipientOutputLength && args[0]?.name === "AES-GCM") {
         genuineRecipientDecrypts += 1;
       }
       return result;
-    };
+    });
     fs.openSync = function (...args) {
       if (String(args[0]).endsWith("recipient-native-byte-length.bin")) {
         reachedExclusivePrivateOutput = true;
@@ -1287,10 +1619,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     try {
       try {
         outputResult = await runRecipientRedeem("portable-offer.json",
-          "recipient-native-byte-length.bin");
+          "recipient-native-byte-length.bin", observedRecipientOutput.cli);
       } catch (error) { outputError = error; }
     } finally {
-      delete subtle.decrypt;
       fs.openSync = originalOpenSync;
       fs.writeSync = originalWriteSync;
       poisonRecipientOutputLength = false;
@@ -1327,11 +1658,11 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     genuineRecipientDecrypts = 0;
     poisonedActualRecipientAuthority = false;
     poisonRecipientOutputLength = true;
-    subtle.decrypt = async function (...args) {
+    const observedDeniedOutput = cryptoObservedModules(async function (...args) {
       const result = await realAeadDecrypt.apply(this, args);
       if (args[0]?.name === "AES-GCM") genuineRecipientDecrypts += 1;
       return result;
-    };
+    });
     fs.openSync = function (...args) {
       if (String(args[0]).endsWith("recipient-denied-at-output.bin")) {
         deniedOutputBoundary = {
@@ -1347,10 +1678,9 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     };
     try {
       await assert.rejects(runRecipientRedeem("portable-offer.json",
-        "recipient-denied-at-output.bin"), /ZK_RECIPIENT_OFFER_CLI_DENIED/,
+        "recipient-denied-at-output.bin", observedDeniedOutput.cli), /ZK_RECIPIENT_OFFER_CLI_DENIED/,
       "a real private-output rejection must never report successful redemption");
     } finally {
-      delete subtle.decrypt;
       fs.openSync = originalOpenSync;
       poisonRecipientOutputLength = false;
       if (savedTypedByteLength) {
@@ -1667,7 +1997,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     const pinnedFinalClock = () => simulatedFinalMilliseconds;
     Date.now = pinnedFinalClock;
     let finalAeadCompleted = false;
-    subtle.decrypt = async function (...args) {
+    const observedFinalExpiry = cryptoObservedModules(async function (...args) {
       const openedFile = await originalFinalDecrypt.apply(this, args);
       if (args[0]?.name === "AES-GCM"
         && args[2]?.byteLength === fileAeadCipherLength) {
@@ -1680,13 +2010,12 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
         Array.prototype.some = () => false;
       }
       return openedFile;
-    };
+    });
     try {
-      await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      await assert.rejects(observedFinalExpiry.share.openProtectedRecipientShareFile({ ...bridgeArgs,
         redeemInput: longShareInput }), /ZK_SHARE_FILE_OPEN_DENIED/,
       "do not release plaintext after owner approval/witness expires during file AEAD");
     } finally {
-      delete subtle.decrypt;
       Date.now = originalFinalNow;
       Math.floor = originalFinalFloor;
       Math.min = originalFinalMin;
@@ -1972,6 +2301,46 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     "owner logout after all three genuine CEK seals must refuse the signed batch");
     assert.equal(ownerSessionChecks, 7,
       "the final post-HPKE owner session checkpoint must be reached");
+    const ownerNativeBufferFill = Buffer.prototype.fill;
+    const ownerNativeUint8ArrayFill = Uint8Array.prototype.fill;
+    const ownerNativeIterator = Array.prototype[Symbol.iterator];
+    const ownerScrubObservations = [];
+    let ownerPoisonedAtFinalFence = false, ownerPoisonChecks = 0;
+    let ownerCleanupIteratorCalls = 0;
+    try {
+      await assert.rejects(cekBatch.sealOwnerAuthorizedVersionedCeks({
+        ownerPrivateKey: owner.privateKey, authority: publicAuthority,
+        versions: versionRows, assertLive: () => {
+          if (++ownerPoisonChecks !== 7) return;
+          ownerPoisonedAtFinalFence = true;
+          const poison = function (value, ...args) {
+            if (value === 0 && this.byteLength === 32)
+              ownerScrubObservations.push(Buffer.from(this));
+            return Reflect.apply(ownerNativeUint8ArrayFill, this, [value, ...args]);
+          };
+          Buffer.prototype.fill = poison;
+          Uint8Array.prototype.fill = poison;
+          Array.prototype[Symbol.iterator] = function* () {
+            if (this.length === 3 && this[0] && typeof this[0] === "object"
+              && Object.prototype.hasOwnProperty.call(this[0], "ownerHeldCek")) {
+              ownerCleanupIteratorCalls++;
+            }
+          };
+          throw Error("OWNER_REVOKED_AFTER_THREE_NATIVE_HPKE_SEALS");
+        },
+      }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/);
+    } finally {
+      Buffer.prototype.fill = ownerNativeBufferFill;
+      Uint8Array.prototype.fill = ownerNativeUint8ArrayFill;
+      Array.prototype[Symbol.iterator] = ownerNativeIterator;
+    }
+    assert.equal(ownerPoisonedAtFinalFence, true);
+    assert.equal(ownerPoisonChecks, 7);
+    assert.equal(ownerCleanupIteratorCalls, 0,
+      "owner batch cleanup must not consult a callback-poisoned array iterator");
+    assert.equal(ownerScrubObservations.some((candidate) =>
+      versionRows.some((row) => crypto.timingSafeEqual(candidate, row.ownerHeldCek))), false,
+    "owner callback may not intercept historical CEKs during failed sealing");
     const openBatch = (overrides = {}) => cekBatch.openOwnerAuthorizedVersionedCeks({
       bundle, authority: { ...linked, nowSeconds: testWallSeconds() },
       operatorMinimumSequence: signedCommittedHead.sequence,
@@ -2004,6 +2373,47 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     "revocation after last real HPKE open must fence all CEKs at final release");
     assert.equal(localSessionChecks, 11,
       "the final post-HPKE recipient session checkpoint must be reached");
+    // Three genuinely signed HPKE opens have completed when final assertLive
+    // executes; inherited .fill and array iterators cannot be trusted now.
+    const versionedBufferFill = Buffer.prototype.fill;
+    const versionedTypedFill = Uint8Array.prototype.fill;
+    const originalBatchIterator = Array.prototype[Symbol.iterator];
+    const scrubObservations = [];
+    let poisonedAtFinalFence = false, transitiveChecks = 0;
+    let recipientCleanupIteratorCalls = 0;
+    try {
+      await assert.rejects(openBatch({ assertLive: () => {
+        if (++transitiveChecks !== 11) return;
+        poisonedAtFinalFence = true;
+        const poison = function (value, ...args) {
+          if (value === 0 && this.byteLength === 32)
+            scrubObservations.push(Buffer.from(this));
+          return Reflect.apply(versionedTypedFill, this, [value, ...args]);
+        };
+        Buffer.prototype.fill = poison;
+        Uint8Array.prototype.fill = poison;
+        Array.prototype[Symbol.iterator] = function* () {
+          if (this.length === 3 && this[0] && typeof this[0] === "object"
+            && Object.prototype.hasOwnProperty.call(this[0], "cek")) {
+            recipientCleanupIteratorCalls++;
+          }
+        };
+        throw Error("REVOKED_AFTER_THREE_NATIVE_HPKE_OPENS");
+      } }), /ZK_OWNER_VERSIONED_CEK_BATCH_DENIED/);
+    } finally {
+      Buffer.prototype.fill = versionedBufferFill;
+      Uint8Array.prototype.fill = versionedTypedFill;
+      Array.prototype[Symbol.iterator] = originalBatchIterator;
+    }
+    assert.equal(poisonedAtFinalFence, true,
+      "the malicious callback must follow three real HPKE decryptions");
+    assert.equal(transitiveChecks, 11);
+    assert.equal(recipientCleanupIteratorCalls, 0,
+      "recipient batch cleanup must not consult a callback-poisoned iterator");
+    assert.equal(scrubObservations.some((candidate) =>
+      versionRows.some((row) => crypto.timingSafeEqual(candidate, row.ownerHeldCek))
+      || crypto.timingSafeEqual(candidate, Buffer.from(fresh.hpkePrivateRaw))), false,
+    "poisoned fill may never observe CEKs or raw HPKE key at batch teardown");
     // A revoked session must stop immediately, not perform unrelated file
     // decryptions or leak a successful partial result.
     let firstOpenChecks = 0;

@@ -181,7 +181,11 @@ async function redeemBatch(root, opts, trustedBuilder) {
       // might have left an incomplete leaf. No atomicity/rollback is claimed.
       throw new BatchIncomplete(completed, entries.length);
     } finally {
-      if (opened?.data instanceof Uint8Array) opened.data.fill(0);
+      // Match the single-file path: callback code must not replace the
+      // native wipe after the third independent authority read.
+      if (opened && !isProxy(opened.data) && isUint8Array(opened.data)) {
+        nativeApply(nativeTypedFill, opened.data, [0]);
+      }
     }
   }
   return `ZK_RECIPIENT_BATCH_REDEEMED_${completed}_OF_${entries.length}`;

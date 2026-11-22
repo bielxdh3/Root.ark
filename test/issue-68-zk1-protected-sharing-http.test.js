@@ -276,6 +276,84 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal(redeemed.durableCopyProven, false);
   assert.equal(redeemed.authorizesPlaintextRelease, false);
   assert.equal(redeemed.serverRevocationProofVerified, false);
+  // The HTTP server might return an authentic owner-signed reply without
+  // enforcing the local device signature. The client must check that the
+  // private signer belongs to its independently pinned recipient roster.
+  const foreignSigner = (await crypto.webcrypto.subtle.generateKey(
+    "Ed25519", false, ["sign", "verify"])).privateKey;
+  let foreignFetches = 0;
+  await assert.rejects(redeem({ signerKey: foreignSigner,
+    fetchImpl: async (...args) => { foreignFetches++; return clientFetch(...args); },
+  }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "foreign signing key cannot redeem even when the server would serve valid ciphertext");
+  assert.equal(foreignFetches, 0, "foreign signer is rejected before network activity");
+  let rotatedRecipientReads = 0;
+  await assert.rejects(redeem({ readIndependentAuthority: async () => {
+    const authority = await independentAuthority();
+    if (++rotatedRecipientReads === 2) {
+      authority.devices = authority.devices.map((device) =>
+        device.deviceId === recipient.device_id ? {
+          ...device, authorizationPublicKey: new Uint8Array(crypto.randomBytes(32)),
+        } : device);
+    }
+    return authority;
+  } }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "recipient roster-key substitution during HTTP awaits must deny the receipt");
+  assert.equal(rotatedRecipientReads, 2);
+  // P2 review: a hostile ciphertext transport can replay an authentic owner
+  // grant and bytes while ignoring the recipient's unrelated GET signature.
+  // The client itself must bind its nonexportable Ed25519 signer to the
+  // independently pinned recipient device, before any HTTP request.
+  const rogueRecipient = await crypto.webcrypto.subtle.generateKey("Ed25519", false,
+    ["sign", "verify"]);
+  assert.equal(rogueRecipient.privateKey.extractable, false);
+  const sameAuthenticResponse = {
+    id: redeemed.objectId, revision: redeemed.revision, epoch: redeemed.epoch,
+    ciphertextBase64: redeemed.ciphertextBase64,
+    shareStatementBase64: redeemed.shareStatementBase64,
+    shareSignatureBase64: redeemed.shareSignatureBase64,
+  };
+  let untrustedHttpCalls = 0;
+  const forgedServer = async () => {
+    untrustedHttpCalls++;
+    return new Response(JSON.stringify(sameAuthenticResponse), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  };
+  const forgedInput = { signerKey: rogueRecipient.privateKey, fetchImpl: forgedServer };
+  await assert.rejects(redeem(forgedInput), /ZK_SHARE_REDEMPTION_DENIED/,
+    "a genuine owner grant must not certify an unrelated recipient Ed25519 signer");
+  assert.equal(untrustedHttpCalls, 0,
+    "recipient pin check must fail locally, before calling an untrusted server");
+  const genuineAgainstUntrustedServer = await redeem({ fetchImpl: forgedServer });
+  assert.deepEqual(genuineAgainstUntrustedServer, redeemed,
+    "positive control: the same authenticated bytes with the pinned device signer remain valid");
+  // Exercise the same client under a browser cookie session: a genuine owner
+  // grant must include the double-submit CSRF header without trusting the
+  // server response to furnish the recipient's authorization history.
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  try {
+    globalThis.document = { cookie: "session=opaque; rootark_csrf=browser%2Dfixture%2Dtoken" };
+    let observedHeader = false;
+    const browserReceipt = await redeem({ fetchImpl: async (_url, options) => {
+      assert.equal(options.headers["x-csrf-token"], "browser-fixture-token");
+      observedHeader = true;
+      return forgedServer();
+    } });
+    assert.equal(observedHeader, true, "browser redemption must reach the CSRF-bound request");
+    assert.deepEqual(browserReceipt, redeemed);
+    globalThis.document.cookie = "rootark_csrf=first; rootark_csrf=second";
+    let attemptedFetch = false;
+    await assert.rejects(redeem({ fetchImpl: async () => {
+      attemptedFetch = true;
+      return forgedServer();
+    } }), /ZK_SHARE_REDEMPTION_DENIED/,
+    "an ambiguous duplicate CSRF cookie must be rejected before request dispatch");
+    assert.equal(attemptedFetch, false);
+  } finally {
+    if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument);
+    else delete globalThis.document;
+  }
   await assert.rejects(redeem({ fetchImpl: fetch }), /ZK_SHARE_REDEMPTION_DENIED/,
     "grant possession without recipient account session must not download ciphertext");
   await assert.rejects(redeem({ readIndependentAuthority: null }),

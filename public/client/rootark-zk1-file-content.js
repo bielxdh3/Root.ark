@@ -9,6 +9,46 @@
   // bootstrap, recovery or the online witness gate. Its wire is independently
   // versioned and must not be substituted for the signed zk-1 keyring format.
   const subtle = webCrypto && webCrypto.subtle;
+  // These references are captured before any owner/recipient authority
+  // callback can mutate shared JS prototypes or WebCrypto methods. In
+  // particular importKey receives raw CEK bytes; a replaced method could
+  // otherwise copy them before returning a legitimate CryptoKey.
+  const nativeApply = Reflect.apply;
+  const NativeUint8Array = Uint8Array;
+  const nativeIsView = ArrayBuffer.isView;
+  const nativeTypedSet = Uint8Array.prototype.set;
+  const nativeTypedProto = Object.getPrototypeOf(Uint8Array.prototype);
+  const nativeTypedLength = Object.getOwnPropertyDescriptor(
+    nativeTypedProto, "length").get;
+  const nativeTypedByteLength = Object.getOwnPropertyDescriptor(
+    nativeTypedProto, "byteLength").get;
+  const nativeTypedBuffer = Object.getOwnPropertyDescriptor(nativeTypedProto, "buffer").get;
+  const nativeTypedByteOffset = Object.getOwnPropertyDescriptor(nativeTypedProto, "byteOffset").get;
+  const nativeDataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, "buffer").get;
+  const nativeDataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, "byteOffset").get;
+  const nativeDataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get;
+  const nativeArrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+  const nativeArrayBufferSlice = ArrayBuffer.prototype.slice;
+  const nativeTypedFill = Uint8Array.prototype.fill;
+  const nativeImportKey = subtle && subtle.importKey;
+  const nativeEncrypt = subtle && subtle.encrypt;
+  const nativeDecrypt = subtle && subtle.decrypt;
+  const nativeTextEncode = TextEncoder.prototype.encode;
+  const nativeTextDecode = TextDecoder.prototype.decode;
+  const nativeJsonParse = JSON.parse;
+  const nativeJsonStringify = JSON.stringify;
+  const nativeAtob = atob;
+  const nativeBtoa = btoa;
+  const nativeCharCodeAt = String.prototype.charCodeAt;
+  const nativeFromCharCode = String.fromCharCode;
+  const nativeGetPrototypeOf = Object.getPrototypeOf;
+  const nativeOwnKeys = Reflect.ownKeys;
+  const nativeHasOwn = Object.hasOwn;
+  const nativeArrayIsArray = Array.isArray;
+  const nativeObjectPrototype = Object.prototype;
+  function wipeOwned(value) {
+    if (value) nativeApply(nativeTypedFill, value, [0]);
+  }
   const encode = new TextEncoder();
   const decode = new TextDecoder("utf-8", { fatal: true });
   const FORMAT = "rootark-zk1-file-v1";
@@ -17,42 +57,97 @@
   const MOVE_DOMAIN = "Root.ark/zk-1/content-aead/v2\0";
   const MAX_PLAIN = 2 * 1024 * 1024;
   const MAX_WIRE = 4 * 1024 * 1024;
-  const B64 = /^[A-Za-z0-9_-]+$/;
-  const OPAQUE_ID = /^[A-Za-z0-9_-]{22}$/;
   const METADATA_FIELDS = ["account_id", "compartment_id", "keyring_id", "object_id",
     "version_id", "parent_version_id", "epoch", "kind"];
   function fail() { throw new Error("ZK_FILE_INVALID"); }
   function strict(obj, fields) {
-    if (!obj || typeof obj !== "object" || Array.isArray(obj)
-      || ![Object.prototype, null].includes(Object.getPrototypeOf(obj))
-      || Reflect.ownKeys(obj).length !== fields.length
-      || fields.some((key) => !Object.hasOwn(obj, key))
-      || Reflect.ownKeys(obj).some((key) => !fields.includes(key))) fail();
+    if (!obj || typeof obj !== "object" || nativeArrayIsArray(obj)) fail();
+    const proto = nativeGetPrototypeOf(obj);
+    if (proto !== nativeObjectPrototype && proto !== null) fail();
+    const ownKeys = nativeOwnKeys(obj);
+    if (ownKeys.length !== fields.length) fail();
+    // The owner callback can replace Array.some/includes as well as the
+    // Object/Reflect methods. Do not dispatch any of them on decoded payload.
+    for (let i = 0; i < fields.length; i++) {
+      if (!nativeHasOwn(obj, fields[i])) fail();
+      let known = false;
+      for (let k = 0; k < fields.length; k++) {
+        if (ownKeys[i] === fields[k]) { known = true; break; }
+      }
+      if (!known) fail();
+    }
   }
   function asBytes(value) {
-    if (value instanceof Uint8Array) return new Uint8Array(value);
-    if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
-    if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer.slice(
-      value.byteOffset, value.byteOffset + value.byteLength));
-    fail();
+    if (nativeIsView(value)) {
+      // No instanceof: Uint8Array Symbol.hasInstance can be replaced by an
+      // authority callback to observe the raw owner CEK. Capture intrinsic
+      // buffer getters and copy internal byte slots without an iterator.
+      let buffer, offset, size;
+      try {
+        buffer = nativeApply(nativeTypedBuffer, value, []);
+        offset = nativeApply(nativeTypedByteOffset, value, []);
+        size = nativeApply(nativeTypedByteLength, value, []);
+      } catch (_) {
+        buffer = nativeApply(nativeDataViewBuffer, value, []);
+        offset = nativeApply(nativeDataViewByteOffset, value, []);
+        size = nativeApply(nativeDataViewByteLength, value, []);
+      }
+      const originalBytes = new NativeUint8Array(buffer, offset, size);
+      const copy = new NativeUint8Array(size);
+      nativeApply(nativeTypedSet, copy, [originalBytes]);
+      return copy;
+    }
+    try {
+      nativeApply(nativeArrayBufferLength, value, []);
+      return new NativeUint8Array(nativeApply(nativeArrayBufferSlice, value, [0]));
+    } catch (_) { fail(); }
   }
   function b64(bytes) {
     let binary = "";
-    for (const byte of bytes) binary += String.fromCharCode(byte);
-    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    const size = nativeApply(nativeTypedLength, bytes, []);
+    for (let index = 0; index < size; index++) {
+      binary += nativeFromCharCode(bytes[index]);
+    }
+    const base = nativeBtoa(binary);
+    let result = "";
+    for (let index = 0; index < base.length; index++) {
+      const code = nativeApply(nativeCharCodeAt, base, [index]);
+      if (code === 61) continue; // terminal '=' padding from genuine btoa
+      result += nativeFromCharCode(code === 43 ? 45 : code === 47 ? 95 : code);
+    }
+    return result;
   }
   function from64(value, min = 1, max = 128) {
     if (typeof value !== "string" || (value.length === 0 && min !== 0)
-      || (value.length > 0 && !B64.test(value)) || value.length > max * 2 + 4) fail();
+      || value.length > max * 2 + 4) fail();
+    // Neither String.replace(regex) nor RegExp.test is safe after executable
+    // independent authority: both dispatch mutable RegExp @@replace/exec.
+    let standard = "";
+    for (let i = 0; i < value.length; i++) {
+      const code = nativeApply(nativeCharCodeAt, value, [i]);
+      if (code >= 65 && code <= 90 || code >= 97 && code <= 122
+        || code >= 48 && code <= 57) standard += nativeFromCharCode(code);
+      else if (code === 45) standard += "+";
+      else if (code === 95) standard += "/";
+      else fail();
+    }
     let binary;
-    try { binary = atob(value.replace(/-/g, "+").replace(/_/g, "/")
-      .padEnd(Math.ceil(value.length / 4) * 4, "=")); } catch (_) { fail(); }
-    const result = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-    if (result.length < min || result.length > max || b64(result) !== value) fail();
+    try {
+      while (standard.length % 4 !== 0) standard += "=";
+      binary = nativeAtob(standard);
+    } catch (_) { fail(); }
+    // Never call an attacker-overridden string iterator on decrypted data.
+    const result = new NativeUint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) {
+      result[index] = nativeApply(nativeCharCodeAt, binary, [index]);
+    }
+    const size = nativeApply(nativeTypedLength, result, []);
+    if (size < min || size > max || b64(result) !== value) fail();
     return result;
   }
   function id(value, min = 16, max = 16) {
-    if (min === 16 && max === 16 && (typeof value !== "string" || !OPAQUE_ID.test(value))) fail();
+    if (min === 16 && max === 16 && (typeof value !== "string"
+      || value.length !== 22)) fail();
     from64(value, min, max);
     return value;
   }
@@ -78,29 +173,41 @@
       || !cek.usages.includes("encrypt") || !cek.usages.includes("decrypt")) fail();
   }
   function aadFor(metadata, format = FORMAT) {
-    return encode.encode((format === MOVE_FORMAT ? MOVE_DOMAIN : DOMAIN)
-      + JSON.stringify(normalizedMetadata(metadata)));
+    return nativeApply(nativeTextEncode, encode, [
+      (format === MOVE_FORMAT ? MOVE_DOMAIN : DOMAIN)
+        + nativeJsonStringify(normalizedMetadata(metadata))]);
   }
   function validName(name) {
-    return typeof name === "string" && name.length >= 1 && name.length <= 255
-      && !/[\\/\u0000-\u001f\u007f]/.test(name);
+    if (typeof name !== "string" || name.length < 1 || name.length > 255) return false;
+    for (let i = 0; i < name.length; i++) {
+      const code = nativeApply(nativeCharCodeAt, name, [i]);
+      if (code <= 31 || code === 127 || code === 47 || code === 92) return false;
+    }
+    return true;
+  }
+  function hasControlCharacters(value) {
+    for (let i = 0; i < value.length; i++) {
+      const code = nativeApply(nativeCharCodeAt, value, [i]);
+      if (code <= 31 || code === 127) return true;
+    }
+    return false;
   }
   async function generateFileCek() {
     if (!subtle) fail();
-    const raw = webCrypto.getRandomValues(new Uint8Array(32));
+    const raw = webCrypto.getRandomValues(new NativeUint8Array(32));
     try {
-      return await subtle.importKey("raw", raw, { name: "AES-GCM", length: 256 },
-        false, ["encrypt", "decrypt"]);
-    } finally { raw.fill(0); }
+      return await nativeApply(nativeImportKey, subtle, ["raw", raw,
+        { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]]);
+    } finally { wipeOwned(raw); }
   }
   async function importFileCek(rawCek) {
     if (!subtle) fail();
     const source = asBytes(rawCek);
-    if (source.length !== 32) fail();
+    if (nativeApply(nativeTypedLength, source, []) !== 32) fail();
     try {
-      return await subtle.importKey("raw", source, { name: "AES-GCM", length: 256 },
-        false, ["encrypt", "decrypt"]);
-    } finally { source.fill(0); }
+      return await nativeApply(nativeImportKey, subtle, ["raw", source,
+        { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]]);
+    } finally { wipeOwned(source); }
   }
   async function encryptFile({ cek, metadata, name, mediaType, data }) {
     return sealFile({ cek, metadata, name, mediaType, data }, FORMAT, undefined);
@@ -117,64 +224,67 @@
     keyIsValid(cek);
     const context = normalizedMetadata(metadata);
     if (!validName(name) || typeof mediaType !== "string" || mediaType.length > 128
-      || /[\u0000-\u001f\u007f]/.test(mediaType)) fail();
+      || hasControlCharacters(mediaType)) fail();
     const raw = asBytes(data);
-    if (raw.length > MAX_PLAIN) fail();
-    const payload = encode.encode(JSON.stringify({
-      name, mediaType, length: raw.length, content: b64(raw),
+    const rawSize = nativeApply(nativeTypedLength, raw, []);
+    if (rawSize > MAX_PLAIN) fail();
+    const payload = nativeApply(nativeTextEncode, encode, [nativeJsonStringify({
+      name, mediaType, length: rawSize, content: b64(raw),
       ...(format === MOVE_FORMAT ? { parentFolderId } : {}),
-    }));
-    const nonce = webCrypto.getRandomValues(new Uint8Array(12));
+    })]);
+    const nonce = webCrypto.getRandomValues(new NativeUint8Array(12));
     try {
-      const sealed = new Uint8Array(await subtle.encrypt({
+      const sealed = new NativeUint8Array(await nativeApply(nativeEncrypt, subtle, [{
         name: "AES-GCM", iv: nonce, additionalData: aadFor(context, format), tagLength: 128,
-      }, cek, payload));
-      const wire = encode.encode(JSON.stringify({
+      }, cek, payload]));
+      const wire = nativeApply(nativeTextEncode, encode, [nativeJsonStringify({
         format, algorithm: "AES-256-GCM", metadata: context,
         nonce: b64(nonce), ciphertext: b64(sealed),
-      }));
-      if (wire.length > MAX_WIRE) fail();
+      })]);
+      if (nativeApply(nativeTypedLength, wire, []) > MAX_WIRE) fail();
       return wire;
     } catch (_) { fail(); }
-    finally { payload.fill(0); raw.fill(0); }
+    finally { wipeOwned(payload); wipeOwned(raw); }
   }
   async function decryptFile({ cek, metadata, envelopeBytes }) {
     if (!subtle) fail();
     keyIsValid(cek);
     const expected = normalizedMetadata(metadata);
     const encoded = asBytes(envelopeBytes);
-    if (encoded.length > MAX_WIRE || !encoded.length) fail();
+    const encodedSize = nativeApply(nativeTypedLength, encoded, []);
+    if (encodedSize > MAX_WIRE || !encodedSize) fail();
     let decrypted;
     try {
-      const value = JSON.parse(decode.decode(encoded));
+      const value = nativeJsonParse(nativeApply(nativeTextDecode, decode, [encoded]));
       strict(value, ["format", "algorithm", "metadata", "nonce", "ciphertext"]);
       if (![FORMAT, MOVE_FORMAT].includes(value.format)
         || value.algorithm !== "AES-256-GCM") fail();
       const receivedMetadata = normalizedMetadata(value.metadata);
-      if (JSON.stringify(expected) !== JSON.stringify(receivedMetadata)) fail();
+      if (nativeJsonStringify(expected) !== nativeJsonStringify(receivedMetadata)) fail();
       // Reject any ambiguous or alternative serialization before accepting
       // a versioned wire object from an untrusted storage provider.
-      if (JSON.stringify(value) !== decode.decode(encoded)) fail();
-      decrypted = new Uint8Array(await subtle.decrypt({
+      if (nativeJsonStringify(value) !== nativeApply(nativeTextDecode, decode, [encoded])) fail();
+      decrypted = new NativeUint8Array(await nativeApply(nativeDecrypt, subtle, [{
         name: "AES-GCM", iv: from64(value.nonce, 12, 12),
         additionalData: aadFor(expected, value.format), tagLength: 128,
-      }, cek, from64(value.ciphertext, 16, MAX_WIRE)));
-      const payload = JSON.parse(decode.decode(decrypted));
+      }, cek, from64(value.ciphertext, 16, MAX_WIRE)]));
+      const payload = nativeJsonParse(nativeApply(nativeTextDecode, decode, [decrypted]));
       strict(payload, ["name", "mediaType", "length", "content",
         ...(value.format === MOVE_FORMAT ? ["parentFolderId"] : [])]);
       if (value.format === MOVE_FORMAT && payload.parentFolderId !== null)
         id(payload.parentFolderId);
       if (!validName(payload.name) || typeof payload.mediaType !== "string"
-        || payload.mediaType.length > 128 || /[\u0000-\u001f\u007f]/.test(payload.mediaType)
+        || payload.mediaType.length > 128
+        || hasControlCharacters(payload.mediaType)
         || !Number.isSafeInteger(payload.length) || payload.length < 0
         || payload.length > MAX_PLAIN) fail();
       const data = from64(payload.content, 0, MAX_PLAIN);
-      if (payload.length !== data.length) fail();
+      if (payload.length !== nativeApply(nativeTypedLength, data, [])) fail();
       return { name: payload.name, mediaType: payload.mediaType, data,
         ...(value.format === MOVE_FORMAT
           ? { parentFolderId: payload.parentFolderId } : {}) };
     } catch (_) { fail(); }
-    finally { decrypted?.fill(0); }
+    finally { wipeOwned(decrypted); }
   }
   return Object.freeze({ generateFileCek, importFileCek, encryptFile,
     encryptFileWithParent, decryptFile });

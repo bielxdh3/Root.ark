@@ -7,6 +7,21 @@ const crypto = require("node:crypto");
 const { types: nativeTypes } = require("node:util");
 const z = require("./rootark-zk-1");
 const transfer = require("./rootark-zk1-owner-authorized-file-cek-transfer");
+// Session fencing invokes an independently supplied callback after real
+// HPKE. Keep cleanup independent of callback-mutated JS array prototypes.
+const nativeApply = Reflect.apply;
+const nativeTypedFill = Uint8Array.prototype.fill;
+const NativeUint8Array = Uint8Array;
+const nativeIsArrayBuffer = nativeTypes.isArrayBuffer;
+const nativeIsUint8Array = nativeTypes.isUint8Array;
+const nativeIsProxy = nativeTypes.isProxy;
+function scrub(bytes) {
+  if (bytes == null) return;
+  if (nativeIsProxy(bytes)) deny();
+  const view = nativeIsArrayBuffer(bytes) ? new NativeUint8Array(bytes) : bytes;
+  if (!nativeIsUint8Array(view)) deny();
+  nativeApply(nativeTypedFill, view, [0]);
+}
 
 const DOMAIN = Buffer.from("Root.ark/zk-1/owner-versioned-cek-batch/v1\0");
 const SCHEMA = "rootark-zk1-owner-versioned-cek-batch/v1";
@@ -224,7 +239,11 @@ async function sealOwnerAuthorizedVersionedCeks(input) {
       signedBatchCompletenessVerified: true,
       globalAccountCompletenessProven: false, authorizesProductionRestore: false };
   } catch (_) { deny(); }
-  finally { for (const row of stable?.versions || []) row.ownerHeldCek?.fill(0); }
+  finally {
+    const all = stable?.versions;
+    // Do not consult Array.prototype[Symbol.iterator] after assertLive().
+    if (all) for (let i = 0; i < all.length; i++) scrub(all[i].ownerHeldCek);
+  }
 }
 
 async function openOwnerAuthorizedVersionedCeks(input) {
@@ -268,7 +287,7 @@ async function openOwnerAuthorizedVersionedCeks(input) {
       });
       if (released.some((previous) => previous.cek.length === opened.cek.length
         && crypto.timingSafeEqual(previous.cek, opened.cek))) {
-        opened.cek.fill(0);
+        scrub(opened.cek);
         deny();
       }
       released.push({ metadata: row.metadata, objectRevision: row.objectRevision,
@@ -281,13 +300,11 @@ async function openOwnerAuthorizedVersionedCeks(input) {
     return { entries: released, signedBatchCompletenessVerified: true,
       globalAccountCompletenessProven: false, authorizesProductionRestore: false };
   } catch (_) {
-    for (const row of released) row.cek.fill(0);
+    for (let i = 0; i < released.length; i++) scrub(released[i].cek);
     deny();
   } finally {
-    raw?.fill(0);
-    const secret = stable?.recipientHpkePrivateRaw;
-    if (secret instanceof ArrayBuffer) new Uint8Array(secret).fill(0);
-    else secret?.fill(0);
+    scrub(raw);
+    scrub(stable?.recipientHpkePrivateRaw);
   }
 }
 

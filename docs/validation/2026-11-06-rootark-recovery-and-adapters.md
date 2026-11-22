@@ -1,0 +1,37 @@
+# Recovery and cloud-adapter verification — 2026-11-06
+
+Status: **BOUNDED LOCAL VERIFICATION**. This is evidence of disposable local tests, **not** production, external provider, key-custody, or ZK-1 cutover certification. No deployment, merge, migration, or secret-bearing provider requests were performed for this checkpoint.
+
+## Source and execution environment
+
+- Source baseline: `Root/main` `ea0445df8ccd8f17da2c70572786d298491fd2c2` (#250). The independent draft PR #253 (`5afe47dceaad3cb29f09406aa306c67127f801e8`) adds read-only `/sync/v1/objects/:objectId/history` and one test. PR #252 (`9d72a7114ce235e87e9fcb98a786229129c731e3`) supplies the first-wave deployment profile.
+- Environment: Windows 10; local Node.js **24.14.1**; isolated `E:\servidor\.worktrees\rootark-issue67-history-20261105` plus disposable fixtures. Reused the existing E: `node_modules` through a local, untracked junction; **no dependency version changes**, no real external credentials. The first backup-cloud attempt failed 10 subtests because test subprocesses resolved absent absolute `node_modules/{unzipper,better-sqlite3}` paths. After the fixture dependency path was made available, all 28 subtests passed; do **not** count the initial environment error as a product regression.
+
+## Reproducible local verification
+
+| Suite / gate | Results | Scope proved |
+| --- | --- | --- |
+| `node --test test/issue-67-sync-burst-guard.test.js` on PR #253 | **39 pass, 0 fail, 0 skip** | History remains available after a logical delete, tenant isolation, `listFiles` denial, ciphertext-only response, persisted destructive-burst pause, resume, TOTP/recovery replay and bounded pruning; new history route had a real RED (404) before implementation |
+| `node --test test/backup-cloud-completeness.test.js` | **28 pass, 0 fail, 0 skip** | Fake local/S3/Drive storage, cloud-only files, SQLite backup/restore, inventory failure, rejected unsafe names and cloud-object scoping |
+| `node --test test/backup-restore-transaction-boundary.test.js` | **125 pass, 0 fail, 6 skip** | Whole-restore preimages, JSON/SQLite consistency, crash/restart and rollback boundaries, fail-closed provider reconciliation, quarantine journals and object authority |
+| `node --test test/cloud-storage.test.js test/issue-65-full-multiprovider-http-restore.test.js` | **64 pass, 0 fail, 1 skip** | Local/S3/Drive adapter behavior, key and parent scope, bad-source cleanup, exact provider identity/version pins, and client-side quorum restore using S3 SDK, Drive HTTPS and WebDAV mTLS fixtures |
+| Independent review of adapter code and `test/cloud-storage.test.js test/issue-65-cloud-physical-readback.test.js test/issue-65-cloud-sidecar-reread-fencing.test.js` | **59 pass, 0 fail, 2 skip** | Independent read-only review of local/S3/Drive storage, backup/restore reconciliation, ZK ciphertext readback and signed catalogs; no actionable P1/P2 found; separate Windows platform skips |
+| Hosted PR #253 | **Ubuntu Node 22, Windows Node 22 canonical and mandatory gates, CodeQL, dependency review, PG18, Kotlin and provider/Android focused jobs: PASS** | Hosted multi-platform gates for exact PR #253 SHA; do not transfer these results to a different future HEAD |
+| Hosted PR #252 | **Ubuntu Node 22, Windows Node 22 canonical and mandatory gates, CodeQL, dependency review: PASS** | Hosted first-wave fail-closed rate-store configuration/profile gate for exact PR #252 SHA |
+
+Six Windows skips in the transaction-boundary suite are platform-specific: POSIX FIFO/symlink/hardlink facilities or directory-fsync behavior not available in that host configuration. The provider suite's single skip covers a POSIX-only public temporary-directory ancestry test. These are **not** counted as passes. Hosted Ubuntu checks above supply independent Linux regression coverage, but not a real cloud restore drill.
+
+## Real acceptance boundaries (R3/R5 → R1)
+
+- **R3 — bounded local recovery evidence is verified.** All tested fake-provider and crash/restore cases passed; an actual encrypted backup export and restore in an operator-controlled nonproduction environment remains a separate operational acceptance before deployment.
+- **R5 — independent source review GO, live-provider acceptance remains R1.** An independent read-only reviewer checked `services/cloudStorage.js`, backup/restore cross-provider reconciliation and `src/services/zk1CloudCiphertextReadbackVerifier.js`/`zk1CloudSignedCatalogSidecar.js` against the implemented Local/S3/Google Drive/WebDAV fixtures. No actionable P1/P2 were identified. GET without `Content-Length` is not itself a vulnerability: legitimate chunked responses omit it, and exact body length, SHA-256 and root are checked by the downstream verifier before trust. A dedicated truncated chunked-response negative test could add value later but is **not** a release blocker without a demonstrated acceptance bug. Confirm which external adapters the owner will actually operate; real provider durability/consistency, live credentials, ingress DNS/TLS and permissions cannot be certified by simulated adapters. The README marks the implemented-adapter source-review milestone complete; real provider/operator certification remains under R1.
+- **R1 — NOT DONE.** Requires trusted external key-custody attestations, physical/provider durability evidence, deployment/ingress configuration and an independently authorized ZK-1 cutover; none were performed. The project's default-off protected ZK mode must not be silently enabled.
+- **#67 — NOT CLOSED.** The bounded Sync v1 history endpoint makes retained ciphertext recoverable by authorized clients but is not off-host immutable snapshots, a client restore UI, or a full ransomware response/recovery acceptance.
+
+## R4 — already merged upload scanner and suspicious-file isolation controls
+
+Independent source/test review of the unchanged `Root/main` baseline covered `UPLOAD_SCAN_*` fail-closed startup configuration and a `clamav` scan before accepted publication on simple uploads, chunk completion, and WebDAV PUT. Suspicious/executable-extension blocking, staging cleanup and scanner-offline behavior are covered in the existing `test/upload-security.test.js` suite. Selected ClamAV focused tests: **5 PASS / 0 FAIL**, including scanner unavailable yields 503 (rather than publishing), clean protocol response, startup guard, unsafe extensions and permission checks after scanning. No actionable R4 P1/P2 found.
+
+Three selected local backup/quarantine restore tests **failed to reach their scenario** on this host because the existing native Windows ancestor-ACL guard rejected untrusted principals that could replace the staging path. This was not bypassed, and those tests are not called passes. The exact baseline and PR #253 hosted canonical Ubuntu/Windows security regressions previously passed. Live ClamAV daemon verdicts, network/service permissions and physical quarantine volumes are an **operator acceptance under R1**, not something CI fakes can certify. R4 **source-level scanner/isolation work is verified** at current baseline; do not construct a new scanner or disable ACL merely to satisfy a checklist.
+
+The pragmatic next action is to record the independent R5 review, resolve only real findings, then select an authorized disposable external-transport/restore acceptance profile before any release recommendation. Avoid adding distributed infrastructure or speculative threat scenarios not part of the supported single-instance architecture.

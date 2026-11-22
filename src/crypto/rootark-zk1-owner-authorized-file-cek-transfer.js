@@ -6,6 +6,8 @@
 const crypto = require("node:crypto");
 const nativeTypes = require("node:util").types;
 const nativeIsProxy = nativeTypes.isProxy;
+const nativeIsUint8Array = nativeTypes.isUint8Array;
+const nativeIsArrayBuffer = nativeTypes.isArrayBuffer;
 const nativeIsCryptoKey = nativeTypes.isCryptoKey;
 const nativeIsKeyObject = nativeTypes.isKeyObject;
 const nativeNumberIsFinite = Number.isFinite;
@@ -34,10 +36,15 @@ const nativeArrayIsArray = Array.isArray;
 const nativeArrayBufferIsView = ArrayBuffer.isView;
 const nativeArrayBuffer = ArrayBuffer;
 const nativeUint8Array = Uint8Array;
-const nativeUint8ArrayFrom = Uint8Array.from;
+const nativeTypedPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const nativeTypedByteLength = Object.getOwnPropertyDescriptor(nativeTypedPrototype, "byteLength").get;
+const nativeTypedSet = Uint8Array.prototype.set;
+const nativeArrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+const nativeTypedFill = Uint8Array.prototype.fill;
 const nativeBufferFrom = Buffer.from.bind(Buffer);
+const nativeBufferPrototype = Buffer.prototype;
+const nativeBufferAlloc = Buffer.alloc.bind(Buffer);
 const nativeBufferConcat = Buffer.concat.bind(Buffer);
-const nativeBufferIsBuffer = Buffer.isBuffer.bind(Buffer);
 const nativeBufferToString = Buffer.prototype.toString;
 const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
 const nativeCreateHash = crypto.createHash.bind(crypto);
@@ -75,6 +82,15 @@ function nativeSha256(value) {
   const hash = nativeCreateHash("sha256");
   nativeApply(nativeHashUpdate, hash, [value]);
   return nativeApply(nativeHashDigest, hash, []);
+}
+function copyOwnedBytes(view, asBuffer = false) {
+  // Typed-array internal slots cannot run caller-replaced @@hasInstance,
+  // @@iterator, length or byteLength accessors after an authority callback.
+  if (!nativeIsUint8Array(view) || nativeIsProxy(view)) deny();
+  const size = nativeApply(nativeTypedByteLength, view, []);
+  const target = asBuffer ? nativeBufferAlloc(size) : new nativeUint8Array(size);
+  nativeApply(nativeTypedSet, target, [view]);
+  return target;
 }
 function nativeBase64Url(value) {
   return nativeApply(nativeBufferToString, nativeBufferFrom(value), ["base64url"]);
@@ -118,18 +134,24 @@ function snapshotFields(value, depth = 0, budget = { count: 0, bytes: 0 }) {
     if (typeof value === "string" && value.length > 524288) deny();
     return value;
   }
-  if (nativeBufferIsBuffer(value) || value instanceof nativeUint8Array
-    || value instanceof nativeArrayBuffer) {
-    const length = value.byteLength;
+  if (nativeIsUint8Array(value) || nativeIsArrayBuffer(value)) {
+    const length = nativeIsUint8Array(value)
+      ? nativeApply(nativeTypedByteLength, value, [])
+      : nativeApply(nativeArrayBufferByteLength, value, []);
     budget.bytes += length;
     if (!nativeNumberIsSafeInteger(length) || length > 4 * 1024 * 1024
       || budget.bytes > 8 * 1024 * 1024) deny();
-    if (nativeBufferIsBuffer(value)) return nativeBufferFrom(value);
-    if (value instanceof nativeUint8Array) return nativeApply(nativeUint8ArrayFrom,
-      nativeUint8Array, [value]);
-    return value.slice(0);
+    // Buffer.isBuffer invokes mutable Uint8Array Symbol.hasInstance internally.
+    // Use the pinned actual Buffer prototype without dispatching callbacks.
+    if (nativeIsUint8Array(value) && nativeGetPrototypeOf(value) === nativeBufferPrototype) {
+      return copyOwnedBytes(value, true);
+    }
+    if (nativeIsUint8Array(value)) return copyOwnedBytes(value);
+    const target = new nativeArrayBuffer(length);
+    nativeApply(nativeTypedSet, new nativeUint8Array(target), [new nativeUint8Array(value)]);
+    return target;
   }
-  if (value instanceof nativeKeyObject
+  if (nativeIsKeyObject(value)
     || nativeIsCryptoKey(value)) return value;
   // @hpke uses XCryptoKey wrapping mutable 32-byte private raw material.
   // Copy that material synchronously; reconstruct a fresh HPKE handle only
@@ -143,8 +165,9 @@ function snapshotFields(value, depth = 0, budget = { count: 0, bytes: 0 }) {
     const expected = ["key", "type", "extractable", "algorithm", "usages"];
     const keys = nativeOwnKeys(d);
     if (keys.length !== expected.length
-      || d.type.value !== "private" || !(d.key.value instanceof nativeUint8Array)
-      || d.key.value.byteLength !== 32 || !nativeArrayIsArray(d.usages.value)
+      || d.type.value !== "private" || !nativeIsUint8Array(d.key.value)
+      || nativeApply(nativeTypedByteLength, d.key.value, []) !== 32
+      || !nativeArrayIsArray(d.usages.value)
       || d.usages.value.length > 8) deny();
     for (const name of expected)
       if (!d[name] || !nativeHasOwn(d[name], "value")) deny();
@@ -155,8 +178,7 @@ function snapshotFields(value, depth = 0, budget = { count: 0, bytes: 0 }) {
       if (!nativeHasOwn(usages[i] ?? {}, "value")
         || typeof usages[i].value !== "string") deny();
     }
-    return nativeFreeze({ hpkePrivateRaw: nativeApply(nativeUint8ArrayFrom,
-      nativeUint8Array, [d.key.value]) });
+    return nativeFreeze({ hpkePrivateRaw: copyOwnedBytes(d.key.value) });
   }
   const plainPrototype = nativeGetPrototypeOf(value);
   if (typeof value !== "object" || nativeArrayIsArray(value)
@@ -198,7 +220,14 @@ function positive(v) { if (!nativeNumberIsSafeInteger(v) || v < 1) deny(); retur
 function requireUnexpiredAtRelease(expiresAt, wallClock) {
   if (!nativeNumberIsSafeInteger(expiresAt)
     || Date.now !== wallClock || !nativeNumberIsFinite(wallClock())
-    || nativeMathFloor(wallClock() / 1000) > expiresAt) deny();
+    || nativeMathFloor(wallClock() / 1000) >= expiresAt) deny();
+}
+function wipeOwnedBytes(value) {
+  // Never dispatch an attacker-replaced Buffer/Uint8Array prototype method:
+  // the final authority callback can run after the actual CEK is in memory.
+  if (value && !nativeIsProxy(value) && nativeIsUint8Array(value)) {
+    nativeApply(nativeTypedFill, value, [0]);
+  }
 }
 function metadataCopy(meta) {
   exact(meta, META);
@@ -403,7 +432,11 @@ async function sealOwnerAuthorizedFileCek(input) {
       owner_signature: b64(nativeSign(null, message, stable.ownerPrivateKey)),
       authorizesProductionRestore: false, externalCustodyProven: false });
   } catch (_) { deny(); }
-  finally { checked?.data?.fill(0); cek?.fill(0); stable?.ownerHeldCek?.fill(0); }
+  finally {
+    wipeOwnedBytes(checked?.data);
+    wipeOwnedBytes(cek);
+    wipeOwnedBytes(stable?.ownerHeldCek);
+  }
 }
 async function openOwnerAuthorizedFileCek(input) {
   const wallClock = Date.now;
@@ -447,7 +480,7 @@ async function openOwnerAuthorizedFileCek(input) {
     const signed = nativeBufferConcat([DOMAIN,
       await nativeEncodeDeterministic({ core, enc, ciphertext })]);
     if (!nativeVerify(null, signed, owner, from64(wire.owner_signature, 64))) deny();
-    if (!(stable.deviceHpkePrivateKey?.hpkePrivateRaw instanceof nativeUint8Array)
+    if (!nativeIsUint8Array(stable.deviceHpkePrivateKey?.hpkePrivateRaw)
       || stable.deviceHpkePrivateKey.hpkePrivateRaw.length !== 32) deny();
     const deviceHpkeKey = await nativeHpkeSuite().kem.deserializePrivateKey(
       stable.deviceHpkePrivateKey.hpkePrivateRaw);
@@ -467,6 +500,9 @@ async function openOwnerAuthorizedFileCek(input) {
       authorizesProductionRestore: false,
       externalCustodyProven: false });
   } catch (_) { deny(); }
-  finally { cek?.fill(0); stable?.deviceHpkePrivateKey?.hpkePrivateRaw?.fill(0); }
+  finally {
+    wipeOwnedBytes(cek);
+    wipeOwnedBytes(stable?.deviceHpkePrivateKey?.hpkePrivateRaw);
+  }
 }
 module.exports = { sealOwnerAuthorizedFileCek, openOwnerAuthorizedFileCek };
