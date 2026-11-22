@@ -1127,8 +1127,8 @@ async function verifyAuthorizationCore(manifest, signature, publicKey, expected 
       }
     }
   };
-  // Preserve the signed v1 scalar type on the detached snapshot, while
-  // treating number/bigint encodings of the same epoch as the same scope.
+  // Compare the detached original v1 scope without rereading caller input;
+  // number/bigint encodings of the same epoch remain semantically equivalent.
   if (normalized.envelope_version === 1) checkExpected(V1_EXPECTED_FIELDS, manifestSnapshot, true);
   if (normalized.envelope_version === 2) {
     for (let index = 0; index < V2_EXPECTED_SCOPE.length; index += 1) {

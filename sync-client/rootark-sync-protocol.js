@@ -384,6 +384,9 @@ function canonicalize(value) {
     const key = keys[index];
     const descriptor = nativeObjectGetOwnPropertyDescriptor(value, key);
     if (!descriptor || !nativeObjectHasOwn(descriptor, "value")) fail("Invalid JSON value");
+    // Define an own data property on the null-prototype result rather than
+    // invoking dynamic bracket assignment. Even reserved JSON keys remain
+    // inert data properties, never setters or prototype mutation.
     nativeObjectDefineProperty(result, key, {
       value: canonicalize(descriptor.value), enumerable: true,
       writable: true, configurable: true,

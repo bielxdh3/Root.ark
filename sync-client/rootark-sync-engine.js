@@ -1143,8 +1143,10 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
   // Required after the held descriptor closes and the durable hardlink removal
   // has been verified; keep this scope outside the descriptor's try block.
   const directoryName = path.dirname(target);
-  // Pin the original inode before consulting the mutable target pathname.
-  // A swapped path cannot authorize recovery of unrelated signed bytes.
+  // Acquire and pin the target descriptor BEFORE using the pathname to
+  // decide whether the old hardlink is eligible for recovery. A concurrent
+  // writer may swap a name at any time; only fstat of this held descriptor
+  // and a subsequent lstat equality check can authenticate the candidate.
   const handle = await fsp.open(target, fs.constants.O_RDONLY
     | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
   try {

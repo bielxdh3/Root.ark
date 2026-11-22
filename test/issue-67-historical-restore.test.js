@@ -26,6 +26,28 @@ const { DOMAIN: OWNER_PROVISION_DOMAIN } =
   require("../sync-client/rootark-sync-atomic-owner-provision");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
+// Read recovery witnesses through an independently opened regular-file handle.
+// A pathname observed during recovery may be rebound before the test reaches
+// its assertions; the byte oracle must authenticate the descriptor it reads.
+async function readHeldRegularFile(filename, expectedIdentity = null) {
+  const handle = await fsp.open(filename, fs.constants.O_RDONLY
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  try {
+    const before = await handle.stat({ bigint: true });
+    assert.equal(before.isFile() && !before.isSymbolicLink(), true);
+    if (expectedIdentity) {
+      assert.equal(before.dev, expectedIdentity.dev);
+      assert.equal(before.ino, expectedIdentity.ino);
+    }
+    const bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    assert.equal(after.dev, before.dev);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.size, before.size);
+    return bytes;
+  } finally { await handle.close(); }
+}
+
 test("#262 P2: bounded CBOR snapshot admits the supported 16,384-wrap history shape", async () => {
   const keyRef = Buffer.alloc(32, 1);
   const wrapId = Buffer.alloc(16, 2);
@@ -186,6 +208,17 @@ function issue67ZkManifestV1() {
     wrapped_key_digest: issue67ZkBytes(12, 32), ciphertext_digest: issue67ZkBytes(13, 32),
   };
 }
+
+test("#262 P2: v1 signed authorization accepts its original numeric epoch scope", async () => {
+  const signed = issue67ZkManifestV1();
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const signature = await zk.signAuthorization(signed, signer.privateKey);
+  assert.equal(await zk.verifyAuthorization(signed, signature, signer.publicKey,
+    { epoch: 7 }), true,
+  "v1 source epoch 7 and expected numeric epoch 7 must have matching semantics");
+  await assert.rejects(zk.verifyAuthorization(signed, signature, signer.publicKey,
+    { epoch: 8 }), (error) => error.code === "SCOPE_MISMATCH");
+});
 
 function issue67ZkStaticCoreV2() {
   return {
@@ -473,7 +506,8 @@ test("#262 P2: bounded canonical JSON preserves shared DAGs, rejects cycles and 
   const reserved = JSON.parse('{"__proto__":{"polluted":true},"constructor":{"value":1}}');
   assert.equal(protocol.canonicalJson(reserved),
     '{"__proto__":{"polluted":true},"constructor":{"value":1}}');
-  assert.equal(Object.prototype.polluted, undefined);
+  assert.equal(Object.prototype.polluted, undefined,
+    "canonical JSON reserved keys must never mutate the ambient prototype");
 
   const originalSort = Array.prototype.sort;
   try {
@@ -615,9 +649,10 @@ test("#262 P2: CBOR snapshot bounds expanded aliases before cloning and preserve
     });
     const poisonedArrayIteratorNextDescriptor = Object.getOwnPropertyDescriptor(
       arrayIteratorPrototype, "next");
-    assert.deepEqual(Array.prototype.values.call([9]).next(),
-      { done: true, value: undefined },
+    const positiveControlResult = Array.prototype.values.call([9]).next();
+    assert.equal(positiveControlResult.done, true,
       "positive control proves the iterator-prototype poison is active");
+    assert.equal(positiveControlResult.value, undefined);
     assert.equal(poisonedArrayIteratorNextCalls, 1);
     assert.deepEqual(await pendingArrayEncoding, expectedArrayEncoding,
       "the awaited encoder must not let mutable ArrayIteratorPrototype.next replace validated array items");
@@ -697,6 +732,60 @@ test("#67 P1: 409 with server-controlled exact signed restore echo cannot clear 
   const [pending] = await f.engine.journal.recover();
   assert.equal(pending.operationId, signedRequest.operationId);
   assert.equal(f.versions.length, 2, "a server-controlled conflict cannot fabricate a physical commit");
+  assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"),
+    "original authenticated bytes");
+});
+
+test("#262 P1: ordinary markSeen cannot discharge a pending signed historical restore", async (t) => {
+  const f = await fixture(t);
+  const signed = await f.sign({ operation: "update",
+    operationId: `histrestore-${crypto.randomUUID()}`, versionId: "unadmitted-restore",
+    revision: { counter: 3, deviceId: "device-a" }, baseRevision: f.deleted.revision,
+    metadata: { path: "document.txt", name: "document.txt" },
+    plaintext: Buffer.from("signed but not physically admitted") });
+  await f.engine.journal.enqueue(signed);
+  await assert.rejects(f.engine.journal.markSeen(signed.operationId),
+    /independently verified markSeenExact/,
+    "even a direct ordinary journal ACK must preserve the original signed restore");
+  const [pending] = await f.engine.journal.recover();
+  assert.equal(pending.operationId, signed.operationId);
+  assert.equal(f.engine.journal.hasSeen(signed.operationId), false);
+});
+
+test("#262 P2: independent physical restore ACK promotes the durable observation", async (t) => {
+  const f = await fixture(t);
+  const outcome = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(outcome.pushed, true);
+  const digest = f.engine.journal.durableSignedReceiptDigest(outcome.operationId);
+  assert.match(digest, /^[a-f0-9]{64}$/);
+  assert.equal(f.engine.journal.state.admitted[outcome.operationId], digest,
+    "independently verified acknowledgement must promote the exact signed receipt");
+  assert.equal(Object.hasOwn(f.engine.journal.state.observed, outcome.operationId), false,
+    "the pre-observation must not consume a slot after physical admission");
+  assert.deepEqual(await f.engine.journal.recover(), []);
+});
+
+test("#262 P1: excluded signed restore LIST echo cannot consume pending physical admission", async (t) => {
+  const f = await fixture(t);
+  let echoed;
+  f.adapter.push = async (operation) => {
+    echoed = structuredClone(operation);
+    throw Object.assign(new Error("unproven server-side CAS conflict"),
+      { code: "sync_conflict", status: 409, current: structuredClone(operation) });
+  };
+  const queued = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(queued.pending, true);
+  assert.ok(echoed?.operationId.startsWith("histrestore-"));
+  f.engine.excludedPaths = ["document.txt"];
+  f.adapter.list = async () => [structuredClone(echoed)];
+  const summary = { pulled: 0, applied: 0, offline: false, conflicts: [] };
+  await f.engine.pullRemote(summary);
+  assert.equal(summary.pulled, 0);
+  assert.equal(f.engine.journal.hasSeen(echoed.operationId), false);
+  const [pending] = await f.engine.journal.recover();
+  assert.equal(pending.operationId, echoed.operationId,
+    "LIST cannot erase the signed outbox or its restore materialization record");
+  assert.equal(f.engine.journal.hasMaterializedRestore(pending), true);
   assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"),
     "original authenticated bytes");
 });
@@ -1262,7 +1351,8 @@ test("#262 P1: signed proof verification cannot reuse proof A bytes for a differ
   const forgedSecond = { ...second.authorization, signature: first.authorization.signature };
   const originalBufferFrom = Buffer.from;
   Buffer.from = function (value, ...args) {
-    if (value instanceof Uint8Array && value.length === cachedFirstCbor.length) {
+    if (typeof value === "object" && value !== null
+      && value instanceof Uint8Array && value.length === cachedFirstCbor.length) {
       return Reflect.apply(originalBufferFrom, Buffer, [cachedFirstCbor]);
     }
     return Reflect.apply(originalBufferFrom, Buffer, [value, ...args]);
@@ -1735,7 +1825,8 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
     throw new Error("simulated process halt after moving original to trash");
   };
   await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"), /simulated process halt/);
-  assert.equal(fs.existsSync(target), false);
+  // The later O_EXCL claim proves target absence atomically; do not authorize
+  // a later open from an earlier path-existence observation.
   assert.equal((await f.engine.journal.recover()).length, 1);
   f.adapter.list = async (id) => id ? structuredClone(f.current()) : [structuredClone(f.current())];
   const reopened = await new SyncEngine({
@@ -1748,7 +1839,6 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
   await assert.rejects(reopened.syncOnce(), (error) => error.code === "restore_local_materialization_missing");
   assert.equal(f.pushes(), 0, "an unmaterialized local restore must never be pushed after restart");
   assert.equal((await reopened.journal.recover()).length, 1);
-  assert.equal(fs.existsSync(target), false);
   const trash = await fsp.readdir(path.join(f.local, ".rootark-trash"));
   assert.equal(trash.length, 1);
   assert.deepEqual(await fsp.readFile(path.join(f.local, ".rootark-trash", trash[0])), old);
@@ -1756,13 +1846,16 @@ test("#67: a restart cannot dispatch a signed restore whose file was not materia
   // exact authenticated pending bytes, then let the existing CAS path resume.
   const recoveredBytes = protocol.decryptPayload(f.original, f.privateFileKey);
   try {
-    // Simulate a competing writer recreating the missing path after the
-    // absence check. Recovery must refuse and preserve those exact bytes.
+    // Simulate a writer atomically claiming the missing path. Exclusive
+    // creation is the absence check; never check-then-write a shared pathname.
     const competingBytes = Buffer.from("rival local edit before explicit recovery");
-    await fsp.writeFile(target, competingBytes, { flag: "wx" });
+    const competing = await fsp.open(target, fs.constants.O_WRONLY
+      | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    try { await competing.writeFile(competingBytes); }
+    finally { await competing.close(); }
     await assert.rejects(() => restoreRecoveredBytesOnlyIfVacant(target, recoveredBytes),
       (error) => error.code === "EEXIST");
-    assert.deepEqual(await fsp.readFile(target), competingBytes);
+    assert.deepEqual(await readHeldRegularFile(target), competingBytes);
     await fsp.unlink(target);
     await restoreRecoveredBytesOnlyIfVacant(target, recoveredBytes);
   } finally {
@@ -2017,7 +2110,8 @@ test("#67 P2: failed POSIX directory fsync after link cannot authorize push on r
     await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
       (error) => error.code === "EIO");
     assert.equal(injectionsRemaining, 1, "first EIO must strike directory sync after physical link");
-    assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+    assert.equal((await readHeldRegularFile(target)).toString("utf8"),
+      "original authenticated bytes");
     const [signed] = await f.engine.journal.recover();
     assert.equal(await verifyAuthorizationProof(signed.authorization, signed, f.trusted), true);
     assert.equal(f.engine.journal.hasMaterializedRestore(signed), false);
@@ -2108,7 +2202,8 @@ test("#67 P2: restart recovers an exactly bound crash hardlink or fails closed o
     assert.equal(f.pushes(), 0);
     assert.equal(fs.existsSync(orphan), true, "mismatched staged identity cannot be deleted");
     assert.equal((await reopened.journal.recover()).length, 1);
-    assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+    assert.equal((await readHeldRegularFile(target)).toString("utf8"),
+      "original authenticated bytes");
     return;
   }
   const result = await reopened.syncOnce();
@@ -2116,7 +2211,8 @@ test("#67 P2: restart recovers an exactly bound crash hardlink or fails closed o
   assert.equal(f.pushes(), 1);
   assert.equal(fs.existsSync(orphan), false, "remove only the authenticated temporary second hardlink");
   assert.equal((await fsp.lstat(target)).nlink, 1);
-  assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+  assert.equal((await readHeldRegularFile(target, current)).toString("utf8"),
+    "original authenticated bytes");
   assert.deepEqual(await reopened.journal.recover(), []);
 });
 
@@ -2144,7 +2240,7 @@ test("#262 P2: unresolved restore staging pathname cannot become a scanned CREAT
 
   await assert.rejects(f.engine.reconcileLocal(),
     (error) => error.code === "restore_local_materialization_missing");
-  assert.deepEqual(await fsp.readFile(staged), payload);
+  assert.deepEqual(await readHeldRegularFile(staged, stats), payload);
   assert.equal((await f.engine.journal.recover()).length, 1,
     "the signed outbox and staging provenance must remain for explicit recovery");
   assert.equal(f.engine.snapshot.files[name], undefined,
