@@ -77,3 +77,79 @@ test("stale session on crypto completion denies preview; source CEK is not modif
   await assert.rejects(preview.open(f.input), /ZK_SELECTED_PREVIEW_DENIED/);
   assert.deepEqual(f.raw, before);
 });
+
+test("P2: real AEAD preview cannot relabel a verified revision after its final live callback", async () => {
+  const f = await setup();
+  const actualId = f.input.selected.objectId;
+  let liveCalls = 0;
+  f.input.assertLive = () => {
+    if (++liveCalls === 6) {
+      // The authentic selected row and catalog anchor are caller-owned. A
+      // late callback must not relabel already decrypted A as arbitrary B.
+      f.input.selected.objectId = id();
+      f.input.selected.revision = 999;
+      f.input.selected.epoch = 99;
+    }
+  };
+  const opened = await preview.open(f.input);
+  assert.equal(liveCalls, 6, "mutation occurred after genuine WebCrypto and AEAD awaits");
+  assert.equal(f.input.selected.revision, 999, "original selection really changed");
+  assert.equal(opened.objectId, actualId);
+  assert.equal(opened.revision, 3);
+  assert.equal(opened.epoch, 2);
+  assert.match(opened.text, /relatório confidencial/,
+    "the fixed identity accompanies genuinely decrypted plaintext");
+});
+
+test("P2: later live callback cannot replace independently pinned CEK fingerprint", async () => {
+  const f = await setup();
+  const legitimatePin = sha(f.raw);
+  f.input.cekSha256Pin = sha(nodeCrypto.randomBytes(32));
+  assert.notEqual(f.input.cekSha256Pin, legitimatePin,
+    "the input starts with an intentionally unauthorized CEK fingerprint");
+  let liveCalls = 0;
+  f.input.assertLive = () => {
+    if (++liveCalls === 2) f.input.cekSha256Pin = legitimatePin;
+  };
+  await assert.rejects(preview.open(f.input), /ZK_SELECTED_PREVIEW_DENIED/,
+    "a callback cannot retroactively authorize the independently pinned CEK");
+  assert.equal(liveCalls, 2, "the mutation ran after the actual SHA-256 await");
+  assert.equal(f.input.cekSha256Pin, legitimatePin,
+    "the original pin really changed before comparison");
+});
+
+test("P2: source CEK changes after fingerprint calculation cannot retarget file AEAD", async () => {
+  const f = await setup();
+  const original = Buffer.from(f.raw);
+  let liveCalls = 0;
+  f.input.assertLive = () => {
+    if (++liveCalls === 2) f.raw.fill(0);
+  };
+  const opened = await preview.open(f.input);
+  assert.equal(liveCalls, 6, "the authentic file decrypted after source-key mutation");
+  assert.ok(f.raw.every((byte) => byte === 0), "the external source key was actually overwritten");
+  assert.notDeepEqual(original, f.raw, "the attack used a different post-hash key");
+  assert.match(opened.text, /relatório confidencial/,
+    "the decrypted file still used the originally pinned local key");
+});
+
+test("P2: replacing the live callback after logout cannot release authenticated text", async () => {
+  const f = await setup();
+  const originalLive = f.input.assertLive;
+  const forgedLive = () => {};
+  let liveCalls = 0;
+  f.input.assertLive = () => {
+    if (++liveCalls === 2) {
+      f.logout();
+      f.input.assertLive = forgedLive;
+      return;
+    }
+    originalLive();
+  };
+  await assert.rejects(preview.open(f.input), /ZK_SELECTED_PREVIEW_DENIED/,
+    "the originally accepted live guard must still govern after the logout");
+  assert.equal(liveCalls, 3,
+    "the pinned callback observes the revoked session after a real digest await");
+  assert.equal(f.input.assertLive, forgedLive,
+    "the input callback was actually replaced during the operation");
+});
