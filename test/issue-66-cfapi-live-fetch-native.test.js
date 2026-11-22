@@ -292,6 +292,43 @@ test("#66 native CFAPI refuses a stale original root enrollment before any posit
     assert.equal(evidence.unregistered, true);
   });
 
+for (const mode of ["--disposable-stale-ancestor", "--disposable-native-publish"]) {
+  test(`#66 native Windows CFAPI verified path ${mode}`,
+    { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {
+      const where = spawnSync("C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe",
+        ["-all", "-products", "*", "-prerelease", "-find", "VC\\Auxiliary\\Build\\vcvars64.bat"],
+        { encoding: "utf8", timeout: 6000, windowsHide: true });
+      const vcvars = where.status === 0
+        ? where.stdout.trim().split(/\r?\n/).find(Boolean) : null;
+      if (!vcvars) { t.skip("MSVC x64 unavailable"); return; }
+      const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-cfapi-live-"));
+      const root = path.join(scratch, "owner-only");
+      t.after(async () => {
+        await fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        await fs.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      });
+      await fs.mkdir(root);
+      protectDisposableRoot(root, scratch);
+      const { receipt } = buildCompiledFixture(scratch, "live-fetch.exe", vcvars);
+      const result = runCompiledFixture(receipt, [mode, root], 25000);
+      assert.equal(result.status, 0,
+        `${mode}: native Windows operation failed: ${result.stdout}\n${result.stderr}`);
+      const evidence = JSON.parse(result.stdout.trim());
+      assert.equal(evidence.unregistered, true);
+      if (mode === "--disposable-stale-ancestor") {
+        assert.equal(evidence.successfulTransfers, 0);
+        assert.ok(evidence.rejectedTransfers >= 1);
+        assert.equal(evidence.positiveReadVerified, false);
+      } else {
+        assert.equal(evidence.nativeNoReplacePublished, true,
+          "native exclusive create/flush/rename must never replace a published inode");
+        assert.equal(evidence.nativePublishStage, 9);
+        assert.equal(evidence.nativePublishError, 0);
+        assert.equal(evidence.positiveReadVerified, true);
+      }
+    });
+}
+
 for (const length of [1, 65537]) {
   test(`#66 native kernel CFAPI hydrates ${length} binary bytes across aligned EOF ranges`,
     { skip: process.platform !== "win32", timeout: 90000 }, async (t) => {

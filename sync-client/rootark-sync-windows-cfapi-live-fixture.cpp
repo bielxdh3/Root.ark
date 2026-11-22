@@ -71,6 +71,8 @@ int wmain(int argc, wchar_t** argv) {
       && std::wcscmp(argv[1], L"--disposable-concurrent-alias") != 0
       && std::wcscmp(argv[1], L"--disposable-no-authority") != 0
       && std::wcscmp(argv[1], L"--disposable-stale-enrollment") != 0
+      && std::wcscmp(argv[1], L"--disposable-stale-ancestor") != 0
+      && std::wcscmp(argv[1], L"--disposable-native-publish") != 0
       && std::wcscmp(argv[1], L"--disposable-native-names") != 0)) return 2;
   const bool streamed = std::wcscmp(argv[1], L"--disposable-live-stdin") == 0;
   const bool aliasMode = std::wcscmp(argv[1], L"--disposable-live-alias") == 0;
@@ -78,6 +80,8 @@ int wmain(int argc, wchar_t** argv) {
   const bool nameMode = std::wcscmp(argv[1], L"--disposable-native-names") == 0;
   const bool denyAuthority = std::wcscmp(argv[1], L"--disposable-no-authority") == 0;
   const bool staleEnrollment = std::wcscmp(argv[1], L"--disposable-stale-enrollment") == 0;
+  const bool staleAncestor = std::wcscmp(argv[1], L"--disposable-stale-ancestor") == 0;
+  const bool publicationMode = std::wcscmp(argv[1], L"--disposable-native-publish") == 0;
   const wchar_t* root = argv[2];
   if (!root || std::wcslen(root) < 8 || std::wcslen(root) > 4096
       || root[1] != L':' || root[2] != L'\\') return 3;
@@ -116,7 +120,7 @@ int wmain(int argc, wchar_t** argv) {
   if (!ancestors.capture(root)) return 15;
   HeldRoot held;
   DWORD platform = 0;
-  if (!held.open(root) || !held.samePath(root) || !ancestors.samePaths()
+  if (!held.open(root, publicationMode) || !held.samePath(root) || !ancestors.samePaths()
     || !ancestors.sameVolume(held.id) || !inspect(root, platform)) return 14;
 
   // Only the disposable fixture self-issues these expected IDs. In a real
@@ -128,6 +132,8 @@ int wmain(int argc, wchar_t** argv) {
     fixtureEnrollment.ancestors.push_back(entry->id);
   if (staleEnrollment)
     fixtureEnrollment.root.FileId.Identifier[0] ^= 0x01;
+  if (staleAncestor && !fixtureEnrollment.ancestors.empty())
+    fixtureEnrollment.ancestors.back().FileId.Identifier[0] ^= 0x01;
 
   Context context;
   context.payload = makePayload();
@@ -165,6 +171,9 @@ int wmain(int argc, wchar_t** argv) {
   unsigned unsafeNameDenials = 0;
   bool nativeRelativeOpen = false;
   bool positiveReadVerified = false;
+  bool nativeNoReplacePublished = false;
+  unsigned nativePublishStage = 0;
+  DWORD nativePublishError = 0;
   DWORD finalTag = 0;
   int exitCode = 8;
   do {
@@ -221,7 +230,7 @@ int wmain(int argc, wchar_t** argv) {
     const BOOL read = ReadFile(handle, received.data(),
       static_cast<DWORD>(received.size()), &got, nullptr);
     CloseHandle(handle);
-    if (denyAuthority || staleEnrollment) {
+    if (denyAuthority || staleEnrollment || staleAncestor) {
       if (read || got != 0 || context.successful.load() != 0
           || context.rejected.load() == 0) break;
       exitCode = 0;
@@ -249,6 +258,61 @@ int wmain(int argc, wchar_t** argv) {
         || std::memcmp(received.data(), context.payload.data(), context.payload.size()) != 0
         || context.callbacks == 0 || context.successful == 0) break;
     positiveReadVerified = true;
+    if (publicationMode) {
+      // Exercise future production's shared HANDLE-relative publishing
+      // primitive only under the already allowlisted disposable native root.
+      ScopedHandle first(INVALID_HANDLE_VALUE);
+      if (!nativeCreateExclusiveStage(held.handle, L"stage-first.bin", first.value)) break;
+      nativePublishStage = 1;
+      if (!nativeWriteAndFlushOpenedStage(first.value,
+            context.payload.data(), context.payload.size())) break;
+      nativePublishStage = 2;
+      if (!nativeRenameOpenedStageNoReplace(first.value, held.handle,
+            L"published.bin", &nativePublishError)) break;
+      nativePublishStage = 3;
+      FILE_ID_INFO firstId{};
+      if (!GetFileInformationByHandleEx(first.value, FileIdInfo,
+            &firstId, sizeof(firstId))) break;
+      // Release the original DELETE/WRITE handle so a refusal on the second
+      // rename is actual no-replace protection, not a sharing violation.
+      CloseHandle(first.value);
+      first.value = INVALID_HANDLE_VALUE;
+      ScopedHandle second(INVALID_HANDLE_VALUE);
+      if (!nativeCreateExclusiveStage(held.handle, L"stage-second.bin", second.value)) break;
+      nativePublishStage = 4;
+      if (!nativeWriteAndFlushOpenedStage(second.value,
+            context.payload.data(), context.payload.size())) break;
+      nativePublishStage = 5;
+      if (nativeRenameOpenedStageNoReplace(second.value, held.handle,
+            L"published.bin")) break;
+      nativePublishStage = 6;
+      // Test-only pathname readback checks the destination content; it never
+      // grants native authority or participates in the actual publication.
+      wchar_t publishedPath[4096]{};
+      if (swprintf_s(publishedPath, L"%ls\\published.bin", root) < 0) break;
+      ScopedHandle published(CreateFileW(publishedPath,
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+      FILE_ID_INFO publishedId{};
+      std::vector<unsigned char> readback(context.payload.size());
+      DWORD bytesRead = 0;
+      if (published.value == INVALID_HANDLE_VALUE) {
+        nativePublishError = GetLastError(); break;
+      }
+      nativePublishStage = 7;
+      if (!GetFileInformationByHandleEx(published.value, FileIdInfo,
+            &publishedId, sizeof(publishedId))
+          || !sameEnrolledFileId(firstId, publishedId)) break;
+      nativePublishStage = 8;
+      if (!ReadFile(published.value, readback.data(),
+            static_cast<DWORD>(readback.size()), &bytesRead, nullptr)
+          || bytesRead != readback.size()
+          || std::memcmp(readback.data(), context.payload.data(),
+            readback.size()) != 0) break;
+      nativeNoReplacePublished = true;
+      nativePublishStage = 9;
+    }
     if (aliasMode) {
       // Reuse the exact same caller-visible FileIdentity but plant a second
       // real NTFS placeholder. A provider relying on FileIdentity alone would
@@ -328,7 +392,8 @@ int wmain(int argc, wchar_t** argv) {
     "\"finalRootIdentity\":%s,\"finalAncestorsHeld\":%s,\"finalRootPolicy\":%s,"
     "\"finalCloudReparse\":%s,\"finalOwnerAcl\":%s,\"alienAliasDenied\":%s,"
     "\"nativeRelativeOpen\":%s,\"unsafeNameDenials\":%u,"
-    "\"concurrentAliasDenials\":%u,"
+    "\"concurrentAliasDenials\":%u,\"nativeNoReplacePublished\":%s,"
+    "\"nativePublishStage\":%u,\"nativePublishError\":%lu,"
     "\"finalReparseTag\":%lu,"
     "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
     context.callbacks.load(), context.successful.load(), context.rejected.load(),
@@ -338,7 +403,8 @@ int wmain(int argc, wchar_t** argv) {
     finalCloudReparse ? "true" : "false", finalOwnerAcl ? "true" : "false",
     alienAliasDenied ? "true" : "false",
     nativeRelativeOpen ? "true" : "false", unsafeNameDenials,
-    concurrentAliasDenials, finalTag,
+    concurrentAliasDenials, nativeNoReplacePublished ? "true" : "false",
+    nativePublishStage, static_cast<unsigned long>(nativePublishError), finalTag,
     SUCCEEDED(unregisterResult) ? "true" : "false",
     positiveReadVerified && exitCode == 0 ? "true" : "false");
   return exitCode;
