@@ -10,6 +10,7 @@
 
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const { types: { isProxy } } = require("node:util");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
 
 const ALLOWED = ["length", "offset", "placeholderId", "relativePath", "requestKey", "type"];
@@ -26,7 +27,10 @@ function boundedOption(value, minimum, maximum) {
 }
 
 function trustedValue(value, props) {
-  if (!value || typeof value !== "object" || Array.isArray(value)
+  // Object.getPrototypeOf and descriptor inspection execute Proxy traps. A
+  // forged native inspection result must never execute caller JavaScript
+  // before we have rejected it as untrusted (nor forge placeholder trust).
+  if (!value || typeof value !== "object" || Array.isArray(value) || isProxy(value)
     || Object.getPrototypeOf(value) !== Object.prototype) return false;
   const desc = Object.getOwnPropertyDescriptors(value);
   return Object.keys(desc).sort().join(",") === props.slice().sort().join(",")
@@ -35,12 +39,15 @@ function trustedValue(value, props) {
 
 function snapshotRequest(raw) {
   // Obtain callback identity and all other data from ONE descriptor snapshot.
-  // A Proxy may return A for its own descriptor and B for a later property get
-  // or descriptor query. Never consult the untrusted raw object again.
+  // Reject Proxy values entirely before their traps run. For accepted plain
+  // objects, never consult untrusted property getters after the snapshot.
   let key = null;
   let input = null;
   try {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { key, input };
+    // Own-key and descriptor Proxy traps are attacker-controlled callbacks.
+    // Reject before invoking them, even if a Proxy later returns a plausible
+    // object shape or offers a syntactically valid requestKey.
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || isProxy(raw)) return { key, input };
     const descriptors = Object.getOwnPropertyDescriptors(raw);
     const identity = descriptors.requestKey;
     if (identity && Object.hasOwn(identity, "value")

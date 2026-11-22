@@ -51,6 +51,32 @@ test("issue 66 CFAPI: forged admission, journal and CAS claims never enable plai
   assert.equal(calls.transfer.length, 0);
 });
 
+test("issue 66 CFAPI: hostile callback Proxy cannot execute ownKeys before admission", async (t) => {
+  const { gate, calls, request } = await fixture(t);
+  let traps = 0;
+  const forged = new Proxy(request(), {
+    ownKeys(target) { traps++; return Reflect.ownKeys(target); },
+  });
+  assert.deepEqual(await gate.fetchData(forged), { status: "denied", code: "invalid_callback" });
+  assert.equal(traps, 0, "untrusted proxy traps must not execute before callback rejection");
+  assert.deepEqual(calls.inspect, []);
+  assert.deepEqual(calls.fail, [], "no trustworthy requestKey was admitted");
+  assert.deepEqual(calls.transfer, []);
+});
+
+test("issue 66 CFAPI: native inspection Proxy cannot run getPrototypeOf or forge placeholder trust", async (t) => {
+  const { native, gate, calls, request } = await fixture(t);
+  let traps = 0;
+  native.inspectPlaceholder = async () => new Proxy(
+    { placeholder: true, reparsePoint: true, syncRootMatch: true },
+    { getPrototypeOf(target) { traps++; return Reflect.getPrototypeOf(target); } },
+  );
+  assert.deepEqual(await gate.fetchData(request()), { status: "denied", code: "placeholder_untrusted" });
+  assert.equal(traps, 0, "an untrusted native result must not execute proxy traps");
+  assert.deepEqual(calls.fail, [{ key: "request-1", code: "placeholder_untrusted" }]);
+  assert.deepEqual(calls.transfer, []);
+});
+
 test("issue 66 CFAPI: traversal, ADS, reserved names, path aliases and ranges denied before any native inspection", async (t) => {
   const { gate, calls, request } = await fixture(t);
   const variants = [
@@ -412,7 +438,7 @@ test("issue 66 W22 P2: orphan ACKs and admitted callbacks share the same concurr
   await within(gate.shutdown());
 });
 
-test("issue 66 W22 P2: callback identity is captured once from the own data descriptor", async (t) => {
+test("issue 66 W22 P2: Proxy cannot forge a callback identity or trigger repeated descriptor access", async (t) => {
   const { gate, calls, request } = await fixture(t);
   let descriptorReads = 0;
   let getterReads = 0;
@@ -434,9 +460,9 @@ test("issue 66 W22 P2: callback identity is captured once from the own data desc
     },
   });
   assert.deepEqual(await gate.fetchData(raw),
-    { status: "denied", code: "authority_unavailable" });
-  assert.equal(descriptorReads, 1, "identity descriptor must never be fetched twice");
+    { status: "denied", code: "invalid_callback" });
+  assert.equal(descriptorReads, 0, "Proxy identity descriptors must never be evaluated");
   assert.equal(getterReads, 0, "callback identity getter must never be consulted");
-  assert.deepEqual(calls.fail, [{ key: "snapshot-A", code: "authority_unavailable" }]);
+  assert.deepEqual(calls.fail, [], "no trustworthy callback identity was admitted to native ACK");
   assert.deepEqual(calls.transfer, []);
 });
