@@ -48,6 +48,7 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw "CFAPI $mode iteration $iteration failed" }
             }
             Write-Output "$mode /W4 /WX: 16/16 native adversarial tests passed."
+          }
   native-kernel-pin-generation:
     name: Windows NTFS CFAPI positive FETCH_DATA and pin-reissue denial
     runs-on: windows-2022
@@ -64,4 +65,4 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          node --test test/issue-66-cfapi-live-fetch-native.test.js
+          node --test test/issue-66-cfapi-build-receipt.test.js test/issue-66-cfapi-live-fetch-native.test.js

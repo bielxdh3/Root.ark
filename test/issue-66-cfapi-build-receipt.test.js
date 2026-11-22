@@ -4,10 +4,50 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 
-const { buildCompiledFixture, runCompiledFixture, sanitizeBuildEnvironment } =
+const { buildCompiledFixture, runCompiledFixture, sanitizeBuildEnvironment, unchangedDirectory } =
   require("./support/issue-66-cfapi-built-artifact");
+
+test("CFAPI build receipt accepts an NTFS 8.3 TEMP ancestor but never a redirected fixture leaf", (t) => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-cfapi-live-"));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  const checked = unchangedDirectory(scratch, "rootark-cfapi-live-");
+  const original = fs.lstatSync(scratch, { bigint: true });
+  assert.equal(checked.ino, original.ino, "the check retains the physical scratch inode");
+  assert.equal(checked.dev, original.dev);
+  if (process.platform === "win32") {
+    const result = spawnSync("C:\\Windows\\System32\\cmd.exe", ["/d", "/q"], {
+      input: `for %I in ("${os.tmpdir()}") do @echo %~sI\r\nexit\r\n`,
+      encoding: "utf8", windowsHide: true,
+    });
+    const shortParent = result.stdout.trim().split(/\r?\n/).at(-1);
+    if (result.status === 0 && shortParent && fs.existsSync(shortParent)) {
+      const same = path.join(shortParent, path.basename(scratch));
+      const aliased = unchangedDirectory(same, "rootark-cfapi-live-");
+      assert.equal(aliased.ino, original.ino,
+        "only a legitimate 8.3 ancestor may expand to the same physical fixture");
+      assert.equal(aliased.dev, original.dev);
+    }
+  }
+  // Even when an attacker redirects a same-prefix leaf to real on-disk bytes,
+  // its link is never accepted as a newly built executable's owning folder.
+  const alias = path.join(os.tmpdir(), "rootark-cfapi-live-" + require("node:crypto").randomBytes(8).toString("hex"));
+  try { fs.symlinkSync(scratch, alias, process.platform === "win32" ? "junction" : "dir"); }
+  catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) return t.diagnostic("symlink privilege unavailable");
+    throw error;
+  }
+  t.after(() => {
+    if (!fs.existsSync(alias)) return;
+    assert.equal(fs.lstatSync(alias).isSymbolicLink(), true,
+      "never remove a same-name real directory substituted during teardown");
+    if (process.platform === "win32") fs.rmdirSync(alias);
+    else fs.unlinkSync(alias);
+  });
+  assert.throws(() => unchangedDirectory(alias, "rootark-cfapi-live-"), /UNTRUSTED_EXECUTABLE/);
+});
 
 test("CFAPI compiler ignores inherited tool selectors and PATH before vcvars initializes", () => {
   const incoming = {

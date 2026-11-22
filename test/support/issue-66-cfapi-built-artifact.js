@@ -59,8 +59,15 @@ function unchangedDirectory(scratch, prefix) {
   assert.ok(path.isAbsolute(scratch), FAIL);
   assert.match(path.basename(scratch), new RegExp(`^${prefix}[A-Za-z0-9_-]{6,}$`), FAIL);
   assert.equal(comparable(path.dirname(scratch)), comparable(os.tmpdir()), FAIL);
+  // Node can obtain a TEMP pathname with an NTFS 8.3 ancestor (RUNNER~1).
+  // fs.realpathSync.native expands that ancestor to runneradmin. Compare the
+  // physical named child under the canonical TEMP parent, not two spellings
+  // of the same parent; never permit a renamed/redirected scratch leaf.
+  const temp = fs.realpathSync.native(os.tmpdir());
+  const tempStat = fs.lstatSync(os.tmpdir(), { bigint: true });
+  assert.ok(tempStat.isDirectory() && !tempStat.isSymbolicLink(), FAIL);
   const actual = fs.realpathSync.native(scratch);
-  assert.equal(comparable(actual), comparable(scratch), FAIL);
+  assert.equal(comparable(actual), comparable(path.join(temp, path.basename(scratch))), FAIL);
   const stat = fs.lstatSync(scratch, { bigint: true });
   assert.ok(stat.isDirectory() && !stat.isSymbolicLink(), FAIL);
   return stat;
@@ -70,7 +77,8 @@ function inspect(scratch, name) {
   assert.ok(NAMES.has(name), FAIL);
   const root = unchangedDirectory(scratch, NAMES.get(name));
   const executable = path.join(scratch, name);
-  assert.equal(comparable(fs.realpathSync.native(executable)), comparable(executable), FAIL);
+  assert.equal(comparable(fs.realpathSync.native(executable)),
+    comparable(path.join(fs.realpathSync.native(scratch), name)), FAIL);
   const fd = fs.openSync(executable, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
   try {
     const opened = fs.fstatSync(fd, { bigint: true });
@@ -145,7 +153,13 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
     assert.doesNotMatch(filename, /[\r\n\x00-\x1f\x7f"%!^&|<>]/, FAIL);
   }
   for (const filename of [vcvars, source, ...dependencies]) {
-    assert.equal(comparable(fs.realpathSync.native(filename)), comparable(filename), FAIL);
+    // Only the generated inherit-only fixture source lives below the TEMP
+    // scratch. Compiler/toolchain inputs elsewhere must retain their exact
+    // original spelling to avoid expanding the toolchain trust boundary.
+    const expected = name === "inherit-only-fixture.exe" && filename === source
+      ? path.join(fs.realpathSync.native(scratch), path.basename(filename))
+      : filename;
+    assert.equal(comparable(fs.realpathSync.native(filename)), comparable(expected), FAIL);
     const stat = fs.lstatSync(filename, { bigint: true });
     assert.ok(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n, FAIL);
   }
@@ -244,4 +258,4 @@ function runCompiledFixture(receipt, args, timeout = 10000, input = undefined) {
 }
 
 module.exports = { buildCompiledFixture, runCompiledFixture, validateFixtureArgs,
-  sanitizeBuildEnvironment };
+  sanitizeBuildEnvironment, unchangedDirectory };

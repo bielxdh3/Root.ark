@@ -1270,7 +1270,7 @@ test("issue 66 #292 P2: remote-only tombstone cannot pre-observe across a signed
   assert.equal(fs.existsSync(path.join(rootDir, childRelative)), false);
 });
 
-test("issue 66 #292 P2 FOD Windows: physical 8.3 ancestor blocks manual hydration", async (t) => {
+nativeTest("issue 66 #292 P2 FOD Windows: physical 8.3 ancestor blocks manual hydration", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Real 8.3 alias requires Windows");
     return;
