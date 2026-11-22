@@ -6,6 +6,18 @@ function isPublicLinkViewerId(viewerId) {
 }
 
 const SHARE_OPERATIONS = ["view", "preview", "download"];
+const CAPABILITY_TOKEN_PATTERN = /^C[a-f0-9]{47}$/;
+const CAPABILITY_ALIAS_PATTERN = /^[a-f0-9]{32}$/;
+const CAPABILITY_SESSION_HASH_PATTERN = /^[a-f0-9]{64}$/;
+
+// The server is deliberately single-instance (authentication and lifecycle
+// coordination are process-local). Keep an in-memory alias -> token index so
+// an unauthenticated capability probe never scans every public_links row.
+// The database row remains authoritative and is re-read by its primary key
+// for every hit; this map is only a lookup accelerator.
+let capabilitySessionIndexDb = null;
+let capabilitySessionIndex = null;
+let capabilityAliasesByToken = null;
 
 // Only a link with no permissions field at all (pre-migration legacy) maps to NULL, which reads back as all operations.
 // Every other non-array value is stored as an empty list and fails closed.
@@ -54,6 +66,112 @@ function loadPublicLinks() {
     WHERE revoked_at IS NULL
   `).all();
   return Object.fromEntries(rows.map((row) => [row.token, rowToLink(row)]));
+}
+
+function addCapabilityLinkToIndex(token, link) {
+  if (!CAPABILITY_TOKEN_PATTERN.test(token || "") || link?.shareKind !== "capability-v1"
+    || link?.resourceBinding?.version !== 2) return;
+  const linkExpiresAt = new Date(link.expiresAt).getTime();
+  const now = Date.now();
+  if (!Number.isFinite(linkExpiresAt) || linkExpiresAt <= now) return;
+  const sessions = link.capabilitySessions;
+  if (!sessions || typeof sessions !== "object" || Array.isArray(sessions)) return;
+
+  const aliases = new Set();
+  for (const [alias, session] of Object.entries(sessions)) {
+    const sessionExpiresAt = new Date(session?.expiresAt).getTime();
+    if (!CAPABILITY_ALIAS_PATTERN.test(alias)
+      || !CAPABILITY_SESSION_HASH_PATTERN.test(session?.hash || "")
+      || !Number.isFinite(sessionExpiresAt) || sessionExpiresAt <= now
+      || sessionExpiresAt > linkExpiresAt) continue;
+    let tokens = capabilitySessionIndex.get(alias);
+    if (!tokens) {
+      tokens = new Set();
+      capabilitySessionIndex.set(alias, tokens);
+    }
+    tokens.add(token);
+    aliases.add(alias);
+  }
+  if (aliases.size) capabilityAliasesByToken.set(token, aliases);
+}
+
+function removeCapabilityLinkFromIndex(token) {
+  if (!capabilitySessionIndex || !capabilityAliasesByToken) return;
+  for (const alias of capabilityAliasesByToken.get(token) || []) {
+    const tokens = capabilitySessionIndex.get(alias);
+    if (!tokens) continue;
+    tokens.delete(token);
+    if (tokens.size === 0) capabilitySessionIndex.delete(alias);
+  }
+  capabilityAliasesByToken.delete(token);
+}
+
+function invalidateCapabilitySessionIndex() {
+  capabilitySessionIndexDb = null;
+  capabilitySessionIndex = null;
+  capabilityAliasesByToken = null;
+}
+
+function ensureCapabilitySessionIndex() {
+  const db = getDb();
+  if (capabilitySessionIndex && capabilitySessionIndexDb === db) return;
+  capabilitySessionIndex = new Map();
+  capabilityAliasesByToken = new Map();
+  for (const [token, link] of Object.entries(loadPublicLinks())) {
+    addCapabilityLinkToIndex(token, link);
+  }
+  capabilitySessionIndexDb = db;
+}
+
+function initializeCapabilitySessionIndex() {
+  ensureCapabilitySessionIndex();
+  return capabilitySessionIndex.size;
+}
+
+function getPublicLinkByToken(token) {
+  if (!/^[a-f0-9]{48}$/i.test(token || "")) return null;
+  const row = getDb().prepare(`
+    SELECT token, folder_id, file_name, created_by, created_at, expires_at,
+      max_views, views, password_hash, metadata_json, permissions_json
+    FROM public_links
+    WHERE token = ? AND revoked_at IS NULL
+  `).get(token);
+  return row ? rowToLink(row) : null;
+}
+
+function refreshCapabilityLinkInIndex(token) {
+  if (!capabilitySessionIndex) return;
+  removeCapabilityLinkFromIndex(token);
+  const link = getPublicLinkByToken(token);
+  if (link) addCapabilityLinkToIndex(token, link);
+}
+
+function findCapabilitySessionByAlias(alias) {
+  if (!CAPABILITY_ALIAS_PATTERN.test(alias || "")) return null;
+  ensureCapabilitySessionIndex();
+  const tokens = capabilitySessionIndex.get(alias);
+  if (!tokens?.size) return null;
+  let resolved = null;
+  // Legacy snapshots can contain duplicate aliases. Revalidate each indexed
+  // candidate and prune revoked/expired rows before deciding whether the
+  // remaining live mapping is unique. Multiple live matches still fail closed.
+  for (const token of [...tokens]) {
+    const link = getPublicLinkByToken(token);
+    const session = link?.capabilitySessions?.[alias];
+    const now = Date.now();
+    const linkExpiry = new Date(link?.expiresAt).getTime();
+    const sessionExpiry = new Date(session?.expiresAt).getTime();
+    if (!link || link.shareKind !== "capability-v1" || link.resourceBinding?.version !== 2
+      || !session || !CAPABILITY_SESSION_HASH_PATTERN.test(session.hash || "")
+      || !Number.isFinite(linkExpiry) || linkExpiry <= now
+      || !Number.isFinite(sessionExpiry) || sessionExpiry <= now || sessionExpiry > linkExpiry) {
+      refreshCapabilityLinkInIndex(token);
+      continue;
+    }
+    if (resolved) return null;
+    resolved = { token, link, session };
+  }
+  return resolved;
 }
 
 function getRecordedPublicLinkTokens(tokens = []) {
@@ -236,6 +354,9 @@ function savePublicLinks(entries = {}, options = {}) {
       );
     }
   }).immediate();
+  // Whole-map reconciliation may change or revoke capability metadata. Rebuild
+  // once on the next lookup rather than trusting a stale process-local index.
+  invalidateCapabilitySessionIndex();
 }
 
 function createCapability(token, link) {
@@ -265,7 +386,7 @@ function createCapability(token, link) {
 function revokeCapability(token, username) {
   if (!/^C[a-f0-9]{47}$/.test(token || "")) return { status: "missing" };
   const db = getDb();
-  return db.transaction(() => {
+  const result = db.transaction(() => {
     const row = db.prepare(`SELECT created_by, metadata_json FROM public_links
       WHERE token = ? AND revoked_at IS NULL`).get(token);
     if (!row) return { status: "missing" };
@@ -281,6 +402,8 @@ function revokeCapability(token, username) {
       WHERE token = ? AND revoked_at IS NULL`).run(nowIso(), token);
     return { status: outcome.changes === 1 ? "ok" : "missing" };
   }).immediate();
+  if (result.status === "ok") removeCapabilityLinkFromIndex(token);
+  return result;
 }
 
 function incrementPublicLinkViews(token, link) {
@@ -314,7 +437,12 @@ function addCapabilitySession(token, options = {}) {
     || maxSessions < 1 || maxSessions > 64) return { status: "invalid" };
 
   const db = getDb();
-  return db.transaction(() => {
+  ensureCapabilitySessionIndex();
+  const existingAliasTokens = capabilitySessionIndex.get(alias);
+  if (existingAliasTokens && [...existingAliasTokens].some((existingToken) => existingToken !== token)) {
+    return { status: "collision" };
+  }
+  const result = db.transaction(() => {
     const row = db.prepare(`
       SELECT token, folder_id, file_name, created_by, created_at, expires_at,
         max_views, views, password_hash, metadata_json, permissions_json
@@ -348,6 +476,8 @@ function addCapabilitySession(token, options = {}) {
     if (updated.changes !== 1) return { status: "missing" };
     return { status: "ok", expiresAt };
   }).immediate();
+  if (result.status === "ok") refreshCapabilityLinkInIndex(token);
+  return result;
 }
 
 function consumePublicLinkQuota(token, options = {}) {
@@ -466,7 +596,10 @@ module.exports = {
   addCapabilitySession,
   createCapability,
   consumePublicLinkQuota,
+  findCapabilitySessionByAlias,
   getRecordedPublicLinkTokens,
+  getPublicLinkByToken,
+  initializeCapabilitySessionIndex,
   incrementPublicLinkViews,
   loadPublicLinks,
   revokeCapability,
