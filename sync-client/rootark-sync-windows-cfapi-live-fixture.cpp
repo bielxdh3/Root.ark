@@ -13,6 +13,8 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <atomic>
+#include <thread>
 #include "rootark-sync-windows-native-root-session.hpp"
 
 namespace {
@@ -32,11 +34,11 @@ struct Context {
   const wchar_t* path = nullptr;
   // Bind the callback to the exact native placeholder inode, independently
   // of user-controlled FileIdentity or a reopened mutable pathname.
-  ULONGLONG placeholderFileId = 0;
-  bool placeholderPinned = false;
-  unsigned callbacks = 0;
-  unsigned successful = 0;
-  unsigned rejected = 0;
+  std::atomic<ULONGLONG> placeholderFileId{0};
+  std::atomic<bool> placeholderPinned{false};
+  std::atomic<unsigned> callbacks{0};
+  std::atomic<unsigned> successful{0};
+  std::atomic<unsigned> rejected{0};
   ~Context() { if (!payload.empty()) SecureZeroMemory(payload.data(), payload.size()); }
 };
 
@@ -95,8 +97,9 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
     && info->FileIdentityLength == sizeof(kIdentity) - 1
     && std::memcmp(info->FileIdentity, kIdentity, sizeof(kIdentity) - 1) == 0
     && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size())
-    && ctx.placeholderPinned
-    && static_cast<ULONGLONG>(info->FileId.QuadPart) == ctx.placeholderFileId;
+    && ctx.placeholderPinned.load(std::memory_order_acquire)
+    && static_cast<ULONGLONG>(info->FileId.QuadPart)
+      == ctx.placeholderFileId.load(std::memory_order_relaxed);
   const bool rangeMatches = offset >= 0 && offset % 4096 == 0 && length > 0
     && offset < static_cast<LONGLONG>(ctx.payload.size())
     && length <= static_cast<LONGLONG>(ctx.payload.size()) - offset
@@ -126,9 +129,11 @@ int wmain(int argc, wchar_t** argv) {
   if (argc != 3 || (std::wcscmp(argv[1], L"--disposable-live") != 0
       && std::wcscmp(argv[1], L"--disposable-live-stdin") != 0
       && std::wcscmp(argv[1], L"--disposable-live-alias") != 0
+      && std::wcscmp(argv[1], L"--disposable-concurrent-alias") != 0
       && std::wcscmp(argv[1], L"--disposable-native-names") != 0)) return 2;
   const bool streamed = std::wcscmp(argv[1], L"--disposable-live-stdin") == 0;
   const bool aliasMode = std::wcscmp(argv[1], L"--disposable-live-alias") == 0;
+  const bool concurrentMode = std::wcscmp(argv[1], L"--disposable-concurrent-alias") == 0;
   const bool nameMode = std::wcscmp(argv[1], L"--disposable-native-names") == 0;
   const wchar_t* root = argv[2];
   if (!root || std::wcslen(root) < 8 || std::wcslen(root) > 4096
@@ -196,6 +201,7 @@ int wmain(int argc, wchar_t** argv) {
   bool finalCloudReparse = false;
   bool finalOwnerAcl = false;
   bool alienAliasDenied = false;
+  unsigned concurrentAliasDenials = 0;
   unsigned unsafeNameDenials = 0;
   bool nativeRelativeOpen = false;
   DWORD finalTag = 0;
@@ -242,9 +248,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!GetFileInformationByHandle(original.value, &physical)
         || physical.nNumberOfLinks != 1
         || !(physical.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) break;
-    context.placeholderFileId =
-      (static_cast<ULONGLONG>(physical.nFileIndexHigh) << 32) | physical.nFileIndexLow;
-    context.placeholderPinned = true;
+    context.placeholderFileId.store(
+      (static_cast<ULONGLONG>(physical.nFileIndexHigh) << 32) | physical.nFileIndexLow,
+      std::memory_order_relaxed);
+    context.placeholderPinned.store(true, std::memory_order_release);
     HANDLE handle = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, nullptr,
       OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (handle == INVALID_HANDLE_VALUE) break;
@@ -288,8 +295,8 @@ int wmain(int argc, wchar_t** argv) {
       HANDLE alienFile = CreateFileW(alienPath, GENERIC_READ, FILE_SHARE_READ,
         nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
       if (alienFile == INVALID_HANDLE_VALUE) break;
-      const auto previousFailures = context.rejected;
-      const auto previousSuccesses = context.successful;
+      const auto previousFailures = context.rejected.load();
+      const auto previousSuccesses = context.successful.load();
       DWORD alienBytes = 0;
       std::vector<unsigned char> alienBuffer(context.payload.size());
       const BOOL alienRead = ReadFile(alienFile, alienBuffer.data(),
@@ -299,6 +306,48 @@ int wmain(int argc, wchar_t** argv) {
         && context.rejected > previousFailures
         && context.successful == previousSuccesses;
       if (!alienAliasDenied) break;
+    }
+    if (concurrentMode) {
+      constexpr std::size_t kRivals = 8;
+      std::array<std::wstring, kRivals> names;
+      std::array<CF_PLACEHOLDER_CREATE_INFO, kRivals> outsiders{};
+      for (std::size_t i = 0; i < kRivals; ++i) {
+        names[i] = L"alien-" + std::to_wstring(i) + L".bin";
+        outsiders[i] = item;
+        outsiders[i].RelativeFileName = names[i].c_str();
+      }
+      processed = 0;
+      result = CfCreatePlaceholders(root, outsiders.data(),
+        static_cast<DWORD>(outsiders.size()), CF_CREATE_FLAG_NONE, &processed);
+      if (FAILED(result) || processed != kRivals) break;
+      bool created = true;
+      for (const auto& outside : outsiders) if (FAILED(outside.Result)) created = false;
+      if (!created) break;
+      const auto positiveBefore = context.successful.load();
+      const auto deniedBefore = context.rejected.load();
+      std::array<std::thread, kRivals> workers;
+      std::array<bool, kRivals> denied{};
+      for (std::size_t i = 0; i < kRivals; ++i) {
+        workers[i] = std::thread([&, i] {
+          wchar_t filename[4096]{};
+          if (swprintf_s(filename, L"%ls\\%ls", root, names[i].c_str()) < 0)
+            return;
+          HANDLE foreign = CreateFileW(filename, GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+          if (foreign == INVALID_HANDLE_VALUE) return;
+          std::vector<unsigned char> destination(context.payload.size());
+          DWORD got = 0;
+          const BOOL fetched = ReadFile(foreign, destination.data(),
+            static_cast<DWORD>(destination.size()), &got, nullptr);
+          CloseHandle(foreign);
+          denied[i] = !fetched && got == 0;
+        });
+      }
+      for (auto& worker : workers) worker.join();
+      for (const bool deniedEntry : denied) if (deniedEntry) ++concurrentAliasDenials;
+      if (concurrentAliasDenials != kRivals
+          || context.successful.load() != positiveBefore
+          || context.rejected.load() < deniedBefore + kRivals) break;
     }
     exitCode = 0;
   } while (false);
@@ -311,14 +360,17 @@ int wmain(int argc, wchar_t** argv) {
     "\"finalRootIdentity\":%s,\"finalAncestorsHeld\":%s,\"finalRootPolicy\":%s,"
     "\"finalCloudReparse\":%s,\"finalOwnerAcl\":%s,\"alienAliasDenied\":%s,"
     "\"nativeRelativeOpen\":%s,\"unsafeNameDenials\":%u,"
+    "\"concurrentAliasDenials\":%u,"
     "\"finalReparseTag\":%lu,"
     "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
-    context.callbacks, context.successful, context.rejected, context.payload.size(),
+    context.callbacks.load(), context.successful.load(), context.rejected.load(),
+    context.payload.size(),
     finalIdentity ? "true" : "false", finalAncestors ? "true" : "false",
     finalPolicy ? "true" : "false",
     finalCloudReparse ? "true" : "false", finalOwnerAcl ? "true" : "false",
     alienAliasDenied ? "true" : "false",
-    nativeRelativeOpen ? "true" : "false", unsafeNameDenials, finalTag,
+    nativeRelativeOpen ? "true" : "false", unsafeNameDenials,
+    concurrentAliasDenials, finalTag,
     SUCCEEDED(unregisterResult) ? "true" : "false",
     exitCode == 0 ? "true" : "false");
   return exitCode;
