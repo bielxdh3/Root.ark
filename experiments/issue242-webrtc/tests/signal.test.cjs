@@ -207,3 +207,41 @@ test('P2 merge: a blocked recipient signaling socket cannot retain more than 512
     WebSocket.prototype.send = originalSend;
   }
 });
+
+test('idle pre-join sockets cannot retain all standalone signaling slots past admission deadline', async t => {
+  let clock = Date.now();
+  const h = await setup(t, { now: () => clock });
+  const { roomId, hostKey } = await h.room();
+  const host = await h.connect();
+  host.send({ type: 'join', roomId, hostKey });
+  assert.equal((await host.next('joined')).role, 'host');
+
+  // One admitted host and 31 idle sockets fill the existing global 32 cap.
+  const idle = await Promise.all(Array.from({ length: 31 }, () => h.connect()));
+  const closes = idle.map(({ ws }) => new Promise(resolve => ws.once('close', resolve)));
+  const extra = new WebSocket(h.origin.replace('http:', 'ws:') + '/signal', {
+    headers: { Origin: h.origin },
+  });
+  extra.on('error', () => {});
+  const denied = await new Promise(resolve => extra.once('unexpected-response', (_req, response) => {
+    response.resume();
+    resolve(response.statusCode);
+  }));
+  assert.equal(denied, 403, 'all signaling slots were exhausted before the admission deadline');
+
+  clock += 20_000;
+  let timeout;
+  const outcome = await Promise.race([
+    Promise.all(closes).then(codes => ({ codes })),
+    new Promise(resolve => { timeout = setTimeout(() => resolve({ timeout: true }), 3000); }),
+  ]);
+  clearTimeout(timeout);
+  assert.ok(outcome.codes, 'idle sockets must be evicted by the existing expiry sweep');
+  assert.ok(outcome.codes.every(code => code === 1006),
+    'idle sockets must be terminated even when a client ignores close handshakes');
+  assert.equal(host.ws.readyState, WebSocket.OPEN, 'joined host must survive idle eviction');
+  const replacement = await h.connect();
+  assert.equal(replacement.ws.readyState, WebSocket.OPEN, 'signaling capacity must recover');
+  host.send({ type: 'invite' });
+  assert.ok((await host.next('invited')).invitation, 'joined room remains usable');
+});

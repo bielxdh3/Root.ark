@@ -15,6 +15,7 @@ const MAX_SOCKETS_PER_ACCOUNT = 8;
 const INVITE_TTL_MS = 60_000;
 const MAX_SIGNAL_BYTES = 16_384;
 const MAX_OUTBOUND_BUFFER_BYTES = 512 * 1024;
+const MAX_UNJOINED_SOCKET_AGE_MS = 15_000;
 // The wire rate cap does not bound a Promise chain held behind a stalled
 // trusted ACL/storage callback. Limit queued closures per room independently.
 const MAX_PENDING_ROOM_ACTIONS = 64;
@@ -477,6 +478,10 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     }
   }
   function onConnection(ws, req) {
+    // A peer that never joins must not occupy one of the standalone broker's
+    // scarce 32 upgrade slots indefinitely. Shared Root.ark /ws connections
+    // may carry unrelated application events and are exempt from this timer.
+    if (!sharedWss) ws.p2pConnectedAt = now();
     if (sharedWss) {
       ws.upgradeRequest = req;
       ws.identity = identify(req);
@@ -714,6 +719,15 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
         .then(async () => { if (validRoom(room)) await recheckBoundRoom(room); })
         .catch(() => { if (rooms.get(room.id) === room) expireRoom(room); })
         .finally(() => { room.sweepPending = false; });
+    }
+    if (!sharedWss) for (const ws of wss.clients) {
+      if (!participants.has(ws) &&
+        (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CLOSING) &&
+        now() - ws.p2pConnectedAt >= MAX_UNJOINED_SOCKET_AGE_MS) {
+        // A noncooperative peer may ignore a graceful WebSocket close frame.
+        // Terminate its socket so the global admission slot is reclaimed now.
+        ws.terminate();
+      }
     }
     if (authenticated) for (const ws of participants.keys()) sessionCurrent(ws);
   }, 1000);
