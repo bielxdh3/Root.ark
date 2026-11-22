@@ -57,6 +57,7 @@ async function connectedRecipient(f, socket, peerId) {
   const channel = {
     readyState: 'open', bufferedAmount: 0, sent: [],
     send(data) { this.sent.push(typeof data === 'string' ? JSON.parse(data) : data); },
+    close() { this.readyState = 'closed'; this.onclose?.(); },
     addEventListener(type, callback) { callbacks.set(type, callback); },
     removeEventListener(type, callback) {
       if (callbacks.get(type) === callback) callbacks.delete(type);
@@ -280,4 +281,164 @@ test('P2: a late create-room HTTP response cannot replace a newer join intent', 
   await f.createRoom();
   assert.equal(f.snapshot().roomId, 'chosen-C', 'fresh explicit room creation still works');
   assert.equal(f.sockets.length, 2);
+});
+
+test('P2 integration: kicking a guest closes the RTC channel before delayed peer-left', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'host-invite');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-joined', role: 'guest', peerId: 'guest-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const channel = f.peerConnections[0].channel;
+  assert.equal(channel.readyState, 'open', 'control: RTC channel was established');
+  await f.sendText('allowed before kick');
+  assert.deepEqual(channel.sent.filter(x => x.type === 'text').map(x => x.text),
+    ['allowed before kick']);
+  const kick = f.elements.get('peers').children[0].children.at(-1);
+  kick.onclick(); // Broker peer-left deliberately delayed.
+  assert.deepEqual(socket.sent.at(-1), { type: 'kick', to: 'guest-A' });
+  assert.equal(channel.readyState, 'closed', 'local revocation cannot await broker');
+  await f.sendText('forbidden after kick');
+  assert.deepEqual(channel.sent.filter(x => x.type === 'text').map(x => x.text),
+    ['allowed before kick'], 'no text can be queued for locally revoked guest');
+});
+
+test('P2 integration: broker REVOKED and ROOM_CLOSED immediately discard guest RTC consent', async () => {
+  for (const code of ['REVOKED', 'ROOM_CLOSED']) {
+    const f = clientFixture();
+    f.joinRoom('room-A', 'invitation');
+    const socket = f.sockets[0];
+    await f.incoming(socket, { type: 'joined', role: 'guest', peerId: 'guest-A' });
+    const channel = await connectedRecipient(f, socket, 'host-A');
+    const peer = f.peerConnections[0];
+    assert.equal(peer.closed, false);
+    assert.equal(channel.readyState, 'open');
+    await f.incoming(socket, { type: 'error', code });
+    assert.equal(peer.closed, true, code + ' must close RTC before WS close');
+    assert.equal(channel.readyState, 'closed', code + ' must directly close data channel');
+    assert.equal(f.snapshot().peers.length, 0, code + ' must clear stale peers');
+    assert.equal(f.elements.get('invite').disabled, true);
+  }
+});
+
+test('P2 integration: late received text SHA cannot validate a revoked or removed peer', async () => {
+  let releaseHash;
+  const gate = new Promise(resolve => { releaseHash = resolve; });
+  const f = clientFixture({ digest: async (...args) => {
+    await gate;
+    return crypto.webcrypto.subtle.digest(...args);
+  } });
+  f.joinRoom('room-A', 'invitation');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const channel = f.peerConnections[0].channel;
+  const digest = crypto.createHash('sha256').update('stale peer bytes').digest('hex');
+  const pending = channel.onmessage({ data: JSON.stringify({
+    type: 'text', text: 'stale peer bytes', digest,
+  }) });
+  await f.incoming(socket, { type: 'peer-left', peerId: 'guest-A' });
+  releaseHash();
+  await pending;
+  assert.equal(f.snapshot().diagnostics.verifiedTexts.length, 0,
+    'revoked peer cannot publish a stale positive SHA result after its async digest');
+});
+
+test('P2 integration: a pending file consent button cannot authorize after ROOM_CLOSED', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'invitation');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'guest', peerId: 'guest-A' });
+  const channel = await connectedRecipient(f, socket, 'host-A');
+  const digest = crypto.createHash('sha256').update(Uint8Array.of(1, 2, 3)).digest('hex');
+  await channel.onmessage({ data: JSON.stringify({
+    type: 'offer-file', id: 'pending-01', name: 'fixture.bin', size: 3, digest,
+  }) });
+  const consentButton = f.elements.get('incoming').children[0].children[0];
+  assert.ok(consentButton, 'control: valid file offer has a pending consent button');
+  await f.incoming(socket, { type: 'error', code: 'ROOM_CLOSED' });
+  consentButton.onclick(); // A stale DOM event is deliberately delivered.
+  assert.equal(f.snapshot().peers.length, 0);
+  assert.equal(channel.sent.filter(m => m.type === 'accept-file').length, 0,
+    'stale clicked consent must never acknowledge a file after room revocation');
+});
+
+test('P2 integration: a file digest completing after kick cannot publish a verified transfer', async () => {
+  let releaseHash;
+  const gate = new Promise(resolve => { releaseHash = resolve; });
+  const f = clientFixture({ digest: async (...args) => {
+    await gate;
+    return crypto.webcrypto.subtle.digest(...args);
+  } });
+  f.joinRoom('room-A', 'invitation');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'guest', peerId: 'guest-A' });
+  const channel = await connectedRecipient(f, socket, 'host-A');
+  const bytes = Uint8Array.of(1, 2, 3);
+  const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+  await channel.onmessage({ data: JSON.stringify({
+    type: 'offer-file', id: 'transfer-01', name: 'fixture.bin', size: bytes.length, digest,
+  }) });
+  const consent = f.elements.get('incoming').children[0].children[0];
+  consent.onclick();
+  assert.equal(channel.sent.some(m => m.type === 'accept-file'), true);
+  await channel.onmessage({ data: bytes.buffer });
+  const finishing = channel.onmessage({ data: JSON.stringify({
+    type: 'end-file', id: 'transfer-01',
+  }) });
+  await f.incoming(socket, { type: 'error', code: 'REVOKED' });
+  releaseHash();
+  await finishing;
+  assert.equal(f.snapshot().diagnostics.verifiedFiles.length, 0,
+    'an asynchronous verified-file completion cannot outlive local consent');
+});
+
+test('P2 integration: delayed peer-accepted cannot recreate a guest after host kick', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'host-key');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-joined', role: 'guest', peerId: 'guest-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const first = f.peerConnections[0].channel;
+  const kick = f.elements.get('peers').children[0].children.at(-1);
+  kick.onclick();
+  assert.equal(first.readyState, 'closed');
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  await f.incoming(socket, { type: 'peer-joined', role: 'guest', peerId: 'guest-A' });
+  assert.equal(f.snapshot().peers.length, 0,
+    'queued peer-accepted cannot reinstate a locally revoked direct transport');
+  assert.equal(f.peerConnections.length, 1,
+    'no extra RTCPeerConnection may be created for a revoked peer');
+});
+
+test('P2 integration: stale signaling after authoritative REVOKED cannot restore guest peers', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'invitation');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'guest', peerId: 'guest-A' });
+  const channel = await connectedRecipient(f, socket, 'host-A');
+  await f.incoming(socket, { type: 'error', code: 'REVOKED' });
+  assert.equal(channel.readyState, 'closed');
+  await f.incoming(socket, { type: 'peer-allowed', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'joined', role: 'guest', peerId: 'guest-A' });
+  assert.equal(f.snapshot().peers.length, 0,
+    'once room consent is revoked, later broker messages from the same socket are inert');
+  assert.equal(f.snapshot().role, null);
+});
+
+test('P2 integration: a delayed peer-accepted cannot reverse a broker peer-left', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'host-key');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const first = f.peerConnections[0].channel;
+  await f.incoming(socket, { type: 'peer-left', peerId: 'guest-A' });
+  assert.equal(first.readyState, 'closed', 'control: broker departure closed direct channel');
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  assert.equal(f.snapshot().peers.length, 0,
+    'departure notification is authoritative for this peer ID until a fresh room');
+  assert.equal(f.peerConnections.length, 1, 'late answer cannot recreate the departed peer');
 });

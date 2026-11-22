@@ -21,14 +21,53 @@
   let ws, roomId, hostKey, selfId, role;
   let roomGeneration = 0;
   const peers = new Map(), invites = new Map();
+  const locallyRevokedPeers = new Set();
+  let roomDenied = false;
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
   // A file/text selected in room A must never be sent to room B after an await.
   const stillInRoom = (socket, selectedRoom) => socket && socket === ws &&
     socket.readyState === 1 && roomId === selectedRoom;
 
+  function dropPeer(id) {
+    const p = peers.get(id);
+    if (p) {
+      p.outgoing = null;
+      p.incoming = null;
+      p.pendingOffer = null;
+      // Stop the direct transport immediately, not merely when the broker's
+      // delayed peer-left notification or WebSocket close finally arrives.
+      if (p.dc?.readyState === 'open' || p.dc?.readyState === 'connecting') p.dc.close?.();
+      p.pc.close();
+      peers.delete(id);
+    }
+    document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
+      if (el.dataset.peerId === id) el.remove();
+    });
+    document.querySelectorAll('#incoming [data-peer-id]').forEach(el => {
+      if (el.dataset.peerId === id) el.remove();
+    });
+  }
+
+  function revokeRoomConsent() {
+    // Broker authority rejected this room. Do not wait for the WS close event:
+    // a direct RTC connection can otherwise still carry sensitive fixture bytes.
+    roomGeneration++;
+    roomDenied = true;
+    for (const id of [...peers.keys()]) dropPeer(id);
+    invites.clear();
+    $('peers').replaceChildren();
+    $('invites').replaceChildren();
+    $('incoming').replaceChildren();
+    $('invite').disabled = true;
+    role = null;
+    selfId = null;
+  }
+
   function connect(credentials) {
     roomGeneration++;
+    roomDenied = false;
+    locallyRevokedPeers.clear();
     const oldSocket = ws;
     ws = null; // old callbacks must not retain authority over the new room.
     if (oldSocket && oldSocket.readyState < 2) oldSocket.close();
@@ -48,10 +87,14 @@
       wire({ type: 'join', roomId, ...credentials });
     };
     ws.onmessage = async event => {
-      if (ws !== eventSocket) return;
+      if (ws !== eventSocket || roomDenied) return;
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
-      if (m.type === 'error') { record(diagnostics.rejected, m.code); return log('Erro: ' + m.code); }
+      if (m.type === 'error') {
+        if (m.code === 'REVOKED' || m.code === 'ROOM_CLOSED') revokeRoomConsent();
+        record(diagnostics.rejected, m.code);
+        return log('Erro: ' + m.code);
+      }
       if (m.type === 'joined') {
         selfId = m.peerId; role = m.role;
         $('invite').disabled = role !== 'host';
@@ -74,13 +117,20 @@
         invites.delete(m.inviteId);
         log('Convite revogado');
       } else if (m.type === 'peer-joined' && role === 'host') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const line = document.createElement('div');
         line.className = 'entry';
         line.dataset.peerId = m.peerId;
         line.textContent = 'Convidado ' + (m.username || m.peerId.slice(0, 5)) + ' ';
         const kick = document.createElement('button');
         kick.textContent = 'Revogar participante';
-        kick.addEventListener('click', () => wire({ type: 'kick', to: m.peerId }));
+        kick.addEventListener('click', () => {
+          if (locallyRevokedPeers.has(m.peerId)) return;
+          locallyRevokedPeers.add(m.peerId);
+          wire({ type: 'kick', to: m.peerId });
+          // Host-initiated consent revocation is local and synchronous.
+          dropPeer(m.peerId);
+        });
         line.append(kick);
         $('peers').append(line);
         wire({ type: 'request-peer', to: m.peerId });
@@ -100,6 +150,7 @@
         }
         $('peers').append(div);
       } else if (m.type === 'peer-accepted') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const p = preparePeer(m.peerId, true);
         const dc = p.pc.createDataChannel('fixture-transfer', { ordered: true });
         attachChannel(p, dc);
@@ -107,8 +158,10 @@
         if (ws !== eventSocket || peers.get(p.id) !== p) return;
         wire({ type: 'signal', to: p.id, signal: { kind: 'offer', sdp: p.pc.localDescription } });
       } else if (m.type === 'peer-allowed') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         preparePeer(m.peerId, false);
       } else if (m.type === 'signal') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const p = peers.get(m.peerId);
         if (!p) return;
         try {
@@ -128,20 +181,16 @@
           }
         } catch (e) { log('Negociação falhou: ' + e.name); }
       } else if (m.type === 'peer-left') {
-        const p = peers.get(m.peerId);
-        if (p) p.pc.close();
-        peers.delete(m.peerId);
-        document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
-          if (el.dataset.peerId === m.peerId) el.remove();
-        });
+        // Broker departure is final for this per-room peer ID too: an
+        // already queued peer-accepted must not create a fresh RTC transport.
+        locallyRevokedPeers.add(m.peerId);
+        dropPeer(m.peerId);
         log('Par desconectado');
       }
     };
     ws.onclose = () => {
       if (ws !== eventSocket) return;
-      $('invite').disabled = true;
-      for (const p of peers.values()) p.pc.close();
-      peers.clear();
+      revokeRoomConsent();
       log('Conexão de sinalização encerrada');
     };
   }
@@ -155,7 +204,7 @@
     const p = { id, pc, initiator, dc: null, candidates: [], outgoing: null, incoming: null, pendingOffer: null };
     peers.set(id, p);
     pc.onicecandidate = e => {
-      if (e.candidate) wire({ type: 'signal', to: id, signal: { kind: 'ice', candidate: e.candidate.toJSON() } });
+      if (e.candidate && peers.get(id) === p) wire({ type: 'signal', to: id, signal: { kind: 'ice', candidate: e.candidate.toJSON() } });
     };
     pc.ondatachannel = e => attachChannel(p, e.channel);
     pc.onconnectionstatechange = () => log('WebRTC (' + id.slice(0, 5) + '): ' + pc.connectionState);
@@ -163,13 +212,16 @@
   }
   function attachChannel(p, dc) {
     p.dc = dc;
+    const active = () => peers.get(p.id) === p && p.dc === dc && dc.readyState === 'open';
     dc.binaryType = 'arraybuffer';
     dc.bufferedAmountLowThreshold = 32 * 1024;
     dc.onopen = () => {
+      if (!active()) return;
       record(diagnostics.channels, p.id);
       log('DataChannel aberto: ' + p.id.slice(0, 5));
     };
     dc.onclose = () => {
+      if (p.dc !== dc || peers.get(p.id) !== p) return;
       p.incoming = null;
       p.outgoing = null;
       log('DataChannel fechado: ' + p.id.slice(0, 5));
@@ -186,6 +238,7 @@
       log('Chunk rejeitado');
     }
     dc.onmessage = async event => {
+      if (!active()) return;
       if (event.data instanceof ArrayBuffer) {
         const rx = p.incoming;
         if (!rx || event.data.byteLength === 0 || rx.chunks.length >= MAX_FILE_CHUNKS ||
@@ -199,6 +252,7 @@
       try { m = JSON.parse(event.data); } catch { return; }
       if (m.type === 'text' && typeof m.text === 'string' && m.text.length <= 1000 && /^[0-9a-f]{64}$/.test(m.digest)) {
         const hash = await sha(new TextEncoder().encode(m.text));
+        if (!active()) return;
         if (hash === m.digest) {
           record(diagnostics.verifiedTexts, { from: p.id, text: m.text, sha256: hash });
           log('Texto SHA-256 OK de ' + p.id.slice(0, 5));
@@ -211,11 +265,13 @@
         p.pendingOffer = m.id;
         const div = document.createElement('div');
         div.className = 'entry';
+        div.dataset.peerId = p.id;
         div.textContent = 'Arquivo ' + m.name + ' (' + m.size + ' bytes) ';
         const button = document.createElement('button');
         button.textContent = 'Aceitar arquivo';
         button.dataset.testid = 'accept-file';
         button.addEventListener('click', () => {
+          if (!active() || p.pendingOffer !== m.id) return;
           p.incoming = { ...m, chunksSize: 0, chunks: [] };
           p.pendingOffer = null;
           dc.send(JSON.stringify({ type: 'accept-file', id: m.id }));
@@ -224,6 +280,7 @@
         const decline = document.createElement('button');
         decline.textContent = 'Recusar arquivo';
         decline.addEventListener('click', () => {
+          if (!active() || p.pendingOffer !== m.id) return;
           p.pendingOffer = null;
           dc.send(JSON.stringify({ type: 'decline-file', id: m.id }));
           div.remove();
@@ -246,6 +303,7 @@
         let offset = 0;
         for (const chunk of rx.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
         const digest = await sha(bytes);
+        if (!active()) return;
         if (digest !== rx.digest) { record(diagnostics.rejected, 'FILE_DIGEST'); return log('Arquivo corrompido'); }
         record(diagnostics.verifiedFiles, { from: p.id, name: rx.name, size: rx.size, sha256: digest });
         log('Arquivo SHA-256 OK: ' + rx.name);
