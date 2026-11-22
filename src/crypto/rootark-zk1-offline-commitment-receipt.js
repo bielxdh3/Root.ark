@@ -88,8 +88,20 @@ function verifySignedReceipt({ receipt, signerPublicKey, independentSignerSpkiSh
     || !same(b64(receipt.digest, 32), Buffer.from(expectedHead.digest))) deny();
   if (previousReceipt !== null) {
     const priorUnsigned = Object.fromEntries(FIELDS.map((key) => [key, previousReceipt[key]]));
+    const priorBytes = commitmentSigningBytes(priorUnsigned);
+    const priorSignature = b64(previousReceipt.signature, 64);
+    // A linked byte hash is not evidence that the previous entry was ever
+    // authenticated by the independent witness. Verify the full predecessor
+    // signature and scope before accepting its revision/fencing claim.
+    if (!crypto.verify(null, priorBytes, signerPublicKey, priorSignature)
+      || previousReceipt.issued_at > receipt.issued_at
+      || previousReceipt.sequence >= receipt.sequence) deny();
+    for (const name of ["account_id", "compartment_id", "keyring_id"]) {
+      if (!same(Buffer.from(previousReceipt[name], "base64url"),
+        Buffer.from(expectedScope[name]))) deny();
+    }
     const priorHash = crypto.createHash("sha256").update(Buffer.concat([
-      commitmentSigningBytes(priorUnsigned), b64(previousReceipt.signature, 64)])).digest();
+      priorBytes, priorSignature])).digest();
     if (!same(b64(receipt.previous_receipt_sha256, 32), priorHash)
       || receipt.sequence <= previousReceipt.sequence
       || receipt.previous_revision !== previousReceipt.revision
