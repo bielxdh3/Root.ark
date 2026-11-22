@@ -626,7 +626,20 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
   };
   const port = await wait(() => {
     const p = path.join(profile, "DevToolsActivePort");
-    return fs.existsSync(p) ? Number(fs.readFileSync(p, "utf8").split(/\r?\n/)[0]) : null;
+    // Edge creates and writes this file asynchronously. On hosted Windows a
+    // separate process can observe the filename before its contents are
+    // readable; neither a transient sharing violation nor an incomplete port
+    // is proof that the required CDP endpoint exists. Keep the original
+    // bounded wait and require a complete valid TCP port before connecting.
+    let value;
+    try { value = fs.readFileSync(p, "utf8").split(/\r?\n/, 1)[0]; }
+    catch (error) {
+      if (["ENOENT", "EACCES", "EPERM", "EBUSY"].includes(error.code)) return null;
+      throw error;
+    }
+    if (!/^[1-9][0-9]{0,4}$/.test(value)) return null;
+    const parsed = Number(value);
+    return parsed <= 65535 ? parsed : null;
   }, "debug-port");
   const pages = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
   socket = new WebSocket(pages.find((p) => p.type === "page").webSocketDebuggerUrl);

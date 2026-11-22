@@ -35,6 +35,9 @@ test("#66 live Windows CFAPI kernel FETCH_DATA completes and unregisters the dis
     const evidence = JSON.parse(result.stdout.trim());
     assert.ok(evidence.liveKernelCallbackCount >= 1);
     assert.ok(evidence.successfulTransfers >= 1);
+    assert.equal(evidence.rejectedTransfers, 0);
+    assert.equal(evidence.verifiedBytes, 4097,
+      "native real callback must hydrate the final unaligned EOF byte");
     assert.equal(evidence.unregistered, true);
     assert.equal(evidence.positiveReadVerified, true);
   });

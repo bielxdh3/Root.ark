@@ -9,11 +9,24 @@
 #include <cstdio>
 #include <cwchar>
 #include <cstring>
+#include <array>
 
 namespace {
-constexpr char kPayload[] = "rootark-cfapi-disposable-positive-fixture";
+constexpr std::size_t kPayloadLength = 4097;
+constexpr char kIdentity[] = "rootark-cfapi-test-v1";
+std::array<unsigned char, kPayloadLength> makePayload() {
+  std::array<unsigned char, kPayloadLength> bytes{};
+  for (std::size_t i = 0; i < bytes.size(); ++i)
+    bytes[i] = static_cast<unsigned char>((i * 19 + 7) % 251);
+  return bytes;
+}
 constexpr NTSTATUS kCloudFailure = static_cast<NTSTATUS>(0xC000CF12UL);
-struct Context { unsigned callbacks = 0; unsigned successful = 0; };
+struct Context {
+  std::array<unsigned char, kPayloadLength> payload = makePayload();
+  unsigned callbacks = 0;
+  unsigned successful = 0;
+  unsigned rejected = 0;
+};
 
 void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS* params) {
   if (!info || !params || !info->CallbackContext) return;
@@ -35,14 +48,23 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
   transfer.TransferData.Length = params->FetchData.RequiredLength;
   const auto offset = params->FetchData.RequiredFileOffset.QuadPart;
   const auto length = params->FetchData.RequiredLength.QuadPart;
-  // CFAPI requires 4096-byte aligned transfers except the final EOF range.
-  // This fixture permits only an exact request for the single static payload.
-  if (offset == 0 && length == static_cast<LONGLONG>(sizeof(kPayload) - 1)) {
+  // Each request must be bound to the provider's exact identity and checked
+  // against the verified immutable buffer. This fixture does not certify a
+  // production owner-signed object or live revocation policy.
+  const bool identityMatches = info->FileIdentity
+    && info->FileIdentityLength == sizeof(kIdentity) - 1
+    && std::memcmp(info->FileIdentity, kIdentity, sizeof(kIdentity) - 1) == 0
+    && info->FileSize.QuadPart == static_cast<LONGLONG>(kPayloadLength);
+  const bool rangeMatches = offset >= 0 && offset % 4096 == 0 && length > 0
+    && length <= static_cast<LONGLONG>(kPayloadLength) - offset
+    && (length % 4096 == 0 || offset + length == static_cast<LONGLONG>(kPayloadLength));
+  if (identityMatches && rangeMatches) {
     transfer.TransferData.CompletionStatus = 0;
-    transfer.TransferData.Buffer = kPayload;
+    transfer.TransferData.Buffer = ctx.payload.data() + static_cast<std::size_t>(offset);
     if (SUCCEEDED(CfExecute(&op, &transfer))) ++ctx.successful;
     return;
   }
+  ++ctx.rejected;
   (void)CfExecute(&op, &transfer);
 }
 
@@ -90,9 +112,8 @@ int wmain(int argc, wchar_t** argv) {
   registration.StructSize = sizeof(registration);
   registration.ProviderName = L"Rootark disposable CFAPI fixture";
   registration.ProviderVersion = L"1";
-  constexpr char identity[] = "rootark-cfapi-test-v1";
-  registration.SyncRootIdentity = identity;
-  registration.SyncRootIdentityLength = sizeof(identity) - 1;
+  registration.SyncRootIdentity = kIdentity;
+  registration.SyncRootIdentityLength = sizeof(kIdentity) - 1;
   CF_SYNC_POLICIES policies{};
   policies.StructSize = sizeof(policies);
   policies.Hydration.Primary = CF_HYDRATION_POLICY_PARTIAL;
@@ -109,10 +130,10 @@ int wmain(int argc, wchar_t** argv) {
     connected = true;
     CF_PLACEHOLDER_CREATE_INFO item{};
     item.RelativeFileName = L"payload.bin";
-    item.FsMetadata.FileSize.QuadPart = sizeof(kPayload) - 1;
+    item.FsMetadata.FileSize.QuadPart = kPayloadLength;
     item.FsMetadata.BasicInfo.FileAttributes = FILE_ATTRIBUTE_NORMAL;
-    item.FileIdentity = identity;
-    item.FileIdentityLength = sizeof(identity) - 1;
+    item.FileIdentity = kIdentity;
+    item.FileIdentityLength = sizeof(kIdentity) - 1;
     DWORD processed = 0;
     result = CfCreatePlaceholders(root, &item, 1, CF_CREATE_FLAG_NONE, &processed);
     if (FAILED(result) || processed != 1 || FAILED(item.Result)) break;
@@ -121,12 +142,13 @@ int wmain(int argc, wchar_t** argv) {
     HANDLE handle = CreateFileW(file, GENERIC_READ, FILE_SHARE_READ, nullptr,
       OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (handle == INVALID_HANDLE_VALUE) break;
-    char received[sizeof(kPayload)]{};
+    std::array<unsigned char, kPayloadLength> received{};
     DWORD got = 0;
-    const BOOL read = ReadFile(handle, received, sizeof(kPayload) - 1, &got, nullptr);
+    const BOOL read = ReadFile(handle, received.data(),
+      static_cast<DWORD>(received.size()), &got, nullptr);
     CloseHandle(handle);
-    if (!read || got != sizeof(kPayload) - 1
-        || std::memcmp(received, kPayload, sizeof(kPayload) - 1) != 0
+    if (!read || got != kPayloadLength
+        || std::memcmp(received.data(), context.payload.data(), kPayloadLength) != 0
         || context.callbacks == 0 || context.successful == 0) break;
     exitCode = 0;
   } while (false);
@@ -135,8 +157,10 @@ int wmain(int argc, wchar_t** argv) {
   const HRESULT unregisterResult = CfUnregisterSyncRoot(root);
   if (FAILED(unregisterResult)) exitCode = 9;
   std::printf("{\"liveKernelCallbackCount\":%u,\"successfulTransfers\":%u,"
+    "\"rejectedTransfers\":%u,\"verifiedBytes\":%zu,"
     "\"unregistered\":%s,\"positiveReadVerified\":%s}\n",
-    context.callbacks, context.successful, SUCCEEDED(unregisterResult) ? "true" : "false",
+    context.callbacks, context.successful, context.rejected, kPayloadLength,
+    SUCCEEDED(unregisterResult) ? "true" : "false",
     exitCode == 0 ? "true" : "false");
   return exitCode;
 }
