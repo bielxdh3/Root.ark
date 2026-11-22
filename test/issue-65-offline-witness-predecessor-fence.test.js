@@ -32,7 +32,8 @@ test("witness predecessor fencing requires a genuine signature and the same scop
     ...predecessor, revision: currentHead.revision, digest: b64(currentHead.digest),
     previous_revision: prior.revision, previous_digest: prior.digest,
     sequence: 5, previous_receipt_sha256: b64(digest(Buffer.concat([
-      witness.commitmentSigningBytes(prior), Buffer.from(prior.signature, "base64url"),
+      witness.commitmentSigningBytes(Object.fromEntries(witness.FIELDS.map(
+        (field) => [field, prior[field]]))), Buffer.from(prior.signature, "base64url"),
     ]))), issued_at: now - 5, expires_at: now + 90,
   });
   const expected = (prior) => ({ receipt: current(prior), previousReceipt: prior,
