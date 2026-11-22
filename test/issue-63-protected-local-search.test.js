@@ -139,12 +139,42 @@ test("local protected index persists encrypted names; reload uses verified CAS a
   const second = await search.search(f.input(key, "secret-"));
   assert.equal(second.entries[0].name, "secret-private-name.txt");
   assert.equal(f.opened, 1, "same authenticated head must reuse encrypted cache");
-  assert.equal(f.remoteReads, 2, "every invocation freshly verifies signed catalog");
+  assert.equal(f.remoteReads, 4,
+    "each invocation verifies signed catalog and rechecks the CAS before release");
   const all = await search.search(f.input(key, ""));
   assert.equal(all.entries.length, 3);
   assert.equal(all.entries.at(-1).logicalTrashCandidate, true);
   f.revoke();
   await assert.rejects(search.search(f.input(key, "secret")), /ZK_LOCAL_SEARCH_DENIED/);
+});
+
+test("P2: cached AES-GCM results remain hidden if signed CAS advances during decryption", async () => {
+  const database = indexedDBMemory();
+  const f = fixture(database);
+  const key = crypto.randomBytes(32);
+  const created = await search.search(f.input(key, "secret"));
+  assert.equal(created.totalMatches, 1, "real AES-GCM creates an authenticated cache");
+  assert.equal(f.opened, 1);
+
+  const input = f.input(key, "secret");
+  const originalVerify = input.client.verifyPrivateListingHead.bind(input.client);
+  let signedReads = 0;
+  input.client.verifyPrivateListingHead = async (...args) => {
+    const signed = await originalVerify(...args);
+    signedReads++;
+    if (signedReads === 1) return signed;
+    // Another valid owner mutation arrives after the initial signed CAS
+    // recheck while the cached ciphertext is being decrypted locally.
+    return { ...signed, head: {
+      ...signed.head, sequence: signed.head.sequence + 1,
+      digest: crypto.randomBytes(32).toString("base64url"),
+    } };
+  };
+
+  await assert.rejects(search.search(input), /ZK_LOCAL_SEARCH_DENIED/,
+    "a changed independently signed CAS may not release cached private names");
+  assert.equal(signedReads, 2, "the post-AEAD independent signed read is mandatory");
+  assert.equal(f.opened, 1, "the attack exercises cached data, not a new full listing");
 });
 
 test("full 4096-row signed catalog is indexed, returns a bounded 100-hit UI page", async () => {

@@ -351,6 +351,14 @@
           live(assertLive);
         }
       }
+      // Even a genuinely verified head can advance while IndexedDB or AEAD
+      // is pending. Release no cached or freshly indexed private names until
+      // a second independent signed read proves the same pinned CAS/scope.
+      const finalVerified = await verifyPrivateListingHead(input.baseline);
+      live(assertLive);
+      if (!sameScope(finalVerified?.scope, pinned.scope)
+        || finalVerified.head?.sequence !== pinned.head.sequence
+        || finalVerified.head.digest !== pinned.head.digest) deny();
       // The initial action can release and zero its imported metadata key.
       // Keep only the authenticated in-memory rows for page navigation.
       rows = Object.freeze(rows.map((row) => Object.freeze({

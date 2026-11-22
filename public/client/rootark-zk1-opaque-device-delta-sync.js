@@ -213,8 +213,12 @@
       const sessionCsrf = trust.csrfToken();
       if (typeof sessionCsrf !== "string" || !sessionCsrf || sessionCsrf.length > 512
         || /[\u0000-\u001f\u007f]/.test(sessionCsrf)) deny();
+      // A signed catalog reader can await while caller-owned input methods
+      // change. Pin the original generation guard at client construction:
+      // never permit a replacement property to authorize decrypted names.
+      const originalAssertLive = input.assertLive.bind(input);
       const assertLive = () => {
-        const result = input.assertLive();
+        const result = originalAssertLive();
         if (result === false || (result && typeof result.then === "function")
           || trust.isSessionCurrent() !== true
           || trust.csrfToken() !== sessionCsrf) deny();
@@ -354,6 +358,22 @@
               // must remain visible when no local filename filter is active.
               if (!query || entries.length < 100) entries.push(entry);
             }
+          }
+          // Every metadata AEAD open awaited above. An owner revocation or
+          // independent CAS successor during those awaits invalidates the
+          // earlier read; recheck the signed current head before local release.
+          const final = await writer.readAll();
+          assertLive();
+          if (final.head.sequence !== current.head.sequence
+            || !equal(bytes(final.head.digest, 32), bytes(current.head.digest, 32))
+            || final.rows.length !== current.rows.length) deny();
+          // A server cannot replay a same-head but different row set while
+          // the filename AEAD callbacks are pending. Compare the signed
+          // immutable listing against the original verified baseline too.
+          for (let index = 0; index < final.rows.length; index++) {
+            const signed = rowWire(final.rows[index]);
+            const baseline = previous.entries[index];
+            if (Object.keys(signed).some((key) => signed[key] !== baseline[key])) deny();
           }
           // One bad entry/key invalidates the ENTIRE list; no partial results.
           return Object.freeze({ head, scope,

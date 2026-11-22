@@ -13,7 +13,6 @@ The existing protected-index AES-GCM primitive is not fed by the production UI. 
 **Acceptance and regression:** (1) matching names visible in the authenticated dialog, unrelated names and trash excluded from nonempty results; (2) Unicode normalization and literal special-character filtering; (3) query longer than 120 UTF-16 units denied; (4) full decryption even when a match is absent, so corruption/wrong keys cannot yield a partial list; (5) no plaintext query in outbound requests or serialized opaque snapshots; (6) old unfiltered behavior, signed readback, revocation and logout checks unchanged. Validate with the existing signed-catalog/real AES-GCM browser fixture, focused Node tests and Edge UI probe.
 
 This is partial functionality. Issue #63 remains open: secure population/lifecycle of a general protected search index, cross-device/offline semantics, richer search and wider acceptance are unresolved.
-
 ## Follow-up: persistent encrypted on-device filename index (stacked draft)
 
 After the existing manual `catalog-delta-anchor` authenticates a device grant,
