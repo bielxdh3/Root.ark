@@ -6,7 +6,6 @@ const { types: nodeUtilTypes } = require("node:util");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
-const { types: nodeUtilTypes } = require("node:util");
 
 // These primitives are captured when the trusted module is loaded. Transport,
 // witness and CAS callbacks are untrusted extension points and may mutate the
