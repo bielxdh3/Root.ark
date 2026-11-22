@@ -460,6 +460,24 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   const genuineAgainstUntrustedServer = await redeem({ fetchImpl: forgedServer });
   assert.deepEqual(genuineAgainstUntrustedServer, redeemed,
     "positive control: the same authenticated bytes with the pinned device signer remain valid");
+  const neverAnswers = () => new Promise(() => {});
+  const beforeHungAuthority = untrustedHttpCalls;
+  await assert.rejects(redeem({ readIndependentAuthority: neverAnswers,
+    fetchImpl: forgedServer }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "an unresponsive independent authority must fail closed before contacting the server");
+  assert.equal(untrustedHttpCalls, beforeHungAuthority,
+    "no ciphertext may be requested without the initial independent authority");
+  let authorityReads = 0;
+  const beforeHungFinal = untrustedHttpCalls;
+  await assert.rejects(redeem({
+    readIndependentAuthority: async () => ++authorityReads === 1
+      ? independentAuthority() : neverAnswers(),
+    fetchImpl: forgedServer,
+  }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "a stalled final current-roster check cannot release otherwise valid ciphertext");
+  assert.equal(authorityReads, 2);
+  assert.equal(untrustedHttpCalls, beforeHungFinal + 1,
+    "the final authority timeout is exercised after authenticated-content-shaped egress");
   await assert.rejects(redeem({ fetchImpl: fetch }), /ZK_SHARE_REDEMPTION_DENIED/,
     "grant possession without recipient account session must not download ciphertext");
   await assert.rejects(redeem({ readIndependentAuthority: null }),
