@@ -4,6 +4,7 @@
 // explicitly rewraps an already-held FILE CEK; a device epoch key alone never
 // grants access to historical file CEKs. No off-host or production claim.
 const crypto = require("node:crypto");
+const { createRequire } = require("node:module");
 const nativeTypes = require("node:util").types;
 const nativeIsProxy = nativeTypes.isProxy;
 const nativeIsUint8Array = nativeTypes.isUint8Array;
@@ -35,9 +36,13 @@ const nativeOwnKeys = Reflect.ownKeys;
 const nativeArrayIsArray = Array.isArray;
 const nativeArrayBufferIsView = ArrayBuffer.isView;
 const nativeArrayBuffer = ArrayBuffer;
+const nativeFunctionHasInstanceDescriptor = nativeGetOwnPropertyDescriptor(
+  Function.prototype, Symbol.hasInstance);
 const nativeUint8Array = Uint8Array;
 const nativeTypedPrototype = Object.getPrototypeOf(Uint8Array.prototype);
 const nativeTypedByteLength = Object.getOwnPropertyDescriptor(nativeTypedPrototype, "byteLength").get;
+const nativeTypedBuffer = Object.getOwnPropertyDescriptor(nativeTypedPrototype, "buffer").get;
+const nativeTypedByteOffset = Object.getOwnPropertyDescriptor(nativeTypedPrototype, "byteOffset").get;
 const nativeTypedSet = Uint8Array.prototype.set;
 const nativeArrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
 const nativeTypedFill = Uint8Array.prototype.fill;
@@ -62,12 +67,24 @@ const nativeKeyObjectExport = nativeGetPrototypeOf(nativeCreatePublicKey({
 })).export;
 const nativeSubtle = crypto.webcrypto.subtle;
 const nativeSubtleExportKey = nativeSubtle.exportKey;
+const nativeSubtleEncrypt = nativeSubtle.encrypt;
 const nativeJsonStringify = JSON.stringify;
 const nativeDecodeDeterministic = z.decodeDeterministic.bind(z);
 const nativeEncodeDeterministic = z.encodeDeterministic.bind(z);
 const nativeHpkeSuite = z.hpkeSuite.bind(z);
-const nativeHpkeSeal = z.hpkeSeal.bind(z);
 const nativeHpkeOpen = z.hpkeOpen.bind(z);
+// Pin the locked @hpke/core native sender implementations at module load.
+// The independent authority callback can otherwise replace sender.seal or
+// CipherSuite.prototype.createSenderContext before the raw CEK is provided.
+const hpkeCore = require("@hpke/core");
+const hpkeRequire = createRequire(require.resolve("@hpke/core"));
+const nativeHpkeCreateSenderContext = nativeGetPrototypeOf(
+  hpkeCore.CipherSuite.prototype).createSenderContext;
+const nativeHpkeSenderSeal = hpkeRequire("./src/senderContext.js")
+  .SenderContextImpl.prototype.seal;
+const hpkeAesContextPrototype = hpkeRequire("./src/aeads/aesGcm.js")
+  .AesGcmContext.prototype;
+const nativeHpkeAesSeal = hpkeAesContextPrototype.seal;
 const nativeDecryptFile = fileContent.decryptFile.bind(fileContent);
 const nativeImportFileCek = fileContent.importFileCek.bind(fileContent);
 const nativeComputeCiphertextRoot = roots.computeCiphertextRoot.bind(roots);
@@ -203,8 +220,13 @@ function exact(v, keys) {
   return v;
 }
 function raw(v, length) {
-  if (!nativeArrayBufferIsView(v) || v.byteLength !== length) deny();
-  return nativeBufferFrom(v.buffer, v.byteOffset, v.byteLength);
+  if (nativeIsProxy(v) || !nativeIsUint8Array(v)
+    || nativeApply(nativeTypedByteLength, v, []) !== length) deny();
+  // A signed authority read can invoke arbitrary JS callbacks. Never read
+  // v.buffer/byteOffset/byteLength through replaceable inherited accessors:
+  // the underlying view may contain the raw owner CEK when this is called.
+  return nativeBufferFrom(nativeApply(nativeTypedBuffer, v, []),
+    nativeApply(nativeTypedByteOffset, v, []), length);
 }
 function from64(v, n) {
   if (typeof v !== "string" || !/^[A-Za-z0-9_-]+$/.test(v)
@@ -227,6 +249,41 @@ function wipeOwnedBytes(value) {
   // the final authority callback can run after the actual CEK is in memory.
   if (value && !nativeIsProxy(value) && nativeIsUint8Array(value)) {
     nativeApply(nativeTypedFill, value, [0]);
+  }
+}
+async function sealPrivateCekHpke(recipientPublicKey, plaintext, info, aad) {
+  // The HPKE library accepts ArrayBuffer directly, but its Uint8Array path
+  // reads mutable .buffer/.byteOffset/.byteLength getters. An independent
+  // authority callback runs before this seal and may replace those getters.
+  // Do not pass a view of the raw owner CEK to that third-party conversion.
+  const isolated = new nativeArrayBuffer(32);
+  const view = new nativeUint8Array(isolated);
+  nativeApply(nativeTypedSet, view, [plaintext]);
+  try {
+    // @hpke/common performs `data instanceof ArrayBuffer` and its AES context
+    // invokes a prototype method with the plaintext. If a callback replaces
+    // either dispatch point, fail closed before supplying the private CEK.
+    if (nativeGetOwnPropertyDescriptor(nativeArrayBuffer, Symbol.hasInstance)
+      || nativeGetOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance)?.value
+        !== nativeFunctionHasInstanceDescriptor.value
+      || nativeGetOwnPropertyDescriptor(hpkeAesContextPrototype, "seal")?.value
+        !== nativeHpkeAesSeal
+      || nativeSubtle.encrypt !== nativeSubtleEncrypt) deny();
+    const sender = await nativeApply(nativeHpkeCreateSenderContext,
+      nativeHpkeSuite(), [{ recipientPublicKey, info }]);
+    if (nativeGetOwnPropertyDescriptor(nativeArrayBuffer, Symbol.hasInstance)
+      || nativeGetOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance)?.value
+        !== nativeFunctionHasInstanceDescriptor.value
+      || nativeGetOwnPropertyDescriptor(hpkeAesContextPrototype, "seal")?.value
+        !== nativeHpkeAesSeal
+      || nativeSubtle.encrypt !== nativeSubtleEncrypt) deny();
+    const encrypted = await nativeApply(nativeHpkeSenderSeal, sender, [isolated, aad]);
+    const encodedKey = nativeIsArrayBuffer(sender.enc)
+      ? new nativeUint8Array(sender.enc) : sender.enc;
+    return { enc: copyOwnedBytes(encodedKey, true),
+      ciphertext: nativeBufferFrom(encrypted) };
+  } finally {
+    nativeApply(nativeTypedFill, view, [0]);
   }
 }
 function metadataCopy(meta) {
@@ -420,8 +477,8 @@ async function sealOwnerAuthorizedFileCek(input) {
     const context = nativeBufferFrom(await nativeEncodeDeterministic(core));
     const recipient = await nativeHpkeSuite().kem.deserializePublicKey(
       ownerApprovedHpkePublicKey);
-    const sealed = await nativeHpkeSeal({ recipientPublicKey: recipient, plaintext: cek,
-      info: nativeBufferConcat([INFO, context]), aad: nativeBufferConcat([AAD, context]) });
+    const sealed = await sealPrivateCekHpke(recipient, cek,
+      nativeBufferConcat([INFO, context]), nativeBufferConcat([AAD, context]));
     const message = nativeBufferConcat([DOMAIN, await nativeEncodeDeterministic({
       core, enc: sealed.enc, ciphertext: sealed.ciphertext })]);
     // AEAD and HPKE are asynchronous. The signed approval can expire while

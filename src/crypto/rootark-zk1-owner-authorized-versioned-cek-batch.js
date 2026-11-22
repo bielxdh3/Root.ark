@@ -10,11 +10,55 @@ const transfer = require("./rootark-zk1-owner-authorized-file-cek-transfer");
 // Session fencing invokes an independently supplied callback after real
 // HPKE. Keep cleanup independent of callback-mutated JS array prototypes.
 const nativeApply = Reflect.apply;
+const nativeArrayIsArray = Array.isArray;
+const nativeGetPrototypeOf = Object.getPrototypeOf;
+const nativeOwnKeys = Reflect.ownKeys;
+const nativeHasOwn = Object.hasOwn;
+const nativeObjectPrototype = Object.prototype;
+const nativeBufferFrom = Buffer.from.bind(Buffer);
+const nativeBufferAlloc = Buffer.alloc.bind(Buffer);
+const nativeBufferConcat = Buffer.concat.bind(Buffer);
+const nativeBufferToString = Buffer.prototype.toString;
+const nativeJsonStringify = JSON.stringify;
+const nativeArraySort = Array.prototype.sort;
+const nativeArrayPush = Array.prototype.push;
+const nativeVerify = crypto.verify.bind(crypto);
+const nativeSign = crypto.sign.bind(crypto);
+const nativeCreatePublicKey = crypto.createPublicKey.bind(crypto);
+const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
+const nativeSubtle = crypto.webcrypto.subtle;
+const nativeExportKey = nativeSubtle.exportKey;
 const nativeTypedFill = Uint8Array.prototype.fill;
+const nativeTypedSet = Uint8Array.prototype.set;
 const NativeUint8Array = Uint8Array;
+const nativeTypedProto = Object.getPrototypeOf(Uint8Array.prototype);
+const nativeTypedByteLength = Object.getOwnPropertyDescriptor(nativeTypedProto, "byteLength").get;
+const nativeArrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
 const nativeIsArrayBuffer = nativeTypes.isArrayBuffer;
 const nativeIsUint8Array = nativeTypes.isUint8Array;
 const nativeIsProxy = nativeTypes.isProxy;
+const nativeIsCryptoKey = nativeTypes.isCryptoKey;
+const nativeIsKeyObject = nativeTypes.isKeyObject;
+const nativeHpkeSuite = z.hpkeSuite.bind(z);
+const nativeKemDeserializePrivateKey = nativeHpkeSuite().kem.deserializePrivateKey;
+const nativeTransferSeal = transfer.sealOwnerAuthorizedFileCek.bind(transfer);
+const nativeTransferOpen = transfer.openOwnerAuthorizedFileCek.bind(transfer);
+function copyPrivateSeed(bytes) {
+  if (nativeIsProxy(bytes)) deny();
+  let view;
+  if (nativeIsUint8Array(bytes)) {
+    if (nativeApply(nativeTypedByteLength, bytes, []) !== 32) deny();
+    view = bytes;
+  } else if (nativeIsArrayBuffer(bytes)) {
+    if (nativeApply(nativeArrayBufferByteLength, bytes, []) !== 32) deny();
+    view = new NativeUint8Array(bytes);
+  } else deny();
+  // Never call a mutable Buffer.from with the X25519 private key after the
+  // caller's assertLive() callback has executed.
+  const owned = nativeBufferAlloc(32);
+  nativeApply(nativeTypedSet, owned, [view]);
+  return owned;
+}
 function scrub(bytes) {
   if (bytes == null) return;
   if (nativeIsProxy(bytes)) deny();
@@ -23,7 +67,7 @@ function scrub(bytes) {
   nativeApply(nativeTypedFill, view, [0]);
 }
 
-const DOMAIN = Buffer.from("Root.ark/zk-1/owner-versioned-cek-batch/v1\0");
+const DOMAIN = nativeBufferFrom("Root.ark/zk-1/owner-versioned-cek-batch/v1\0");
 const SCHEMA = "rootark-zk1-owner-versioned-cek-batch/v1";
 const VERSION_KEYS = ["metadata", "objectRevision", "ciphertext", "ciphertextRoot", "ownerHeldCek"];
 const ENTRY_KEYS = ["metadata", "objectRevision", "ciphertext", "ciphertextRoot", "envelope"];
@@ -37,10 +81,11 @@ const BUNDLE_KEYS = ["schema", "manifest", "entries", "owner_signature",
 const sha = (bytes) => crypto.createHash("sha256").update(bytes).digest("base64url");
 function deny() { throw Error("ZK_OWNER_VERSIONED_CEK_BATCH_DENIED"); }
 function exact(obj, fields) {
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(obj))
-    || Reflect.ownKeys(obj).length !== fields.length
-    || fields.some((name) => !Object.hasOwn(obj, name))) deny();
+  if (!obj || nativeIsProxy(obj) || typeof obj !== "object" || nativeArrayIsArray(obj)) deny();
+  const proto = nativeGetPrototypeOf(obj);
+  if (proto !== nativeObjectPrototype && proto !== null
+    || nativeOwnKeys(obj).length !== fields.length) deny();
+  for (let i = 0; i < fields.length; i++) if (!nativeHasOwn(obj, fields[i])) deny();
   return obj;
 }
 function str(value, limit = 512) {
@@ -54,7 +99,7 @@ function positive(value) {
 function b64(value, length) {
   str(value, length === undefined ? 6 * 1024 * 1024 : Math.ceil(length * 4 / 3) + 4);
   if (!/^[A-Za-z0-9_-]+$/.test(value)) deny();
-  const bytes = Buffer.from(value, "base64url");
+  const bytes = nativeBufferFrom(value, "base64url");
   if ((length !== undefined && bytes.length !== length)
     || bytes.toString("base64url") !== value) deny();
   return bytes;
@@ -68,17 +113,20 @@ function snapshot(value, meter = { count: 0, bytes: 0 }, depth = 0) {
     if (typeof value === "string" && value.length > 22 * 1024 * 1024) deny();
     return value;
   }
-  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-    meter.bytes += value.byteLength;
-    if (value.byteLength > 4 * 1024 * 1024 || meter.bytes > 32 * 1024 * 1024) deny();
-    return Buffer.from(value);
+  if (nativeIsUint8Array(value)) {
+    const size = nativeApply(nativeTypedByteLength, value, []);
+    meter.bytes += size;
+    if (size > 4 * 1024 * 1024 || meter.bytes > 32 * 1024 * 1024) deny();
+    const owned = nativeBufferAlloc(size);
+    nativeApply(nativeTypedSet, owned, [value]);
+    return owned;
   }
   if (value instanceof ArrayBuffer) {
     meter.bytes += value.byteLength;
     if (value.byteLength > 4 * 1024 * 1024 || meter.bytes > 32 * 1024 * 1024) deny();
     return value.slice(0);
   }
-  if (value instanceof crypto.KeyObject || nativeTypes.isCryptoKey(value)) return value;
+  if (nativeIsKeyObject(value) || nativeIsCryptoKey(value)) return value;
   if (!value || typeof value !== "object") deny();
   const isArray = Array.isArray(value);
   if (!isArray && ![Object.prototype, null].includes(Object.getPrototypeOf(value))) deny();
@@ -127,11 +175,12 @@ function normalizedMetadata(meta) {
   return Object.fromEntries(META_KEYS.map((key) => [key, meta[key]]));
 }
 function verifyVersionChain(entries) {
-  if (!Array.isArray(entries) || entries.length === 0 || entries.length > 32) deny();
+  if (!nativeArrayIsArray(entries) || entries.length === 0 || entries.length > 32) deny();
   const groups = new Map();
   const versionIds = new Set();
   let fixedScope;
-  for (const entry of entries) {
+  for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+    const entry = entries[entryIndex];
     const meta = normalizedMetadata(entry.metadata);
     positive(entry.objectRevision);
     // A signed per-file version UUID must never alias another object/version.
@@ -145,19 +194,21 @@ function verifyVersionChain(entries) {
       versionId: meta.version_id, parent: meta.parent_version_id, epoch: meta.epoch });
   }
   for (const versions of groups.values()) {
-    versions.sort((a, b) => a.revision - b.revision);
+    nativeApply(nativeArraySort, versions, [(a, b) => a.revision - b.revision]);
     for (let i = 0; i < versions.length; i++) {
       if (versions[i].revision !== i + 1
         || versions[i].parent !== (i === 0 ? null : versions[i - 1].versionId)
         || (i > 0 && versions[i].epoch < versions[i - 1].epoch)) deny();
     }
   }
-  return [...entries].sort((a, b) => {
+  const sorted = new Array(entries.length);
+  for (let index = 0; index < entries.length; index++) sorted[index] = entries[index];
+  return nativeApply(nativeArraySort, sorted, [(a, b) => {
     const left = a.metadata.object_id, right = b.metadata.object_id;
     // Canonical base64url UUIDs are ASCII; avoid OS/ICU locale-dependent order.
     return (left < right ? -1 : left > right ? 1 : 0)
       || a.objectRevision - b.objectRevision;
-  });
+  }]);
 }
 function entryRecord(entry) {
   exact(entry, ENTRY_KEYS);
@@ -205,33 +256,40 @@ async function sealOwnerAuthorizedVersionedCeks(input) {
     ({ stable, assertLive } = snapshotWithSessionFence(input,
       ["ownerPrivateKey", "authority", "versions"]));
     assertLive();
-    if (!Array.isArray(stable.versions) || stable.versions.length > 8) deny();
-    const versions = verifyVersionChain(stable.versions.map((row) => exact(row, VERSION_KEYS)));
+    if (!nativeArrayIsArray(stable.versions) || stable.versions.length > 8) deny();
+    const candidateRows = new Array(stable.versions.length);
+    for (let i = 0; i < stable.versions.length; i++) {
+      candidateRows[i] = exact(stable.versions[i], VERSION_KEYS);
+    }
+    const versions = verifyVersionChain(candidateRows);
     for (let i = 0; i < versions.length; i++) {
       const cek = versions[i].ownerHeldCek;
-      if (!Buffer.isBuffer(cek) || cek.length !== 32) deny();
+      if (!nativeIsUint8Array(cek)
+        || nativeApply(nativeTypedByteLength, cek, []) !== 32) deny();
       for (let j = 0; j < i; j++) {
-        if (crypto.timingSafeEqual(cek, versions[j].ownerHeldCek)) deny();
+        if (nativeTimingSafeEqual(cek, versions[j].ownerHeldCek)) deny();
       }
     }
     const entries = [];
-    for (const row of versions) {
+    for (let versionIndex = 0; versionIndex < versions.length; versionIndex++) {
+      const row = versions[versionIndex];
       assertLive();
-      const envelope = await transfer.sealOwnerAuthorizedFileCek({
+      const envelope = await nativeTransferSeal({
         ownerPrivateKey: stable.ownerPrivateKey, authority: stable.authority,
         ownerHeldCek: row.ownerHeldCek, metadata: row.metadata,
         objectRevision: row.objectRevision,
         ciphertext: row.ciphertext, ciphertextRoot: row.ciphertextRoot,
       });
       assertLive();
-      entries.push({ metadata: normalizedMetadata(row.metadata),
+      nativeApply(nativeArrayPush, entries, [{ metadata: normalizedMetadata(row.metadata),
         objectRevision: row.objectRevision,
         ciphertext: row.ciphertext.toString("base64url"),
-        ciphertextRoot: Buffer.from(row.ciphertextRoot).toString("base64url"), envelope });
+        ciphertextRoot: nativeApply(nativeBufferToString,
+          nativeBufferFrom(row.ciphertextRoot), ["base64url"]), envelope }]);
     }
     assertLive();
     const manifest = makeManifest(entries);
-    const ownerSignature = crypto.sign(null, signingBytes(manifest),
+    const ownerSignature = nativeSign(null, signingBytes(manifest),
       stable.ownerPrivateKey).toString("base64url");
     assertLive();
     return { schema: SCHEMA, manifest, entries,
@@ -259,39 +317,52 @@ async function openOwnerAuthorizedVersionedCeks(input) {
     if (wire.schema !== SCHEMA || wire.signedBatchCompletenessVerified !== true
       || wire.globalAccountCompletenessProven !== false
       || wire.authorizesProductionRestore !== false) deny();
-    const records = wire.entries.map(entryRecord);
+    const records = new Array(wire.entries.length);
+    for (let i = 0; i < records.length; i++) records[i] = entryRecord(wire.entries[i]);
     const rows = verifyVersionChain(records);
-    if (rows.some((row, i) => row !== records[i])) deny();
+    for (let i = 0; i < rows.length; i++) if (rows[i] !== records[i]) deny();
     const manifest = exact(wire.manifest, MANIFEST_KEYS);
     const expected = makeManifest(rows);
     if (JSON.stringify(expected) !== JSON.stringify(manifest)) deny();
     const ownerKey = stable.authority.ownerPublicKey;
     if (!nativeTypes.isCryptoKey(ownerKey)) deny();
-    const ownerSpki = Buffer.from(await crypto.webcrypto.subtle.exportKey("spki", ownerKey));
+    const ownerSpki = nativeBufferFrom(await nativeApply(nativeExportKey,
+      nativeSubtle, ["spki", ownerKey]));
     assertLive();
-    const ownerPublic = crypto.createPublicKey({ key: ownerSpki, format: "der", type: "spki" });
-    if (!crypto.verify(null, signingBytes(manifest), ownerPublic,
+    const ownerPublic = nativeCreatePublicKey({ key: ownerSpki, format: "der", type: "spki" });
+    if (!nativeVerify(null, signingBytes(manifest), ownerPublic,
       b64(wire.owner_signature, 64))) deny();
-    raw = Buffer.from(stable.recipientHpkePrivateRaw);
-    if (raw.length !== 32) deny();
-    for (const row of rows) {
+    raw = copyPrivateSeed(stable.recipientHpkePrivateRaw);
+    const suite = nativeHpkeSuite();
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      const row = rows[rowIndex];
       assertLive();
-      const recipient = await z.hpkeSuite().kem.deserializePrivateKey(raw);
+      // The session fence callback may replace Function.prototype.bind or
+      // mutate the KEM prototype. Never rebind/reload a method while a private
+      // X25519 seed is about to cross the third-party deserializer.
+      const recipient = await nativeApply(nativeKemDeserializePrivateKey, suite.kem, [raw]);
       assertLive();
-      const opened = await transfer.openOwnerAuthorizedFileCek({
+      const opened = await nativeTransferOpen({
         envelope: row.envelope, authority: stable.authority,
         operatorMinimumSequence: stable.operatorMinimumSequence,
         metadata: row.metadata, objectRevision: row.objectRevision,
         ciphertext: b64(row.ciphertext), ciphertextRoot: b64(row.ciphertextRoot, 32),
         deviceHpkePrivateKey: recipient, nowSeconds: stable.nowSeconds,
       });
-      if (released.some((previous) => previous.cek.length === opened.cek.length
-        && crypto.timingSafeEqual(previous.cek, opened.cek))) {
+      let duplicateCek = false;
+      for (let i = 0; i < released.length; i++) {
+        const previous = released[i];
+        if (previous.cek.length === opened.cek.length
+          && nativeTimingSafeEqual(previous.cek, opened.cek)) duplicateCek = true;
+      }
+      if (duplicateCek) {
         scrub(opened.cek);
         deny();
       }
-      released.push({ metadata: row.metadata, objectRevision: row.objectRevision,
-        cek: opened.cek });
+      // Array.prototype.push is also callback-mutable and receives the raw
+      // opened CEK as part of its argument.
+      nativeApply(nativeArrayPush, released, [{ metadata: row.metadata,
+        objectRevision: row.objectRevision, cek: opened.cek }]);
       // Protect the last awaited HPKE operation as well as intermediate ones.
       // No CEK escapes until the full batch passes this final synchronous gate.
       assertLive();

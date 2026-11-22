@@ -1046,6 +1046,156 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "the owner-held file CEK must never be exposed to the malicious fill method");
     assert.equal(copiedTypedCekObserved, false,
       "file AEAD CEK import must not send the raw CEK through a callback-mutated typed fill");
+    // After the independent grant callback has executed, the CEK is already
+    // copied into the protected owner transfer. It must not cross mutable
+    // inherited typed-array getters (.buffer/.byteOffset/.byteLength).
+    const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+    const originalOwnByteDescriptors = Object.fromEntries(
+      ["buffer", "byteOffset", "byteLength"].map(key => [key,
+        Object.getOwnPropertyDescriptor(Uint8Array.prototype, key)]));
+    const internalByteGetters = Object.fromEntries(
+      ["buffer", "byteOffset", "byteLength"].map(key => [key,
+        Object.getOwnPropertyDescriptor(typedArrayPrototype, key).get]));
+    const nativeByteSet = Uint8Array.prototype.set;
+    const nativeArrayBufferView = require("node:util").types.isUint8Array;
+    let signedGetterOffer;
+    let checkedPrivateGetter = false;
+    let interceptedPrivateBuffer = false;
+    let interceptedPrivateGetterStack = "";
+    try {
+      signedGetterOffer = await createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, readIndependentAuthority: async () => {
+          const a = await readIndependentAuthority();
+          checkedPrivateGetter = true;
+          for (const name of ["buffer", "byteOffset", "byteLength"]) {
+            Object.defineProperty(Uint8Array.prototype, name, {
+              configurable: true, get() {
+                if (nativeArrayBufferView(this) &&
+                  Reflect.apply(internalByteGetters.byteLength, this, []) === 32) {
+                  const snap = new Uint8Array(32);
+                  Reflect.apply(nativeByteSet, snap, [this]);
+                  if (crypto.timingSafeEqual(snap, ownerHeldCek)) {
+                    interceptedPrivateBuffer = true;
+                    if (!interceptedPrivateGetterStack) interceptedPrivateGetterStack = new Error(
+                      "AUDIT_OWNER_CEK_MUTABLE_GETTER").stack || "";
+                  }
+                }
+                return Reflect.apply(internalByteGetters[name], this, []);
+              },
+            });
+          }
+          return a;
+        },
+      });
+    } finally {
+      for (const name of ["buffer", "byteOffset", "byteLength"]) {
+        const original = originalOwnByteDescriptors[name];
+        if (original) Object.defineProperty(Uint8Array.prototype, name, original);
+        else delete Uint8Array.prototype[name];
+      }
+    }
+    assert.equal(checkedPrivateGetter, true,
+      "the getter-poisoning callback must run before signed HPKE export");
+    assert.equal(signedGetterOffer.schema, "rootark-zk1-recipient-share-offer-dev/v1",
+      "the getter poisoning test must complete actual HPKE/AEAD and owner signature");
+    assert.equal(interceptedPrivateBuffer, false,
+      "mutable typed-array buffer/offset/length getters may never observe the owner CEK\n"
+        + interceptedPrivateGetterStack);
+    // The third-party HPKE sender has mutable prototype methods too. A
+    // malicious authority callback must not replace the function that accepts
+    // the isolated raw CEK ArrayBuffer for real RFC9180 encryption.
+    const hpkeCore = require("@hpke/core");
+    const hpkeLoader = require("node:module").createRequire(require.resolve("@hpke/core"));
+    const hpkeSenderProto = hpkeLoader("./src/senderContext.js").SenderContextImpl.prototype;
+    const hpkeSuiteProto = Object.getPrototypeOf(hpkeCore.CipherSuite.prototype);
+    const originalHpkeSeal = hpkeSenderProto.seal;
+    const originalHpkeCreateSender = hpkeSuiteProto.createSenderContext;
+    let reachedHpkeMethodPoison = false, poisonedHpkeSealCalled = false;
+    let poisonedHpkeCreateCalled = false, leakedCekToHpkeMethod = false;
+    let signedMethodOffer;
+    try {
+      signedMethodOffer = await createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          reachedHpkeMethodPoison = true;
+          hpkeSuiteProto.createSenderContext = function (...args) {
+            poisonedHpkeCreateCalled = true;
+            return Reflect.apply(originalHpkeCreateSender, this, args);
+          };
+          hpkeSenderProto.seal = function (rawSecret, ...args) {
+            poisonedHpkeSealCalled = true;
+            let rawView = null;
+            if (require("node:util").types.isArrayBuffer(rawSecret)) rawView = new Uint8Array(rawSecret);
+            else if (require("node:util").types.isUint8Array(rawSecret)) rawView = rawSecret;
+            if (rawView && rawView.length === 32 &&
+              crypto.timingSafeEqual(Buffer.from(rawView), ownerHeldCek)) {
+              leakedCekToHpkeMethod = true;
+            }
+            return Reflect.apply(originalHpkeSeal, this, [rawSecret, ...args]);
+          };
+          return current;
+        },
+      });
+    } finally {
+      hpkeSuiteProto.createSenderContext = originalHpkeCreateSender;
+      hpkeSenderProto.seal = originalHpkeSeal;
+    }
+    assert.equal(reachedHpkeMethodPoison, true,
+      "the adversarial callback must precede a real owner-authorized HPKE seal");
+    assert.equal(signedMethodOffer.schema, "rootark-zk1-recipient-share-offer-dev/v1",
+      "the pinned HPKE sender must still produce a genuinely signed owner offer");
+    assert.equal(poisonedHpkeCreateCalled, false,
+      "HPKE context creation must not dispatch a callback-swapped prototype method");
+    assert.equal(poisonedHpkeSealCalled, false,
+      "HPKE seal must not dispatch a callback-swapped sender prototype method");
+    assert.equal(leakedCekToHpkeMethod, false,
+      "the raw owner CEK must not be exposed to a replaced HPKE sender method");
+    const hpkeAesProto = hpkeLoader("./src/aeads/aesGcm.js").AesGcmContext.prototype;
+    const originalHpkeAesSeal = hpkeAesProto.seal;
+    const originalArrayBufferHasInstance = Object.getOwnPropertyDescriptor(
+      ArrayBuffer, Symbol.hasInstance);
+    for (const attack of ["arraybuffer-hasinstance", "aes-seal"]) {
+      let reachedPoisonedAuthority = false, attackerMethodCalled = false;
+      try {
+        await assert.rejects(createProtectedRecipientShareOffer({
+          ...ownerOfferArgs, readIndependentAuthority: async () => {
+            const current = await readIndependentAuthority();
+            reachedPoisonedAuthority = true;
+            if (attack === "arraybuffer-hasinstance") {
+              Object.defineProperty(ArrayBuffer, Symbol.hasInstance, {
+                configurable: true, value(value) {
+                  if (require("node:util").types.isArrayBuffer(value)) {
+                    const length = Reflect.apply(Object.getOwnPropertyDescriptor(
+                      ArrayBuffer.prototype, "byteLength").get, value, []);
+                    if (length === ownerHeldCek.length &&
+                      crypto.timingSafeEqual(Buffer.from(new Uint8Array(value)), ownerHeldCek)) {
+                      attackerMethodCalled = true;
+                    }
+                  }
+                  return Reflect.apply(Function.prototype[Symbol.hasInstance], ArrayBuffer, [value]);
+                },
+              });
+            } else {
+              hpkeAesProto.seal = function (...args) {
+                attackerMethodCalled = true;
+                return Reflect.apply(originalHpkeAesSeal, this, args);
+              };
+            }
+            return current;
+          },
+        }), /ZK_SHARE_OFFER_DENIED/,
+        "post-authority hostile HPKE internals must fail closed before exposing a CEK");
+      } finally {
+        if (originalArrayBufferHasInstance) {
+          Object.defineProperty(ArrayBuffer, Symbol.hasInstance, originalArrayBufferHasInstance);
+        } else delete ArrayBuffer[Symbol.hasInstance];
+        hpkeAesProto.seal = originalHpkeAesSeal;
+      }
+      assert.equal(reachedPoisonedAuthority, true,
+        "the adversarial mutation must occur after authentic authority verification");
+      assert.equal(attackerMethodCalled, false,
+        "the raw owner CEK may never pass through a replaced HPKE internal method");
+    }
     // A passed owner authority callback runs before genuine AES-GCM key import
     // and before AEAD plaintext parsing. An untrusted callback must not be
     // able to replace WebCrypto, a CEK byte iterator, or TextDecoder to spy
@@ -2359,6 +2509,131 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.deepEqual(entry.cek, original.ownerHeldCek);
       entry.cek.fill(0);
     }
+    // Real signed, three-version HPKE recovery must never hand the raw X25519
+    // private seed to Buffer.from redefined by an independent session fence.
+    // This callback executes AFTER the private key snapshot and BEFORE the
+    // first genuine HPKE deserialize/open, not in a synthetic crypto mock.
+    const realBatchBufferFrom = Buffer.from;
+    const exactPrivateKey = Buffer.from(fresh.hpkePrivateRaw);
+    const pinnedBatchTypedSet = Uint8Array.prototype.set;
+    const pinnedBatchTypedByteLength = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(Uint8Array.prototype), "byteLength").get;
+    const pinnedBatchArrayBufferByteLength = Object.getOwnPropertyDescriptor(
+      ArrayBuffer.prototype, "byteLength").get;
+    const pinnedBatchTypes = require("node:util").types;
+    let batchPrivateKeyWasObserved = false;
+    let batch32ByteFromDispatches = 0;
+    let batchPrivateSeedCopyWasDispatched = false;
+    let batchPrivateSeedCopyStack = "";
+    let batchPrivateKeyFenceReads = 0;
+    let batchPrivateKeyPoisonInstalled = false;
+    let hostileBatchOpen;
+    try {
+      hostileBatchOpen = await openBatch({ assertLive: () => {
+        const currentFenceRead = ++batchPrivateKeyFenceReads;
+        // The one target copy occurs strictly after the independent signed
+        // receipt is exported (fence #2) and before first HPKE open (#3).
+        // Restore the native method before unrelated receipt checks run.
+        if (currentFenceRead === 3) { Buffer.from = realBatchBufferFrom; return; }
+        if (currentFenceRead !== 2) return;
+        batchPrivateKeyPoisonInstalled = true;
+        Buffer.from = function (candidate, ...args) {
+          const uint8 = pinnedBatchTypes.isUint8Array(candidate);
+          const arrayBuffer = pinnedBatchTypes.isArrayBuffer(candidate);
+          const size = uint8 ? Reflect.apply(pinnedBatchTypedByteLength, candidate, [])
+            : arrayBuffer ? Reflect.apply(pinnedBatchArrayBufferByteLength, candidate, []) : -1;
+          if (size === 32) {
+            batch32ByteFromDispatches++;
+            const stack = new Error("AUDIT_PRIVATE_SEED_COPY").stack || "";
+            if (stack.includes("openOwnerAuthorizedVersionedCeks")
+              && stack.includes("rootark-zk1-owner-authorized-versioned-cek-batch.js")) {
+              batchPrivateSeedCopyWasDispatched = true;
+              if (!batchPrivateSeedCopyStack) batchPrivateSeedCopyStack = stack;
+            }
+            const snapshot = new Uint8Array(32);
+            Reflect.apply(pinnedBatchTypedSet, snapshot, [uint8
+              ? candidate : new Uint8Array(candidate)]);
+            if (crypto.timingSafeEqual(snapshot, exactPrivateKey)) {
+              batchPrivateKeyWasObserved = true;
+            }
+          }
+          return Reflect.apply(realBatchBufferFrom, Buffer, [candidate, ...args]);
+        };
+      } });
+      assert.equal(hostileBatchOpen.entries.length, 3,
+        "the callback attack must follow three real signed/HPKE recovery operations");
+      for (const entry of hostileBatchOpen.entries) {
+        const original = versionRows.find(row => row.metadata.object_id === entry.metadata.object_id
+          && row.objectRevision === entry.objectRevision);
+        assert.ok(original);
+        assert.deepEqual(entry.cek, original.ownerHeldCek);
+        entry.cek.fill(0);
+      }
+    } finally { Buffer.from = realBatchBufferFrom; }
+    assert.equal(batchPrivateKeyFenceReads, 12,
+      "the private seed interception attempt must reach all three genuine HPKE opens");
+    assert.equal(batchPrivateKeyPoisonInstalled, true,
+      "the adversarial Buffer.from shim must be installed over the exact pre-HPKE private copy window");
+    assert.equal(batchPrivateKeyWasObserved, false,
+      "session callbacks may not intercept the recipient private X25519 key through Buffer.from");
+    assert.equal(batchPrivateSeedCopyWasDispatched, false,
+      "a callback-replaced Buffer.from must never be invoked by a batch open with raw private bytes\n"
+        + batchPrivateSeedCopyStack);
+    // Neither dynamic Function.prototype.bind nor Array.prototype.push may
+    // receive sensitive material after assertLive. The first would expose the
+    // X25519 private seed, the latter the three just-opened historical CEKs.
+    const realBatchBind = Function.prototype.bind;
+    const realBatchPush = Array.prototype.push;
+    const expectedRecipientSeed = Buffer.from(fresh.hpkePrivateRaw);
+    let batchBindPoisonInstalled = false, bindSawRecipientSeed = false;
+    let pushSawHistoricalCek = false, bindFenceReads = 0;
+    try {
+      const defendedBatch = await openBatch({ assertLive: () => {
+        if (++bindFenceReads !== 2) return;
+        batchBindPoisonInstalled = true;
+        Function.prototype.bind = function (...args) {
+          const bound = Reflect.apply(realBatchBind, this, args);
+          if (this.name !== "deserializePrivateKey") return bound;
+          return function (...later) {
+            const key = later[0];
+            if (require("node:util").types.isUint8Array(key)
+              && key.length === expectedRecipientSeed.length
+              && crypto.timingSafeEqual(key, expectedRecipientSeed)) bindSawRecipientSeed = true;
+            return Reflect.apply(bound, undefined, later);
+          };
+        };
+        Array.prototype.push = function (...args) {
+          for (const arg of args) {
+            if (!arg || typeof arg !== "object" || !Object.hasOwn(arg, "cek")) continue;
+            for (const row of versionRows) {
+              if (require("node:util").types.isUint8Array(arg.cek)
+                && arg.cek.length === row.ownerHeldCek.length
+                && crypto.timingSafeEqual(arg.cek, row.ownerHeldCek)) pushSawHistoricalCek = true;
+            }
+          }
+          return Reflect.apply(realBatchPush, this, args);
+        };
+      } });
+      assert.equal(defendedBatch.entries.length, 3,
+        "the poisoned methods must surround three genuine signed HPKE opens");
+      for (const entry of defendedBatch.entries) {
+        const row = versionRows.find(item => item.metadata.object_id === entry.metadata.object_id
+          && item.objectRevision === entry.objectRevision);
+        assert.ok(row);
+        assert.deepEqual(entry.cek, row.ownerHeldCek);
+        entry.cek.fill(0);
+      }
+    } finally {
+      Function.prototype.bind = realBatchBind;
+      Array.prototype.push = realBatchPush;
+    }
+    assert.equal(batchBindPoisonInstalled, true);
+    assert.equal(bindFenceReads, 12,
+      "the poisoned callback must surround all three genuine native HPKE reads");
+    assert.equal(bindSawRecipientSeed, false,
+      "a callback-replaced bind may never intercept the X25519 private seed");
+    assert.equal(pushSawHistoricalCek, false,
+      "a callback-replaced array push may never intercept a released historical CEK");
     // Eleven assertLive checks reach the point immediately AFTER all three
     // genuine native HPKE opens, before any historical CEK is released.
     let localSessionChecks = 0;
