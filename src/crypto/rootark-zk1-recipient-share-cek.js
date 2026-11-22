@@ -3,7 +3,7 @@
 // DEV-OFF recipient-side bridge. Requires separately provisioned owner/V2
 // custody and a real owner-approved, recipient-specific HPKE file CEK.
 const crypto = require("node:crypto");
-const nativeIsProxy = require("node:util").types.isProxy;
+const { isProxy: nativeIsProxy, isUint8Array: nativeIsUint8Array } = require("node:util").types;
 const nativeNumberIsFinite = Number.isFinite;
 const nativeNumberIsSafeInteger = Number.isSafeInteger;
 const nativeMathFloor = Math.floor;
@@ -26,6 +26,7 @@ const nativeAssign = Object.assign;
 const nativeOwnKeys = Reflect.ownKeys;
 const nativeArrayIsArray = Array.isArray;
 const nativeBufferFrom = Buffer.from.bind(Buffer);
+const nativeTypedFill = Uint8Array.prototype.fill;
 const nativeBufferConcat = Buffer.concat.bind(Buffer);
 const nativeBufferToString = Buffer.prototype.toString;
 const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
@@ -72,6 +73,14 @@ function deny() { throw Error("ZK_SHARE_FILE_OPEN_DENIED"); }
 function denyOffer() { throw Error("ZK_SHARE_OFFER_DENIED"); }
 function isProxy(value) { return value !== null && (typeof value === "object" || typeof value === "function")
   && nativeIsProxy(value); }
+function wipeOwnedBytes(value) {
+  // Independent owner/recipient authority callbacks are executable. They can
+  // replace Buffer.prototype.fill and Uint8Array.prototype.fill after the CEK
+  // or authenticated plaintext has been copied. Never invoke those methods
+  // through the mutable prototype chain during cleanup.
+  if (value && !nativeIsProxy(value) && nativeIsUint8Array(value))
+    nativeApply(nativeTypedFill, value, [0]);
+}
 function currentSeconds(wallClock, reject = deny) {
   if (Date.now !== wallClock) reject();
   const milliseconds = wallClock();
@@ -361,7 +370,7 @@ async function createProtectedRecipientShareOffer(input) {
       authorizesProductionIo: false, externalCustodyProven: false,
     });
   } catch (_) { denyOffer(); }
-  finally { ownerCek?.fill(0); ciphertext?.fill(0); }
+  finally { wipeOwnedBytes(ownerCek); wipeOwnedBytes(ciphertext); }
 }
 function safeEnvelope(value) {
   strict(value, ENVELOPE);
@@ -496,7 +505,7 @@ async function openProtectedRecipientShareFile(input) {
     plaintext = null;
     return result;
   } catch (_) { deny(); }
-  finally { opened?.cek?.fill(0); plaintext?.data?.fill(0); }
+  finally { wipeOwnedBytes(opened?.cek); wipeOwnedBytes(plaintext?.data); }
 }
 
 async function openPortableProtectedRecipientShareFile(input) {

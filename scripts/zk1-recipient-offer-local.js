@@ -57,11 +57,13 @@ function parse(argv) {
       || typeof argv[i + 1] !== "string" || !argv[i + 1]) deny();
     opts[argv[i]] = argv[i + 1];
   }
-  if (fields.some((field) => !Object.hasOwn(opts, field))
-    || opts["--offer"] === opts["--context-module"]
-    || opts["--offer"] === opts["--grant"]
-    || opts["--output"] === opts["--offer"]
-    || opts["--output"] === opts["--context-module"]) deny();
+  if (fields.some((field) => !Object.hasOwn(opts, field))) deny();
+  // On Windows, case-insensitive aliases resolve to the same private leaf.
+  // Reject collisions before reading grant/context files or opening output.
+  const filenames = fields.filter((field) => field !== "--owned-dir")
+    .map((field) => process.platform === "win32"
+      ? opts[field].toLowerCase() : opts[field]);
+  if (new Set(filenames).size !== filenames.length) deny();
   return { mode, opts };
 }
 function privateOutput(root, name, bytes) {
