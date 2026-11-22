@@ -187,10 +187,21 @@ test('P2: signed room release frees abandoned capacity but cannot free a differe
   assert.equal((await release(alice, { ...proof, hostKey: '0'.repeat(64) })).status, 204);
   assert.equal((await release(alice, proof, false)).status, 403,
     'browser release requires the same session CSRF proof as creating a room');
+  const joinedRoom = JSON.parse(second.text);
+  const host = await f.connect(alice);
+  t.after(() => host.socket.terminate());
+  host.send({ type: 'join', roomId: joinedRoom.roomId, hostKey: joinedRoom.hostKey });
+  assert.equal((await host.next('joined')).role, 'host');
+  assert.equal((await release(alice,
+    { roomId: joinedRoom.roomId, hostKey: joinedRoom.hostKey })).status, 204,
+  'even the exact host key cannot release a room after admission');
   assert.equal((await f.request('/p2p/rooms', { method: 'POST', session: alice })).status, 429,
-    'unauthorized release attempts must not return owner capacity');
+    'unauthorized release attempts and active-room release must preserve owner capacity');
   assert.equal((await release(alice, proof)).status, 204);
   assert.equal((await release(alice, proof)).status, 204);
   assert.equal((await f.request('/p2p/rooms', { method: 'POST', session: alice })).status, 200,
     'canceling the delivered-but-unjoined room must immediately restore one owner slot');
+  host.send({ type: 'invite', recipient: 'bob' });
+  assert.equal((await host.next('invited')).recipient, 'bob',
+    'joined room must remain authorized and usable after a bogus release attempt');
 });
