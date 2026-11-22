@@ -46,7 +46,10 @@ function deny() {
   throw err;
 }
 function exact(value, fields) {
-  if (!value || typeof value !== "object" || Array.isArray(value)
+  // A Proxy getPrototypeOf/ownKeys/descriptor trap can run BEFORE Ed25519
+  // verification and replace process-wide crypto.verify. Reject proxies
+  // without evaluating any of their user-defined traps.
+  if (!value || typeof value !== "object" || isProxy(value) || Array.isArray(value)
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))
     || Reflect.ownKeys(value).length !== fields.length) deny();
   const output = {};
@@ -114,7 +117,7 @@ function ownerPayload(payload) {
     || p.migration_disposition !== "closed") deny();
   // Completed cutover cannot carry compatibility grants. Migration windows
   // require their own separately signed pre-cutover policy protocol.
-  if (!Array.isArray(p.grants) || p.grants.length !== 0
+  if (isProxy(p.grants) || !Array.isArray(p.grants) || p.grants.length !== 0
     || Reflect.ownKeys(p.grants).length !== 1) deny();
   decode(p.immutable_account_id, 16);
   decode(p.zk_account_id, 16);
@@ -124,7 +127,7 @@ function ownerPayload(payload) {
     || !Number.isSafeInteger(p.issued_at) || p.issued_at < 1) deny();
   if (p.previous_cutover_digest !== null) hex(p.previous_cutover_digest);
   if ((p.generation === 1) !== (p.previous_cutover_digest === null)) deny();
-  if (!Array.isArray(p.covered_compartments) || p.covered_compartments.length < 1
+  if (isProxy(p.covered_compartments) || !Array.isArray(p.covered_compartments) || p.covered_compartments.length < 1
     || p.covered_compartments.length > 128
     || Reflect.ownKeys(p.covered_compartments).length !== p.covered_compartments.length + 1) deny();
   let previous = "";
@@ -191,7 +194,7 @@ function signOwnerRotation(payload, previousPrivateKey, nextPrivateKey) {
     signature_next: crypto.sign(null, data, nextPrivateKey).toString("base64url") });
 }
 function verifyOwnerRotationKeys(rotations, pinnedRoot, immutableAccountId) {
-  if (!Array.isArray(rotations) || rotations.length > 8
+  if (isProxy(rotations) || !Array.isArray(rotations) || rotations.length > 8
     || Reflect.ownKeys(rotations).length !== rotations.length + 1) deny();
   let current = key(pinnedRoot, "public");
   const accepted = [current];
@@ -217,9 +220,9 @@ function verifyOwnerRotationChain(rotations, pinnedRoot, immutableAccountId) {
   return keys[keys.length - 1];
 }
 function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
-  if (!Array.isArray(history) || history.length < 1 || history.length > 64
+  if (isProxy(history) || !Array.isArray(history) || history.length < 1 || history.length > 64
     || Reflect.ownKeys(history).length !== history.length + 1
-    || !Array.isArray(ownerKeys) || !ownerKeys.length) deny();
+    || isProxy(ownerKeys) || !Array.isArray(ownerKeys) || !ownerKeys.length) deny();
   let previous = null;
   let keyIndex = 0;
   let last;
@@ -262,7 +265,7 @@ function pathBits(accountId) {
     decode(accountId, 16)).toString("hex")}`);
 }
 function verifySparseEnrollmentProof(accountId, cutoverDigest, siblings, expectedRoot) {
-  if (!Array.isArray(siblings) || siblings.length !== 256
+  if (isProxy(siblings) || !Array.isArray(siblings) || siblings.length !== 256
     || Reflect.ownKeys(siblings).length !== 257) deny();
   let at = pathBits(accountId), current = leaf(accountId, cutoverDigest);
   for (const sibling of siblings) {
@@ -276,7 +279,7 @@ function verifySparseEnrollmentProof(accountId, cutoverDigest, siblings, expecte
 // Pure deterministic fixture/proof builder. The authority, not an app server,
 // must create and independently retain the committed head for a real deployment.
 function buildSparseEnrollmentProof(entries, accountId) {
-  if (!Array.isArray(entries) || entries.length > 1024) deny();
+  if (isProxy(entries) || !Array.isArray(entries) || entries.length > 1024) deny();
   let level = new Map();
   for (const record of entries) {
     const v = exact(record, ["accountId", "cutoverDigest"]);
