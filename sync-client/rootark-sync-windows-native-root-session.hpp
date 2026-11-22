@@ -164,6 +164,7 @@ bool exactHeldChildFileId(HANDLE directory, const wchar_t* expected,
   std::vector<unsigned char> bytes(kBufferSize);
   bool restart = true;
   bool found = false;
+  std::uint64_t enumerated = 0;
   for (;;) {
     const auto info = restart ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo;
     restart = false;
@@ -179,6 +180,9 @@ bool exactHeldChildFileId(HANDLE directory, const wchar_t* expected,
       if (available < kMinEntry || available > kBufferSize - at
           || !item->FileNameLength || item->FileNameLength % sizeof(WCHAR) != 0
           || item->FileNameLength > available - kMinEntry) return false;
+      // The ancestor/root session must not let a hostile or pathological
+      // directory stall a signed-data callback for an unbounded scan.
+      if (++enumerated > 2'000'000) return false;
       const int itemChars = static_cast<int>(item->FileNameLength / sizeof(WCHAR));
       const bool exact = static_cast<std::size_t>(itemChars) == count
         && std::memcmp(item->FileName, expected, item->FileNameLength) == 0;
