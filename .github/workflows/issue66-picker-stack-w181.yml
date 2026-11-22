@@ -1,0 +1,37 @@
+name: Issue 66 picker / pinned MOVE candidate validation
+
+on:
+  push:
+    branches:
+      - agent/pr286-picker-integration-w181-20261122
+      - agent/pr292-move-picker-w181-20261122
+
+permissions:
+  contents: read
+
+jobs:
+  picker-and-pin:
+    name: Pinned picker and FOD security (${{ matrix.os }}, Node 22)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify native picker, signed pin, pathname and hydration contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          node --test \
+            test/issue-66-device-pin.test.js \
+            test/issue-66-files-on-demand.test.js \
+            test/issue-66-protected-create-path-atomic.test.js \
+            test/issue-66-picker-inventory-response-cap.test.js \
+            test/issue-66-windows-picker.test.js \
+            test/issue-66-windows-picker-real-cli.test.js
