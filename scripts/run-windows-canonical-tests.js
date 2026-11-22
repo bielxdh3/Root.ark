@@ -115,7 +115,8 @@ function createTapProgressRecorder(write) {
         }
         // Extract only an integer stack frame line for the already verified
         // test file. Do not print stack content, private paths or assertions.
-        if (pending.pathHash !== "none" && pending.assertionLine === null) {
+        if (pending.pathHash !== "none" && pending.assertionLine === null
+          && /^\s+at \S/.test(line)) {
           const frame = /(?:^|[\\/])test[\\/]([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}/.exec(line);
           if (frame && hash(`test/${frame[1]}`) === pending.pathHash)
             pending.assertionLine = Number(frame[2]);
