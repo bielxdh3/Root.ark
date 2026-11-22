@@ -6,8 +6,9 @@
 const crypto = require("node:crypto");
 const path = require("node:path");
 const { createRequire } = require("node:module");
-const { Worker } = require("node:worker_threads");
+const { Worker, MessagePort } = require("node:worker_threads");
 const nativeEventOn = require("node:events").EventEmitter.prototype.on;
+const nativeEventEmit = require("node:events").EventEmitter.prototype.emit;
 const nativeSetTimeout = setTimeout;
 const nativeClearTimeout = clearTimeout;
 const NativePromise = Promise;
@@ -61,6 +62,7 @@ const nativeBufferConcat = Buffer.concat.bind(Buffer);
 const nativeBufferToString = Buffer.prototype.toString;
 const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
 const nativeCreateHash = crypto.createHash.bind(crypto);
+const nativeCreateHmac = crypto.createHmac.bind(crypto);
 const nativeCreatePublicKey = crypto.createPublicKey.bind(crypto);
 const nativeSign = crypto.sign.bind(crypto);
 const nativeVerify = crypto.verify.bind(crypto);
@@ -78,6 +80,8 @@ const nativeSubtleExportKey = nativeSubtle.exportKey;
 const nativeSubtleEncrypt = nativeSubtle.encrypt;
 const nativeWorkerPostMessage = Worker.prototype.postMessage;
 const nativeWorkerTerminate = Worker.prototype.terminate;
+const nativeMessagePortPrototype = MessagePort.prototype;
+const nativeMessagePortPostMessage = MessagePort.prototype.postMessage;
 const hpkeSealWorkerPath = path.join(__dirname,
   "rootark-zk1-owner-authorized-hpke-seal-worker.js");
 const nativeJsonStringify = JSON.stringify;
@@ -102,6 +106,10 @@ const nativeTargetDigest = browserPop.targetDigest.bind(browserPop);
 const nativeHashPrototype = nativeGetPrototypeOf(nativeCreateHash("sha256"));
 const nativeHashUpdate = nativeHashPrototype.update;
 const nativeHashDigest = nativeHashPrototype.digest;
+const nativeHmacPrototype = nativeGetPrototypeOf(nativeCreateHmac("sha256", nativeBufferAlloc(32)));
+const nativeHmacUpdate = nativeHmacPrototype.update;
+const nativeHmacDigest = nativeHmacPrototype.digest;
+const HPKE_WORKER_ACK_DOMAIN = nativeBufferFrom("Root.ark/zk-1/owner-hpke-worker-ack/v1\0");
 function nativeSha256(value) {
   const hash = nativeCreateHash("sha256");
   nativeApply(nativeHashUpdate, hash, [value]);
@@ -268,6 +276,35 @@ function newPrivateHpkeWorker() {
   // that only needs the already-pinned module and explicit public inputs.
   options.env = nativeCreate(null);
   const worker = new Worker(hpkeSealWorkerPath, options);
+  let deadline;
+  try {
+  // Node 22 Worker.postMessage internally delegates to two private native
+  // MessagePorts. A callback can poison MessagePort.prototype.postMessage
+  // and observe the 32-byte CEK despite a captured Worker.postMessage. Pin
+  // the native method ON EACH actual internal port before any secret transfer.
+  // Inspect own value descriptors only; never invoke inherited getters.
+  const ownedPorts = nativeGetOwnPropertyDescriptors(worker);
+  let pinnedPorts = 0;
+  for (const key of nativeOwnKeys(ownedPorts)) {
+    const descriptor = ownedPorts[key];
+    if (!nativeHasOwn(descriptor, "value")) continue;
+    const port = descriptor.value;
+    if (!port || typeof port !== "object" || nativeIsProxy(port)
+      || nativeGetPrototypeOf(port) !== nativeMessagePortPrototype) continue;
+    nativeDefineProperty(port, "postMessage", {
+      value: nativeMessagePortPostMessage, writable: false, configurable: false,
+    });
+    pinnedPorts++;
+  }
+  // Fail closed if a future Node version changes the Worker transport layout.
+  if (pinnedPorts !== 2) deny();
+  // Worker inherits EventEmitter.emit from the caller's mutable realm. An
+  // authority callback can replace that method after the worker is started
+  // and substitute a valid HPKE envelope for a different CEK. Pin the native
+  // dispatcher on this instance before registering any response handlers.
+  nativeDefineProperty(worker, "emit", {
+    value: nativeEventEmit, writable: false, configurable: false,
+  });
   let completed = false;
   let resolveReply, rejectReply;
   const reply = new NativePromise((resolve, reject) => {
@@ -277,7 +314,6 @@ function newPrivateHpkeWorker() {
   // An early worker failure may precede the eventual await; consume that
   // rejection immediately without changing what await(reply) will observe.
   nativeApply(nativePromiseThen, reply, [undefined, () => {}]);
-  let deadline;
   const settle = (ok, value) => {
     if (completed) return;
     completed = true;
@@ -305,6 +341,16 @@ function newPrivateHpkeWorker() {
     } catch (_) { /* only the denial may escape */ }
   }, 45_000);
   return { worker, reply };
+  } catch (error) {
+    // A malicious callback can poison Promise[Symbol.species] or another
+    // mutable intrinsic between construction and listener installation. Do
+    // not leak a live worker when any part of its setup throws: no CEK has
+    // crossed the boundary at this point, and no worker handle was returned.
+    nativeClearTimeout(deadline);
+    try { nativeApply(nativeWorkerTerminate, worker, []); }
+    catch (_) { /* preserve the original fail-closed setup error */ }
+    throw error;
+  }
 }
 async function sealPrivateCekHpke(isolatedWorker, recipientPublicKeyRaw, plaintext, info, aad) {
   // The only secret-bearing message crosses the native structured-clone
@@ -312,6 +358,14 @@ async function sealPrivateCekHpke(isolatedWorker, recipientPublicKeyRaw, plainte
   // the authority callback's realm can observe those 32 bytes.
   const isolated = new nativeArrayBuffer(32);
   const view = new nativeUint8Array(isolated);
+  // A malicious authority callback can replace the native transport's
+  // MessagePort.on handler and forge a syntactically valid HPKE response. A
+  // per-operation MAC key is transferred privately along with the CEK; the
+  // receiving realm can inspect a response but cannot forge its authenticator.
+  const ackSecret = nativeRandomBytes(32);
+  const ackKey = new nativeArrayBuffer(32);
+  const ackView = new nativeUint8Array(ackKey);
+  nativeApply(nativeTypedSet, ackView, [ackSecret]);
   nativeApply(nativeTypedSet, view, [plaintext]);
   try {
     // Retain the earlier fail-closed policy for directly poisoned HPKE or
@@ -327,20 +381,31 @@ async function sealPrivateCekHpke(isolatedWorker, recipientPublicKeyRaw, plainte
     const request = nativeCreate(null);
     request.type = "seal";
     request.cek = isolated;
+    request.ackKey = ackKey;
     request.recipientPublicKey = copyOwnedBytes(recipientPublicKeyRaw);
     request.info = copyOwnedBytes(info);
     request.aad = copyOwnedBytes(aad);
     // The native Worker method is pinned at module initialization, and the
     // transfer detaches the CEK bytes from this realm synchronously.
-    nativeApply(nativeWorkerPostMessage, isolatedWorker.worker, [request, [isolated]]);
+    nativeApply(nativeWorkerPostMessage, isolatedWorker.worker, [request, [isolated, ackKey]]);
     const response = await isolatedWorker.reply;
     if (!response || response.ok !== true) deny();
     const enc = copyOwnedBytes(response.enc, true);
     const ciphertext = copyOwnedBytes(response.ciphertext, true);
+    const ackMac = copyOwnedBytes(response.ackMac, true);
     if (nativeApply(nativeTypedByteLength, enc, []) !== 32
-      || nativeApply(nativeTypedByteLength, ciphertext, []) !== 48) deny();
+      || nativeApply(nativeTypedByteLength, ciphertext, []) !== 48
+      || nativeApply(nativeTypedByteLength, ackMac, []) !== 32) deny();
+    const verifier = nativeCreateHmac("sha256", ackSecret);
+    nativeApply(nativeHmacUpdate, verifier, [HPKE_WORKER_ACK_DOMAIN]);
+    nativeApply(nativeHmacUpdate, verifier, [enc]);
+    nativeApply(nativeHmacUpdate, verifier, [ciphertext]);
+    if (!nativeTimingSafeEqual(nativeApply(nativeHmacDigest, verifier, []), ackMac)) deny();
     return { enc, ciphertext };
   } finally {
+    nativeApply(nativeTypedFill, ackSecret, [0]);
+    if (nativeApply(nativeArrayBufferByteLength, ackKey, []) !== 0)
+      nativeApply(nativeTypedFill, ackView, [0]);
     // Detachment is expected. On a failed transfer the original view remains
     // attached, and must be erased by the original native typed-array method.
     if (nativeApply(nativeArrayBufferByteLength, isolated, []) !== 0)

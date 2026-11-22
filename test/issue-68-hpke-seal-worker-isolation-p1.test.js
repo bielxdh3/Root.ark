@@ -24,6 +24,9 @@ test("P1: isolated production HPKE worker never dispatches poisoned main-realm A
   const aad = Buffer.from("Root.ark/zk-1/sharing/isolated-worker-p1/aad\0");
   const source = new ArrayBuffer(32);
   Reflect.apply(nativeSet, new Uint8Array(source), [cek]);
+  const ackKey = crypto.randomBytes(32);
+  const ackTransport = new ArrayBuffer(32);
+  Reflect.apply(nativeSet, new Uint8Array(ackTransport), [ackKey]);
   const originalAesSeal = aesPrototype.seal;
   const originalMutexLock = mutexPrototype.lock;
   const subtle = crypto.webcrypto.subtle;
@@ -51,13 +54,19 @@ test("P1: isolated production HPKE worker never dispatches poisoned main-realm A
         && crypto.timingSafeEqual(Buffer.from(args[2]), cek)) observedCek = true;
       return Reflect.apply(originalSubtleEncrypt, this, args);
     };
-    worker.postMessage({ type: "seal", cek: source, recipientPublicKey: publicKey,
-      info, aad }, [source]);
+    worker.postMessage({ type: "seal", cek: source, ackKey: ackTransport,
+      recipientPublicKey: publicKey, info, aad }, [source, ackTransport]);
     assert.equal(source.byteLength, 0, "the owner's original CEK buffer must detach synchronously");
+    assert.equal(ackTransport.byteLength, 0,
+      "the worker acknowledgement key must also cross an isolated transfer boundary");
     const [sealed] = await response;
     assert.equal(sealed.ok, true);
     assert.equal(Buffer.from(sealed.enc).length, 32);
     assert.equal(Buffer.from(sealed.ciphertext).length, 48);
+    assert.deepEqual(Buffer.from(sealed.ackMac), crypto.createHmac("sha256", ackKey)
+      .update(Buffer.from("Root.ark/zk-1/owner-hpke-worker-ack/v1\0"))
+      .update(sealed.enc).update(sealed.ciphertext).digest(),
+    "the real worker must authenticate the exact encrypted CEK bytes");
     assert.equal(attackerAesCalls, 0);
     assert.equal(attackerMutexCalls, 0);
     assert.equal(attackerSubtleCalls, 0);
@@ -76,6 +85,7 @@ test("P1: isolated production HPKE worker never dispatches poisoned main-realm A
     mutexPrototype.lock = originalMutexLock;
     subtle.encrypt = originalSubtleEncrypt;
     cek.fill(0);
+    ackKey.fill(0);
   }
 });
 
@@ -83,7 +93,7 @@ test("P1: isolated production HPKE worker rejects malformed raw CEK without ciph
   const worker = new Worker(SCRIPT, { execArgv: [], env: {} });
   t.after(async () => { await worker.terminate().catch(() => {}); });
   const response = once(worker, "message");
-  worker.postMessage({ type: "seal", cek: new ArrayBuffer(31),
+  worker.postMessage({ type: "seal", cek: new ArrayBuffer(31), ackKey: new ArrayBuffer(32),
     recipientPublicKey: new Uint8Array(32), info: new Uint8Array(1),
     aad: new Uint8Array(1) });
   assert.deepEqual((await response)[0], { ok: false });
