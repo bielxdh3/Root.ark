@@ -25,6 +25,7 @@ struct Context {
   std::vector<unsigned char> identity;
   const HeldRoot* root = nullptr;
   const HeldAncestors* ancestors = nullptr;
+  const NativeOriginalEnrollment* enrollment = nullptr;
   const wchar_t* path = nullptr;
 private:
   // Native pin state can be withdrawn while a callback is authorizing a
@@ -72,12 +73,12 @@ bool matchesPinnedPlaceholder(const Context& ctx, const CF_CALLBACK_INFO* info) 
     && std::memcmp(info->FileIdentity, ctx.identity.data(), ctx.identity.size()) == 0
     && info->FileSize.QuadPart == static_cast<LONGLONG>(ctx.payload.size())
     && ctx.isPlaceholderPinned()
-    && static_cast<ULONGLONG>(info->FileId.QuadPart)
-      == ctx.pinnedFileId();
+    && static_cast<ULONGLONG>(info->FileId.QuadPart) == ctx.pinnedFileId();
 }
 
 bool retainsNativeCustody(const Context& ctx) {
-  return ctx.root && ctx.ancestors && ctx.path
+  return ctx.root && ctx.ancestors && ctx.enrollment && ctx.path
+    && matchesOriginalEnrollment(*ctx.enrollment, *ctx.root, *ctx.ancestors)
     && ctx.ancestors->samePaths() && ctx.root->samePath(ctx.path)
     && ctx.root->registeredPolicy();
 }

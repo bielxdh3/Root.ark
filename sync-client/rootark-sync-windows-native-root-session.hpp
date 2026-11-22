@@ -7,17 +7,21 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstddef>
+#include <cstdint>
 #include "rootark-sync-windows-cfapi-root-policy.hpp"
 namespace {
 struct HeldRoot {
   HANDLE handle = INVALID_HANDLE_VALUE;
   FILE_ID_INFO id{};
   ~HeldRoot() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
-  bool open(const wchar_t* root) {
+  bool open(const wchar_t* root, bool allowExclusiveChildCreate = false) {
     // A retained handle without FILE_SHARE_DELETE prevents ordinary rename
     // of this root while a disposable callback is connected. Full RootSession
     // still needs independently enrolled ancestors and anti-rollback custody.
-    handle = CreateFileW(root, FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | READ_CONTROL,
+    const DWORD access = FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | READ_CONTROL
+      | (allowExclusiveChildCreate ? FILE_ADD_FILE : 0);
+    handle = CreateFileW(root, access,
       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return false;
@@ -151,6 +155,37 @@ struct HeldAncestors {
       && entries.front()->id.VolumeSerialNumber == rootId.VolumeSerialNumber;
   }
 };
+
+// Exact physical IDs expected from an independently authenticated enrollment
+// receipt. This native comparator never issues or authenticates that receipt:
+// a caller must verify its signer outside the mutable root and pin the whole
+// original chain BEFORE its first native open. A locally self-issued snapshot
+// can be used for tests only; it provides no production authority.
+struct NativeOriginalEnrollment {
+  FILE_ID_INFO root{};
+  std::vector<FILE_ID_INFO> ancestors;
+};
+
+bool sameEnrolledFileId(const FILE_ID_INFO& actual,
+    const FILE_ID_INFO& expected) {
+  return actual.VolumeSerialNumber == expected.VolumeSerialNumber
+    && std::memcmp(&actual.FileId, &expected.FileId,
+      sizeof(actual.FileId)) == 0;
+}
+
+bool matchesOriginalEnrollment(const NativeOriginalEnrollment& expected,
+    const HeldRoot& root, const HeldAncestors& held) {
+  if (root.handle == INVALID_HANDLE_VALUE || held.entries.empty()
+      || expected.ancestors.size() != held.entries.size()
+      || expected.ancestors.size() > 64
+      || !sameEnrolledFileId(root.id, expected.root)) return false;
+  for (std::size_t i = 0; i < held.entries.size(); ++i) {
+    if (!sameEnrolledFileId(held.entries[i]->id, expected.ancestors[i])
+        || held.entries[i]->id.VolumeSerialNumber
+          != expected.root.VolumeSerialNumber) return false;
+  }
+  return true;
+}
 
 // Open an exact child of the retained native directory HANDLE. Never
 // construct a new pathname or follow a directory alias from this operation.
@@ -287,6 +322,151 @@ bool openNativeCloudChild(HANDLE parent, const wchar_t* exactName, HANDLE& child
 
 bool openNativeDirectoryChild(HANDLE parent, const wchar_t* exactName, HANDLE& child) {
   return openNativeExactChild(parent, exactName, false, child);
+}
+
+// Native no-replace building blocks for a separately authorized RootSession.
+// Do not treat a successful FILE_CREATE + FlushFileBuffers + rename as a
+// crash-durable transaction: the ordered namespace checkpoint and independent
+// signed PREPARE/COMMIT fence must still be implemented before product writes.
+bool nativeSafeLeaf(const wchar_t* leaf, std::size_t& count) {
+  count = 0;
+  if (!leaf) return false;
+  while (count <= 255 && leaf[count]) ++count;
+  if (!count || count > 255 || leaf[0] == L'.'
+      || leaf[count - 1] == L'.' || leaf[count - 1] == L' ') return false;
+  for (std::size_t i = 0; i < count; ++i)
+    if (leaf[i] < 0x20 || wcschr(L"\\/:*?\"<>|", leaf[i])) return false;
+  return true;
+}
+
+bool nativeCreateExclusiveStage(HANDLE parent, const wchar_t* leaf,
+    HANDLE& stage) {
+  stage = INVALID_HANDLE_VALUE;
+  std::size_t count = 0;
+  if (!parent || parent == INVALID_HANDLE_VALUE
+      || !nativeSafeLeaf(leaf, count)) return false;
+  FILE_ID_INFO parentId{};
+  if (!GetFileInformationByHandleEx(parent, FileIdInfo,
+      &parentId, sizeof(parentId))) return false;
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  if (!ntdll) return false;
+  using NtCreateFileFn = NTSTATUS (NTAPI *)(PHANDLE, ACCESS_MASK,
+    POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG,
+    ULONG, PVOID, ULONG);
+  auto create = reinterpret_cast<NtCreateFileFn>(GetProcAddress(ntdll, "NtCreateFile"));
+  if (!create) return false;
+  UNICODE_STRING name{};
+  name.Buffer = const_cast<PWSTR>(leaf);
+  name.Length = static_cast<USHORT>(count * sizeof(WCHAR));
+  name.MaximumLength = name.Length;
+  OBJECT_ATTRIBUTES attributes{};
+  attributes.Length = sizeof(attributes);
+  attributes.RootDirectory = parent;
+  attributes.ObjectName = &name;
+  attributes.Attributes = 0x00001000UL; // OBJ_DONT_REPARSE
+  IO_STATUS_BLOCK io{};
+  HANDLE opened = INVALID_HANDLE_VALUE;
+  const NTSTATUS result = create(&opened, FILE_READ_DATA | FILE_WRITE_DATA
+      | FILE_READ_ATTRIBUTES | DELETE | SYNCHRONIZE,
+    &attributes, &io, nullptr, FILE_ATTRIBUTE_NORMAL,
+    FILE_SHARE_READ, FILE_CREATE, FILE_NON_DIRECTORY_FILE
+      | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
+  if (result < 0 || !opened || opened == INVALID_HANDLE_VALUE) return false;
+  FILE_ID_INFO stageId{};
+  FILE_ATTRIBUTE_TAG_INFO tags{};
+  BY_HANDLE_FILE_INFORMATION fileInfo{};
+  const bool accepted = GetFileInformationByHandleEx(opened, FileIdInfo,
+      &stageId, sizeof(stageId))
+    && GetFileInformationByHandleEx(opened, FileAttributeTagInfo,
+      &tags, sizeof(tags))
+    && GetFileInformationByHandle(opened, &fileInfo)
+    && stageId.VolumeSerialNumber == parentId.VolumeSerialNumber
+    && !(tags.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+    && !(tags.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+    && fileInfo.nNumberOfLinks == 1;
+  if (!accepted) { CloseHandle(opened); return false; }
+  stage = opened;
+  return true;
+}
+
+bool nativeWriteAndFlushOpenedStage(HANDLE stage,
+    const unsigned char* bytes, std::size_t length) {
+  if (!stage || stage == INVALID_HANDLE_VALUE || !bytes
+      || !length || length > 1024 * 1024) return false;
+  LARGE_INTEGER zero{};
+  if (!SetFilePointerEx(stage, zero, nullptr, FILE_BEGIN)) return false;
+  std::size_t at = 0;
+  while (at < length) {
+    DWORD written = 0;
+    const DWORD step = static_cast<DWORD>(length - at);
+    if (!WriteFile(stage, bytes + at, step, &written, nullptr) || !written)
+      return false;
+    at += written;
+  }
+  if (!FlushFileBuffers(stage)) return false;
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(stage, &size)
+      || size.QuadPart != static_cast<LONGLONG>(length)
+      || !SetFilePointerEx(stage, zero, nullptr, FILE_BEGIN)) return false;
+  std::vector<unsigned char> verified(length);
+  at = 0;
+  while (at < length) {
+    DWORD read = 0;
+    const DWORD step = static_cast<DWORD>(length - at);
+    if (!ReadFile(stage, verified.data() + at, step, &read, nullptr) || !read) {
+      SecureZeroMemory(verified.data(), verified.size());
+      return false;
+    }
+    at += read;
+  }
+  const bool exact = std::memcmp(verified.data(), bytes, length) == 0;
+  SecureZeroMemory(verified.data(), verified.size());
+  return exact;
+}
+
+bool nativeRenameOpenedStageNoReplace(HANDLE stage, HANDLE heldParent,
+    const wchar_t* destinationLeaf, DWORD* failedError = nullptr) {
+  std::size_t count = 0;
+  if (!stage || stage == INVALID_HANDLE_VALUE
+      || !heldParent || heldParent == INVALID_HANDLE_VALUE
+      || !nativeSafeLeaf(destinationLeaf, count)) return false;
+  FILE_ID_INFO stageBefore{}, parent{};
+  if (!GetFileInformationByHandleEx(stage, FileIdInfo,
+      &stageBefore, sizeof(stageBefore))
+      || !GetFileInformationByHandleEx(heldParent, FileIdInfo,
+        &parent, sizeof(parent))
+      || stageBefore.VolumeSerialNumber != parent.VolumeSerialNumber
+      || !FlushFileBuffers(stage)) return false;
+  const std::size_t nameBytes = count * sizeof(WCHAR);
+  const std::size_t bytes = offsetof(FILE_RENAME_INFO, FileName) + nameBytes;
+  std::vector<unsigned char> storage(bytes);
+  auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+  rename->ReplaceIfExists = FALSE;
+  rename->RootDirectory = heldParent;
+  rename->FileNameLength = static_cast<DWORD>(nameBytes);
+  std::memcpy(rename->FileName, destinationLeaf, nameBytes);
+  // Win32 FileRenameInfo rejects relative RootDirectory on supported hosts
+  // (ERROR_INVALID_PARAMETER 87). Native NtSetInformationFile accepts the
+  // retained directory HANDLE and FILE_RENAME_INFORMATION (class 10).
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  if (!ntdll) return false;
+  using NtSetInformationFileFn = NTSTATUS (NTAPI *)(HANDLE,
+    PIO_STATUS_BLOCK, PVOID, ULONG, int);
+  auto nativeSet = reinterpret_cast<NtSetInformationFileFn>(
+    GetProcAddress(ntdll, "NtSetInformationFile"));
+  if (!nativeSet) return false;
+  IO_STATUS_BLOCK io{};
+  const NTSTATUS result = nativeSet(stage, &io, rename,
+    static_cast<ULONG>(bytes), 10 /* FileRenameInformation */);
+  if (result < 0) {
+    if (failedError) *failedError = static_cast<DWORD>(result);
+    return false;
+  }
+  FILE_ID_INFO after{};
+  // This proves identity through the native rename. It does not establish
+  // directory fsync or independent replay authorization after power loss.
+  return GetFileInformationByHandleEx(stage, FileIdInfo, &after, sizeof(after))
+    && sameEnrolledFileId(stageBefore, after);
 }
 
 } // namespace
