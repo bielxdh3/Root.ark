@@ -337,6 +337,28 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
     };
   }
 
+  await t.test("a caller-owned Proxy cannot run pre-verification inventory HTTP input hooks", async (child) => {
+    const h = await harness(child);
+    const reader = h.makeClient("reader");
+    let prototypeReads = 0;
+    let ownKeyReads = 0;
+    const hostile = new Proxy({}, {
+      getPrototypeOf(target) {
+        prototypeReads += 1;
+        return Reflect.getPrototypeOf(target);
+      },
+      ownKeys(target) {
+        ownKeyReads += 1;
+        return Reflect.ownKeys(target);
+      },
+    });
+    assert.throws(() => reader.getProofPage(hostile), /INVENTORY_HTTP_UNAVAILABLE/);
+    assert.equal(prototypeReads, 0,
+      "a Proxy getPrototypeOf hook must never run before the input is authenticated");
+    assert.equal(ownKeyReads, 0,
+      "a Proxy ownKeys hook must never run before the input is authenticated");
+  });
+
   await t.test("fresh nonce proves absence, append inclusion, and historical revision over TLS 1.3", async (child) => {
     const h = await harness(child);
     const reader = h.makeClient("reader");

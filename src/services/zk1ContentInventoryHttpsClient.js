@@ -175,19 +175,38 @@ function fail() {
 }
 
 function exact(value, required, optional = []) {
-  if (!value || typeof value !== "object" || Array.isArray(value)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail();
-  const keys = Reflect.ownKeys(value);
-  if (required.some((name) => !keys.includes(name))
-    || keys.some((name) => !required.includes(name) && !optional.includes(name))) fail();
-  const result = Object.create(null);
-  for (const name of [...required, ...optional]) {
-    if (!keys.includes(name)) {
+  // Caller-owned Proxies can run getPrototypeOf/ownKeys/descriptor traps before
+  // the first signed inventory verification and replace process-wide crypto
+  // hooks. Reject them before invoking ANY reflective operation. Once a native
+  // key getter has run, inherited Array methods may also be poisoned; inspect
+  // the bounded field schema through captured native intrinsics instead.
+  if (!value || typeof value !== "object" || isProxy(value) || Array.isArray(value)) fail();
+  const prototype = NATIVE_GET_PROTOTYPE(value);
+  if (prototype !== NATIVE_OBJECT_PROTO && prototype !== null) fail();
+  const keys = NATIVE_OWN_KEYS(value);
+  if (keys.length < required.length || keys.length > required.length + optional.length) fail();
+  for (let index = 0; index < keys.length; index += 1) {
+    const name = keys[index];
+    let allowed = false;
+    for (let cursor = 0; cursor < required.length; cursor += 1) {
+      if (name === required[cursor]) allowed = true;
+    }
+    for (let cursor = 0; cursor < optional.length; cursor += 1) {
+      if (name === optional[cursor]) allowed = true;
+    }
+    if (!allowed) fail();
+  }
+  const result = NATIVE_OBJECT_CREATE(null);
+  for (let index = 0; index < required.length + optional.length; index += 1) {
+    const name = index < required.length
+      ? required[index] : optional[index - required.length];
+    const descriptor = NATIVE_OWN_DESCRIPTOR(value, name);
+    if (!descriptor) {
+      if (index < required.length) fail();
       result[name] = undefined;
       continue;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail();
+    if (!NATIVE_HAS_OWN(descriptor, "value")) fail();
     result[name] = descriptor.value;
   }
   return result;
