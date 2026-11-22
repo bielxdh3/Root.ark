@@ -432,6 +432,25 @@ test("#67: plan validates bounded unique IDs before any remote history read", as
   assert.equal(f.pushes(), 0);
 });
 
+test("#67: plan rejects Proxy containers and entries without running any traps", () => {
+  const events = [];
+  const forbidden = {
+    get: () => { events.push("get"); throw new Error("untrusted get trap"); },
+    getOwnPropertyDescriptor: () => { events.push("descriptor"); throw new Error("untrusted descriptor trap"); },
+    ownKeys: () => { events.push("ownKeys"); throw new Error("untrusted ownKeys trap"); },
+  };
+  const safe = { objectId: "object-1", versionId: "v1" };
+  const proxiedPlan = new Proxy([safe], forbidden);
+  assert.throws(() => normalizeHistoricalRestorePlan(proxiedPlan),
+    (error) => error.code === "invalid_restore_plan");
+  const proxiedEntry = new Proxy(safe, forbidden);
+  assert.throws(() => normalizeHistoricalRestorePlan([proxiedEntry]),
+    (error) => error.code === "invalid_restore_plan");
+  assert.deepEqual(events, [], "untrusted Proxy traps must not execute during plan validation");
+  assert.deepEqual(normalizeHistoricalRestorePlan([safe]), [safe],
+    "ordinary data-only plan entries remain supported");
+});
+
 test("#67: multi-object plan rejects case-folded file collisions and ancestor targets", async (t) => {
   const f = await fixture(t);
   await attachSecondSignedHistory(f, "NOTE.TXT");

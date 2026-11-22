@@ -5,6 +5,7 @@ const { AsyncLocalStorage } = require("node:async_hooks");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const { types: nodeUtilTypes } = require("node:util");
 
 const protocol = require("./rootark-sync-protocol");
 const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owner-provision");
@@ -560,7 +561,10 @@ function sameSnapshotRevision(left, right) {
 function normalizeHistoricalRestorePlan(requests) {
   let length;
   try {
-    if (!Array.isArray(requests)) throw Error();
+    // Array.isArray(proxyOfArray) is true. Reject Proxy containers before
+    // querying any descriptors: a Proxy trap can mutate state or invoke
+    // arbitrary callbacks despite the absence of ordinary JS getters.
+    if (!Array.isArray(requests) || nodeUtilTypes.isProxy(requests)) throw Error();
     length = Object.getOwnPropertyDescriptor(requests, "length")?.value;
   } catch { fail("Invalid historical restore plan array", "invalid_restore_plan"); }
   if (!Number.isSafeInteger(length) || length < 1 || length > 32) {
@@ -578,7 +582,8 @@ function normalizeHistoricalRestorePlan(requests) {
       const slot = Object.getOwnPropertyDescriptor(requests, String(index));
       if (!slot || !Object.hasOwn(slot, "value")) throw Error();
       request = slot.value;
-      if (!request || typeof request !== "object" || Array.isArray(request)) throw Error();
+      if (!request || typeof request !== "object" || Array.isArray(request)
+        || nodeUtilTypes.isProxy(request)) throw Error();
       fields = Object.getOwnPropertyDescriptors(request);
       const names = Reflect.ownKeys(fields);
       if (names.length !== 2 || names.some((name) => !["objectId", "versionId"].includes(name))
