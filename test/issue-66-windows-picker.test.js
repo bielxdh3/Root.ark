@@ -67,10 +67,11 @@ function Start-Process {
   param([string]$FilePath, [string[]]$ArgumentList)
   Set-Content -LiteralPath $env:ROOTARK_TEST_LAUNCH -Value (@{ process = $FilePath; arguments = @($ArgumentList) } | ConvertTo-Json -Compress)
 }
+if ($env:ROOTARK_TEST_LOCATION) { Set-Location -LiteralPath $env:ROOTARK_TEST_LOCATION }
 try { & $env:ROOTARK_TEST_PICKER -Config $env:ROOTARK_TEST_CONFIG } catch { Write-Output $_.Exception.Message; exit 42 }
 `;
 
-async function runPicker(t, mode, selectedPath = "docs/verified.txt") {
+async function runPicker(t, mode, selectedPath = "docs/verified.txt", options = {}) {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-picker-test-"));
   t.after(() => fs.rm(temp, { recursive: true, force: true }));
   const local = path.join(temp, "Root Ark Files");
@@ -101,11 +102,20 @@ async function runPicker(t, mode, selectedPath = "docs/verified.txt") {
     assert.equal((await fs.lstat(prepared)).isSymbolicLink(), true,
       "the prepared reparse point must be real before running PowerShell");
   }
-  await fs.writeFile(config, JSON.stringify({ localFolder: local }));
+  const drive = path.parse(temp).root.slice(0, 2);
+  const configuredFolder = options.folderMode === "relative" ? "Root Ark Files"
+    : options.folderMode === "drive-relative" ? `${drive}Root Ark Files`
+      : options.folderMode === "root-relative" ? local.slice(path.parse(local).root.length - 1)
+        : local;
+  await fs.writeFile(config, JSON.stringify({ localFolder: configuredFolder }));
+  const otherLocation = path.join(temp, "other-working-directory");
+  if (options.differentLocation) await fs.mkdir(otherLocation);
   const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", harness], {
     env: { ...process.env, ROOTARK_TEST_MODE: mode, ROOTARK_TEST_CHOICE: selectedPath,
       ROOTARK_TEST_TRACE: trace, ROOTARK_TEST_LAUNCH: launch,
-      ROOTARK_TEST_CONFIG: config, ROOTARK_TEST_PICKER: picker,
+      ROOTARK_TEST_CONFIG: options.relativeConfig ? ".\\private-config.json" : config,
+      ROOTARK_TEST_LOCATION: options.relativeConfig ? temp : options.differentLocation ? otherLocation : "",
+      ROOTARK_TEST_PICKER: picker,
       ROOTARK_TEST_TARGET: target, ROOTARK_TEST_PARENT: path.dirname(target),
       ROOTARK_TEST_PREPARED_LINK: prepared },
     encoding: "utf8", timeout: 20000,
@@ -139,6 +149,24 @@ test("issue 66 Windows: Explorer picker pages metadata then reveals only a verif
   assert.deepEqual(launch.arguments, [`/select,"${path.join(local, "docs", "verified.txt")}"`]);
   assert.equal(await fs.readFile(path.join(local, "docs", "verified.txt"), "utf8"), "unchanged local bytes");
 });
+
+test("issue 66 Windows: relative config argument uses PowerShell provider location", { skip: process.platform !== "win32" }, async (t) => {
+  const { result, local, trace, launch } = await runPicker(t, "ok", "docs/verified.txt", { relativeConfig: true });
+  assert.equal(result.status, 0, `${result.stdout} ${result.stderr}`);
+  assert.match(trace, /\|browse\|/);
+  assert.deepEqual(launch.arguments, [`/select,"${path.join(local, "docs", "verified.txt")}"`]);
+});
+
+for (const folderMode of ["relative", "drive-relative", "root-relative"]) {
+  test(`issue 66 Windows: ${folderMode} localFolder resolves from config directory`, { skip: process.platform !== "win32" }, async (t) => {
+    const { result, local, launch, trace } = await runPicker(t, "ok", "docs/verified.txt", {
+      folderMode, differentLocation: true,
+    });
+    assert.equal(result.status, 0, `${result.stdout} ${result.stderr}`);
+    assert.match(trace, /\|hydrate\|/);
+    assert.deepEqual(launch.arguments, [`/select,"${path.join(local, "docs", "verified.txt")}"`]);
+  });
+}
 
 test("issue 66 Windows: failed verified hydration does not reveal or alter local bytes", { skip: process.platform !== "win32" }, async (t) => {
   const { result, local, launch, trace } = await runPicker(t, "deny");
