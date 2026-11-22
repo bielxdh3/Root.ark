@@ -203,7 +203,8 @@ bool exactHeldChildFileId(HANDLE directory, const wchar_t* expected,
   }
 }
 
-bool openNativeCloudChild(HANDLE parent, const wchar_t* exactName, HANDLE& child) {
+bool openNativeExactChild(HANDLE parent, const wchar_t* exactName,
+    bool cloudFile, HANDLE& child) {
   child = INVALID_HANDLE_VALUE;
   if (!parent || parent == INVALID_HANDLE_VALUE || !exactName) return false;
   std::size_t count = 0;
@@ -238,30 +239,54 @@ bool openNativeCloudChild(HANDLE parent, const wchar_t* exactName, HANDLE& child
   attrs.Attributes = 0x00001000UL; // OBJ_DONT_REPARSE: do not traverse child aliases
   IO_STATUS_BLOCK io{};
   HANDLE opened = INVALID_HANDLE_VALUE;
-  const NTSTATUS result = ntCreateFile(&opened, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+  const ACCESS_MASK access = FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    | (cloudFile ? 0 : FILE_LIST_DIRECTORY | READ_CONTROL);
+  const ULONG options = FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
+    | (cloudFile ? FILE_NON_DIRECTORY_FILE : FILE_DIRECTORY_FILE);
+  const NTSTATUS result = ntCreateFile(&opened, access,
     &attrs, &io, nullptr, FILE_ATTRIBUTE_NORMAL,
     FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
-    FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-    nullptr, 0);
+    options, nullptr, 0);
   if (result < 0 || !opened || opened == INVALID_HANDLE_VALUE) return false;
   FILE_ID_INFO childId{};
   FILE_ATTRIBUTE_TAG_INFO tags{};
   BY_HANDLE_FILE_INFORMATION fileInfo{};
-  const bool trusted = GetFileInformationByHandleEx(opened, FileIdInfo,
+  bool trusted = GetFileInformationByHandleEx(opened, FileIdInfo,
       &childId, sizeof(childId))
     && GetFileInformationByHandleEx(opened, FileAttributeTagInfo,
       &tags, sizeof(tags))
     && GetFileInformationByHandle(opened, &fileInfo)
     && parentId.VolumeSerialNumber == childId.VolumeSerialNumber
-    && !(tags.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-    && (tags.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-    && (tags.ReparseTag & 0xFFFF0FFFUL) == IO_REPARSE_TAG_CLOUD
-    && fileInfo.nNumberOfLinks == 1
+    && (cloudFile ? !(tags.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        && (tags.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        && (tags.ReparseTag & 0xFFFF0FFFUL) == IO_REPARSE_TAG_CLOUD
+        && fileInfo.nNumberOfLinks == 1
+      : (tags.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        && !(tags.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
     && ((static_cast<ULONGLONG>(fileInfo.nFileIndexHigh) << 32)
       | fileInfo.nFileIndexLow) == listedId;
+  if (trusted && !cloudFile) {
+    std::vector<unsigned char> sid;
+    ScopedDescriptor descriptor;
+    PSID owner = nullptr;
+    PACL dacl = nullptr;
+    trusted = currentUserSid(sid)
+      && GetSecurityInfo(opened, SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner, nullptr, &dacl, nullptr, &descriptor.value) == ERROR_SUCCESS
+      && trustedDacl(descriptor.value, dacl, owner, sid);
+  }
   if (!trusted) { CloseHandle(opened); return false; }
   child = opened;
   return true;
+}
+
+bool openNativeCloudChild(HANDLE parent, const wchar_t* exactName, HANDLE& child) {
+  return openNativeExactChild(parent, exactName, true, child);
+}
+
+bool openNativeDirectoryChild(HANDLE parent, const wchar_t* exactName, HANDLE& child) {
+  return openNativeExactChild(parent, exactName, false, child);
 }
 
 } // namespace

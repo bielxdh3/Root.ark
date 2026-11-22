@@ -189,8 +189,8 @@ function validateFixtureArgs(name, scratch, args) {
   let allowed = false;
   if (name === "acl-preflight.exe") {
     allowed = values.length === 2 && (
-      (["--inspect", "--enumerate", "--native-session-inspect"].includes(values[0])
-        && ["owner-only", "broad-access", "inherited-access", "missing", "junction"]
+      (["--inspect", "--enumerate", "--native-session-inspect", "--native-child-inspect"].includes(values[0])
+        && ["owner-only", "broad-access", "inherited-access", "missing", "junction", "held-child"]
           .some(leaf => localTarget(values[1], leaf)))
       || (values[0] === "--register" && localTarget(values[1], "owner-only"))
     );

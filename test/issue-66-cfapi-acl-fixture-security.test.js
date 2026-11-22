@@ -102,4 +102,13 @@ test("CFAPI fixture never changes an existing directory outside its disposable s
     const after = await fs.stat(target);
     assert.equal(after.ino, before.ino, "untrusted target still references original object");
     assert.equal(daclDigest(), beforeDacl, "foreign directory owner and DACL remain unchanged");
+    const nested = path.join(foreign, "held-child", "owner-child");
+    await fs.mkdir(nested, { recursive: true });
+    const deniedNested = spawnSync(systemPowerShell, ["-NoProfile", "-NonInteractive",
+      "-ExecutionPolicy", "Bypass", "-File", fixtureScript, nested, "1"], {
+      cwd: foreign, encoding: "utf8", windowsHide: true, timeout: 12000,
+    });
+    assert.notEqual(deniedNested.status, 0,
+      "a nested owner-child under a foreign parent may not be modified");
+    assert.equal(deniedNested.stderr.trim(), "ROOTARK_CFAPI_FIXTURE_V1 phase=INIT");
   });

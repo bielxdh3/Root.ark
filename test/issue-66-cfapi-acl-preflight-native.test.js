@@ -126,6 +126,29 @@ test("#66 Windows SDK ACL preflight accepts a protected owner-only DACL and reje
     assert.equal(nativeRoot.syncRootRegistered, false);
     assert.equal(nativeRoot.cloudDataBytesTransferred, 0);
 
+    // Actual NtCreateFile RootDirectory open against the retained, protected
+    // parent, with the exact child name and native FileId. The same child must
+    // be denied when a broad DACL replaces its protected owner-only policy.
+    const childRoot = path.join(scratch, "held-child");
+    const childDir = path.join(childRoot, "owner-child");
+    await fs.mkdir(childRoot);
+    await fs.mkdir(childDir);
+    for (const dir of [childRoot, childDir]) {
+      const applied = runFixturePowershell(["-NoProfile", "-NonInteractive",
+        "-ExecutionPolicy", "Bypass", "-File", aclScript, dir, "0"], scratch);
+      assert.equal(applied.status, 0, "native child test requires protected owner-only ACL");
+    }
+    const nested = runCompiledFixture(receipt, ["--native-child-inspect", childRoot]);
+    assert.equal(nested.status, 0);
+    assert.equal(JSON.parse(nested.stdout.trim()).nativeChildDirectoryHeld, true);
+    const broadened = runFixturePowershell(["-NoProfile", "-NonInteractive",
+      "-ExecutionPolicy", "Bypass", "-File", aclScript, childDir, "1"], scratch);
+    assert.equal(broadened.status, 0);
+    const rejectedChild = runCompiledFixture(receipt, ["--native-child-inspect", childRoot]);
+    assert.notEqual(rejectedChild.status, 0,
+      "a broad-access nested directory may not enter the held native RootSession");
+    assert.equal(JSON.parse(rejectedChild.stdout.trim()).nativeChildDirectoryHeld, false);
+
     // A genuine native NTFS directory HANDLE must enumerate beyond 16,384
     // entries without JS pathname reopens or truncation. All generated empty
     // files are confined to the disposable owner-ACL fixture, not the user's
