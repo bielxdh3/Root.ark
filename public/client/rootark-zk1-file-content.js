@@ -30,6 +30,10 @@
   const nativeArrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
   const nativeArrayBufferSlice = ArrayBuffer.prototype.slice;
   const nativeTypedFill = Uint8Array.prototype.fill;
+  // Independent authority callbacks run after this module is initialized.
+  // Never redispatch a mutable WebCrypto RNG lookup when generating either a
+  // fresh 256-bit CEK or a 96-bit AES-GCM nonce.
+  const nativeGetRandomValues = webCrypto && webCrypto.getRandomValues;
   const nativeImportKey = subtle && subtle.importKey;
   const nativeEncrypt = subtle && subtle.encrypt;
   const nativeDecrypt = subtle && subtle.decrypt;
@@ -42,6 +46,7 @@
   const nativeCharCodeAt = String.prototype.charCodeAt;
   const nativeFromCharCode = String.fromCharCode;
   const nativeGetPrototypeOf = Object.getPrototypeOf;
+  const nativeCreate = Object.create;
   const nativeOwnKeys = Reflect.ownKeys;
   const nativeHasOwn = Object.hasOwn;
   const nativeArrayIsArray = Array.isArray;
@@ -153,16 +158,19 @@
   }
   function normalizedMetadata(metadata) {
     strict(metadata, METADATA_FIELDS);
-    const normalized = {
-      account_id: id(metadata.account_id),
-      compartment_id: id(metadata.compartment_id, 1, 128),
-      keyring_id: id(metadata.keyring_id),
-      object_id: id(metadata.object_id),
-      version_id: id(metadata.version_id),
-      parent_version_id: metadata.parent_version_id === null
-        ? null : id(metadata.parent_version_id),
-      epoch: metadata.epoch, kind: metadata.kind,
-    };
+    // Native JSON.stringify honors inherited Object.prototype.toJSON even when
+    // the JSON.stringify function itself was pinned. Cryptographic AAD and
+    // plaintext records must never inherit executable serialization hooks.
+    const normalized = nativeCreate(null);
+    normalized.account_id = id(metadata.account_id);
+    normalized.compartment_id = id(metadata.compartment_id, 1, 128);
+    normalized.keyring_id = id(metadata.keyring_id);
+    normalized.object_id = id(metadata.object_id);
+    normalized.version_id = id(metadata.version_id);
+    normalized.parent_version_id = metadata.parent_version_id === null
+      ? null : id(metadata.parent_version_id);
+    normalized.epoch = metadata.epoch;
+    normalized.kind = metadata.kind;
     if (!Number.isSafeInteger(normalized.epoch) || normalized.epoch < 1
       || !["file", "derived-data"].includes(normalized.kind)) fail();
     return normalized;
@@ -194,8 +202,9 @@
   }
   async function generateFileCek() {
     if (!subtle) fail();
-    const raw = webCrypto.getRandomValues(new NativeUint8Array(32));
+    const raw = new NativeUint8Array(32);
     try {
+      nativeApply(nativeGetRandomValues, webCrypto, [raw]);
       return await nativeApply(nativeImportKey, subtle, ["raw", raw,
         { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]]);
     } finally { wipeOwned(raw); }
@@ -226,25 +235,33 @@
     if (!validName(name) || typeof mediaType !== "string" || mediaType.length > 128
       || hasControlCharacters(mediaType)) fail();
     const raw = asBytes(data);
-    const rawSize = nativeApply(nativeTypedLength, raw, []);
-    if (rawSize > MAX_PLAIN) fail();
-    const payload = nativeApply(nativeTextEncode, encode, [nativeJsonStringify({
-      name, mediaType, length: rawSize, content: b64(raw),
-      ...(format === MOVE_FORMAT ? { parentFolderId } : {}),
-    })]);
-    const nonce = webCrypto.getRandomValues(new NativeUint8Array(12));
+    let payload, nonce;
     try {
+      const rawSize = nativeApply(nativeTypedLength, raw, []);
+      if (rawSize > MAX_PLAIN) fail();
+      const payloadRecord = nativeCreate(null);
+      payloadRecord.name = name;
+      payloadRecord.mediaType = mediaType;
+      payloadRecord.length = rawSize;
+      payloadRecord.content = b64(raw);
+      if (format === MOVE_FORMAT) payloadRecord.parentFolderId = parentFolderId;
+      payload = nativeApply(nativeTextEncode, encode, [nativeJsonStringify(payloadRecord)]);
+      nonce = new NativeUint8Array(12);
+      nativeApply(nativeGetRandomValues, webCrypto, [nonce]);
       const sealed = new NativeUint8Array(await nativeApply(nativeEncrypt, subtle, [{
         name: "AES-GCM", iv: nonce, additionalData: aadFor(context, format), tagLength: 128,
       }, cek, payload]));
-      const wire = nativeApply(nativeTextEncode, encode, [nativeJsonStringify({
-        format, algorithm: "AES-256-GCM", metadata: context,
-        nonce: b64(nonce), ciphertext: b64(sealed),
-      })]);
+      const wireRecord = nativeCreate(null);
+      wireRecord.format = format;
+      wireRecord.algorithm = "AES-256-GCM";
+      wireRecord.metadata = context;
+      wireRecord.nonce = b64(nonce);
+      wireRecord.ciphertext = b64(sealed);
+      const wire = nativeApply(nativeTextEncode, encode, [nativeJsonStringify(wireRecord)]);
       if (nativeApply(nativeTypedLength, wire, []) > MAX_WIRE) fail();
       return wire;
     } catch (_) { fail(); }
-    finally { wipeOwned(payload); wipeOwned(raw); }
+    finally { wipeOwned(payload); wipeOwned(raw); wipeOwned(nonce); }
   }
   async function decryptFile({ cek, metadata, envelopeBytes }) {
     if (!subtle) fail();
