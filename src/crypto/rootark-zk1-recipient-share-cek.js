@@ -315,7 +315,7 @@ async function createProtectedRecipientShareOffer(input) {
       if (metadata[field] !== b64(statement[field])) denyOffer();
     }
     const signature = from64(grant.shareSignatureBase64, 64);
-    await verifyOfferAuthority(d.readIndependentAuthority.value,
+    const preAuthority = await verifyOfferAuthority(d.readIndependentAuthority.value,
       statement, statementBytes, signature, pin, issuerPin);
     // Existing owner ceremony verifies an independent owner pin, an authentic
     // V2 approval + PoP, witness receipt, matching signed X25519 roster key,
@@ -334,8 +334,10 @@ async function createProtectedRecipientShareOffer(input) {
       || envelope.core.owner_digest !== b64(statement.manifest_digest)
       || envelope.core.owner_epoch !== statement.epoch
       || envelope.core.epoch !== statement.epoch) denyOffer();
-    await verifyOfferAuthority(d.readIndependentAuthority.value,
+    const postAuthority = await verifyOfferAuthority(d.readIndependentAuthority.value,
       statement, statementBytes, signature, pin, issuerPin);
+    if (postAuthority.head.revision < preAuthority.head.revision
+      || postAuthority.head.epoch < preAuthority.head.epoch) denyOffer();
     // The independently verified second authority read can outlast the
     // owner-approved HPKE envelope even while the share grant remains valid.
     // Neither lease may expire before releasing the portable CEK offer.

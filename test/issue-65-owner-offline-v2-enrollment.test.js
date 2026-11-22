@@ -664,6 +664,40 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "genuine approved B still unwraps the owner CEK after caller mutation");
     bOpenedRaced.fill(0);
 
+    // The owner CEK primitive may also be called directly, without the
+    // recipient-share bridge. The authenticated file AEAD awaits an external
+    // callback; a spoofed global clock or Math.min must never extend the
+    // owner-approved HPKE lease on that direct release path.
+    const trustedClock = Date.now;
+    const trustedFloor = Math.floor;
+    const trustedMin = Math.min;
+    let releaseClockPoisoned = false;
+    subtle.decrypt = async function (...args) {
+      const decrypted = await realDecrypt.apply(this, args);
+      releaseClockPoisoned = true;
+      Date.now = () => 0;
+      Math.floor = () => 0;
+      Math.min = () => Number.MAX_SAFE_INTEGER;
+      return decrypted;
+    };
+    let sealedWithPoisonedGlobals;
+    try {
+      sealedWithPoisonedGlobals = await cekTransfer.sealOwnerAuthorizedFileCek({
+        ownerPrivateKey: owner.privateKey, ownerHeldCek,
+        metadata, objectRevision: 1, ciphertext: sealed,
+        ciphertextRoot: root, authority: publicAuthority,
+      });
+    } finally {
+      delete subtle.decrypt;
+      Date.now = trustedClock;
+      Math.floor = trustedFloor;
+      Math.min = trustedMin;
+    }
+    assert.equal(releaseClockPoisoned, true,
+      "the direct CEK path must cross a real asynchronous authenticated-file boundary");
+    assert.equal(sealedWithPoisonedGlobals.core.expires_at, envelope.core.expires_at,
+      "callback-poisoned intrinsics cannot extend the signed owner's CEK expiry");
+
     for (const label of ["metadata", "ciphertext", "head", "root"]) {
       const otherMeta = { ...metadata };
       const otherCipher = Buffer.from(sealed);
@@ -700,8 +734,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.equal(safe.core.owner_digest, committed.digest,
         `${label}: signed owner head pinned before await`);
     }
-    // The owner also must not create a fresh CEK grant after the signed
-    // approval expires while the real file AEAD open is pending.
+    // A caller callback cannot forge global wall-clock passage after a real
+    // file AEAD; it must not prematurely expire the pinned owner lease.
     const originalWallClock = Date.now;
     let ownerDecryptFinished = false;
     subtle.decrypt = async function (...args) {
@@ -711,12 +745,13 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       return result;
     };
     try {
-      await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
+      const pinnedEnvelope = await cekTransfer.sealOwnerAuthorizedFileCek({
         ownerPrivateKey: owner.privateKey, ownerHeldCek,
         metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
         authority: publicAuthority,
-      }), /ZK_OWNER_FILE_CEK_DENIED/,
-      "A must refuse CEK rewrap after authorization expires during real file AEAD open");
+      });
+      assert.equal(pinnedEnvelope.core.expires_at, envelope.core.expires_at,
+        "post-AEAD global clock mutation must not alter the signed owner CEK lease");
     } finally {
       Date.now = originalWallClock;
       delete subtle.decrypt;
@@ -843,6 +878,10 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       "test must complete actual HPKE decrypt before the protected clock expires");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
+    assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(
+      envelope.core.expires_at, issued.approval.expires_at,
+      signedCommittedHead.expires_at),
+    "owner CEK opener returns the signed owner/approval/witness expiration actually verified");
     const decrypted = await content.decryptFile({
       cek: await content.importFileCek(bCek.cek), metadata,
       envelopeBytes: recoveredCiphertext,
