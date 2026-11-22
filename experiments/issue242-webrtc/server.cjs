@@ -8,6 +8,8 @@ const { join } = require('node:path');
 const WebSocket = require('ws');
 
 const MAX_MEMBERS = 4;
+const MAX_ROOMS_PER_ACCOUNT = 4;
+const MAX_SOCKETS_PER_ACCOUNT = 8;
 const ROOM_TTL_MS = 5 * 60_000;
 const INVITE_TTL_MS = 60_000;
 const MAX_SIGNAL_BYTES = 16_384;
@@ -195,6 +197,16 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     if (req.method === 'POST' && url.pathname === '/rooms' && req.headers.origin === origin) {
       const user = identify(req);
       if (authenticated && !user) { res.writeHead(401).end(); return; }
+      // One authenticated principal must not consume every global room slot.
+      // Reap expired rooms at admission, rather than depending on the 1s sweep.
+      for (const room of rooms.values()) {
+        if (user && room.owner === user.username && room.ownerSessionVersion !== user.sessionVersion) {
+          expireRoom(room);
+        } else validRoom(room);
+      }
+      if (authenticated && [...rooms.values()].filter(room => room.owner === user.username).length >= MAX_ROOMS_PER_ACCOUNT) {
+        res.writeHead(429).end(); return;
+      }
       if (rooms.size >= 16) { res.writeHead(429).end(); return; }
       const room = { id: shortId(), hostKey: token(), expires: now() + roomTtlMs,
         owner: user?.username, ownerSessionVersion: user?.sessionVersion,
@@ -219,6 +231,15 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     const identity = identify(req);
     if (authenticated && !identity) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    // Idle, never-joined sockets still count toward the global 32-client cap.
+    // Apply admission fairness to the verified principal, not a client claim.
+    if (authenticated && [...wss.clients].filter(ws =>
+      ws.readyState === WebSocket.OPEN && ws.identity?.username === identity.username
+    ).length >= MAX_SOCKETS_PER_ACCOUNT) {
+      socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
     }

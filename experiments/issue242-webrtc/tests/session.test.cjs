@@ -7,7 +7,7 @@ const WebSocket = require('ws');
 const { createRealtimeAuthenticator, parseCookies } = require('../../../src/middlewares/auth');
 const { makeBroker } = require('../server.cjs');
 
-async function fixture(t) {
+async function fixture(t, brokerOptions = {}) {
   const secret = randomBytes(48).toString('hex');
   const users = new Map(['alice', 'bob', 'eve'].map(username => [
     username, { username, role: 'user', sessionVersion: 1, disabled: false, totpEnabled: true, permissions: {} }
@@ -17,7 +17,7 @@ async function fixture(t) {
     normalizeUserPermissions: user => user.permissions
   });
   const auth = req => verify(parseCookies(req.headers.cookie).get('rootark_session'));
-  const broker = makeBroker({ authenticateSession: auth });
+  const broker = makeBroker({ authenticateSession: auth, ...brokerOptions });
   const origin = await broker.listen();
   const sockets = [];
   t.after(async () => {
@@ -84,6 +84,53 @@ test('real Root.ark session verification gates room creation and WebSocket upgra
   await assert.rejects(f.connect(''), /upgrade 401/);
   await assert.rejects(f.connect('rootark_session=forged'), /upgrade 401/);
   assert.equal((await f.createRoom(f.cookie('alice'))).status, 200);
+});
+
+test('P2: one signed-in principal cannot monopolize all 16 room slots', async t => {
+  const f = await fixture(t);
+  const alice = f.cookie('alice');
+  const otherAliceSession = f.cookie('alice', { expiresIn: '4m' });
+  for (let i = 0; i < 4; i++) {
+    assert.equal((await f.createRoom(i % 2 ? otherAliceSession : alice)).status, 200,
+      'different valid sessions of the same owner share one admission budget');
+  }
+  assert.equal((await f.createRoom(otherAliceSession)).status, 429,
+    'fifth room by a single account must be denied before global capacity exhaustion');
+  assert.equal((await f.createRoom(f.cookie('bob'))).status, 200,
+    'another authenticated account must retain room creation capacity');
+});
+
+test('P2: expired room admission is reclaimed without waiting for the periodic sweep', async t => {
+  let clock = Date.now();
+  const f = await fixture(t, { now: () => clock, roomTtlMs: 100 });
+  const alice = f.cookie('alice');
+  for (let i = 0; i < 4; i++) assert.equal((await f.createRoom(alice)).status, 200);
+  assert.equal((await f.createRoom(alice)).status, 429);
+  clock += 101;
+  assert.equal((await f.createRoom(alice)).status, 200,
+    'expired rooms no longer occupy per-account admission slots');
+});
+
+test('P2: a new signed session epoch expires older room allocations for that owner', async t => {
+  const f = await fixture(t);
+  for (let i = 0; i < 4; i++) {
+    assert.equal((await f.createRoom(f.cookie('alice'))).status, 200);
+  }
+  f.users.get('alice').sessionVersion = 2;
+  assert.equal((await f.createRoom(f.cookie('alice', { sessionVersion: 2 }))).status, 200,
+    'stale, now-unauthorized room allocations must not lock the revived owner out');
+});
+
+test('P2: one signed-in principal cannot exhaust all 32 signaling socket slots', async t => {
+  const f = await fixture(t);
+  const alice = f.cookie('alice');
+  const otherAliceSession = f.cookie('alice', { expiresIn: '4m' });
+  for (let i = 0; i < 8; i++) await f.connect(i % 2 ? otherAliceSession : alice);
+  await assert.rejects(f.connect(otherAliceSession), /upgrade 429/,
+    'ninth idle socket by one principal must be rejected');
+  const bob = await f.connect(f.cookie('bob'));
+  assert.equal(bob.ws.readyState, WebSocket.OPEN,
+    'another account must retain signaling capacity');
 });
 
 test('recipient-bound single-use invite and host session prevent impersonation and unauthorized signaling', async t => {
