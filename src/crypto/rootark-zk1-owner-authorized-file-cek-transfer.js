@@ -4,7 +4,14 @@
 // explicitly rewraps an already-held FILE CEK; a device epoch key alone never
 // grants access to historical file CEKs. No off-host or production claim.
 const crypto = require("node:crypto");
+const path = require("node:path");
 const { createRequire } = require("node:module");
+const { Worker } = require("node:worker_threads");
+const nativeEventOn = require("node:events").EventEmitter.prototype.on;
+const nativeSetTimeout = setTimeout;
+const nativeClearTimeout = clearTimeout;
+const NativePromise = Promise;
+const nativePromiseThen = Promise.prototype.then;
 const nativeTypes = require("node:util").types;
 const nativeIsProxy = nativeTypes.isProxy;
 const nativeIsUint8Array = nativeTypes.isUint8Array;
@@ -36,6 +43,7 @@ const nativeOwnKeys = Reflect.ownKeys;
 const nativeArrayIsArray = Array.isArray;
 const nativeArrayBufferIsView = ArrayBuffer.isView;
 const nativeArrayBuffer = ArrayBuffer;
+const nativeArrayBufferConstructorPrototype = nativeGetPrototypeOf(nativeArrayBuffer);
 const nativeFunctionHasInstanceDescriptor = nativeGetOwnPropertyDescriptor(
   Function.prototype, Symbol.hasInstance);
 const nativeUint8Array = Uint8Array;
@@ -68,20 +76,19 @@ const nativeKeyObjectExport = nativeGetPrototypeOf(nativeCreatePublicKey({
 const nativeSubtle = crypto.webcrypto.subtle;
 const nativeSubtleExportKey = nativeSubtle.exportKey;
 const nativeSubtleEncrypt = nativeSubtle.encrypt;
+const nativeWorkerPostMessage = Worker.prototype.postMessage;
+const nativeWorkerTerminate = Worker.prototype.terminate;
+const hpkeSealWorkerPath = path.join(__dirname,
+  "rootark-zk1-owner-authorized-hpke-seal-worker.js");
 const nativeJsonStringify = JSON.stringify;
 const nativeDecodeDeterministic = z.decodeDeterministic.bind(z);
 const nativeEncodeDeterministic = z.encodeDeterministic.bind(z);
 const nativeHpkeSuite = z.hpkeSuite.bind(z);
 const nativeHpkeOpen = z.hpkeOpen.bind(z);
-// Pin the locked @hpke/core native sender implementations at module load.
-// The independent authority callback can otherwise replace sender.seal or
-// CipherSuite.prototype.createSenderContext before the raw CEK is provided.
-const hpkeCore = require("@hpke/core");
+// A captured @hpke/core method is not sufficient: its internal async mutex
+// and AEAD dispatch are still callback-mutable. Only an isolated V8 realm may
+// receive this CEK after the independent authority callback has executed.
 const hpkeRequire = createRequire(require.resolve("@hpke/core"));
-const nativeHpkeCreateSenderContext = nativeGetPrototypeOf(
-  hpkeCore.CipherSuite.prototype).createSenderContext;
-const nativeHpkeSenderSeal = hpkeRequire("./src/senderContext.js")
-  .SenderContextImpl.prototype.seal;
 const hpkeAesContextPrototype = hpkeRequire("./src/aeads/aesGcm.js")
   .AesGcmContext.prototype;
 const nativeHpkeAesSeal = hpkeAesContextPrototype.seal;
@@ -251,39 +258,93 @@ function wipeOwnedBytes(value) {
     nativeApply(nativeTypedFill, value, [0]);
   }
 }
-async function sealPrivateCekHpke(recipientPublicKey, plaintext, info, aad) {
-  // The HPKE library accepts ArrayBuffer directly, but its Uint8Array path
-  // reads mutable .buffer/.byteOffset/.byteLength getters. An independent
-  // authority callback runs before this seal and may replace those getters.
-  // Do not pass a view of the raw owner CEK to that third-party conversion.
+function newPrivateHpkeWorker() {
+  // Construct a fresh worker only after valid owner authorization. No
+  // authority callback can mutate this worker's separate V8 realm, even when
+  // those callbacks have already changed the caller realm's prototypes.
+  const options = nativeCreate(null);
+  options.execArgv = [];
+  // Do not inherit unrelated process credentials/environment into a helper
+  // that only needs the already-pinned module and explicit public inputs.
+  options.env = nativeCreate(null);
+  const worker = new Worker(hpkeSealWorkerPath, options);
+  let completed = false;
+  let resolveReply, rejectReply;
+  const reply = new NativePromise((resolve, reject) => {
+    resolveReply = resolve;
+    rejectReply = reject;
+  });
+  // An early worker failure may precede the eventual await; consume that
+  // rejection immediately without changing what await(reply) will observe.
+  nativeApply(nativePromiseThen, reply, [undefined, () => {}]);
+  let deadline;
+  const settle = (ok, value) => {
+    if (completed) return;
+    completed = true;
+    nativeClearTimeout(deadline);
+    if (ok) resolveReply(value);
+    else rejectReply(Error(value));
+  };
+  nativeApply(nativeEventOn, worker, ["message", (message) => {
+    settle(true, message);
+  }]);
+  nativeApply(nativeEventOn, worker, ["error", () => {
+    settle(false, "ZK_OWNER_HPKE_WORKER_FAILED");
+  }]);
+  nativeApply(nativeEventOn, worker, ["exit", () => {
+    settle(false, "ZK_OWNER_HPKE_WORKER_EXITED");
+  }]);
+  // Never wait indefinitely with a sensitive CEK detached into a worker.
+  // Terminate a stalled worker and deny, without accepting a late ciphertext.
+  deadline = nativeSetTimeout(() => {
+    if (completed) return;
+    settle(false, "ZK_OWNER_HPKE_WORKER_TIMEOUT");
+    try {
+      const dying = nativeApply(nativeWorkerTerminate, worker, []);
+      nativeApply(nativePromiseThen, dying, [() => {}, () => {}]);
+    } catch (_) { /* only the denial may escape */ }
+  }, 45_000);
+  return { worker, reply };
+}
+async function sealPrivateCekHpke(isolatedWorker, recipientPublicKeyRaw, plaintext, info, aad) {
+  // The only secret-bearing message crosses the native structured-clone
+  // boundary via a transferred ArrayBuffer. No mutable HPKE JS prototype in
+  // the authority callback's realm can observe those 32 bytes.
   const isolated = new nativeArrayBuffer(32);
   const view = new nativeUint8Array(isolated);
   nativeApply(nativeTypedSet, view, [plaintext]);
   try {
-    // @hpke/common performs `data instanceof ArrayBuffer` and its AES context
-    // invokes a prototype method with the plaintext. If a callback replaces
-    // either dispatch point, fail closed before supplying the private CEK.
-    if (nativeGetOwnPropertyDescriptor(nativeArrayBuffer, Symbol.hasInstance)
+    // Retain the earlier fail-closed policy for directly poisoned HPKE or
+    // WebCrypto methods. The worker isolation is the decisive protection for
+    // mutations installed after these checks (for example, via mutex.lock).
+    if (nativeGetPrototypeOf(nativeArrayBuffer) !== nativeArrayBufferConstructorPrototype
+      || nativeGetOwnPropertyDescriptor(nativeArrayBuffer, Symbol.hasInstance)
       || nativeGetOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance)?.value
         !== nativeFunctionHasInstanceDescriptor.value
       || nativeGetOwnPropertyDescriptor(hpkeAesContextPrototype, "seal")?.value
         !== nativeHpkeAesSeal
       || nativeSubtle.encrypt !== nativeSubtleEncrypt) deny();
-    const sender = await nativeApply(nativeHpkeCreateSenderContext,
-      nativeHpkeSuite(), [{ recipientPublicKey, info }]);
-    if (nativeGetOwnPropertyDescriptor(nativeArrayBuffer, Symbol.hasInstance)
-      || nativeGetOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance)?.value
-        !== nativeFunctionHasInstanceDescriptor.value
-      || nativeGetOwnPropertyDescriptor(hpkeAesContextPrototype, "seal")?.value
-        !== nativeHpkeAesSeal
-      || nativeSubtle.encrypt !== nativeSubtleEncrypt) deny();
-    const encrypted = await nativeApply(nativeHpkeSenderSeal, sender, [isolated, aad]);
-    const encodedKey = nativeIsArrayBuffer(sender.enc)
-      ? new nativeUint8Array(sender.enc) : sender.enc;
-    return { enc: copyOwnedBytes(encodedKey, true),
-      ciphertext: nativeBufferFrom(encrypted) };
+    const request = nativeCreate(null);
+    request.type = "seal";
+    request.cek = isolated;
+    request.recipientPublicKey = copyOwnedBytes(recipientPublicKeyRaw);
+    request.info = copyOwnedBytes(info);
+    request.aad = copyOwnedBytes(aad);
+    // The native Worker method is pinned at module initialization, and the
+    // transfer detaches the CEK bytes from this realm synchronously.
+    nativeApply(nativeWorkerPostMessage, isolatedWorker.worker, [request, [isolated]]);
+    const response = await isolatedWorker.reply;
+    if (!response || response.ok !== true) deny();
+    const enc = copyOwnedBytes(response.enc, true);
+    const ciphertext = copyOwnedBytes(response.ciphertext, true);
+    if (nativeApply(nativeTypedByteLength, enc, []) !== 32
+      || nativeApply(nativeTypedByteLength, ciphertext, []) !== 48) deny();
+    return { enc, ciphertext };
   } finally {
-    nativeApply(nativeTypedFill, view, [0]);
+    // Detachment is expected. On a failed transfer the original view remains
+    // attached, and must be erased by the original native typed-array method.
+    if (nativeApply(nativeArrayBufferByteLength, isolated, []) !== 0)
+      nativeApply(nativeTypedFill, view, [0]);
   }
 }
 function metadataCopy(meta) {
@@ -448,7 +509,7 @@ async function binding({ metadata, revision, ciphertext, ciphertextRoot, authori
 }
 async function sealOwnerAuthorizedFileCek(input) {
   const wallClock = Date.now;
-  let cek, checked, stable;
+  let cek, checked, stable, isolatedWorker;
   try {
     stable = snapshotFields(input);
     exact(stable, ["ownerPrivateKey", "ownerHeldCek", "metadata",
@@ -475,10 +536,13 @@ async function sealOwnerAuthorizedFileCek(input) {
     exact(core, CORE);
     if (!compare(from64(core.hpke_public_key, 32), ownerApprovedHpkePublicKey)) deny();
     const context = nativeBufferFrom(await nativeEncodeDeterministic(core));
-    const recipient = await nativeHpkeSuite().kem.deserializePublicKey(
-      ownerApprovedHpkePublicKey);
-    const sealed = await sealPrivateCekHpke(recipient, cek,
+    isolatedWorker = newPrivateHpkeWorker();
+    const sealed = await sealPrivateCekHpke(isolatedWorker, ownerApprovedHpkePublicKey, cek,
       nativeBufferConcat([INFO, context]), nativeBufferConcat([AAD, context]));
+    // The helper wipes its CEK before returning ciphertext. Ensure the
+    // worker exits before the signed release's final wall-clock check.
+    await nativeApply(nativeWorkerTerminate, isolatedWorker.worker, []);
+    isolatedWorker = null;
     const message = nativeBufferConcat([DOMAIN, await nativeEncodeDeterministic({
       core, enc: sealed.enc, ciphertext: sealed.ciphertext })]);
     // AEAD and HPKE are asynchronous. The signed approval can expire while
@@ -493,6 +557,10 @@ async function sealOwnerAuthorizedFileCek(input) {
     wipeOwnedBytes(checked?.data);
     wipeOwnedBytes(cek);
     wipeOwnedBytes(stable?.ownerHeldCek);
+    if (isolatedWorker) {
+      try { await nativeApply(nativeWorkerTerminate, isolatedWorker.worker, []); }
+      catch (_) { /* keep the original denial and scrub regardless */ }
+    }
   }
 }
 async function openOwnerAuthorizedFileCek(input) {

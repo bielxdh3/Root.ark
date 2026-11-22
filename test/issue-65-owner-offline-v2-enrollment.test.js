@@ -1196,6 +1196,82 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.equal(attackerMethodCalled, false,
         "the raw owner CEK may never pass through a replaced HPKE internal method");
     }
+    // A direct prototype guard is insufficient on its own: HPKE awaits an
+    // internal mutex and then dispatches its AEAD dynamically. A malicious
+    // callback can replace the mutex to install the AEAD spy *after* the
+    // preflight guard. Genuine CEK wrapping must run in another V8 realm.
+    const mutexProto = hpkeLoader("./src/mutex.js").Mutex.prototype;
+    const originalMutexLock = mutexProto.lock;
+    let poisonedMutexAuthorityReached = false;
+    let mainRealmMutexInvoked = false;
+    let leakedCekAfterMutex = false;
+    let mutexIsolatedOffer;
+    try {
+      mutexIsolatedOffer = await createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          poisonedMutexAuthorityReached = true;
+          mutexProto.lock = function (...args) {
+            mainRealmMutexInvoked = true;
+            hpkeAesProto.seal = function (iv, data, ...rest) {
+              const secret = require("node:util").types.isArrayBuffer(data)
+                ? new Uint8Array(data) : require("node:util").types.isUint8Array(data)
+                  ? data : null;
+              if (secret && secret.length === 32 &&
+                crypto.timingSafeEqual(Buffer.from(secret), ownerHeldCek)) {
+                leakedCekAfterMutex = true;
+              }
+              return Reflect.apply(originalHpkeAesSeal, this, [iv, data, ...rest]);
+            };
+            return Reflect.apply(originalMutexLock, this, args);
+          };
+          return current;
+        },
+      });
+    } finally {
+      mutexProto.lock = originalMutexLock;
+      hpkeAesProto.seal = originalHpkeAesSeal;
+    }
+    assert.equal(poisonedMutexAuthorityReached, true,
+      "the mutex poisoning must happen after independent authority verification");
+    assert.equal(mutexIsolatedOffer.schema, "rootark-zk1-recipient-share-offer-dev/v1",
+      "isolated HPKE must still create an authentic owner-signed offer");
+    assert.equal(mainRealmMutexInvoked, false,
+      "private CEK HPKE must not enter the authority callback's mutable mutex realm");
+    assert.equal(leakedCekAfterMutex, false,
+      "a late AES-GCM dispatch hook may never observe the raw CEK");
+    // The same callback may inherit @@hasInstance through the ArrayBuffer
+    // constructor's prototype, bypassing a guard that checks own properties.
+    const originalArrayBufferConstructorProto = Object.getPrototypeOf(ArrayBuffer);
+    let inheritedAuthorityReached = false, inheritedCekObserved = false;
+    try {
+      await assert.rejects(createProtectedRecipientShareOffer({
+        ...ownerOfferArgs, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          inheritedAuthorityReached = true;
+          const inherited = Object.create(originalArrayBufferConstructorProto);
+          Object.defineProperty(inherited, Symbol.hasInstance, {
+            configurable: true,
+            value(candidate) {
+              if (require("node:util").types.isArrayBuffer(candidate)) {
+                const value = new Uint8Array(candidate);
+                if (value.length === 32 &&
+                  crypto.timingSafeEqual(Buffer.from(value), ownerHeldCek)) {
+                  inheritedCekObserved = true;
+                }
+              }
+              return Reflect.apply(Function.prototype[Symbol.hasInstance], ArrayBuffer, [candidate]);
+            },
+          });
+          Object.setPrototypeOf(ArrayBuffer, inherited);
+          return current;
+        },
+      }), /ZK_SHARE_OFFER_DENIED/,
+      "inherited ArrayBuffer @@hasInstance must fail closed before raw CEK release");
+    } finally { Object.setPrototypeOf(ArrayBuffer, originalArrayBufferConstructorProto); }
+    assert.equal(inheritedAuthorityReached, true);
+    assert.equal(inheritedCekObserved, false,
+      "inherited instanceof hooks must never intercept the genuine 32-byte CEK");
     // A passed owner authority callback runs before genuine AES-GCM key import
     // and before AEAD plaintext parsing. An untrusted callback must not be
     // able to replace WebCrypto, a CEK byte iterator, or TextDecoder to spy
@@ -2143,7 +2219,12 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     const originalFinalFloor = Math.floor;
     const originalFinalMin = Math.min;
     const originalFinalSome = Array.prototype.some;
-    let simulatedFinalMilliseconds = (now + 9) * 1000;
+    // The isolated owner HPKE worker deliberately performs real crypto and
+    // may spend many seconds loading dependencies on Windows/WSL. Starting an
+    // attack clock at the subtest's old (now + 9) would simulate an unrelated
+    // wall-clock rollback and deny before the intended final file AEAD. Pin
+    // the *current* real instant, then advance only after genuine decryption.
+    let simulatedFinalMilliseconds = originalFinalNow();
     const pinnedFinalClock = () => simulatedFinalMilliseconds;
     Date.now = pinnedFinalClock;
     let finalAeadCompleted = false;
@@ -2332,7 +2413,11 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     const recipientExpiryClock = Date.now;
     const recipientExpiryFloor = Math.floor;
     const recipientExpiryMin = Math.min;
-    let recipientExpiryMilliseconds = (now + 9) * 1000;
+    // The fully authenticated HPKE/AEAD sequence now uses an isolated V8
+    // worker. Begin at the real current instant, not the subtest's stale
+    // startup instant; otherwise this tests clock rollback, not the intended
+    // final-third-authority-read expiry race.
+    let recipientExpiryMilliseconds = recipientExpiryClock();
     const stableRecipientClock = () => recipientExpiryMilliseconds;
     Date.now = stableRecipientClock;
     let recipientExpiryReads = 0;
