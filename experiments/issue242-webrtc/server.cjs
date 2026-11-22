@@ -11,8 +11,10 @@ const MAX_MEMBERS = 4;
 const ROOM_TTL_MS = 5 * 60_000;
 const UNJOINED_ROOM_TTL_MS = 15_000;
 const MAX_ACTIVE_ROOMS_PER_OWNER = 2;
+const MAX_SOCKETS_PER_ACCOUNT = 8;
 const INVITE_TTL_MS = 60_000;
 const MAX_SIGNAL_BYTES = 16_384;
+const MAX_OUTBOUND_BUFFER_BYTES = 512 * 1024;
 // The wire rate cap does not bound a Promise chain held behind a stalled
 // trusted ACL/storage callback. Limit queued closures per room independently.
 const MAX_PENDING_ROOM_ACTIONS = 64;
@@ -89,7 +91,16 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     return false;
   }
   function send(ws, data) {
-    if (ws.readyState === WebSocket.OPEN && sessionCurrent(ws)) ws.send(JSON.stringify(data));
+    if (ws.readyState !== WebSocket.OPEN || !sessionCurrent(ws)) return;
+    const payload = JSON.stringify(data);
+    // A compliant peer may stop reading while a host continues relaying
+    // signaling. Never retain an unbounded per-socket outbound backlog.
+    if (ws.bufferedAmount + Buffer.byteLength(payload) > MAX_OUTBOUND_BUFFER_BYTES) {
+      ws.terminate();
+      removePeer(ws);
+      return;
+    }
+    ws.send(payload);
   }
   function error(ws, code) { send(ws, { type: 'error', code }); }
   function roomOf(ws) {
@@ -677,6 +688,16 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     const identity = identify(req);
     if (authenticated && !identity) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    // This standalone broker admits its own sockets. Do not impose this
+    // quota on sharedWss: those sockets also serve unrelated Root.ark routes.
+    if (authenticated && [...wss.clients].filter(ws =>
+      ws.identity?.username === identity.username &&
+      ws.readyState !== WebSocket.CLOSING &&
+      ws.readyState !== WebSocket.CLOSED).length >= MAX_SOCKETS_PER_ACCOUNT) {
+      socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
     }

@@ -430,3 +430,97 @@ test('P2: attachChannel strictly rejects data channels with missing or invalid l
     assert.ok(f.snapshot().diagnostics.rejected.includes('INVALID_CHANNEL'));
   }
 });
+
+test('P2 merge: host kick closes an already-consented RTCDataChannel synchronously, ahead of broker peer-left', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'host-invite');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-joined', role: 'guest', peerId: 'guest-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const channel = f.testChannel(0);
+  const peer = f.peerConnections[0];
+  assert.equal(channel.readyState, 'open', 'positive: the consented RTC channel is open');
+  const kick = f.elements.get('peers').children[0].children.at(-1);
+  kick.onclick();
+  assert.deepEqual(socket.sent.at(-1), { type: 'kick', to: 'guest-A' });
+  assert.equal(channel.readyState, 'closed', 'local revocation must close the direct channel before a delayed peer-left');
+  assert.equal(peer.closed, true, 'direct PeerConnection must be closed at kick');
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  assert.equal(f.snapshot().peers.length, 0, 'queued peer-accepted cannot resurrect a kicked participant');
+});
+
+test('P2 merge: broker REVOKED and ROOM_CLOSED close guest RTC before signaling socket shuts down', async () => {
+  for (const code of ['REVOKED', 'ROOM_CLOSED']) {
+    const f = clientFixture();
+    f.joinRoom('room-A', 'guest-invitation');
+    const socket = f.sockets[0];
+    await f.incoming(socket, { type: 'joined', role: 'guest', peerId: 'guest-A' });
+    await f.incoming(socket, { type: 'peer-allowed', peerId: 'host-A' });
+    const peer = f.peerConnections[0];
+    const channel = makeChannel();
+    peer.ondatachannel({ channel });
+    assert.equal(channel.readyState, 'open', 'positive: guest channel is live');
+    await f.incoming(socket, { type: 'error', code });
+    assert.equal(peer.closed, true, code + ' immediately closes direct RTC');
+    assert.equal(channel.readyState, 'closed', code + ' immediately closes the DataChannel');
+    assert.equal(f.snapshot().peers.length, 0, code + ' clears local consent');
+    await f.incoming(socket, { type: 'peer-allowed', peerId: 'host-A' });
+    assert.equal(f.snapshot().peers.length, 0, code + ' denies stale consent replay on same socket');
+  }
+});
+
+test('P2 merge: peer-left prevents a late peer-accepted from recreating its RTC transport', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'host-key');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const channel = f.testChannel(0);
+  await f.incoming(socket, { type: 'peer-left', peerId: 'guest-A' });
+  assert.equal(channel.readyState, 'closed', 'broker departure retires live transport');
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  assert.equal(f.snapshot().peers.length, 0, 'stale acceptance may not recreate a departed guest');
+  assert.equal(f.peerConnections.length, 1, 'no new RTCPeerConnection for departed peer ID');
+});
+
+test('P2 merge: host kick aborts a paused 32 MiB-capable sender without publishing late file frames', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'host-key');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-joined', role: 'guest', peerId: 'guest-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const channel = f.testChannel(0);
+  channel.sent = [];
+  channel.send = data => channel.sent.push(typeof data === 'string' ? JSON.parse(data) : data);
+  let reachedWindow, releaseWindow, aborted = false;
+  const paused = new Promise(resolve => { reachedWindow = resolve; });
+  f.window.P2PFileWire.waitForSendWindow = (_channel, signal) => {
+    reachedWindow();
+    return new Promise((resolve, reject) => {
+      releaseWindow = resolve;
+      signal.addEventListener('abort', () => {
+        aborted = true;
+        reject(new Error('canceled by revocation'));
+      }, { once: true });
+    });
+  };
+  const payload = Uint8Array.of(1, 2, 3);
+  await f.sendFile({ name: 'disposable.bin', size: payload.length,
+    arrayBuffer: async () => payload.buffer,
+    slice: () => ({ arrayBuffer: async () => payload.buffer }) });
+  const offer = channel.sent.find(message => message.type === 'offer-file');
+  assert.ok(offer, 'positive: file offer passed digest and original consent checks');
+  await channel.onmessage({ data: JSON.stringify({ type: 'accept-file', id: offer.id }) });
+  await paused;
+  const kick = f.elements.get('peers').children[0].children.at(-1);
+  kick.onclick();
+  assert.equal(aborted, true, 'direct kick must abort the suspended send-window promise');
+  assert.equal(channel.readyState, 'closed');
+  releaseWindow();
+  await Promise.resolve();
+  assert.equal(channel.sent.some(message => message instanceof ArrayBuffer ||
+    message?.type === 'end-file'), false,
+  'a kicked recipient must receive no file chunks or completion while the old buffer drains');
+});

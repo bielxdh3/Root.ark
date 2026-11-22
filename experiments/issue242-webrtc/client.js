@@ -29,6 +29,9 @@
   let creatingRoom = false;
   let pendingCreateController = null;
   const peers = new Map(), invites = new Map();
+  // The broker may deliver earlier signaling after a local kick or peer-left.
+  // A departed peer ID is never eligible for a fresh RTC transport in this room.
+  const locallyRevokedPeers = new Set();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
   async function releaseUnusedRoom(reservation) {
@@ -60,6 +63,7 @@
   function retireRoom() {
     const oldSocket = ws;
     ws = null; // Ignore callbacks from the previous room immediately.
+    locallyRevokedPeers.clear();
     ++preparingFileToken;
     preparingFile = false;
     if (oldSocket && oldSocket.readyState < 2) oldSocket.close();
@@ -130,6 +134,12 @@
       try { m = JSON.parse(event.data); } catch { return; }
       if (m.type === 'error') {
         record(diagnostics.rejected, m.code);
+        if (m.code === 'REVOKED' || m.code === 'ROOM_CLOSED') {
+          // An authoritative room denial must close direct WebRTC now, not
+          // after the broker's asynchronous WebSocket close handshake.
+          leaveRoom();
+          return log('Erro: ' + m.code);
+        }
         // Any server error before `joined` is an admission failure. A bound
         // room can lose ACL/object eligibility between its successful POST
         // and the WebSocket recheck; never retain that pending room identity.
@@ -181,6 +191,7 @@
         invites.delete(m.inviteId);
         log('Convite revogado');
       } else if (m.type === 'peer-joined' && role === 'host') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const line = document.createElement('div');
         line.className = 'entry';
         line.dataset.peerId = m.peerId;
@@ -188,8 +199,10 @@
         const kick = document.createElement('button');
         kick.textContent = 'Revogar participante';
         kick.addEventListener('click', () => {
-          if (ws !== eventSocket) return;
+          if (ws !== eventSocket || locallyRevokedPeers.has(m.peerId)) return;
+          locallyRevokedPeers.add(m.peerId);
           wire({ type: 'kick', to: m.peerId });
+          dropPeer(m.peerId);
         });
         line.append(kick);
         $('peers').append(line);
@@ -211,6 +224,7 @@
         }
         $('peers').append(div);
       } else if (m.type === 'peer-accepted') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const p = preparePeer(m.peerId, true);
         try {
           const dc = p.pc.createDataChannel('fixture-transfer', { ordered: true });
@@ -229,8 +243,10 @@
           }
         }
       } else if (m.type === 'peer-allowed') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         preparePeer(m.peerId, false);
       } else if (m.type === 'signal') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const p = peers.get(m.peerId);
         if (!p) return;
         try {
@@ -262,12 +278,8 @@
           if (ws === eventSocket && peers.get(p.id) === p) log('Negociação falhou: ' + e.name);
         }
       } else if (m.type === 'peer-left') {
-        const p = peers.get(m.peerId);
-        peers.delete(m.peerId);
-        if (p) closePeer(p);
-        document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
-          if (el.dataset.peerId === m.peerId) el.remove();
-        });
+        locallyRevokedPeers.add(m.peerId);
+        dropPeer(m.peerId);
         log('Par desconectado');
       }
     };
@@ -356,7 +368,20 @@
       p.saved.element.remove();
       p.saved = null;
     }
+    // Closing only RTCPeerConnection does not synchronously change the
+    // DataChannel state in every browser. Stop locally queued bytes first.
+    if (p.dc && p.dc.readyState !== 'closed') {
+      try { p.dc.close(); } catch { /* Closing the parent still retires RTC. */ }
+    }
     p.pc.close();
+  }
+  function dropPeer(id) {
+    const p = peers.get(id);
+    peers.delete(id);
+    if (p) closePeer(p);
+    document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
+      if (el.dataset.peerId === id) el.remove();
+    });
   }
   function transferUi(p, title, direction, cancel) {
     const node = document.createElement('div');
@@ -422,7 +447,8 @@
       log('Arquivo rejeitado: ' + code);
     }
     dc.onmessage = async event => {
-      if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc) return;
+      if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc ||
+        dc.readyState !== 'open') return;
       const messageRoomIntent = roomIntent;
       if (event.data instanceof ArrayBuffer) {
         const rx = p.incoming;

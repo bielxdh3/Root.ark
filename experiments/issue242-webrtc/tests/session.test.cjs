@@ -86,6 +86,16 @@ test('real Root.ark session verification gates room creation and WebSocket upgra
   assert.equal((await f.createRoom(f.cookie('alice'))).status, 200);
 });
 
+test('P2 merge: per-principal signaling socket budget preserves another authenticated user capacity', async t => {
+  const f = await fixture(t);
+  const firstSession = f.cookie('alice');
+  const secondSession = f.cookie('alice', { expiresIn: '4m' });
+  for (let index = 0; index < 8; index++) await f.connect(index % 2 ? firstSession : secondSession);
+  await assert.rejects(f.connect(secondSession), /upgrade 429/,
+    'ninth socket of the same username must not monopolize the global socket budget');
+  await f.connect(f.cookie('bob')); // Positive control: unrelated principal still admitted.
+});
+
 test('recipient-bound single-use invite and host session prevent impersonation and unauthorized signaling', async t => {
   const f = await fixture(t);
   const room = (await f.createRoom(f.cookie('alice'))).data;

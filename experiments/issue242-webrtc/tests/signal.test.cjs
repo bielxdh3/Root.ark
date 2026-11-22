@@ -175,3 +175,35 @@ test('room expires even when idle, and rejected consent cannot forward SDP', asy
   assert.equal((await host.next('error')).code, 'ROOM_CLOSED');
   assert.equal((await guest.next('error')).code, 'ROOM_CLOSED');
 });
+
+test('P2 merge: a blocked recipient signaling socket cannot retain more than 512 KiB outbound', async t => {
+  const h = await setup(t);
+  const { roomId, hostKey } = await h.room();
+  const originalSend = WebSocket.prototype.send;
+  let serverSideHost = null;
+  WebSocket.prototype.send = function (data, ...args) {
+    // Observe the actual server-facing object without changing its send path.
+    if (this._isServer && typeof data === 'string' &&
+      JSON.parse(data).type === 'joined') serverSideHost = this;
+    return Reflect.apply(originalSend, this, [data, ...args]);
+  };
+  try {
+    const host = await h.connect();
+    host.send({ type: 'join', roomId, hostKey });
+    await host.next('joined');
+    assert.ok(serverSideHost, 'positive: actual server-side WebSocket was captured');
+    Object.defineProperty(serverSideHost, 'bufferedAmount', {
+      configurable: true, get: () => 512 * 1024,
+    });
+    const closed = new Promise(resolve => host.ws.once('close', () => resolve(true)));
+    host.send({ type: 'invite' });
+    const stopped = await Promise.race([
+      closed,
+      new Promise(resolve => setTimeout(() => resolve(false), 400)),
+    ]);
+    assert.equal(stopped, true,
+      'a full outbound queue must evict a stalled signaling socket, not append an invite ACK');
+  } finally {
+    WebSocket.prototype.send = originalSend;
+  }
+});
