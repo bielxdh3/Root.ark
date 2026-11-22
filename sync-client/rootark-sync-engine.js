@@ -2154,7 +2154,11 @@ class SyncEngine {
               fail("Unrelated pending signed operation blocks reconciliation", "restore_plan_indeterminate");
             }
             await this._verifyCommittedRestorePlanItem(item, requested);
-            if (pending.length === 1) await this.journal.markSeen(item.operationId);
+            if (pending.length === 1) {
+              const captured = captureHistoricalRestoreEnvelope(pending[0], this);
+              await this.confirmHistoricalRestorePhysicalAdmission(captured);
+              await this.journal.markSeenExact(captured.operationId, captured.digest, captured.digest);
+            }
             item.status = "committed";
             delete item.code;
             await persist(state);
@@ -2486,9 +2490,10 @@ class SyncEngine {
     };
     const validId = (value) => typeof value === "string" && regexTest(/^[A-Za-z0-9._:-]{1,160}$/, value);
     if (!validId(objectId) || !validId(versionId)) fail("Invalid historical restore identifier", "invalid_restore_id");
-    // Without separately provisioned physical witness and CURRENT CAS, do
-    // not start a restore that could stage local bytes and strand its outbox.
-    assertHistoricalRestorePhysicalAuthority(this);
+    // Read-only preview verification does not mutate state or enqueue an outbox
+    // entry, whereas restore execution requires separately provisioned physical
+    // witness and CURRENT CAS authority before staging local bytes.
+    if (verifyRetained !== true) assertHistoricalRestorePhysicalAuthority(this);
     if (typeof adapterHistory !== "function" || typeof adapterList !== "function"
       || typeof adapterPush !== "function") fail("Sync history is unavailable", "history_unavailable");
     if ((await nativeReflectApply(journalMethods.recover, journal, [])).length) {
@@ -4354,7 +4359,11 @@ class SyncEngine {
     // Detect old root-level temps without excluding similarly named user
     // files from normal sync. A restore must not adopt that ambiguity.
     const relative = await canonicalRelativePath(this.rootDir, relativePath);
-    const target = path.join(this.rootDir, ...relative.split("/"));
+    const segments = stringSplit(relative, "/");
+    let target = this.rootDir;
+    for (let index = 0; index < segments.length; index += 1) {
+      target = path.join(target, segments[index]);
+    }
     const prefix = `${path.basename(target)}.tmp-`;
     const suffix = /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
     let neighbors;
@@ -4363,13 +4372,14 @@ class SyncEngine {
       if (error?.code !== "ENOENT") throw error;
       neighbors = [];
     }
-    const normalizedPrefix = process.platform === "win32" ? prefix.toLowerCase() : prefix;
-    if (neighbors.some((name) => {
-      const candidate = process.platform === "win32" ? name.toLowerCase() : name;
-      return candidate.startsWith(normalizedPrefix)
-        && suffix.test(candidate.slice(normalizedPrefix.length));
-    })) {
-      fail("Historical restore has an unresolved syncable temporary", "restore_local_materialization_missing");
+    const normalizedPrefix = process.platform === "win32" ? stringToLowerCase(prefix) : prefix;
+    for (let index = 0; index < neighbors.length; index += 1) {
+      const name = neighbors[index];
+      const candidate = process.platform === "win32" ? stringToLowerCase(name) : name;
+      if (stringStartsWith(candidate, normalizedPrefix)
+        && regexTest(suffix, stringSlice(candidate, normalizedPrefix.length))) {
+        fail("Historical restore has an unresolved syncable temporary", "restore_local_materialization_missing");
+      }
     }
   }
 
@@ -4388,17 +4398,17 @@ class SyncEngine {
     }
     // Scope private residue to the exact signed outbox operation. A leftover
     // for another restore must not permanently wedge unrelated pending work.
-    const privatePrefix = `restore-materialize-${crypto.createHash("sha256")
-      .update(operation.operationId).digest("hex")}.tmp-`;
+    const privatePrefix = `restore-materialize-${sha256Hex(operation.operationId)}.tmp-`;
     const suffix = /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-    if (privateNames.some((name) => {
+    for (let index = 0; index < privateNames.length; index += 1) {
+      const name = privateNames[index];
       // NTFS resolves mixed-case aliases. Neither a case-only rename nor a
       // change to the hexadecimal UUID's case may bypass the pending gate.
-      const candidate = process.platform === "win32" ? name.toLowerCase() : name;
-      return candidate.startsWith(privatePrefix)
-        && suffix.test(candidate.slice(privatePrefix.length));
-    })) {
-      fail("Historical restore has an unresolved private temporary", "restore_local_materialization_missing");
+      const candidate = process.platform === "win32" ? stringToLowerCase(name) : name;
+      if (stringStartsWith(candidate, privatePrefix)
+        && regexTest(suffix, stringSlice(candidate, privatePrefix.length))) {
+        fail("Historical restore has an unresolved private temporary", "restore_local_materialization_missing");
+      }
     }
   }
 

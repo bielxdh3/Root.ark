@@ -9,8 +9,80 @@ const test = require("node:test");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
+const { DOMAIN: OWNER_PROVISION_DOMAIN } =
+  require("../sync-client/rootark-sync-atomic-owner-provision");
 const { SyncObjectStore } = require("../src/routes/sync");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
+
+const RESTORE_WITNESS_DOMAIN = "rootark-sync-historical-restore-physical-witness-v1\0";
+const RESTORE_CURRENT_DOMAIN = "rootark-sync-historical-restore-physical-current-v1\0";
+
+function simulatedRestorePhysicalAuthority(root) {
+  const witness = crypto.generateKeyPairSync("ed25519");
+  const cas = crypto.generateKeyPairSync("ed25519");
+  const owner = crypto.generateKeyPairSync("ed25519");
+  const spki = (pair) => pair.publicKey.export({ type: "spki", format: "der" }).toString("base64url");
+  const signing = (pair, domain, statement) => ({ statement,
+    signature: crypto.sign(null, Buffer.from(domain + protocol.canonicalJson(statement)),
+      pair.privateKey).toString("base64url") });
+  const scope = "alice:historical-restore";
+  const identity = { accountId: crypto.randomUUID(), storeId: crypto.randomUUID(),
+    username: "alice", compartmentId: "private" };
+  const provisioning = signing(owner, OWNER_PROVISION_DOMAIN, {
+    type: "atomic-owner-provisioning", version: 1, scope, ...identity,
+    witnessSpki: spki(witness), casSpki: spki(cas), sequence: 1,
+  });
+  const digest = crypto.createHash("sha256")
+    .update(OWNER_PROVISION_DOMAIN + protocol.canonicalJson(provisioning)).digest("hex");
+  const statePath = path.join(root, "witness-store-current.json");
+  let sequence = 0;
+  const reopen = async () => JSON.parse(await fsp.readFile(statePath, "utf8"));
+  const physicalStoreCommitted = async (operation) => {
+    const state = { operation, commitId: crypto.randomBytes(24).toString("base64url"),
+      fencingEpoch: ++sequence };
+    state.storeHeadSha256 = crypto.createHash("sha256")
+      .update(protocol.canonicalJson(operation)).digest("hex");
+    const temporary = `${statePath}.tmp-${crypto.randomUUID()}`;
+    const handle = await fsp.open(temporary, "wx", 0o600);
+    try { await handle.writeFile(protocol.canonicalJson(state)); await handle.sync(); }
+    finally { await handle.close(); }
+    await fsp.rename(temporary, statePath);
+  };
+  const options = {
+    atomicBatchWitnessScope: scope,
+    atomicBatchOwnerIdentity: identity,
+    atomicBatchOwnerProvisionerPublicKey: spki(owner),
+    atomicBatchOwnerProvisioning: provisioning,
+    atomicBatchOwnerProvisionDigest: digest,
+    atomicBatchWitnessPublicKey: spki(witness),
+    atomicBatchCasFloorPublicKey: spki(cas),
+    async atomicBatchWitnessReadback({ nonce, operationIds, envelopeDigests }) {
+      const disk = await reopen();
+      assert.deepEqual(operationIds, [disk.operation.operationId]);
+      assert.deepEqual(envelopeDigests, [crypto.createHash("sha256")
+        .update(protocol.canonicalJson(disk.operation)).digest("hex")]);
+      return signing(witness, RESTORE_WITNESS_DOMAIN, {
+        version: 2, scope, ...identity, nonce, operationIds, envelopeDigests,
+        commitId: disk.commitId, storeHeadSha256: disk.storeHeadSha256,
+        fencingEpoch: disk.fencingEpoch, physicalDurable: true,
+      });
+    },
+    async atomicBatchCasFloorReadback({ nonce, commitId, storeHeadSha256, fencingEpoch }) {
+      const disk = await reopen();
+      assert.equal(disk.commitId, commitId);
+      assert.equal(disk.storeHeadSha256, storeHeadSha256);
+      assert.equal(disk.fencingEpoch, fencingEpoch);
+      assert.equal(crypto.createHash("sha256")
+        .update(protocol.canonicalJson(disk.operation)).digest("hex"), storeHeadSha256);
+      return signing(cas, RESTORE_CURRENT_DOMAIN, {
+        version: 2, scope, accountId: identity.accountId, storeId: identity.storeId,
+        nonce, commitId, storeHeadSha256, fencingEpoch, sequence: disk.fencingEpoch,
+        current: true,
+      });
+    },
+  };
+  return { physicalStoreCommitted, options };
+}
 
 async function fixture(t) {
   const root = createPrivateAuthorityFixture("rootark-67-batch-execute-");
@@ -44,6 +116,7 @@ async function fixture(t) {
   let grants = true;
   let custody = true;
   let pushes = 0;
+  const physical = simulatedRestorePhysicalAuthority(root);
   const adapter = {
     history: async (id) => ({ protocolVersion: 2, versions: store.history("alice", id) }),
     list: async (id) => store.list("alice", id)[0],
@@ -52,6 +125,7 @@ async function fixture(t) {
       const result = await store.put("alice", operation);
       if (result.kind !== "stored") throw Object.assign(new Error(`Remote denied: ${result.kind}`),
         { status: result.kind === "conflict" ? 409 : 403 });
+      await physical.physicalStoreCommitted(result.record);
       return result.record;
     },
   };
@@ -66,6 +140,7 @@ async function fixture(t) {
     verifyIncoming: (record) => custody && verifyAuthorizationProof(record.authorization, record, policy),
     authorizationFactory: (record) => createAuthorizationProof(record,
       { username: "alice", privateKey, publicKey: spki }),
+    ...physical.options,
   };
   const engine = await new SyncEngine(opts).open();
   const requests = [
