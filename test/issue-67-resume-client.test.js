@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const http = require("node:http");
 const path = require("node:path");
 const test = require("node:test");
 const { Readable } = require("node:stream");
@@ -128,14 +129,15 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
     "stray positional arguments must not trigger HTTP or consume credentials");
 
   for (const extras of [["--password=secret-on-argv"], ["--code=123456"],
-    ["--credentialsStream", "secret-json-on-argv"]]) {
+    ["--credentialsStream", "secret-json-on-argv"], ["--path", "other-file"],
+    ["--once"], ["--plan-stdin"], ["--unrecognized"]]) {
     const forbidden = await runResume(config, "device-a", credentials, extras);
-    assert.notEqual(forbidden.status, 0, "secret-bearing CLI options must fail");
+    assert.notEqual(forbidden.status, 0, "unsupported CLI options must fail");
     assert.match(forbidden.stderr, /Unsupported resume option/i);
     assert.doesNotMatch(forbidden.stdout + forbidden.stderr,
       /secret-on-argv|123456|secret-json-on-argv|secret-resume-password|test-resume-token/);
     assert.equal(resumeHttpRequests, beforeAmbiguousRequests,
-      "secret-bearing CLI options may neither read stdin nor contact the server");
+      "unsupported CLI options must not contact the server");
   }
 
   const resumed = await runResume(config, "device-a", credentials);
