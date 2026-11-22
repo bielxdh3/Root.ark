@@ -115,8 +115,10 @@ class ProtectedSyncFetchTest {
     ) : HttpsURLConnection(url) {
         var opened = 0
         var disconnected = false
+        var forcedStream: java.io.InputStream? = null
         override fun getResponseCode(): Int = status
-        override fun getInputStream() = ByteArrayInputStream(payload).also { opened++ }
+        override fun getInputStream(): java.io.InputStream =
+            (forcedStream ?: ByteArrayInputStream(payload)).also { opened++ }
         override fun getContentType(): String? = mime
         override fun getContentEncoding(): String? = encoding
         override fun getContentLengthLong(): Long = declaredSize
@@ -128,6 +130,37 @@ class ProtectedSyncFetchTest {
         override fun getServerCertificates(): Array<Certificate> = emptyArray()
         override fun getPeerPrincipal(): Principal = Principal { "CN=test" }
         override fun getLocalPrincipal(): Principal? = null
+    }
+
+    @Test fun signedCiphertextGetNeverAcceptsAnEofDeliveredAfterTheAbsoluteDeadline() {
+        var nowNanos = 0L
+        var reads = 0
+        val sealed = response
+        val stream = object : java.io.InputStream() {
+            override fun read(): Int = throw AssertionError("Expected bulk read")
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                // Each 9s read is below the transport's 10s idle timeout.
+                // A successful body at t=9s followed by EOF at t=18s must not
+                // be accepted as an authenticated GET within the 10s total cap.
+                nowNanos += 9_000_000_000L
+                if (reads == 1) {
+                    require(sealed.size <= length)
+                    sealed.copyInto(buffer, offset)
+                    return sealed.size
+                }
+                return -1
+            }
+        }
+        val connection = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = sealed)
+        connection.forcedStream = stream
+        val fetch = ProtectedSyncFetch(clockNanos = { nowNanos }, openConnection = { connection })
+        val failure = assertThrows(IOException::class.java) {
+            fetch.fetchPacket(origin, session, "fixture-object-1", SessionCiphertextCache.MAX_PACKET_BYTES)
+        }
+        assertTrue(failure.message.orEmpty().contains("deadline"))
+        assertEquals(2, reads)
+        assertTrue(connection.disconnected)
     }
 
     private class Transport {

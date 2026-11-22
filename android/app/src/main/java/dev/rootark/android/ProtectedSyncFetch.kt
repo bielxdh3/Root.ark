@@ -52,8 +52,12 @@ internal data class FetchedCiphertextPacket(val bytes: ByteArray, val record: Sy
  * This component is not wired to any UI or automatic download.
  */
 internal class ProtectedSyncFetch(
+    private val clockNanos: () -> Long = System::nanoTime,
     private val openConnection: (URL) -> URLConnection = { it.openConnection() },
 ) {
+    // Keep existing one-argument/handler call sites while allowing deterministic
+    // monotonic deadline tests without real sleeps or network access.
+    constructor(openConnection: (URL) -> URLConnection) : this(System::nanoTime, openConnection)
     companion object {
         // An 8 MiB ciphertext becomes ~11.2 MiB base64url, plus signed metadata/AAD.
         const val MAX_RESPONSE_BYTES = 12 * 1024 * 1024
@@ -108,17 +112,21 @@ internal class ProtectedSyncFetch(
             if (connection.contentLengthLong > maxResponseBytes) {
                 throw IOException("Protected sync response exceeds limit")
             }
-            val deadlineNanos = System.nanoTime() + BODY_READ_DEADLINE_NANOS
+            val readStartedAt = clockNanos()
             val body = connection.inputStream.use { input ->
                 val output = ByteArrayOutputStream()
                 val buffer = ByteArray(8192)
                 var size = 0
                 while (true) {
-                    if (System.nanoTime() > deadlineNanos) {
-                        connection.disconnect()
+                    if (clockNanos() - readStartedAt >= BODY_READ_DEADLINE_NANOS) {
                         throw IOException("Protected sync response read deadline exceeded")
                     }
                     val read = input.read(buffer)
+                    // A final EOF is still a read. Checking only before it can
+                    // incorrectly accept a signed packet after the wall budget.
+                    if (clockNanos() - readStartedAt >= BODY_READ_DEADLINE_NANOS) {
+                        throw IOException("Protected sync response read deadline exceeded")
+                    }
                     if (read < 0) break
                     if (read > maxResponseBytes - size) {
                         throw IOException("Protected sync response exceeds limit")
