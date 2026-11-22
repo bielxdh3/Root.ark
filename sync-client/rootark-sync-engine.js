@@ -1172,6 +1172,7 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
   // Required after the held descriptor closes and the durable hardlink removal
   // has been verified; keep this scope outside the descriptor's try block.
   const directoryName = path.dirname(target);
+  let staged = null;
   // Acquire and pin the target descriptor BEFORE using the pathname to
   // decide whether the old hardlink is eligible for recovery. A concurrent
   // writer may swap a name at any time; only fstat of this held descriptor
@@ -1182,7 +1183,7 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
   const current = await fsp.lstat(target, { bigint: true });
   if (!current.isFile() || current.isSymbolicLink() || current.ino === 0n
     || current.nlink !== 2n) return;
-  const staged = historicalRestoreStagingPath(rootDir, target, staging, operationId);
+  staged = historicalRestoreStagingPath(rootDir, target, staging, operationId);
   if (bigIntToString(current.dev) !== staging.dev
     || bigIntToString(current.ino) !== staging.ino) {
     fail("Historical restore staging identity is not proven", "restore_local_materialization_missing");
@@ -1244,7 +1245,7 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
     await fsp.unlink(staged);
   } finally { await handle.close(); }
   await syncDirectoryChain(rootDir, directoryName);
-  if (path.dirname(staged) !== directoryName) {
+  if (staged && path.dirname(staged) !== directoryName) {
     await syncDirectoryChain(rootDir, path.dirname(staged));
   }
   // The caller now reopens and physically flushes target as nlink=1, and
