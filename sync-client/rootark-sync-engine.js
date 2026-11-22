@@ -348,6 +348,15 @@ function assertHistoricalRestorePhysicalAuthority(engine) {
   }
 }
 
+function hasHistoricalRestorePhysicalAuthority(engine) {
+  try {
+    assertHistoricalRestorePhysicalAuthority(engine);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function pushCapturedHistoricalRestore(captured) {
   assertCapturedHistoricalRestoreEnvelope(captured);
   if (!captured || !captured.adapter || typeof captured.adapterPush !== "function"
@@ -1179,6 +1188,19 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
     fail("Historical restore staging identity is not proven", "restore_local_materialization_missing");
   }
   await containedAbsolute(rootDir, staged, false);
+  const stageDirEntries = await nativeReflectApply(nativePromiseCatch,
+    fsp.readdir(path.dirname(staged)), [(error) => ownDataValue(error, "code") === "ENOENT"
+      ? [] : nativePromiseReject(error)]);
+  let exactCaseFound = false;
+  for (let index = 0; index < stageDirEntries.length; index += 1) {
+    if (stageDirEntries[index] === staging.name) {
+      exactCaseFound = true;
+      break;
+    }
+  }
+  if (!exactCaseFound) {
+    fail("Recorded historical restore staging file missing", "restore_local_materialization_missing");
+  }
   const stagedStats = await nativeReflectApply(nativePromiseCatch,
     fsp.lstat(staged, { bigint: true }), [(error) => {
     if (ownDataValue(error, "code") === "ENOENT") {
@@ -4062,8 +4084,8 @@ class SyncEngine {
           historicalRestoreEnvelope = captureHistoricalRestoreEnvelope(operation, this);
           operation = historicalRestoreEnvelope.operation;
           assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
-          await this.assertNoHistoricalRestoreTempResidue(operation);
-          assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
+          const staging = nativeReflectApply(historicalRestoreEnvelope.journalMethods.restoreStagingInfo,
+            journal, [operation]);
           // The signed outbox can survive a crash between staging and local
           // materialization. An exact signed-envelope journal observation is
           // recorded only AFTER _apply has durably persisted restored local
@@ -4083,13 +4105,16 @@ class SyncEngine {
             && snapshot.versionId === operation.versionId
             && snapshot.hash === expected
             && canonicalJson(snapshot.revision) === canonicalJson(operation.revision);
+          if (durablyMaterialized || !hasHistoricalRestorePhysicalAuthority(this)
+            || !staging || staging.dev === null || staging.ino === null) {
+            await this.assertNoHistoricalRestoreTempResidue(operation);
+            assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
+          }
           if (!durablyMaterialized) {
             let observed;
             try {
               const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
               assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
-              const staging = nativeReflectApply(historicalRestoreEnvelope.journalMethods.restoreStagingInfo,
-                journal, [operation]);
               await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected,
                 staging, operation.operationId);
               assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
@@ -4108,6 +4133,8 @@ class SyncEngine {
                   fail("Historical restore staging remains unresolved", "restore_local_materialization_missing");
                 }
               }
+              await this.assertNoHistoricalRestoreTempResidue(operation);
+              assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
               const local = await readContainedFile(this.rootDir, relative, null, true);
               assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
               try { observed = sha256Hex(local); }
@@ -4874,6 +4901,19 @@ class SyncEngine {
       // not infer ownership from their names or silently adopt an orphan.
       if (typeof operation.operationId === "string"
         && stringStartsWith(operation.operationId, "histrestore-")) {
+        if (hasHistoricalRestorePhysicalAuthority(this) && typeof operation.metadata?.path === "string") {
+          const staging = this.journal.restoreStagingInfo(operation);
+          if (staging && staging.dev !== null && staging.ino !== null) {
+            try {
+              const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
+              const expected = await this.hashPendingPayload(operation);
+              await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected,
+                staging, operation.operationId);
+            } catch (error) {
+              if (ownDataValue(error, "code") !== "ENOENT") throw error;
+            }
+          }
+        }
         await this.assertNoHistoricalRestoreTempResidue(operation);
       }
     }

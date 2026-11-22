@@ -212,8 +212,10 @@ test("#67: first signed success, second grant denied, then safe resume only seco
 test("#67: stage crash leaves an indeterminate signed intent; resume never repeats it", async (t) => {
   const f = await fixture(t);
   const preview = await f.engine.previewHistoricalRestorePlan(f.requests);
-  f.engine._pushPending = async () => { throw new Error("simulated process termination after local stage"); };
+  const originalPush = f.adapter.push;
+  f.adapter.push = async () => { throw new Error("simulated process termination after local stage"); };
   const outcome = await f.engine.restoreHistoricalPlan(preview, { confirm: true });
+  f.adapter.push = originalPush;
   assert.equal(outcome.partial, true);
   assert.equal(outcome.items[0].status, "indeterminate");
   assert.equal(f.pushes(), 0);
@@ -274,7 +276,9 @@ test("#67: new epoch or concurrent untracked destination rejects controlled exec
   const preview = await f.engine.previewHistoricalRestorePlan(f.requests);
   f.engine.keyEpoch = "epoch-2";
   await assert.rejects(f.engine.restoreHistoricalPlan(preview, { confirm: true }),
-    (error) => error.code === "stale_key_epoch" || error.code === "restore_plan_stale");
+    (error) => error.code === "sync_key_epoch_mismatch"
+      || error.code === "stale_key_epoch"
+      || error.code === "restore_plan_stale");
   f.engine.keyEpoch = "epoch-1";
   const target = path.join(f.local, "file-2.txt");
   await fsp.writeFile(target, "untracked owner edits");
