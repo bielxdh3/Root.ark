@@ -359,6 +359,39 @@ test("Root.ark #65 standalone mTLS inventory transport verifies signed, nonautho
       "a Proxy ownKeys hook must never run before the input is authenticated");
   });
 
+  await t.test("nested Proxy input cannot execute pre-verification HTTPS authority hooks", async (child) => {
+    const h = await harness(child);
+    const reader = h.makeClient("reader");
+    const entry = { object_id: crypto.randomBytes(16), revision: 1, epoch: 1,
+      ciphertext_sha256: crypto.randomBytes(32) };
+    const scope = h.scope;
+    const nonce = crypto.randomBytes(32);
+    const floor = { sequence: 0, root: crypto.randomBytes(32) };
+    let traps = 0;
+    const proxy = (value) => new Proxy(value, {
+      getPrototypeOf() { traps++; throw new Error("PROXY_HOOK_BEFORE_SIGNATURE"); },
+      ownKeys() { traps++; throw new Error("PROXY_HOOK_BEFORE_SIGNATURE"); },
+    });
+    const typedArrayProxy = new Proxy(new Uint8Array(64), {
+      get() { traps++; throw new Error("PROXY_BYTE_GET_BEFORE_SIGNATURE"); },
+    });
+    const operation = newOperation({ root: floor.root });
+    const cases = [
+      () => reader.getProofPage({ scope: proxy(scope), afterSequence: 0, limit: 1 }),
+      () => reader.getSnapshot({ scope, nonce, requested: proxy(entry), minimumHead: floor }),
+      () => reader.getSnapshot({ scope, nonce, requested: entry, minimumHead: proxy(floor) }),
+      () => reader.getSnapshot({ scope, nonce, requested: entry, minimumHead: floor,
+        minimumSnapshot: typedArrayProxy }),
+      () => reader.getOperationStatus({ scope,
+        operation: { ...operation, operation_id: typedArrayProxy } }),
+    ];
+    for (const invoke of cases) {
+      assert.throws(invoke, { code: "INVENTORY_HTTP_UNAVAILABLE" },
+        "reject an attacker-owned nested Proxy without consulting any traps");
+      assert.equal(traps, 0, "no Proxy callback may execute before signed admission");
+    }
+  });
+
   await t.test("fresh nonce proves absence, append inclusion, and historical revision over TLS 1.3", async (child) => {
     const h = await harness(child);
     const reader = h.makeClient("reader");

@@ -212,8 +212,24 @@ function exact(value, required, optional = []) {
   return result;
 }
 
+// A caller-owned nested Proxy can run getPrototypeOf/ownKeys traps inside the
+// otherwise strict inventory normalizers before any signer verification.
+// Reject it before reflection, just as we already do for the outer input.
+function normalizeScope(value) {
+  if (isProxy(value)) fail();
+  return inventory.normalizeScope(value);
+}
+function normalizeRequested(value) {
+  if (isProxy(value)) fail();
+  return inventory.normalizeRequested(value);
+}
+function normalizeMinimumHead(value) {
+  if (isProxy(value)) fail();
+  return inventory.normalizeMinimumHead(value);
+}
+
 function copyBytes(value, min, max = min) {
-  if ((!Buffer.isBuffer(value) && !(value instanceof Uint8Array))
+  if (isProxy(value) || (!Buffer.isBuffer(value) && !(value instanceof Uint8Array))
     || (typeof SharedArrayBuffer !== "undefined" && value.buffer instanceof SharedArrayBuffer)
     || value.byteLength < min || value.byteLength > max) fail();
   return NATIVE_BUFFER_FROM(value);
@@ -470,7 +486,7 @@ function createZk1ContentInventoryHttpsClient({
   const client = Object.freeze({
     getProofPage(input) {
       const raw = exact(input, ["scope", "afterSequence", "limit"], ["pageNonce"]);
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       if (!Number.isSafeInteger(raw.afterSequence) || raw.afterSequence < 0
         || raw.afterSequence > inventory.MAX_ENTRIES
         || !Number.isSafeInteger(raw.limit) || raw.limit < 1
@@ -552,10 +568,10 @@ function createZk1ContentInventoryHttpsClient({
         && raw.includeVerifiedProofChain !== true) fail();
       // Copy every user-controlled buffer before fetching the first page. The
       // network's reported head is never accepted as an authenticated floor.
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       const nonce = inventory.normalizeNonce(raw.nonce);
-      const requested = inventory.normalizeRequested(raw.requested);
-      const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
+      const requested = normalizeRequested(raw.requested);
+      const minimumHead = normalizeMinimumHead(raw.minimumHead);
       const minimumSnapshot = copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
       const committedProofChain = [];
       const physicalProofChain = [];
@@ -607,10 +623,10 @@ function createZk1ContentInventoryHttpsClient({
     getSnapshot(input) {
       const raw = exact(input, ["scope", "nonce", "requested", "minimumHead"],
         ["minimumSnapshot", "committedProofChain"]);
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       const nonce = inventory.normalizeNonce(raw.nonce);
-      const entry = inventory.normalizeRequested(raw.requested);
-      const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
+      const entry = normalizeRequested(raw.requested);
+      const minimumHead = normalizeMinimumHead(raw.minimumHead);
       const minimumSnapshot = raw.minimumSnapshot === undefined || raw.minimumSnapshot === null
         ? undefined : copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
       // Snapshot all caller-controlled receipts before any TLS/network await.
@@ -636,10 +652,10 @@ function createZk1ContentInventoryHttpsClient({
 
     append(input) {
       const raw = exact(input, ["scope", "operation", "nonce", "minimumHead"], ["minimumSnapshot"]);
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       const operation = normalizeOperation(raw.operation);
       const nonce = inventory.normalizeNonce(raw.nonce);
-      const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
+      const minimumHead = normalizeMinimumHead(raw.minimumHead);
       const minimumSnapshot = raw.minimumSnapshot === undefined || raw.minimumSnapshot === null
         ? undefined : copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
       const body = {
@@ -731,7 +747,7 @@ function createZk1ContentInventoryHttpsClient({
 
     getOperationStatus(input) {
       const raw = exact(input, ["scope", "operation"]);
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       const operation = normalizeOperation(raw.operation);
       const nonce = physicalAttestorPublicKey ? NATIVE_RANDOM_BYTES(32) : null;
       const response = call("/v1/inventory/operation", {
@@ -806,9 +822,9 @@ function createZk1ContentInventoryHttpsClient({
     async getOperationStatusWithVerifiedChain(input) {
       if (!physicalAttestorPublicKey) fail();
       const raw = exact(input, ["scope", "operation", "minimumHead", "minimumSnapshot"]);
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       const operation = normalizeOperation(raw.operation);
-      const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
+      const minimumHead = normalizeMinimumHead(raw.minimumHead);
       const minimumSnapshot = copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
       try {
         const before = await publicClient.getOperationStatus({ scope, operation });

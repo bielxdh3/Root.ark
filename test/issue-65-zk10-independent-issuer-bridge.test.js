@@ -196,8 +196,8 @@ test("alternating Proxy issuer descriptors cannot combine stale signature with c
   });
   assert.throws(() => f.verify({ ...f.input, issuerProvisioning: switchingWire }),
     /ZK10_ISSUER_BRIDGE_UNVERIFIED/);
-  assert.equal(descriptorReads, fieldCount,
-    "issuer statement must be captured once and never re-read for digest");
+  assert.equal(descriptorReads, 0,
+    "issuer Proxy must be rejected before consulting its descriptors");
 });
 
 test("accessor and throwing Proxy issuer descriptors fail closed", () => {
