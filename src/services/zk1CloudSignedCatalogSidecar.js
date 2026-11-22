@@ -38,7 +38,14 @@ function keyIdentity(target, method) {
     || (target.provider === "gdrive"
       ? !/^[A-Za-z0-9_-]{1,256}$/.test(target.pinnedDriveFileId)
       : target.pinnedDriveFileId !== null)) deny();
-  return { adapter, provider: target.provider, context: target.expectedContext,
+  const methodNames = ["status", "enabled", "key", "resolveInventoryContext",
+    "zk1StorageNamespace", method === "cloudWriter" ? "upload" : "download"];
+  // Signed provider claims pin the identity and namespace; capture the actual
+  // adapter callbacks too, so another async GET/PUT cannot replace the code
+  // being consulted while retaining a previously valid signed claim.
+  const callbacks = Object.freeze(Object.fromEntries(methodNames.map((name) =>
+    [name, adapter[name]])));
+  return { adapter, callbacks, provider: target.provider, context: target.expectedContext,
     namespace: adapter.zk1StorageNamespace(), driveFileId: target.pinnedDriveFileId,
     domainAttestation: target.domainAttestation };
 }
@@ -59,8 +66,10 @@ function copyAddress(scope, operationId) {
     .update(bytes(operationId, 16)).digest().subarray(0, 16);
   return zk1CloudCopyAddress({ scope: inventory.normalizeScope(scope), operationId: id });
 }
-function writerLocallyPinned(target, address, expectedKey) {
-  return target.adapter.enabled?.() === true
+function adapterLocallyPinned(target, address, expectedKey) {
+  return Object.entries(target.callbacks).every(([name, callback]) =>
+    target.adapter[name] === callback)
+    && target.adapter.enabled?.() === true
     && target.adapter.status?.()?.provider === target.provider
     && target.adapter.zk1StorageNamespace() === target.namespace
     && target.adapter.key(address.folder, address.name, "uploads") === expectedKey;
@@ -145,25 +154,25 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
     const keys = pinned.map((target) => target.adapter.key(
       address.folder, address.name, "uploads"));
     for (const [index, target] of pinned.entries())
-      if (!writerLocallyPinned(target, address, keys[index])) deny();
+      if (!adapterLocallyPinned(target, address, keys[index])) deny();
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-write-"));
     const staged = path.join(dir, "signed-catalog.ct");
     fs.writeFileSync(staged, payload, { flag: "wx", mode: 0o600 });
     const acknowledgements = [];
     for (const [index, target] of pinned.entries()) {
       const expectedKey = keys[index];
-      if (!writerLocallyPinned(target, address, expectedKey)) deny();
+      if (!adapterLocallyPinned(target, address, expectedKey)) deny();
       if (await target.adapter.resolveInventoryContext() !== target.context) deny();
-      if (!writerLocallyPinned(target, address, expectedKey)) deny();
+      if (!adapterLocallyPinned(target, address, expectedKey)) deny();
       const result = await target.adapter.upload(staged, address.folder, address.name,
         "uploads", { zk1BoundedBytes: payload.length,
           ...(target.provider === "webdav" ? { zk1ExpectedSha256: crypto.createHash("sha256").update(payload).digest("hex") } : {}),
           ...(target.driveFileId === null ? {} : { providerFileId: target.driveFileId }) });
-      if (!writerLocallyPinned(target, address, expectedKey)
+      if (!adapterLocallyPinned(target, address, expectedKey)
         || !result || result.provider !== target.provider || result.key !== expectedKey
         || (target.driveFileId !== null && result.id !== target.driveFileId)
         || await target.adapter.resolveInventoryContext() !== target.context
-        || !writerLocallyPinned(target, address, expectedKey)) deny();
+        || !adapterLocallyPinned(target, address, expectedKey)) deny();
       acknowledgements.push(Object.freeze({ provider: target.provider,
         providerObjectKey: expectedKey, providerFileId: target.driveFileId }));
     }
@@ -171,13 +180,13 @@ async function publishSignedCatalogSidecars({ scope, operationId, signedCatalog,
     // provider before even a NON-AUTHORIZING ACK, including expiry of signed
     // domain attestations; separate probes do not prove an atomic cloud lease.
     for (const [index, target] of pinned.entries()) {
-      if (!writerLocallyPinned(target, address, keys[index])) deny();
+      if (!adapterLocallyPinned(target, address, keys[index])) deny();
       if (await target.adapter.resolveInventoryContext() !== target.context) deny();
-      if (!writerLocallyPinned(target, address, keys[index])) deny();
+      if (!adapterLocallyPinned(target, address, keys[index])) deny();
     }
     pinnedDomains(providerDomainPinset, scope, pinned);
     for (const [index, target] of pinned.entries())
-      if (!writerLocallyPinned(target, address, keys[index])) deny();
+      if (!adapterLocallyPinned(target, address, keys[index])) deny();
     return Object.freeze({ status: "SIGNED_CATALOG_PUT_ACK_NONAUTHORITATIVE",
       acknowledgements: Object.freeze(acknowledgements), remoteDurabilityProven: false });
   } catch (_) { deny(); }
@@ -206,21 +215,30 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   pinnedDomains(providerDomainPinset, scope, pinned);
   if (deadline !== undefined && !isZk1ProviderDeadline(deadline)) deny();
   const limit = deadline || createZk1ProviderDeadline({ deadlineMs, parentSignal: abortSignal });
-  const address = copyAddress(scope, operationId);
   const recovered = [];
   try {
-  for (const target of pinned) {
+  const address = copyAddress(scope, operationId);
+  const keys = pinned.map((target) => target.adapter.key(address.folder, address.name, "uploads"));
+  for (const [index, target] of pinned.entries()) {
+    if (typeof keys[index] !== "string"
+      || !keys[index].endsWith(`/uploads/${address.folder}/${address.name}`)
+      || !adapterLocallyPinned(target, address, keys[index])) deny();
+  }
+  for (const [index, target] of pinned.entries()) {
     let dir;
     try {
+      if (!adapterLocallyPinned(target, address, keys[index])) deny();
       if (await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context) deny();
+      if (!adapterLocallyPinned(target, address, keys[index])) deny();
       dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk1-signed-catalog-read-"));
       const destination = path.join(dir, "catalog.ct");
       const received = await limit.run((signal) => target.adapter.download(address.folder, address.name,
         destination, "uploads", () => !signal.aborted,
         { maxBytes: MAX, boundedLengthOnly: true, ...(target.driveFileId === null ? {}
           : { providerFileId: target.driveFileId }), abortSignal: signal }));
-      if (received !== true || await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context
-        || target.adapter.zk1StorageNamespace() !== target.namespace) deny();
+      if (received !== true || !adapterLocallyPinned(target, address, keys[index])
+        || await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context
+        || !adapterLocallyPinned(target, address, keys[index])) deny();
       const info = fs.lstatSync(destination, { bigint: true });
       if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1n
         || info.size < 1n || info.size > BigInt(MAX)) deny();
@@ -264,11 +282,17 @@ async function recoverSignedCatalogSidecar({ scope, operationId, readers,
   // enough for the first to be reconfigured or its attestation to expire.
   for (const match of eligible[0]) {
     const target = pinned.find((item) => item.provider === match.provider);
-    if (!target || await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context
-      || target.adapter.zk1StorageNamespace() !== target.namespace) deny();
+    const index = pinned.indexOf(target);
+    if (!target || !adapterLocallyPinned(target, address, keys[index])
+      || await limit.run(() => target.adapter.resolveInventoryContext()) !== target.context
+      || !adapterLocallyPinned(target, address, keys[index])) deny();
   }
   pinnedDomains(providerDomainPinset, scope, pinned);
   limit.assertActive();
+  for (const match of eligible[0]) {
+    const index = pinned.findIndex((entry) => entry.provider === match.provider);
+    if (index < 0 || !adapterLocallyPinned(pinned[index], address, keys[index])) deny();
+  }
   // No ordering of separate awaited identity checks proves that the first
   // principal stayed valid during the last provider's check. A full strict
   // success requires a future independently verified shared authority fence.

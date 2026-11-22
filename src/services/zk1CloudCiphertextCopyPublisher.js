@@ -74,6 +74,7 @@ function capturedChunks(values, expectedSha, expectedRoot) {
 
 class Zk1CloudCiphertextCopyPublisher {
   #writer;
+  #writerCallbacks;
   #context;
   #provider;
   #driveId;
@@ -96,6 +97,9 @@ class Zk1CloudCiphertextCopyPublisher {
         (typeof pinnedDriveFileId !== "string"
           || !/^[A-Za-z0-9_-]{1,256}$/.test(pinnedDriveFileId)))) fail();
     this.#writer = cloudWriter;
+    this.#writerCallbacks = Object.freeze(Object.fromEntries(
+      ["status", "enabled", "resolveInventoryContext", "key", "upload",
+        "zk1StorageNamespace"].map((name) => [name, cloudWriter[name]])));
     this.#context = expectedWriterContext;
     this.#provider = expectedProvider;
     this.#driveId = pinnedDriveFileId;
@@ -115,7 +119,9 @@ class Zk1CloudCiphertextCopyPublisher {
     // provider adapter for future use. Synchronously refuse a provider,
     // namespace, enabled-state or object-key rebind at each local boundary.
     // This is rejection-only; it is NOT a remote linearizable owner fence.
-    if (this.#writer.enabled() !== true
+    if (Object.entries(this.#writerCallbacks).some(([name, callback]) =>
+      this.#writer[name] !== callback)
+      || this.#writer.enabled() !== true
       || this.#writer.status()?.provider !== this.#provider
       || (typeof this.#writer.zk1StorageNamespace === "function"
         ? this.#writer.zk1StorageNamespace() : null) !== this.#namespace

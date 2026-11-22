@@ -140,6 +140,31 @@ for (const provider of ["s3", "gdrive"]) {
   });
 }
 
+test("ciphertext physical GET must reject late cloud adapter revocation and callback replacement", async () => {
+  for (const mutation of ["disabled", "provider", "namespace", "key", "download-callback"]) {
+    const f = fixture("s3");
+    const context = await f.reader.resolveInventoryContext();
+    const download = f.reader.download.bind(f.reader);
+    let completedGet = false;
+    f.reader.download = async (...args) => {
+      const result = await download(...args);
+      completedGet = true;
+      if (mutation === "disabled") f.reader.enabled = () => false;
+      else if (mutation === "provider") f.reader.status = () => ({ provider: "gdrive" });
+      else if (mutation === "namespace") f.reader.zk1StorageNamespace = () => "e".repeat(64);
+      else if (mutation === "key") f.reader.key = () => "foreign/uploads/other.ct";
+      else f.reader.download = async () => false;
+      return result;
+    };
+    const verifier = new Zk1CloudCiphertextReadbackVerifier({
+      cloudReader: f.reader, expectedProvider: "s3", expectedReaderContext: context,
+    });
+    await assert.rejects(verifier.verifyExact(f.input), /ZK_CLOUD_READBACK_UNAVAILABLE/,
+      `${mutation} cannot leave a matched readback from an unpinned provider`);
+    assert.equal(completedGet, true, "exercise the actual provider GET before mutation");
+  }
+});
+
 test("cloud physical verifier rejects unsafe length/commitment inputs before provider reads", async () => {
   const f = fixture("s3");
   const pinned = await f.reader.resolveInventoryContext();

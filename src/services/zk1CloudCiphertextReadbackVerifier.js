@@ -71,6 +71,7 @@ function zk1CloudCopyAddress(input) {
 
 class Zk1CloudCiphertextReadbackVerifier {
   #reader;
+  #readerCallbacks;
   #expectedProvider;
   #expectedContext;
   #driveId;
@@ -96,6 +97,9 @@ class Zk1CloudCiphertextReadbackVerifier {
         (typeof pinnedDriveFileId !== "string"
           || !/^[A-Za-z0-9_-]{1,256}$/.test(pinnedDriveFileId)))) fail();
     this.#reader = cloudReader;
+    this.#readerCallbacks = Object.freeze(Object.fromEntries(
+      ["status", "enabled", "resolveInventoryContext", "key", "download",
+        "zk1StorageNamespace"].map((name) => [name, cloudReader[name]])));
     this.#expectedProvider = expectedProvider;
     this.#expectedContext = expectedReaderContext;
     this.#driveId = pinnedDriveFileId;
@@ -110,6 +114,19 @@ class Zk1CloudCiphertextReadbackVerifier {
     return Object.freeze({ provider: this.#expectedProvider, driveFileId: this.#driveId,
       namespaceIdentity: this.#namespace, providerVersionId: this.#s3Version,
       providerEtag: this.#webdavEtag });
+  }
+
+  #assertReaderStillPinned(address, expectedKey) {
+    // An identical digest does not prove which configured cloud principal
+    // supplied the bytes if the adapter was disabled, rebound or replaced
+    // while an awaited GET was active.
+    if (Object.entries(this.#readerCallbacks).some(([name, callback]) =>
+      this.#reader[name] !== callback)
+      || this.#reader.enabled() !== true
+      || this.#reader.status()?.provider !== this.#expectedProvider
+      || (typeof this.#reader.zk1StorageNamespace === "function"
+        ? this.#reader.zk1StorageNamespace() : null) !== this.#namespace
+      || this.#reader.key(address.folder, address.name, "uploads") !== expectedKey) fail();
   }
 
   async verifyExact(input) {
@@ -135,8 +152,11 @@ class Zk1CloudCiphertextReadbackVerifier {
       const { folder, name } = location(scope, operationId);
       const expectedKey = this.#reader.key(folder, name, "uploads");
       if (typeof expectedKey !== "string" || !expectedKey.endsWith(`/uploads/${folder}/${name}`)) fail();
+      const address = { folder, name };
+      this.#assertReaderStillPinned(address, expectedKey);
       const before = await boundedIdentityRead(() => this.#reader.resolveInventoryContext());
       if (before !== this.#expectedContext) fail();
+      this.#assertReaderStillPinned(address, expectedKey);
       dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk1-cloud-readback-"));
       const destination = path.join(dir, "ciphertext.ct");
       const downloaded = await this.#reader.download(folder, name, destination, "uploads",
@@ -145,8 +165,10 @@ class Zk1CloudCiphertextReadbackVerifier {
           ...(this.#webdavEtag === null ? {} : { expectedEtag: this.#webdavEtag }),
           ...(this.#driveId === null ? {} : { providerFileId: this.#driveId }) });
       if (downloaded !== true) fail();
+      this.#assertReaderStillPinned(address, expectedKey);
       const identity = await boundedIdentityRead(() => this.#reader.resolveInventoryContext());
       if (identity !== this.#expectedContext) fail();
+      this.#assertReaderStillPinned(address, expectedKey);
       // Node's ordinary numeric inode/file IDs can round adjacent 64-bit
       // Windows identities to the same Number. Keep every comparison bigint.
       const stat = fs.lstatSync(destination, { bigint: true });
@@ -189,6 +211,7 @@ class Zk1CloudCiphertextReadbackVerifier {
       }
       if (!equal(crypto.createHash("sha256").update(contents).digest(), expectedSha)
         || !equal(computeZk1CiphertextRoot(chunks), expectedRoot)) fail();
+      this.#assertReaderStillPinned(address, expectedKey);
       return Object.freeze({ status: "EXTERNAL_CIPHERTEXT_REREAD_MATCHED",
         provider: this.#expectedProvider, readbackMatched: true,
         providerFileId: this.#driveId,

@@ -60,6 +60,26 @@ test("late S3/Drive/WebDAV writer rebind after real synthetic PUT cannot mint ev
   "a late provider disable, namespace rebind or type switch invalidates even a nonauthoritative receipt");
 });
 
+test("physical ciphertext PUT rejects callback identity replacement after remote bytes are written", async () => {
+  const f = fixture("s3");
+  const writer = f.client("writer");
+  const originalUpload = writer.upload.bind(writer);
+  let finishedPut = false;
+  writer.upload = async (...args) => {
+    const answer = await originalUpload(...args);
+    finishedPut = true;
+    writer.resolveInventoryContext = async () => await f.client("writer").resolveInventoryContext();
+    return answer;
+  };
+  const publisher = new Zk1CloudCiphertextCopyPublisher({
+    cloudWriter: writer, expectedProvider: "s3",
+    expectedWriterContext: await writer.resolveInventoryContext(),
+  });
+  await assert.rejects(publisher.publishExact(f.payload), /ZK_CLOUD_COPY_UNAVAILABLE/,
+    "mutating a trusted principal callback during PUT must invalidate its ACK");
+  assert.equal(finishedPut, true, "remote PUT must finish before callback replacement");
+});
+
 function fixture(provider) {
   const scope = { account_id: crypto.randomBytes(16),
     compartment_id: crypto.randomBytes(7), keyring_id: crypto.randomBytes(16) };

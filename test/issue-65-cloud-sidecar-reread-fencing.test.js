@@ -181,6 +181,27 @@ test("sidecar PUT does not acknowledge an earlier S3 principal revoked during la
   assert.equal(uploaded, true, "exercise actual later Drive PUT before detecting stale S3");
 });
 
+test("signed sidecar PUT rejects late callback replacement of an earlier writer", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-stale-callback-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+  const fixture = durableFixture(directory);
+  const first = fixture.publication.writers[0].cloudWriter;
+  const second = fixture.publication.writers[1].cloudWriter;
+  const originalUpload = second.upload;
+  let secondPutCompleted = false;
+  second.upload = async function (...args) {
+    const result = await originalUpload.apply(this, args);
+    secondPutCompleted = true;
+    first.resolveInventoryContext = async () => fixture.identities.s3;
+    return result;
+  };
+  await assert.rejects(publishSignedCatalogSidecars({ ...fixture.publication,
+    writers: fixture.publication.writers.slice(0, 2) }),
+  /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+  "an earlier signed principal cannot be accepted after its identity callback is replaced");
+  assert.equal(secondPutCompleted, true, "second cloud PUT must finish before stale callback detection");
+});
+
 test("recovery refuses a provider whose pinned principal changes while another provider downloads", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-principal-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
@@ -228,4 +249,34 @@ test("late principal change during final probe is observational only; strict quo
   assert.equal(observed.coherentProviderIdentityQuorumProven, false);
   assert.equal(observed.crossProviderAtomicFenceProven, false);
   assert.equal(observed.authorizesIo, false);
+});
+
+test("signed provider-domain readback rejects late local revocation and callback rebinding", async (t) => {
+  for (const mutation of ["disabled", "provider", "key", "download-callback", "cancelled"]) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-sidecar-late-rebind-"));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5 }));
+    const fixture = durableFixture(directory);
+    await publishSignedCatalogSidecars(fixture.publication);
+    const first = fixture.readers[0].cloudReader;
+    const second = fixture.readers[1].cloudReader;
+    const secondDownload = second.download;
+    const controller = new AbortController();
+    let secondReadCompleted = false;
+    second.download = async function (...args) {
+      const received = await secondDownload.apply(this, args);
+      secondReadCompleted = true;
+      if (mutation === "disabled") first.enabled = () => false;
+      else if (mutation === "provider") first.status = () => ({ provider: "gdrive" });
+      else if (mutation === "key") first.key = () => "foreign/uploads/unrelated.ct";
+      else if (mutation === "download-callback") first.download = async () => false;
+      else controller.abort();
+      return received;
+    };
+    await assert.rejects(verifyPublishedSignedCatalogSidecars({
+      ...fixture.verification, abortSignal: controller.signal,
+    }), /ZK_SIGNED_CATALOG_SIDECAR_DENIED/,
+    `signed ${mutation} provider state must invalidate the earlier S3 GET`);
+    assert.equal(secondReadCompleted, true,
+      `${mutation} must occur after a successful second physical GET`);
+  }
 });
