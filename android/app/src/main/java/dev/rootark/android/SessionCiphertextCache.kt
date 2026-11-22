@@ -65,6 +65,11 @@ internal class SessionCiphertextCache(
         }
         val snapshot = captureIdentity(record, expectedObjectId, bytes)
         val previous = saved
+        // A later server revision is not evidence that our existing local
+        // AEAD packet is still intact. Authenticate the old disk bytes before
+        // permitting any replacement; corruption must be surfaced and evicted
+        // rather than silently overwritten by an unrelated network response.
+        if (previous != null) inspect(requester, previous.objectId)
         if (previous != null && previous.objectId == snapshot.objectId &&
             snapshot.revisionCounter <= previous.revisionCounter) {
             if (snapshot == previous) {

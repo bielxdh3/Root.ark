@@ -141,6 +141,27 @@ class SessionCiphertextCacheTest {
         assertTrue(root.listFiles().isNullOrEmpty())
     }
 
+    @Test fun newerRevisionCannotSilentlyReplaceCorruptedEncryptedCapture() {
+        val cache = SessionCiphertextCache(root, binding, key)
+        cache.save(binding, "fixture-object-1", body)
+        val sealed = File(root, "packet.bin")
+        val tampered = sealed.readBytes()
+        tampered[tampered.lastIndex] = (tampered.last().toInt() xor 1).toByte()
+        sealed.writeBytes(tampered)
+
+        // The remote envelope is only structurally checked here. Its claimed
+        // incremented revision must not conceal local tampering with the
+        // previously authenticated AEAD storage record.
+        val next = JSONObject(String(body, Charsets.UTF_8))
+        next.getJSONObject("revision").put("counter", 2)
+        next.getJSONObject("authorization").getJSONObject("revision").put("counter", 2)
+        assertThrows(SecurityException::class.java) {
+            cache.save(binding, "fixture-object-1", next.toString().toByteArray())
+        }
+        assertNull(cache.snapshot(binding))
+        assertTrue(root.listFiles().isNullOrEmpty())
+    }
+
     @Test fun logoutErasesTheCiphertextAndRejectsInFlightCapture() {
         val cache = SessionCiphertextCache(root, binding, key)
         cache.save(binding, "fixture-object-1", body)
