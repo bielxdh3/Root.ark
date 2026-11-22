@@ -34,6 +34,27 @@ function node {
   }
   if ($argv[1] -eq 'hydrate') {
     if ($env:ROOTARK_TEST_MODE -eq 'deny') { $global:LASTEXITCODE = 1; return '' }
+    if ($env:ROOTARK_TEST_MODE -eq 'config-swap') {
+      # A local adversary rewrites the sync root after Node reports a
+      # verified hydrate, hoping to reveal an unrelated preexisting file.
+      [IO.File]::WriteAllText($env:ROOTARK_TEST_CONFIG,
+        (@{ localFolder = $env:ROOTARK_TEST_FOREIGN_ROOT } | ConvertTo-Json -Compress))
+    }
+    if ($env:ROOTARK_TEST_MODE -eq 'reparse-leaf') {
+      # Node created the real symlink before this PowerShell process started.
+      # Windows PowerShell 5.1 New-Item -ItemType SymbolicLink can fail for a
+      # non-admin even when Node can create unprivileged Windows symlinks.
+      [IO.File]::Move($env:ROOTARK_TEST_TARGET, ($env:ROOTARK_TEST_TARGET + '.before-swap'))
+      [IO.File]::Move($env:ROOTARK_TEST_PREPARED_LINK, $env:ROOTARK_TEST_TARGET)
+      $global:LASTEXITCODE = 0
+      return '{"path":"docs/verified.txt","action":"hydrate","result":true}'
+    }
+    if ($env:ROOTARK_TEST_MODE -eq 'reparse-parent') {
+      [IO.Directory]::Move($env:ROOTARK_TEST_PARENT, ($env:ROOTARK_TEST_PARENT + '.before-swap'))
+      [IO.Directory]::Move($env:ROOTARK_TEST_PREPARED_LINK, $env:ROOTARK_TEST_PARENT)
+      $global:LASTEXITCODE = 0
+      return '{"path":"docs/verified.txt","action":"hydrate","result":true}'
+    }
     $global:LASTEXITCODE = 0
     return '{"path":"verified","action":"hydrate","result":true}'
   }
@@ -52,10 +73,11 @@ function Start-Process {
   param([string]$FilePath, [string[]]$ArgumentList)
   Set-Content -LiteralPath $env:ROOTARK_TEST_LAUNCH -Value (@{ process = $FilePath; arguments = @($ArgumentList) } | ConvertTo-Json -Compress)
 }
+if ($env:ROOTARK_TEST_LOCATION) { Set-Location -LiteralPath $env:ROOTARK_TEST_LOCATION }
 try { & $env:ROOTARK_TEST_PICKER -Config $env:ROOTARK_TEST_CONFIG } catch { Write-Output $_.Exception.Message; exit 42 }
 `;
 
-async function runPicker(t, mode, selectedPath = "docs/verified.txt") {
+async function runPicker(t, mode, selectedPath = "docs/verified.txt", options = {}) {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-picker-test-"));
   t.after(() => fs.rm(temp, { recursive: true, force: true }));
   const local = path.join(temp, "Root Ark Files");
@@ -64,15 +86,70 @@ async function runPicker(t, mode, selectedPath = "docs/verified.txt") {
   const config = path.join(temp, "private-config.json");
   const trace = path.join(temp, "trace.txt");
   const launch = path.join(temp, "launch.json");
-  await fs.writeFile(config, JSON.stringify({ localFolder: local }));
+  const target = path.join(local, "docs", "verified.txt");
+  const foreignRoot = path.join(temp, "foreign-root");
+  if (mode === "config-swap") {
+    await fs.mkdir(path.join(foreignRoot, "docs"), { recursive: true });
+    await fs.writeFile(path.join(foreignRoot, "docs", "verified.txt"), "foreign bytes were not verified");
+  }
+  const outside = path.join(temp, mode === "reparse-parent" ? "outside-dir" : "outside.txt");
+  const prepared = path.join(temp, mode === "reparse-parent" ? "prepared-junction" : "prepared-symlink.txt");
+  if (mode === "reparse-leaf" || mode === "reparse-parent") {
+    if (mode === "reparse-parent") {
+      await fs.mkdir(outside);
+      await fs.writeFile(path.join(outside, "verified.txt"), "foreign bytes never hydrated by the engine");
+    } else {
+      await fs.writeFile(outside, "foreign bytes never hydrated by the engine");
+    }
+    try {
+      await fs.symlink(outside, prepared, mode === "reparse-parent" ? "junction" : "file");
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) {
+        t.skip("Windows symlink/junction creation requires sufficient privileges");
+        return null;
+      }
+      throw error;
+    }
+    assert.equal((await fs.lstat(prepared)).isSymbolicLink(), true,
+      "the prepared reparse point must be real before running PowerShell");
+  }
+  const drive = path.parse(temp).root.slice(0, 2);
+  const configuredFolder = options.folderMode === "relative" ? "Root Ark Files"
+    : options.folderMode === "drive-relative" ? `${drive}Root Ark Files`
+      : options.folderMode === "root-relative" ? local.slice(path.parse(local).root.length - 1)
+        : local;
+  await fs.writeFile(config, JSON.stringify({ localFolder: configuredFolder }));
+  const otherLocation = path.join(temp, "other-working-directory");
+  if (options.differentLocation) await fs.mkdir(otherLocation);
   const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", harness], {
     env: { ...process.env, ROOTARK_TEST_MODE: mode, ROOTARK_TEST_CHOICE: selectedPath,
       ROOTARK_TEST_TRACE: trace, ROOTARK_TEST_LAUNCH: launch,
-      ROOTARK_TEST_CONFIG: config, ROOTARK_TEST_PICKER: picker },
+      ROOTARK_TEST_CONFIG: options.relativeConfig ? ".\\private-config.json" : config,
+      ROOTARK_TEST_LOCATION: options.relativeConfig ? temp : options.differentLocation ? otherLocation : "",
+      ROOTARK_TEST_PICKER: picker,
+      ROOTARK_TEST_FOREIGN_ROOT: foreignRoot,
+      ROOTARK_TEST_TARGET: target, ROOTARK_TEST_PARENT: path.dirname(target),
+      ROOTARK_TEST_PREPARED_LINK: prepared },
     encoding: "utf8", timeout: 20000,
   });
   return { result, local, trace: await fs.readFile(trace, "utf8").catch(() => ""),
     launch: await fs.readFile(launch, "utf8").then(JSON.parse, () => null) };
+}
+
+async function assertExplorerRevealsFile(launch, expectedFile) {
+  assert.ok(launch, "Explorer must be launched after verified hydration");
+  assert.equal(launch.process.toLowerCase().endsWith("explorer.exe"), true);
+  assert.equal(launch.arguments.length, 1, "Explorer must receive exactly one selection argument");
+  const selection = /^\/select,"([^"]+)"$/i.exec(launch.arguments[0]);
+  assert.ok(selection, "Explorer must receive a quoted, single-file /select argument");
+  // Windows PowerShell's GetFullPath expands NTFS 8.3 components while Node's
+  // os.tmpdir() can report RUNNER~1. Compare the actual on-disk destination;
+  // different names, symlinks, or sibling files must never satisfy this check.
+  const [actualCanonical, expectedCanonical] = await Promise.all([
+    fs.realpath(selection[1]), fs.realpath(expectedFile),
+  ]);
+  assert.equal(actualCanonical.toLowerCase(), expectedCanonical.toLowerCase(),
+    "Explorer must reveal the exact verified local file");
 }
 
 for (const [mode, message] of [
@@ -96,10 +173,27 @@ test("issue 66 Windows: Explorer picker pages metadata then reveals only a verif
   assert.equal(trace.split(/\r?\n/).filter((line) => line.includes("|browse|")).length, 2);
   assert.equal(trace.split(/\r?\n/).filter((line) => line.includes("|hydrate|")).length, 1);
   assert.match(trace, /--path=docs\/verified\.txt/);
-  assert.equal(launch.process.toLowerCase().endsWith("explorer.exe"), true);
-    assert.deepEqual(launch.arguments, [`/select,"${path.join(local, "docs", "verified.txt")}"`]);
+  await assertExplorerRevealsFile(launch, path.join(local, "docs", "verified.txt"));
   assert.equal(await fs.readFile(path.join(local, "docs", "verified.txt"), "utf8"), "unchanged local bytes");
 });
+
+test("issue 66 Windows: relative config argument uses PowerShell provider location", { skip: process.platform !== "win32" }, async (t) => {
+  const { result, local, trace, launch } = await runPicker(t, "ok", "docs/verified.txt", { relativeConfig: true });
+  assert.equal(result.status, 0, `${result.stdout} ${result.stderr}`);
+  assert.match(trace, /\|browse\|/);
+  await assertExplorerRevealsFile(launch, path.join(local, "docs", "verified.txt"));
+});
+
+for (const folderMode of ["relative", "drive-relative", "root-relative"]) {
+  test(`issue 66 Windows: ${folderMode} localFolder resolves from config directory`, { skip: process.platform !== "win32" }, async (t) => {
+    const { result, local, launch, trace } = await runPicker(t, "ok", "docs/verified.txt", {
+      folderMode, differentLocation: true,
+    });
+    assert.equal(result.status, 0, `${result.stdout} ${result.stderr}`);
+    assert.match(trace, /\|hydrate\|/);
+    await assertExplorerRevealsFile(launch, path.join(local, "docs", "verified.txt"));
+  });
+}
 
 test("issue 66 Windows: failed verified hydration does not reveal or alter local bytes", { skip: process.platform !== "win32" }, async (t) => {
   const { result, local, launch, trace } = await runPicker(t, "deny");
@@ -108,6 +202,40 @@ test("issue 66 Windows: failed verified hydration does not reveal or alter local
   assert.match(trace, /\|hydrate\|/);
   assert.equal(await fs.readFile(path.join(local, "docs", "verified.txt"), "utf8"), "unchanged local bytes");
 });
+
+test("issue 66 Windows P2: config root cannot change between verified hydrate and Explorer reveal",
+  { skip: process.platform !== "win32" }, async (t) => {
+    const { result, local, launch, trace } = await runPicker(t, "config-swap");
+    assert.notEqual(result.status, 0, "the config rewrite must fail during the guarded hydrate");
+    assert.match(trace, /\|hydrate\|/, "the malicious rewrite must be attempted after a positive inventory");
+    assert.equal(launch, null, "Explorer must never reveal the unrelated foreign file");
+    assert.equal(await fs.readFile(path.join(local, "docs", "verified.txt"), "utf8"), "unchanged local bytes");
+    assert.equal(await fs.readFile(path.join(path.dirname(local), "foreign-root", "docs", "verified.txt"), "utf8"),
+      "foreign bytes were not verified");
+  });
+
+for (const { mode, reparseComponent } of [
+  { mode: "reparse-leaf", reparseComponent: "verified.txt" },
+  { mode: "reparse-parent", reparseComponent: "docs" },
+]) {
+  test(`issue 66 Windows: post-hydrate ${mode} fails before Explorer reveal`,
+    { skip: process.platform !== "win32" }, async (t) => {
+      const outcome = await runPicker(t, mode);
+      if (!outcome) return;
+      const { result, local, trace, launch } = outcome;
+      const swapped = path.join(local, "docs", "verified.txt");
+      const reparse = path.join(local, "docs", ...(reparseComponent === "docs" ? [] : ["verified.txt"]));
+      assert.equal((await fs.lstat(reparse).catch((error) => {
+        throw new Error(`the adversarial swap did not create a reparse point (${error.code}); PowerShell: ${result.stdout} ${result.stderr}`);
+      })).isSymbolicLink(), true,
+      `the adversarial hook must actually rename the prepared ${reparseComponent} link`);
+      assert.match(trace, /\|hydrate\|/, "the fake successful hydrate must be invoked first");
+      assert.notEqual(result.status, 0, "a swapped path must fail closed after hydrate");
+      assert.match(result.stdout + result.stderr, /reparse point/i);
+      assert.equal(launch, null, "Explorer must not reveal a now-unverified foreign target");
+      assert.equal(await fs.readFile(swapped, "utf8"), "foreign bytes never hydrated by the engine");
+    });
+}
 
 test("issue 66 Windows: advisory traversal metadata cannot reveal outside local root", { skip: process.platform !== "win32" }, async (t) => {
   const { result, launch } = await runPicker(t, "ok", "../outside.txt");

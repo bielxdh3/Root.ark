@@ -12,8 +12,53 @@ if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   throw 'Node.js is required to run the Root.ark Windows picker. Ensure node is available on PATH.'
 }
+
+# Resolve config and localFolder using PowerShell's provider location and the
+# config file directory. .NET Framework's process current directory can be
+# stale after Set-Location; drive/root-relative Windows paths also need an
+# explicit anchor before revealing hydrated bytes in Explorer.
+function Resolve-RootArkPath([string]$base, [string]$target) {
+  if ([string]::IsNullOrWhiteSpace($target)) { return $base }
+  $cleanTarget = $target.Replace('/', '\')
+  $isFullyQualified = if ($null -ne [IO.Path].GetMethod('IsPathFullyQualified', [type[]]@([string]))) {
+    [IO.Path]::IsPathFullyQualified($cleanTarget)
+  } else {
+    $cleanTarget -match '^[A-Za-z]:\\' -or $cleanTarget -match '^\\\\'
+  }
+  if ($isFullyQualified) { return [IO.Path]::GetFullPath($cleanTarget) }
+  if ($cleanTarget -match '^\\') {
+    $driveRoot = [IO.Path]::GetPathRoot($base)
+    if ([string]::IsNullOrEmpty($driveRoot)) { $driveRoot = '\' }
+    return [IO.Path]::GetFullPath([IO.Path]::Combine($driveRoot, $cleanTarget.TrimStart('\')))
+  }
+  if ($cleanTarget -match '^([A-Za-z]:)(.*)$') {
+    $drive = $Matches[1]
+    $relativePart = $Matches[2].TrimStart('\')
+    $baseDrive = if ($base -match '^([A-Za-z]:)') { $Matches[1] } else { '' }
+    if ($baseDrive -and $drive.Equals($baseDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return [IO.Path]::GetFullPath([IO.Path]::Combine($base, $relativePart))
+    }
+    return [IO.Path]::GetFullPath([IO.Path]::Combine("$drive\", $relativePart))
+  }
+  return [IO.Path]::GetFullPath([IO.Path]::Combine($base, $cleanTarget))
+}
+
+$Config = Resolve-RootArkPath (Get-Location).ProviderPath $Config
+
 $previousOutputEncoding = [Console]::OutputEncoding
+$configLease = $null
 try {
+# The same private config must authorize inventory, signed hydration and the
+# Explorer target. Hold an OS read-sharing lease so another process cannot
+# rewrite or rename this file between the Node calls and the final reveal.
+$configLease = [IO.File]::Open($Config, [IO.FileMode]::Open,
+  [IO.FileAccess]::Read, [IO.FileShare]::Read)
+$configContents = Get-Content -LiteralPath $Config -Raw -Encoding UTF8
+$localFolder = [string](($configContents | ConvertFrom-Json).localFolder)
+if ([string]::IsNullOrWhiteSpace($localFolder)) { throw 'Local sync folder unavailable.' }
+$configDir = Split-Path -Parent $Config
+$root = Resolve-RootArkPath $configDir $localFolder
+
 # Windows PowerShell 5.1 otherwise decodes Node's UTF-8 JSON using the OEM
 # codepage, corrupting signed remote filenames before the hydrate lookup.
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -66,12 +111,10 @@ if ($hydrated.action -ne 'hydrate' -or $hydrated.result -isnot [bool] -or $hydra
 }
 
 # Reveal only. Opening an associated app automatically could execute remote content.
-$localFolder = [string]((Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json).localFolder)
-if ([string]::IsNullOrWhiteSpace($localFolder)) { throw 'Local sync folder unavailable.' }
-$root = if ([IO.Path]::IsPathRooted($localFolder)) {
-  [IO.Path]::GetFullPath($localFolder)
-} else {
-  [IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath $localFolder))
+# If the config path has been redirected despite the held file handle, refuse
+# to reveal a path based on settings different from those used for hydration.
+if ((Get-Content -LiteralPath $Config -Raw -Encoding UTF8) -cne $configContents) {
+  throw 'Root.ark private config changed during hydration; Explorer was not opened.'
 }
 $target = [IO.Path]::GetFullPath((Join-Path $root ([string]$chosen[0].Path -replace '/', '\')))
 $rootPrefix = $root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
@@ -79,7 +122,27 @@ if (-not $target.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) 
   -not (Test-Path -LiteralPath $target -PathType Leaf)) {
   throw 'Hydrated file is missing or outside the local sync folder.'
 }
+# Best-effort check-time defense: a local writer can leave a reparse point at
+# the just-hydrated leaf or an ancestor. Test-Path follows it, so inspect the
+# link itself at every path component before Explorer selection. This check
+# does NOT hold filesystem handles or close the later check-to-Explorer race;
+# it must not be used as proof of native held-handle path custody.
+$inspected = $target
+$rootBoundary = $root.TrimEnd('\', '/')
+while ($true) {
+  $entry = Get-Item -LiteralPath $inspected -Force -ErrorAction Stop
+  if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw 'Hydrated file path changed to a reparse point; Explorer was not opened.'
+  }
+  if ($inspected.TrimEnd('\', '/').Equals($rootBoundary, [StringComparison]::OrdinalIgnoreCase)) { break }
+  $parent = [IO.Path]::GetDirectoryName($inspected)
+  if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $inspected) {
+    throw 'Hydrated file parent path is invalid.'
+  }
+  $inspected = $parent
+}
 Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList @(('/select,"' + $target + '"')) | Out-Null
 } finally {
+  if ($null -ne $configLease) { $configLease.Dispose() }
   [Console]::OutputEncoding = $previousOutputEncoding
 }

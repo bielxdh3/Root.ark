@@ -7,7 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
-const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { createAuthorizationProof, verifyAuthorizationProof } =
+  require("../sync-client/rootark-sync-authorization");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { SyncObjectStore } = require("../src/routes/sync");
@@ -137,4 +138,135 @@ test("issue 66 P2 atomic: losing Files On-Demand client preserves outbox when ri
   assert.equal((await client.journal.recover())[0].metadata.path, relative);
   assert.equal((await fsp.readFile(filename, "utf8")), "local bytes must survive the race");
   assert.deepEqual(second.list("alice").map((record) => record.objectId), ["object-rival"]);
+});
+
+test("issue 66 P1: even stored signed CREATE remains pending without independent receipt", async (t) => {
+  const { first, second, authorize, publicKey, storagePath } = await fixture(t);
+  const rootDir = path.join(path.dirname(storagePath), "lost-ack-client");
+  const relative = "docs/own-create.txt";
+  const filename = path.join(rootDir, "docs", "own-create.txt");
+  const bytes = "owner file survives unknown server acknowledgement";
+  await fsp.mkdir(path.dirname(filename), { recursive: true });
+  await fsp.writeFile(filename, bytes);
+  const key = crypto.randomBytes(32);
+  let calls = 0;
+  let fullReads = 0;
+  const adapter = {
+    async push(operation) {
+      calls++;
+      const stored = await first.put("alice", operation);
+      assert.equal(stored.kind, "stored", "remote commits the exact signed CREATE first");
+      throw Object.assign(new Error("HTTP ACK lost after fsync"), { code: "offline" });
+    },
+    async list(objectId = "") {
+      fullReads++;
+      return second.list("alice", objectId || null);
+    },
+    async listInventory() {
+      const records = second.list("alice").map(({ ciphertext, nonce, tag, aad,
+        authorization, ...record }) => record);
+      return { protocolVersion: 2, view: "metadata", objects: records,
+        nextCursor: null };
+    },
+  };
+  const open = () => new SyncEngine({
+    rootDir, adapter, deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    filesOnDemand: true, selectedPaths: ["docs"], maxRetries: 1,
+    requireAuthorization: true,
+    authorizationFactory: async (operation) => (await authorize(operation)).authorization,
+    verifyIncoming: (operation) => verifyAuthorizationProof(
+      operation.authorization, operation, { username: "alice",
+        trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] }),
+    requireCurrentOutgoingAuthorization: true,
+    currentDeviceAuthorization: () => true,
+  }).open();
+  const started = await open();
+  // A native-required root cannot treat a lost outbound ACK as a proven
+  // no-write failure. Even if the adapter labels it "offline", the physical
+  // lock remains quarantined until an independent durable receipt exists.
+  await assert.rejects(started.syncOnce(), { code: "offline" });
+  assert.equal(calls, 1);
+  assert.equal((await started.journal.recover()).length, 1);
+  const authentic = second.list("alice")[0];
+  assert.equal(await verifyAuthorizationProof(authentic.authorization, authentic, {
+    username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+    revokedDeviceIds: [] }), true);
+  assert.equal(fullReads, 0,
+    "the first attempt has not yet fetched the full remote ciphertext");
+
+  await assert.rejects(open(), { code: "sync_root_busy" },
+    "the uncertain physical remote write cannot release the native-required root");
+  assert.equal((await started.journal.recover()).length, 1,
+    "a stored but unproven CREATE must remain queued behind the physical lock");
+  assert.equal(calls, 1, "unproven admission must not send a second destructive CREATE");
+  assert.equal(fullReads, 0,
+    "a second server-controlled GET cannot establish physical admission");
+  assert.equal(second.list("alice").length, 1);
+  assert.equal(await fsp.readFile(filename, "utf8"), bytes);
+});
+
+test("issue 66 P1: malicious signed CREATE echo cannot prove physical admission", async (t) => {
+  const { first, second, authorize, publicKey, storagePath } = await fixture(t);
+  const rootDir = path.join(path.dirname(storagePath), "malicious-echo-client");
+  const relative = "docs/phantom-create.txt";
+  const filename = path.join(rootDir, "docs", "phantom-create.txt");
+  const bytes = "local bytes cannot disappear behind a fake ACK";
+  await fsp.mkdir(path.dirname(filename), { recursive: true });
+  await fsp.writeFile(filename, bytes);
+  const key = crypto.randomBytes(32);
+  let echoed = null;
+  let pushCount = 0;
+  const adapter = {
+    async push(operation) {
+      pushCount++;
+      // Deliberately DO NOT call store.put. The server only remembers the
+      // genuine signed request, and lies to every later read endpoint.
+      echoed = JSON.parse(JSON.stringify(operation));
+      assert.equal(await verifyAuthorizationProof(echoed.authorization, echoed, {
+        username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+        revokedDeviceIds: [],
+      }), true, "the echoed CREATE has a genuine Ed25519 signature");
+      throw Object.assign(new Error("HTTP ACK lost, no physical COMMIT"), { code: "offline" });
+    },
+    async list() { return echoed ? [echoed] : []; },
+    async listInventory() {
+      const objects = echoed ? [(({ ciphertext, nonce, tag, aad, authorization, ...record }) =>
+        record)(echoed)] : [];
+      return { protocolVersion: 2, view: "metadata", objects, nextCursor: null };
+    },
+  };
+  const open = () => new SyncEngine({
+    rootDir, adapter, deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    filesOnDemand: true, selectedPaths: ["docs"], maxRetries: 1,
+    requireAuthorization: true,
+    authorizationFactory: async (operation) => (await authorize(operation)).authorization,
+    verifyIncoming: (operation) => verifyAuthorizationProof(
+      operation.authorization, operation, { username: "alice",
+        trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] }),
+    requireCurrentOutgoingAuthorization: true,
+    currentDeviceAuthorization: () => true,
+  }).open();
+  const interrupted = await open();
+  await assert.rejects(interrupted.syncOnce(), { code: "offline" },
+    "an unproven outbound attempt cannot be reported as safely offline");
+  const pending = await interrupted.journal.recover();
+  assert.equal(pending.length, 1);
+  assert.equal(pushCount, 1);
+  assert.deepEqual(first.list("alice"), [], "no CREATE reached the physical backend");
+  assert.deepEqual(second.list("alice"), [], "independent backend view remains empty");
+  assert.equal(pending[0].operationId, echoed.operationId);
+  const originalSnapshot = JSON.stringify(interrupted.snapshot.files);
+
+  await assert.rejects(open(), { code: "sync_root_busy" },
+    "the local root must remain quarantined after a forged remote ACK");
+  const preserved = await interrupted.journal.recover();
+  assert.equal(preserved.length, 1, "markSeen must not consume locally pending CREATE");
+  assert.equal(preserved[0].operationId, pending[0].operationId);
+  assert.equal(JSON.stringify(interrupted.snapshot.files), originalSnapshot,
+    "the forged readback must not create a remotely acknowledged snapshot");
+  assert.equal(await fsp.readFile(filename, "utf8"), bytes);
+  assert.deepEqual(second.list("alice"), [], "physical backend must still be empty");
+  assert.equal(pushCount, 1, "fake receipt must not resend or consume the CREATE");
 });

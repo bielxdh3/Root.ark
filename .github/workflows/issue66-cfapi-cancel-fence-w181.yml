@@ -5,6 +5,7 @@ on:
     branches:
       - agent/pr300-cfapi-native-w181-20261122
       - agent/pr300-fetch-positive-w190-20261122
+      - agent/pr295-pr300-integrated-w190-20261122
     paths:
       - '.github/workflows/issue66-cfapi-cancel-fence-w181.yml'
       - 'sync-client/rootark-sync-windows-cfapi-cancel-fence.hpp'
@@ -64,4 +65,3 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           node --test test/issue-66-cfapi-live-fetch-native.test.js
-          }

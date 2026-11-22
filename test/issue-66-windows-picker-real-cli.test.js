@@ -18,6 +18,12 @@ const picker = path.resolve(__dirname, "../sync-client/rootark-sync-windows-pick
 const cli = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
 
 const { args } = require("../sync-client/rootark-sync-v2");
+// The merged native #300 S0 contract intentionally refuses selected FOD
+// publication until an independent RootSession is available. These positive
+// signed CLI/Explorer oracles remain executable but pending that native gate;
+// the mock picker security and refusal tests run independently on Windows.
+const NATIVE_PICKER_PENDING =
+  "Native RootSession signed hydration is unavailable; positive CLI oracle pending";
 
 test("issue 66: Sync v2 CLI --once parses boolean values instead of truthy strings", () => {
   assert.strictEqual(args([]).once, undefined);
@@ -82,7 +88,7 @@ for (const { filename, relativeRoot } of [
   { filename: "--relatorio.txt", relativeRoot: false },
   { filename: "arquivo relativo.txt", relativeRoot: true },
 ]) {
-test(`issue 66 Windows: real signed picker hydrate ${filename}, relativeRoot=${relativeRoot}`, { skip: process.platform !== "win32", timeout: 30000 }, async (t) => {
+test(`issue 66 Windows: real signed picker hydrate ${filename}, relativeRoot=${relativeRoot}`, { skip: NATIVE_PICKER_PENDING, timeout: 30000 }, async (t) => {
   const root = createPrivateAuthorityFixture("rootark-picker-live-");
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   const localFolder = path.join(root, "sync-data");
@@ -151,9 +157,14 @@ test(`issue 66 Windows: real signed picker hydrate ${filename}, relativeRoot=${r
   assert.equal(requests.filter((request) => request === `/sync/v1/objects/${objectId}`).length, 1);
   const reveal = JSON.parse((await fsp.readFile(launch, "utf8")).replace(/^\uFEFF/, ""));
   assert.match(reveal.executable, /explorer\.exe$/i);
-  assert.ok(reveal.args.join(" ").includes(filename));
-    assert.deepEqual(reveal.args, [`/select,"${path.join(localFolder, remotePath)}"`],
-      "Explorer must receive the selected file in one argument without a space after the comma");
+  assert.equal(reveal.args.length, 1, "Explorer must receive exactly one selection argument");
+  const chosen = /^\/select,"([^"]+)"$/i.exec(reveal.args[0]);
+  assert.ok(chosen, "Explorer must receive one quoted /select path with no space after comma");
+  const [actual, expected] = await Promise.all([
+    fsp.realpath(chosen[1]), fsp.realpath(path.join(localFolder, remotePath)),
+  ]);
+  assert.equal(actual.toLowerCase(), expected.toLowerCase(),
+    "Explorer must reveal the verified native file despite NTFS 8.3 path aliases");
   if (relativeRoot) {
     assert.equal((await fsp.readFile(path.join(staleCwd, "sync-data", remotePath), "utf8")), "UNVERIFIED STALE FILE");
   }

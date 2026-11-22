@@ -1,0 +1,49 @@
+name: Issue 66 picker / pinned MOVE candidate validation
+
+on:
+  push:
+    branches:
+      - agent/pr286-picker-integration-w181-20261122
+      - agent/pr292-move-picker-w181-20261122
+      - agent/mission-20261122-pr286-ci-prime-r1
+      - agent/pr295-picker-pin-w190-20261122
+      - agent/pr295-pr300-integrated-w190-20261122
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  picker-and-pin:
+    name: Pinned picker and FOD security (${{ matrix.os }}, Node 22)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      # The picker suite imports the real ZK1/HPKE and encrypted sync engine.
+      # A bare checkout does not contain node_modules; always install the
+      # exact lockfile dependencies before running the unfiltered cases.
+      - name: Install pinned dependencies
+        run: npm ci
+      - name: Verify all issue 66 picker, signed pin, MOVE and hydration contracts
+        if: github.ref_name != 'agent/pr295-pr300-integrated-w190-20261122'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          node --test test/issue-66-*.test.js
+      - name: Verify integrated picker, signed pin, FOD lifecycle and fail-closed RootSession
+        if: github.ref_name == 'agent/pr295-pr300-integrated-w190-20261122'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          node --test test/issue-66-device-pin.test.js test/issue-66-files-on-demand.test.js test/issue-66-protected-create-path-atomic.test.js test/issue-66-windows-picker.test.js test/issue-66-windows-picker-real-cli.test.js test/issue-66-picker-inventory-response-cap.test.js

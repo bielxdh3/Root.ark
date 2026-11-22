@@ -79,6 +79,23 @@ function args(argv) {
   return result;
 }
 
+function syncCycleReport(summary, filesOnDemand) {
+  return { pushed: summary.pushed, pulled: summary.pulled,
+    // Retain the existing available:0 contract on ordinary offline cycles.
+    // Only an unresolved 409 defers the inventory and makes zero misleading.
+    ...(filesOnDemand && (!summary.indeterminate || summary.available !== undefined)
+      ? { available: summary.available || 0 } : {}),
+    conflicts: summary.conflicts.length, offline: summary.offline,
+    ...(summary.indeterminate ? { indeterminate: summary.indeterminate } : {}) };
+}
+
+function assertOneShotSyncComplete(report) {
+  if (report.indeterminate) {
+    throw Object.assign(new Error("Sync has unresolved signed remote admission; pending outbox requires independent CURRENT/CAS reconciliation"),
+      { code: "remote_admission_unproven" });
+  }
+}
+
 async function readConfig(filePath) {
   // Enforce the same private-directory/owner/ACL boundary as other local
   // authority material before parsing a URL, token or device trust policy.
@@ -409,9 +426,9 @@ async function start(options = {}) {
   const once = options.once === true || options.once === "true";
   do {
     const summary = await engine.syncOnce();
-    console.log(JSON.stringify({ pushed: summary.pushed, pulled: summary.pulled,
-      ...(config.filesOnDemand ? { available: summary.available || 0 } : {}),
-      conflicts: summary.conflicts.length, offline: summary.offline }));
+    const report = syncCycleReport(summary, config.filesOnDemand);
+    console.log(JSON.stringify(report));
+    if (once) assertOneShotSyncComplete(report);
     if (!once) await new Promise((resolve) => setTimeout(resolve, Number(config.scanIntervalMs) || 5000));
   } while (!once);
   return engine;
@@ -435,4 +452,5 @@ if (require.main === module) {
 }
 
 module.exports = { args, fileKeyResolver, normalizeTrustedDevicePolicy,
-  trustedAtomicBatchWitnessOptions, assertPinnedStrictLocalDeviceIdentity, start };
+  trustedAtomicBatchWitnessOptions, assertPinnedStrictLocalDeviceIdentity,
+  syncCycleReport, assertOneShotSyncComplete, start };
