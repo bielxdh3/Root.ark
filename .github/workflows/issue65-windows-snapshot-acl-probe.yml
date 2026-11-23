@@ -1,0 +1,25 @@
+name: Issue 65 Windows private snapshot ACL diagnostic
+
+on:
+  push:
+    branches:
+      - 'cdx/issue68-zk-recipient-w32-20261106'
+
+permissions:
+  contents: read
+
+jobs:
+  issue65-windows-snapshot-acl-probe:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify sanitized diagnostic behavior before accessing native ACLs
+        run: node --test test/issue-65-windows-snapshot-acl-probe.test.js
+      - name: Isolate protected authority fixture vs snapshot ACL vs copy
+        run: node scripts/issue65-windows-snapshot-acl-probe.js
