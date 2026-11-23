@@ -878,8 +878,8 @@ class Zk1ProtectedObjectStore {
       // Account-session authorization is mutable independently of the owner's
       // device witness. A guard supplied by HTTP must run AFTER the admission
       // await and BEFORE a PUT changes durable ciphertext.
-      if (guard) guard();
-      return emit(this.perform(authenticated, operation));
+      if (guard) guard(authenticated);
+      return emit(this.perform(authenticated, operation), authenticated);
     });
   }
   // Catalog read/commit use the identical independently witnessed current
