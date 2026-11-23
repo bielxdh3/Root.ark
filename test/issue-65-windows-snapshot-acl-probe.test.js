@@ -130,6 +130,78 @@ test("#65 P2: production ACL helper never forwards native PowerShell stderr to s
     "the production helper must not expose raw native diagnostics to process stderr");
 });
 
+test("#65 P2: caught native ACL failures cannot expose the PowerShell command or stderr", {
+  skip: process.platform !== "win32",
+}, () => {
+  const sourceFile = path.join(__dirname, "../services/fileReadHandle.js");
+  const sentinel = "ROOTARK_ACL_EXCEPTION_PRIVATE_SENTINEL";
+  const childCode = [
+    'const fs = require("node:fs");',
+    'const vm = require("node:vm");',
+    `const source = fs.readFileSync(${JSON.stringify(sourceFile)}, "utf8");`,
+    'const start = source.indexOf("function runPowerShell(");',
+    'const end = source.indexOf("function windowsDirectoryAcl(", start);',
+    'const helperStart = source.indexOf("function fileReadError(");',
+    'const helperEnd = source.indexOf("function invalidInternalFile(", helperStart);',
+    'if (start < 0 || end <= start || helperStart < 0 || helperEnd <= helperStart) process.exit(3);',
+    'const run = vm.runInNewContext(source.slice(start, end) + "\\n" + source.slice(helperStart, helperEnd) + "\\nrunPowerShell", {',
+    '  execFileSync: require("node:child_process").execFileSync, path: require("node:path"), process,',
+    '});',
+    `try { run(${JSON.stringify(`[Console]::Error.WriteLine('${sentinel}'); exit 7`)}); process.stdout.write("UNEXPECTED_SUCCESS"); }`,
+    'catch (error) {',
+    '  const raw = [String(error.message), String(error.stack), JSON.stringify(error)].join("\\n");',
+    `  const leaked = raw.includes(${JSON.stringify(sentinel)});`,
+    '  const ownsNativeData = ["stderr", "stdout", "cmd", "spawnargs"].some((key) =>',
+    '    Object.prototype.hasOwnProperty.call(error, key));',
+    '  process.stdout.write(JSON.stringify({ leaked, ownsNativeData, code: error.code, message: error.message }));',
+    '}',
+  ].join("\n");
+  const child = spawnSync(process.execPath, ["-e", childCode], {
+    encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 10_000,
+  });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0);
+  assert.equal(child.stderr, "");
+  const observed = JSON.parse(child.stdout);
+  assert.equal(observed.leaked, false, "native stderr/command must not survive in the thrown error");
+  assert.equal(observed.ownsNativeData, false, "do not attach native child process output to the error");
+  assert.equal(observed.code, "PRIVATE_SNAPSHOT_DIRECTORY_INVALID");
+  assert.equal(observed.message, "Private snapshot ACL command failed");
+});
+
+test("#65 P2: ACL diagnostic codes survive sanitization, but forged codes and native details do not", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../services/fileReadHandle.js"), "utf8");
+  const start = source.indexOf("function runPowerShell(");
+  const end = source.indexOf("function windowsDirectoryAcl(", start);
+  const helperStart = source.indexOf("function fileReadError(");
+  const helperEnd = source.indexOf("function invalidInternalFile(", helperStart);
+  assert.ok(start >= 0 && end > start && helperStart >= 0 && helperEnd > helperStart);
+  const native = Object.assign(new Error("ROOTARK_FAKE_RAW_ACL_DETAILS"), {
+    code: "ACL_READ_ANCESTOR_D2_GET_ACL_ACCESS_DENIED",
+    stderr: "ROOTARK_FAKE_RAW_ACL_DETAILS",
+    cmd: "ROOTARK_FAKE_RAW_ACL_DETAILS",
+  });
+  const context = {
+    process, path, execFileSync: () => { throw native; },
+  };
+  const run = vm.runInNewContext(source.slice(start, end) + "\n"
+    + source.slice(helperStart, helperEnd) + "\nrunPowerShell", context);
+  assert.throws(() => run("discarded native command"), (error) => {
+    assert.equal(error.code, "ACL_READ_ANCESTOR_D2_GET_ACL_ACCESS_DENIED");
+    assert.equal(error.message, "Private snapshot ACL command failed");
+    assert.doesNotMatch(error.stack, /ROOTARK_FAKE_RAW_ACL_DETAILS|discarded native command/);
+    assert.equal(Object.hasOwn(error, "stderr"), false);
+    assert.equal(Object.hasOwn(error, "cmd"), false);
+    return true;
+  });
+  native.code = "ACL_READ_ANCESTOR_D2_GET_ACL_ACCESS_DENIED\nROOTARK_FAKE_RAW_ACL_DETAILS";
+  assert.throws(() => run("discarded native command"), (error) => {
+    assert.equal(error.code, "PRIVATE_SNAPSHOT_DIRECTORY_INVALID");
+    assert.equal(error.message, "Private snapshot ACL command failed");
+    return true;
+  });
+});
+
 test("#65 P2: malformed native child output and hidden stderr always fail closed", () => {
   const messages = [];
   const result = runIsolatedDiagnostic(() => ({

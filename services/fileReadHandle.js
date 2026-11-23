@@ -78,13 +78,24 @@ function runPowerShell(script) {
   const executable = process.env.SystemRoot
     ? path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
     : "powershell.exe";
-  return execFileSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
-    // On native failure execFileSync with implicit stdio can forward the raw
-    // PowerShell diagnostic directly to process stderr before the caller can
-    // classify or sanitize it. Never expose private paths/SIDs in server logs.
-    encoding: "utf8", windowsHide: true, timeout: 5_000,
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim().replace(/^\uFEFF/, "");
+  try {
+    return execFileSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+      // Piping prevents native stderr from directly reaching server logs.
+      // The thrown Node error also embeds that stderr and the full command,
+      // so never allow the original exception to escape this boundary.
+      encoding: "utf8", windowsHide: true, timeout: 5_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim().replace(/^\uFEFF/, "");
+  } catch (error) {
+    const nativeCode = typeof error?.code === "string" ? error.code : "";
+    // The isolated hosted probe supplies fixed diagnostic codes. Preserve
+    // those (and conventional OS failure codes) without preserving native
+    // stderr, spawnargs, command, cause, or any attacker-controlled text.
+    const diagnostic = /^ACL_(?:READ|SEAL_SCRIPT)_(?:ANCESTOR|PARENT|LEAF)(?:_D[234])?(?:_(?:GET_ACL|CURRENT_USER|OWNER_READ|RULES|JSON)(?:_(?:ACCESS_DENIED|SECURITY_EXCEPTION|PATH_NOT_FOUND|NOT_FOUND|ITEM_NOT_FOUND|OTHER))?)?$/.test(nativeCode);
+    const code = diagnostic || ["ENOENT", "EACCES", "EPERM", "EBUSY", "EIO", "ETIMEDOUT"].includes(nativeCode)
+      ? nativeCode : "PRIVATE_SNAPSHOT_DIRECTORY_INVALID";
+    throw fileReadError(code, "Private snapshot ACL command failed");
+  }
 }
 
 function windowsDirectoryAcl(directoryPath) {
