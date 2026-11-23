@@ -204,7 +204,7 @@ test("#65 read-only ACL failure probe pinpoints a failed production script step 
     assert.deepEqual(opts.stdio, ["ignore", "pipe", "pipe"]);
     const transformed = nestedArgs.at(-1);
     assert.match(transformed, /ROOTARK_ISSUE65_READ_SUBSTEP=/);
-    assert.match(transformed, /Get-Acl -LiteralPath \$target/);
+    assert.match(transformed, /\[System\.IO\.Directory\]::GetAccessControl\(\$target\)/);
     assert.match(transformed, /GetOwner\(/);
     assert.match(transformed, /GetAccessRules\(/);
     assert.match(transformed, /ConvertTo-Json/);
@@ -294,7 +294,7 @@ test("#65 ACL diagnostic uses the effective production snapshot directory when a
   assert.doesNotMatch(probeSource, /loadSnapshotApiWithConfinedNativeErrors\(path\.join\(local, "Rootark", "share-snapshots"\)\)/);
 });
 
-test("#65 real Windows ACL reader retries provider ItemNotFound only when the directory physically exists", () => {
+test("#65 real Windows ACL reader uses native directory security instead of the PowerShell provider", () => {
   const source = fs.readFileSync(path.join(__dirname, "../services/fileReadHandle.js"), "utf8");
   const first = source.indexOf("function windowsDirectoryAcl(");
   const last = source.indexOf("function secureNewWindowsSnapshotDirectory(", first);
@@ -305,9 +305,8 @@ test("#65 real Windows ACL reader retries provider ItemNotFound only when the di
   });
   read("C:\\Users\\runner\\AppData\\Local");
   const script = commands.pop();
-  assert.match(script, /try \{ \$acl = Get-Acl -LiteralPath \$target \} catch \[System\.Management\.Automation\.ItemNotFoundException\]/);
-  assert.match(script, /if \(-not \[System\.IO\.Directory\]::Exists\(\$target\)\) \{ throw \}/);
   assert.match(script, /\$acl = \[System\.IO\.Directory\]::GetAccessControl\(\$target\)/);
+  assert.doesNotMatch(script, /Get-Acl -LiteralPath/);
 });
 
 test("#65 Windows PowerShell 5.1 retrieves owner and ACEs when its Get-Acl provider falsely misses an existing directory", {
@@ -332,6 +331,33 @@ test("#65 Windows PowerShell 5.1 retrieves owner and ACEs when its Get-Acl provi
   assert.equal(result.status, 0, "native ACL reader must recover without emitting private PowerShell data");
   const acl = JSON.parse(result.stdout);
   assert.match(acl.current, /^S-1-/);
+  assert.match(acl.owner, /^S-1-/);
+  assert.ok(acl.rules);
+  assert.equal(result.stderr, "");
+});
+
+test("#65 Windows ACL reading never depends on the PowerShell Get-Acl provider", {
+  skip: process.platform !== "win32",
+}, () => {
+  const source = fs.readFileSync(path.join(__dirname, "../services/fileReadHandle.js"), "utf8");
+  const first = source.indexOf("function windowsDirectoryAcl(");
+  const last = source.indexOf("function secureNewWindowsSnapshotDirectory(", first);
+  const commands = [];
+  const read = vm.runInNewContext(`${source.slice(first, last)}\nwindowsDirectoryAcl`, {
+    Buffer, runPowerShell: (script) => { commands.push(script); return "{}"; },
+  });
+  const target = process.env.LOCALAPPDATA;
+  assert.ok(target && fs.statSync(target).isDirectory());
+  read(target);
+  const script = commands.pop();
+  const result = spawnSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    "function Get-Acl { throw 'provider unavailable' }; " + script], {
+    encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 10000,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, "native Directory ACL reading must not require Get-Acl");
+  assert.doesNotMatch(script, /Get-Acl -LiteralPath/);
+  const acl = JSON.parse(result.stdout);
   assert.match(acl.owner, /^S-1-/);
   assert.ok(acl.rules);
   assert.equal(result.stderr, "");

@@ -45,7 +45,8 @@ function classifyNativeAclCommand(args, snapshotDirectory) {
   // The seal SCRIPT first executes Get-Acl and other mutations before Set-Acl;
   // its failure does not prove which individual PowerShell command failed.
   const action = command.includes("Set-Acl -LiteralPath $target") ? "SEAL_SCRIPT"
-    : command.includes("Get-Acl -LiteralPath $target") ? "READ" : null;
+    : (command.includes("Get-Acl -LiteralPath $target")
+      || command.includes("[System.IO.Directory]::GetAccessControl($target)")) ? "READ" : null;
   const encoded = command.match(/FromBase64String\('([A-Za-z0-9+/=]{1,8192})'\)/)?.[1];
   if (!action || !encoded) return "OTHER";
   let candidate;
@@ -66,7 +67,8 @@ function classifyNativeAclCommand(args, snapshotDirectory) {
 function classifyNativeAclAncestorDepth(args, snapshotDirectory) {
   const command = Array.isArray(args) ? args[args.length - 1] : null;
   if (typeof command !== "string" || typeof snapshotDirectory !== "string"
-    || !command.includes("Get-Acl -LiteralPath $target")) return null;
+    || (!command.includes("Get-Acl -LiteralPath $target")
+      && !command.includes("[System.IO.Directory]::GetAccessControl($target)"))) return null;
   const encoded = command.match(/FromBase64String\('([A-Za-z0-9+/=]{1,8192})'\)/)?.[1];
   if (!encoded) return null;
   const bytes = Buffer.from(encoded, "base64");
@@ -105,8 +107,9 @@ function classifyReadAclSubstep(native, binary, args, options, snapshotDirectory
     ? classifyNativeAclAncestorDepth(args, snapshotDirectory) : null;
   if (!/^ACL_READ_(?:ANCESTOR|PARENT|LEAF)$/.test(code)) return code;
   const original = args[args.length - 1];
+  const nativeRead = "$acl = [System.IO.Directory]::GetAccessControl($target)";
   const stages = [
-    ["$acl = Get-Acl -LiteralPath $target", "GET_ACL"],
+    [original.includes(nativeRead) ? nativeRead : "$acl = Get-Acl -LiteralPath $target", "GET_ACL"],
     ["$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value", "CURRENT_USER"],
     ["$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value", "OWNER_READ"],
     ["$rules = @($acl.GetAccessRules(", "RULES"],
