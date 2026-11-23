@@ -21,6 +21,8 @@ const { Zk1OpaqueCatalog, catalogCasDomain } = require("../src/services/zk1Opaqu
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 const catalogBrowser = require("../public/client/rootark-zk1-browser-opaque-catalog-commit");
 const opaqueSync = require("../public/client/rootark-zk1-opaque-device-delta-sync");
+const fileContent = require("../public/client/rootark-zk1-file-content");
+const selectedLocalPreview = require("../public/client/rootark-zk1-selected-local-preview");
 const { openZk1CatalogMetadataV1 } = require("../src/crypto/rootark-zk1-opaque-catalog-client-v1");
 
 const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
@@ -236,7 +238,17 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
     assert.equal(response.status, predecessor === null ? 201 : 200, await response.text());
   };
   const objectId = b64(nodeCrypto.randomBytes(16));
-  const firstCipher = nodeCrypto.randomBytes(100);
+  const offlineCek = nodeCrypto.randomBytes(32);
+  const offlineMetadata = {
+    ...Object.fromEntries(Object.entries(scope).map(([key, value]) => [key, b64(value)])),
+    object_id: objectId, version_id: b64(nodeCrypto.randomBytes(16)),
+    parent_version_id: null, epoch: 1, kind: "file",
+  };
+  const firstCipher = Buffer.from(await fileContent.encryptFile({
+    cek: await fileContent.importFileCek(offlineCek),
+    metadata: offlineMetadata, name: "local.txt", mediaType: "text/plain",
+    data: new TextEncoder().encode("conteúdo assinado local"),
+  }));
   const metadataKey = nodeCrypto.randomBytes(32);
   const cryptoMeta = await crypto.subtle.importKey("raw", metadataKey, "AES-GCM", false,
     ["encrypt", "decrypt"]);
@@ -309,6 +321,20 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   assert.equal(selectedCiphertext.plaintextAvailable, false);
   assert.equal(selectedCiphertext.authorizesMutation, false);
   assert.ok(csrfRequests > beforeSelectedGetRequests, "selection GET must reach authenticated HTTP");
+  const getOnlyCount = csrfRequests;
+  const currentHead = (await clientOptions(1)).pinnedOwnerHead;
+  const openedSelected = await selectedLocalPreview.open({
+    selected: receiverBefore.entries[0], checked: selectedCiphertext,
+    metadata: offlineMetadata, rawCek: offlineCek,
+    cekSha256Pin: b64(digest(offlineCek)),
+    grant: await grant(manifest.devices[1]),
+    ownerHead: { revision: currentHead.revision, epoch: currentHead.epoch,
+      digest: b64(currentHead.digest) },
+    baseline: receiverBefore, assertLive: () => active && csrf === "known-csrf-token",
+  });
+  assert.equal(openedSelected.text, "conteúdo assinado local");
+  assert.equal(openedSelected.plaintextSentToServer, false);
+  assert.equal(csrfRequests, getOnlyCount, "CEK and plaintext must never cross signed HTTP");
   await assert.rejects(receiver.readSelectedCiphertext(receiverBefore, objectId, 2),
     /ZK_OPAQUE_DELTA_SYNC_DENIED/, "uncommitted revision cannot be selected for read");
   await assert.rejects(receiver.readSelectedCiphertext(receiverBefore,
