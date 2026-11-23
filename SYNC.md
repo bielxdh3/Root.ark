@@ -56,6 +56,45 @@ existe para integracoes que injetem as autoridades independentes do cliente.
 Na CLI isolada, sem esse provedor e os pins externos, **falha fechado**;
 `--config` e a resposta de `history` nao substituem custodia verificavel.
 
+### Plano consultivo de recuperacao de multiplos objetos (#67)
+
+O mesmo cliente confiavel pode chamar
+`SyncEngine.previewHistoricalRestorePlan([{objectId, versionId}, ...])` para
+consultar **1 a 32 objetos diferentes** antes de qualquer restauracao.
+Cada entrada passa pelo preflight individual de historico assinado, prova de
+admissao fisica independente, HEAD atual, AEAD/AAD e destino local limpo. A
+consulta inteira compartilha a verificacao de integridade de snapshot e
+journal e recusa dois objetos que usem caminhos locais iguais (inclusive
+diferencas de maiusculas/minusculas) ou relacao arquivo/descendente. No final,
+reconsulta os HEADs e a autorizacao atual e reexamina os destinos anteriores,
+para detectar alteracoes ocorridas enquanto os outros objetos eram consultados.
+Um erro em qualquer objeto rejeita o plano inteiro, sem resposta parcial `ready`.
+
+O resultado JSON inclui `readOnly:true`, `ready:true`, `atomic:false`,
+`objectCount`, `localOverwriteCount` e `entries` com os IDs, revisoes, caminhos,
+quantidade de versoes verificadas e `localAction` de cada arquivo. O valor
+`replace-clean-tracked` significa que uma restauracao posterior **substituiria
+bytes locais atualmente limpos**; `create-from-deleted` exige destino ausente.
+Nenhum plaintext, chave ou ciphertext e impresso, e nenhuma operacao e assinada,
+enfileirada ou enviada. O plano **nao reserva** HEADs, autorizacoes ou arquivos,
+nao e uma transacao de restauracao e nao prova o estado de pausa/retomada remota.
+
+Para a integracao com autoridade externa, a entrada equivalente do CLI e:
+
+```powershell
+'[{"objectId":"objeto-1","versionId":"versao-1"},{"objectId":"objeto-2","versionId":"versao-2"}]' | node sync-client/rootark-sync-v2.js preview-plan --config <config-v2-privado> --plan-stdin
+```
+
+O `preview-plan` da CLI isolada continua **falhando fechado** sem o provedor de
+custodia independente e os pins de dispositivo mantidos fora da configuracao.
+A entrada JSON via stdin e limitada e validada antes de carregar credenciais.
+Depois de revisar o resultado em uma integracao confiavel, cada `restore`
+individual precisa de nova validacao e de commit CAS assinado; uma falha em um
+objeto pode deixar restauracoes anteriores concluidas e as posteriores intactas.
+O fluxo `resume` de outro dispositivo confiavel continua separado, com prova
+de senha/2FA e persistencia pelo servidor. Nenhum desses previews certifica a
+custodia independente de producao ou o encerramento da issue #67.
+
 ### Revisao de falso positivo e retomada de dispositivo pausado (#67)
 
 Quando a protecao contra alteracoes destrutivas devolve `sync_burst_paused`
