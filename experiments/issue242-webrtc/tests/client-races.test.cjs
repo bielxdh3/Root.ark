@@ -348,3 +348,54 @@ test('P2 RED: late room creation response cannot hijack a newer signed room join
     'obsolete HTTP creation response must not replace the newer room intent');
   assert.equal(f.sockets.length, 1, 'no stale WebSocket should be created');
 });
+
+test('P2: createRoom starting during async hashing invalidates pending sendText and sendFile', async () => {
+  let releaseHash;
+  const releaseFetches = [];
+  const cryptoApi = {
+    subtle: {
+      digest: async (...args) => {
+        await new Promise(resolve => { releaseHash = resolve; });
+        return crypto.webcrypto.subtle.digest(...args);
+      }
+    },
+    randomUUID: () => crypto.randomUUID(),
+  };
+  const f = clientFixture({
+    cryptoApi,
+    fetchImpl: async () => {
+      await new Promise(resolve => { releaseFetches.push(resolve); });
+      return { ok: true, json: async () => ({ roomId: 'room-B', hostKey: 'host-B' }) };
+    }
+  });
+  f.joinRoom('room-A', 'invite-A');
+  const sockA = f.sockets[0];
+  await f.incoming(sockA, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(sockA, { type: 'peer-accepted', peerId: 'peer-A' });
+  const channel = f.peerConnections[0].channels[0];
+
+  const pendingText = f.sendText('secret-for-A');
+  assert.equal(typeof releaseHash, 'function', 'hashing must pause before createRoom');
+  const pendingCreate = f.createRoom();
+  releaseHash();
+  await pendingText;
+  assert.equal(channel.sent.length, 0, 'pending sendText must abort once createRoom increments roomGeneration');
+
+  releaseHash = null;
+  const file = {
+    name: 'secret.txt',
+    size: 5,
+    async arrayBuffer() { return new Uint8Array([1, 2, 3, 4, 5]).buffer; }
+  };
+  const pendingFile = f.sendFile(file);
+  // Wait a microtask for file.arrayBuffer() to settle before subtle.digest is entered
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof releaseHash, 'function', 'file hashing must pause before second createRoom');
+  const pendingCreate2 = f.createRoom();
+  releaseHash();
+  await pendingFile;
+  assert.equal(channel.sent.length, 0, 'pending sendFile must abort once createRoom increments roomGeneration');
+
+  for (const r of releaseFetches) r();
+  await Promise.allSettled([pendingCreate, pendingCreate2]);
+});

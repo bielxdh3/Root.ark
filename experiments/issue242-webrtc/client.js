@@ -443,8 +443,8 @@
     }
     // A digest may take long enough for the user to leave this room. Never
     // offer that room's file to a later session or a detached old DataChannel.
-    const sendingSocket = ws, sendingRoom = roomId, sendingSelf = selfId, sendingRole = role;
-    const sameRoom = () => ws === sendingSocket && roomId === sendingRoom &&
+    const sendingGeneration = roomGeneration, sendingSocket = ws, sendingRoom = roomId, sendingSelf = selfId, sendingRole = role;
+    const sameRoom = () => roomGeneration === sendingGeneration && ws === sendingSocket && roomId === sendingRoom &&
       selfId === sendingSelf && role === sendingRole;
     const receivers = [...peers.values()].filter(p => p.dc?.readyState === 'open' && !p.outgoing)
       .map(p => ({ peer: p, channel: p.dc }));
@@ -476,11 +476,11 @@
   async function sendText(value) {
     if (!value || value.length > 1000) return;
     // Do not enumerate the *new* room's peers after hashing text selected for
-    // the previous room. Preserve the exact socket, identity and channel set.
-    const sendingSocket = ws, sendingRoom = roomId, sendingSelf = selfId, sendingRole = role;
+    // the previous room. Preserve the exact generation, socket, identity and channel set.
+    const sendingGeneration = roomGeneration, sendingSocket = ws, sendingRoom = roomId, sendingSelf = selfId, sendingRole = role;
     const receivers = [...peers.values()].map(p => ({ peer: p, channel: p.dc }));
     const digest = await sha(new TextEncoder().encode(value));
-    if (ws !== sendingSocket || roomId !== sendingRoom ||
+    if (roomGeneration !== sendingGeneration || ws !== sendingSocket || roomId !== sendingRoom ||
       selfId !== sendingSelf || role !== sendingRole) return;
     let count = 0;
     for (const { peer: p, channel } of receivers) if (peers.get(p.id) === p &&
