@@ -663,6 +663,7 @@ class SyncEngine {
         for (const entry of parsed.pendingHydrations) {
           if (!entry || typeof entry !== "object" || !/^[a-f0-9]{64}$/.test(entry.hash || "")
             || typeof entry.stagedName !== "string" || !/^[A-Za-z0-9._-]+$/.test(entry.stagedName)
+            || (entry.payloadHash !== undefined && !/^[a-f0-9]{64}$/.test(entry.payloadHash || ""))
             || (entry.tempName !== null && entry.tempName !== undefined && (typeof entry.tempName !== "string" || !/^[A-Za-z0-9._-]+$/.test(entry.tempName)))) {
             fail("Invalid pending hydration entry", "invalid_snapshot");
           }
@@ -670,6 +671,13 @@ class SyncEngine {
             protocol.safeRelativePath(entry.path, "path");
             if (entry.targetPath) protocol.safeRelativePath(entry.targetPath, "targetPath");
           } catch { fail("Invalid pending hydration path", "invalid_snapshot"); }
+        }
+      }
+      if (parsed.hydrationParents !== undefined) {
+        if (!Array.isArray(parsed.hydrationParents)) fail("Invalid hydration parents", "invalid_snapshot");
+        for (const parentPath of parsed.hydrationParents) {
+          try { protocol.safeRelativePath(parentPath, "hydrationParent"); }
+          catch { fail("Invalid hydration parent path", "invalid_snapshot"); }
         }
       }
       for (const [objectId, item] of Object.entries(parsed.remoteOnly)) {
@@ -702,8 +710,14 @@ class SyncEngine {
             fsp.lstat(target, { bigint: true }),
           ]);
           if (sameFileIdentity(tempStats, targetStats)) {
-            await fsp.unlink(target);
-            await fsp.rm(tempPath, { force: true });
+            const targetHash = crypto.createHash("sha256").update(await fsp.readFile(target)).digest("hex");
+            if (entry.payloadHash && targetHash === entry.payloadHash) {
+              await fsp.unlink(target);
+              await fsp.rm(tempPath, { force: true });
+            } else {
+              // Preserve locally edited published bytes; only drop the private alias.
+              await fsp.rm(tempPath, { force: true });
+            }
           }
         }
       }
@@ -2259,6 +2273,20 @@ class SyncEngine {
       }
       this.rememberOperation(operation, hash, sourcePath);
     } else {
+      if (beforeHydrationWrite) {
+        const segments = metadata.path.split("/").slice(0, -1);
+        let prefix = "";
+        for (const segment of segments) {
+          prefix = prefix ? `${prefix}/${segment}` : segment;
+          const dirTarget = await contained(this.rootDir, prefix, true);
+          if (!(await exists(dirTarget)) && !this.snapshot.files[prefix]?.directory) {
+            this.snapshot.hydrationParents = this.snapshot.hydrationParents || [];
+            if (!this.snapshot.hydrationParents.some((p) => pathsEqual(p, prefix))) {
+              this.snapshot.hydrationParents.push(prefix);
+            }
+          }
+        }
+      }
       await fsp.mkdir(path.dirname(target), { recursive: true });
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
@@ -2351,6 +2379,7 @@ class SyncEngine {
           let stagedSourceDest = null;
           let stagedTargetDest = null;
           if (hydrationTempDir && (stageRelocated || stageTarget)) {
+            const payloadHash = crypto.createHash("sha256").update(plaintext).digest("hex");
             if (stageRelocated) {
               const stagedName = `stage-${crypto.randomUUID()}.tmp`;
               stagedSourceDest = path.join(hydrationTempDir, stagedName);
@@ -2358,6 +2387,7 @@ class SyncEngine {
                 path: relocatedSource,
                 stagedName,
                 hash: this.snapshot.files[relocatedSource]?.hash || "",
+                payloadHash,
                 tempName: hydrationTempName,
                 targetPath: metadata.path,
               });
@@ -2369,6 +2399,7 @@ class SyncEngine {
                 path: metadata.path,
                 stagedName,
                 hash: trackedTarget.hash || "",
+                payloadHash,
                 tempName: hydrationTempName,
                 targetPath: metadata.path,
               });
@@ -2624,6 +2655,11 @@ class SyncEngine {
         }
       }
       const isDirectory = Boolean(file.directory);
+      if (this.filesOnDemand && isDirectory && (!prior || prior.deleted)
+        && Array.isArray(this.snapshot.hydrationParents)
+        && this.snapshot.hydrationParents.some((parentPath) => pathsEqual(parentPath, relative))) {
+        continue;
+      }
       if (prior && !prior.deleted && prior.hash === file.hash && Boolean(prior.directory) === isDirectory) continue;
       const isUpdate = prior && !prior.deleted;
       const identitySeed = prior?.deleted
