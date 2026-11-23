@@ -2807,6 +2807,30 @@ class SyncEngine {
               fail("Exact signed CREATE echo does not prove physical admission",
                 "remote_admission_unproven");
             }
+            if (operation.metadata?.contentType === "inode/directory"
+              && Array.isArray(this.snapshot.hydrationParents)
+              && this.snapshot.hydrationParents.some((p) => pathsEqual(p, operation.metadata.path))) {
+              const listed = await this.adapter.list(candidate.objectId);
+              const records = Array.isArray(listed) ? listed : Array.isArray(listed?.objects) ? listed.objects : listed ? [listed] : [];
+              if (records.length === 1) {
+                const remote = protocol.validateStoredOperation(records[0]);
+                await this.verifyIncomingOperation(remote);
+                if (!remote.tombstone && remote.operation !== "delete"
+                  && remote.metadata?.contentType === "inode/directory"
+                  && pathsEqual(remote.metadata.path, operation.metadata.path)) {
+                  const dirKey = await this.keyFor(remote);
+                  const dirPayload = remote.operation === "move"
+                    ? protocol.decodeMovePayload(protocol.decryptPayload(remote, dirKey), dirKey) || Buffer.alloc(0)
+                    : protocol.decryptPayload(remote, dirKey);
+                  this.rememberOperation(remote, crypto.createHash("sha256").update(dirPayload).digest("hex"));
+                  this.snapshot.hydrationParents = this.snapshot.hydrationParents.filter((p) => !pathsEqual(p, operation.metadata.path));
+                  if (!this.snapshot.hydrationParents.length) delete this.snapshot.hydrationParents;
+                  await this.persistSnapshot();
+                  await this.journal.markSeen(operation.operationId);
+                  continue;
+                }
+              }
+            }
             fail("A remote object already owns the Files On-Demand CREATE path",
               "remote_path_collision");
           }
@@ -3888,11 +3912,6 @@ class SyncEngine {
         }
       }
       const isDirectory = Boolean(file.directory);
-      if (this.filesOnDemand && isDirectory && (!prior || prior.deleted)
-        && Array.isArray(this.snapshot.hydrationParents)
-        && this.snapshot.hydrationParents.some((parentPath) => pathsEqual(parentPath, relative))) {
-        continue;
-      }
       if (prior && !prior.deleted && prior.hash === file.hash && Boolean(prior.directory) === isDirectory) continue;
       const isUpdate = prior && !prior.deleted;
       const identitySeed = prior?.deleted
