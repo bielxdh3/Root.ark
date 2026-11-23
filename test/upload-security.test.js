@@ -2964,7 +2964,8 @@ test("a failed handed-off ledger transition preserves registered publication for
     const operation = database.prepare("SELECT state, charge_bytes, relative_path FROM quota_operations WHERE state = 'handoff_published'").get();
     assert.ok(operation);
     assert.equal(operation.charge_bytes, bytes.length);
-    assert.equal(operation.relative_path.replaceAll("\\", "/"), `handoff/${FOLDER_ID}/${encodeURIComponent(fileName)}#${bytes.length}`);
+    assert.equal(operation.relative_path.replaceAll("\\", "/"),
+      `handoff/${FOLDER_ID}/${encodeURIComponent(fileName)}#${bytes.length}@${crypto.createHash("sha256").update("uploader").digest("hex")}`);
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE state = 'handoff_published'").get().count, 1);
   } finally {
     database.close();
@@ -4534,7 +4535,7 @@ test("startup completes an injected metadata-unlink handoff interruption with an
       const root = ${JSON.stringify(chunkRoot)};
       const session = ${JSON.stringify(FOLDER_ID + "/" + uploadId)};
       const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
-      quota.initialize([{ operationId: "handed-off-marker", accountKey: "uploader", sessionKey: session, relativePath: ${JSON.stringify("handoff/" + FOLDER_ID + "/" + encodeURIComponent(fileName) + "#" + bytes.length)}, state: "handed_off", chargeBytes: 0 }]);
+      quota.initialize([{ operationId: "handed-off-marker", accountKey: "uploader", sessionKey: session, relativePath: ${JSON.stringify("handoff/" + FOLDER_ID + "/" + encodeURIComponent(fileName) + "#" + bytes.length + "@" + crypto.createHash("sha256").update("uploader").digest("hex"))}, state: "handed_off", chargeBytes: 0 }]);
       quota.close();
       // Inject the crash boundary after metadata unlink and before session rmdir.
       fs.unlinkSync(path.join(root, ${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "metadata.json"));
@@ -4555,6 +4556,54 @@ test("startup completes an injected metadata-unlink handoff interruption with an
   }
 });
 
+for (const { tagged, pendingOwner, shouldRecover, uploadId, description } of [
+  { tagged: false, pendingOwner: "uploader", shouldRecover: false, uploadId: "owner-proof-legacy", description: "refuses legacy case-colliding quota identity" },
+  { tagged: true, pendingOwner: "UPLOADER", shouldRecover: true, uploadId: "owner-proof-complete", description: "confirms a durable exact uppercase owner" },
+  { tagged: true, pendingOwner: "uploader", shouldRecover: false, uploadId: "owner-proof-wrong-case", description: "rejects a wrong-case pending record for the signed owner" },
+]) {
+  test(`identity-proof: empty-metadata handoff ${description}`, { timeout: 75_000 }, async (t) => {
+    const fileName = `${uploadId}.txt`;
+    const bytes = Buffer.from("durable owner-proof ciphertext");
+    const originalOwner = "UPLOADER";
+    const proof = crypto.createHash("sha256").update(originalOwner, "utf8").digest("hex");
+    const suffix = tagged ? `@${proof}` : "";
+    const harness = await createHarness(t, {
+      readyTimeout: 45_000,
+      chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, {
+        totalChunks: 1, originalName: fileName, fileName, uploadedBy: originalOwner,
+      }) } }],
+      preloadSource: ({ dir, chunkRoot }) => `
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const { createChunkUploadQuota } = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
+        const session = ${JSON.stringify(`${FOLDER_ID}/${uploadId}`)};
+        const quota = createChunkUploadQuota({ rootDir: ${JSON.stringify(chunkRoot)}, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
+        quota.initialize([{ operationId: "owner-proof-handoff", accountKey: "UPLOADER", sessionKey: session,
+          relativePath: ${JSON.stringify(`handoff/${FOLDER_ID}/${encodeURIComponent(fileName)}#${bytes.length}${suffix}`)}, state: "handed_off", chargeBytes: 0 }]);
+        quota.close();
+        fs.unlinkSync(path.join(${JSON.stringify(chunkRoot)}, ${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "metadata.json"));
+        const dest = path.join(${JSON.stringify(dir)}, "temp", ${JSON.stringify(FOLDER_ID)});
+        fs.mkdirSync(dest, { recursive: true });
+        fs.writeFileSync(path.join(dest, ${JSON.stringify(fileName)}), ${JSON.stringify(bytes.toString())});
+        fs.writeFileSync(path.join(${JSON.stringify(dir)}, "data", "pending-uploads.json"), JSON.stringify({
+          ${JSON.stringify(`${FOLDER_ID}/${fileName}`)}: { folderId: ${JSON.stringify(FOLDER_ID)}, uploadedBy: ${JSON.stringify(pendingOwner)} },
+        }));
+      `,
+    });
+    const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+    const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+    try {
+      assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, fileName)), bytes);
+      assert.equal(fs.existsSync(sessionDir), !shouldRecover,
+        "only a durable exact-owner proof may release a post-metadata handoff marker");
+      assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, shouldRecover ? 0 : 1);
+      assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_sessions").get().count, shouldRecover ? 0 : 1);
+    } finally {
+      database.close();
+    }
+  });
+}
+
 test("startup rejects unexpected contents in an empty-metadata handoff session directory", { timeout: 30_000 }, async (t) => {
   const uploadId = "handoff-unexpected-session-content";
   const fileName = "handoff-unexpected-content.txt";
@@ -4571,7 +4620,7 @@ test("startup rejects unexpected contents in an empty-metadata handoff session d
       const root = ${JSON.stringify(chunkRoot)};
       const session = ${JSON.stringify(FOLDER_ID + "/" + uploadId)};
       const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
-      quota.initialize([{ operationId: "handed-off-marker", accountKey: "uploader", sessionKey: session, relativePath: ${JSON.stringify("handoff/" + FOLDER_ID + "/" + encodeURIComponent(fileName) + "#" + bytes.length)}, state: "handed_off", chargeBytes: 0 }]);
+      quota.initialize([{ operationId: "handed-off-marker", accountKey: "uploader", sessionKey: session, relativePath: ${JSON.stringify("handoff/" + FOLDER_ID + "/" + encodeURIComponent(fileName) + "#" + bytes.length + "@" + crypto.createHash("sha256").update("uploader").digest("hex"))}, state: "handed_off", chargeBytes: 0 }]);
       quota.close();
       fs.unlinkSync(path.join(root, ${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(uploadId)}, "metadata.json"));
       fs.mkdirSync(path.join(${JSON.stringify(dir)}, "temp", ${JSON.stringify(FOLDER_ID)}), { recursive: true });
@@ -4643,11 +4692,13 @@ test("startup removes an unregistered published handoff and keeps charged parts 
   }
 });
 
-test("startup cleans an interrupted hard-link handoff and keeps its accepted part retryable", { timeout: 30_000 }, async (t) => {
-  const uploadId = "hardlink-handoff-recovery";
+for (const hardLinked of [true, false]) {
+test("startup cleans a tagged handoff " + (hardLinked ? "with hard-link" : "without hard-link") + " and keeps its accepted part retryable", { timeout: 75_000 }, async (t) => {
+  const uploadId = hardLinked ? "hardlink-handoff-recovery" : "unlinked-handoff-recovery";
   const fileName = "hardlink-recovery.txt";
   const bytes = Buffer.from("accepted source part survives interrupted publication");
   const harness = await createHarness(t, {
+    readyTimeout: 45_000,
     chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { totalChunks: 1, encryptionLevel: "none", originalName: fileName, fileName }), "0.part": bytes, "assembled.upload": bytes } }],
     preloadSource: ({ dir, chunkRoot }) => `
       const fs = require("node:fs");
@@ -4658,11 +4709,11 @@ test("startup cleans an interrupted hard-link handoff and keeps its accepted par
       const source = path.join(root, session, "assembled.upload");
       const destination = path.join(${JSON.stringify(dir)}, "temp", ${JSON.stringify(FOLDER_ID)}, ${JSON.stringify(fileName)});
       fs.mkdirSync(path.dirname(destination), { recursive: true });
-      fs.linkSync(source, destination);
+      if (${hardLinked}) fs.linkSync(source, destination);
       const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483000 });
       quota.initialize([
         { operationId: "a-part", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "part_committed", chargeBytes: ${bytes.length} },
-        { operationId: "z-handoff", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: ${JSON.stringify(`handoff/${FOLDER_ID}/${fileName}#${bytes.length}`)}, state: "handoff_pending", chargeBytes: ${bytes.length} },
+        { operationId: "z-handoff", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: ${JSON.stringify(`handoff/${FOLDER_ID}/${fileName}#${bytes.length}@${crypto.createHash("sha256").update("uploader").digest("hex")}`)}, state: "handoff_pending", chargeBytes: ${bytes.length} },
       ]);
       quota.close();
     `,
@@ -4684,6 +4735,60 @@ test("startup cleans an interrupted hard-link handoff and keeps its accepted par
   const retry = await uploadChunk(harness.port, session, { uploadId, originalName: fileName, chunkIndex: 0, totalChunks: 1, encryptionLevel: "none", bytes });
   assert.equal(retry.status, 200, retry.body);
   assert.deepEqual(fs.readFileSync(destinationPath), bytes);
+});
+}
+
+test("tagged handoff rollback after pending-transition fault releases only its own assembly", { timeout: 75_000 }, async (t) => {
+  const uploadId = "tagged-pending-rollback";
+  const fileName = "tagged-pending-rollback.txt";
+  const bytes = Buffer.from("case-sensitive pending-transition rollback ciphertext");
+  const harness = await createHarness(t, {
+    readyTimeout: 45_000,
+    preloadSource: () => `
+      const quotaModule = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
+      const originalFactory = quotaModule.createChunkUploadQuota;
+      quotaModule.createChunkUploadQuota = (...args) => {
+        const quota = originalFactory(...args);
+        const originalTransition = quota.transition;
+        let injected = false;
+        let rollbackBlocked = false;
+        quota.transition = (operation) => {
+          if (!injected && operation.state === "handoff_pending") {
+            injected = true;
+            originalTransition(operation);
+            throw Object.assign(new Error("injected pending-transition fault"), { code: "EIO" });
+          }
+          if (injected && !rollbackBlocked && operation.state === "encrypting" && String(operation.relativePath || "").endsWith("assembled.upload")) {
+            rollbackBlocked = true;
+            throw Object.assign(new Error("injected rollback transition fault"), { code: "EIO" });
+          }
+          return originalTransition(operation);
+        };
+        return quota;
+      };
+    `,
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const first = await uploadChunk(harness.port, session, {
+    uploadId, originalName: fileName, chunkIndex: 0, totalChunks: 1, encryptionLevel: "none", bytes,
+  });
+  assert.equal(first.status, 500, first.body);
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), bytes);
+  assert.equal(fs.existsSync(path.join(sessionDir, "assembled.upload")), false);
+  assert.equal(fs.existsSync(path.join(harness.dir, "temp", FOLDER_ID, fileName)), false);
+  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    const operations = database.prepare("SELECT state FROM quota_operations ORDER BY state").all();
+    assert.deepEqual(operations, [{ state: "part_committed" }], "failed handoff must not strand its charged assembly");
+  } finally {
+    database.close();
+  }
+  const retry = await uploadChunk(harness.port, session, {
+    uploadId, originalName: fileName, chunkIndex: 0, totalChunks: 1, encryptionLevel: "none", bytes,
+  });
+  assert.equal(retry.status, 200, retry.body);
+  assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, fileName)), bytes);
 });
 
 test("startup resumes per-part cleanup after a durable handoff crash", { timeout: 30_000 }, async (t) => {
@@ -5077,6 +5182,52 @@ test("handoff recovery preserves session data when quota ownership disagrees wit
   assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), bytes);
   assert.equal(fs.existsSync(path.join(sessionDir, "metadata.json")), true);
   assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, fileName)), bytes);
+});
+
+test("handoff recovery does not conflate case-distinct pending uploader with session owner", { timeout: 75_000 }, async (t) => {
+  const uploadId = "handoff-case-distinct-owner";
+  const fileName = "handoff-case-distinct-owner.txt";
+  const bytes = Buffer.from("accepted case-sensitive owner bytes");
+  const sessionKey = `${FOLDER_ID}/${uploadId}`;
+  const metadata = legacyChunkMetadata(uploadId, {
+    totalChunks: 1, encryptionLevel: "none", originalName: fileName, fileName, uploadedBy: "uploader",
+  });
+  const harness = await createHarness(t, {
+    readyTimeout: 45_000,
+    chunkSessions: [{ uploadId, files: { "metadata.json": metadata, "0.part": bytes } }],
+    preloadSource: ({ dir, chunkRoot }) => `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const { createChunkUploadQuota } = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
+      const root = ${JSON.stringify(chunkRoot)};
+      const session = ${JSON.stringify(sessionKey)};
+      const folderTemp = path.join(${JSON.stringify(dir)}, "temp", ${JSON.stringify(FOLDER_ID)});
+      fs.mkdirSync(path.join(root, "incoming"), { recursive: true });
+      fs.mkdirSync(folderTemp, { recursive: true });
+      fs.writeFileSync(path.join(folderTemp, ${JSON.stringify(fileName)}), ${JSON.stringify(bytes.toString())});
+      fs.writeFileSync(path.join(${JSON.stringify(dir)}, "data", "pending-uploads.json"), JSON.stringify({
+        ${JSON.stringify(`${FOLDER_ID}/${fileName}`)}: { folderId: ${JSON.stringify(FOLDER_ID)}, uploadedBy: "UPLOADER" },
+      }));
+      const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 64 * 1024 * 1024, systemBytes: 128 * 1024 * 1024, perAccountEntries: 5000, systemEntries: 10000, processInstanceId: "dead-owner", processId: 2147483647 });
+      quota.initialize([
+        { operationId: "case-part", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: path.join(session, "0.part"), state: "part_committed", chargeBytes: ${bytes.length} },
+        { operationId: "case-handoff", accountKey: "uploader", sessionKey: session.replace(path.sep, "/"), relativePath: ${JSON.stringify(`handoff/${FOLDER_ID}/${encodeURIComponent(fileName)}#${bytes.length}`)}, state: "handoff_pending", chargeBytes: ${bytes.length} },
+      ]);
+      quota.close();
+    `,
+  });
+  const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), bytes,
+    "case-distinct pending uploader must not finalize and remove the owner's accepted part");
+  assert.equal(fs.existsSync(path.join(sessionDir, "metadata.json")), true);
+  assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, fileName)), bytes);
+  const session = await login(harness.port, "uploader", harness.password);
+  const blocked = await uploadChunk(harness.port, session, {
+    uploadId: "case-distinct-denied", originalName: "case-distinct-denied.txt",
+    chunkIndex: 0, totalChunks: 1, bytes: Buffer.from("must not start staging"),
+  });
+  assert.equal(blocked.status, 503, blocked.body);
+  assert.equal(JSON.parse(blocked.body).code, "CHUNK_QUOTA_UNAVAILABLE");
 });
 
 test("an untracked incoming file is preserved and disables only chunk uploads at startup", { timeout: 30_000 }, async (t) => {

@@ -7295,6 +7295,32 @@ function getChunkAssemblySizeIfCompleting(sessionDir, totalChunks, incomingIndex
   return totalBytes;
 }
 
+function parseChunkHandoffDestination(value) {
+  if (typeof value !== "string") return null;
+  const separator = value.lastIndexOf("#");
+  if (separator < 1) return null;
+  const encodedName = value.slice(0, separator);
+  const sizeAndProof = value.slice(separator + 1);
+  const ownerSeparator = sizeAndProof.indexOf("@");
+  const sizeText = ownerSeparator < 0 ? sizeAndProof : sizeAndProof.slice(0, ownerSeparator);
+  const ownerProof = ownerSeparator < 0 ? null : sizeAndProof.slice(ownerSeparator + 1);
+  if (!encodedName || encodedName.length > 1024 || !/^(0|[1-9]\d*)$/.test(sizeText)
+    || (ownerProof !== null && !/^[a-f0-9]{64}$/.test(ownerProof))) return null;
+  const expectedSize = Number(sizeText);
+  if (!Number.isSafeInteger(expectedSize)) return null;
+  let fileName;
+  try { fileName = decodeURIComponent(encodedName); }
+  catch { return null; }
+  if (!fileName || fileName === "." || fileName === ".." || path.basename(fileName) !== fileName
+    || /[\\/]/.test(fileName) || encodeURIComponent(fileName) !== encodedName) return null;
+  return { fileName, encodedName, expectedSize, ownerProof };
+}
+
+function matchesChunkHandoffOwnerProof(ownerProof, username) {
+  return typeof username === "string" && typeof ownerProof === "string"
+    && crypto.createHash("sha256").update(username, "utf8").digest("hex") === ownerProof;
+}
+
 function removeAndReleaseChunkAssembly(req, sessionDir) {
   const operationId = req?.[CHUNK_UPLOAD_QUOTA_ASSEMBLY_ID];
   if (!operationId) return false;
@@ -7309,14 +7335,11 @@ function removeAndReleaseChunkAssembly(req, sessionDir) {
     if (operation.state === "handoff_pending") {
       const [folderId, uploadId] = String(operation.sessionKey || "").split("/");
       const handoffParts = operation.relativePath.split(/[\\/]/);
-      const destinationWithSize = handoffParts[2] || "";
-      const separator = destinationWithSize.lastIndexOf("#");
-      const encodedName = separator < 0 ? destinationWithSize : destinationWithSize.slice(0, separator);
-      const sizeText = separator < 0 ? String(operation.chargeBytes) : destinationWithSize.slice(separator + 1);
-      if (handoffParts.length !== 3 || handoffParts[0] !== "handoff" || handoffParts[1] !== folderId || folderId !== String(operation.sessionKey).split("/")[0] || uploadId !== path.basename(sessionDir) || !/^(0|[1-9]\\d*)$/.test(sizeText)) return false;
-      const expectedSize = Number(sizeText);
-      const fileName = decodeURIComponent(encodedName);
-      if (!Number.isSafeInteger(expectedSize) || expectedSize !== operation.chargeBytes || !fileName || path.basename(fileName) !== fileName || /[\\/]/.test(fileName)) return false;
+      const parsedHandoff = parseChunkHandoffDestination(handoffParts[2]);
+      if (!parsedHandoff || handoffParts.length !== 3 || handoffParts[0] !== "handoff" || handoffParts[1] !== folderId
+        || uploadId !== path.basename(sessionDir) || parsedHandoff.expectedSize !== operation.chargeBytes) return false;
+      if (parsedHandoff.ownerProof !== null && !matchesChunkHandoffOwnerProof(parsedHandoff.ownerProof, req?.user?.username)) return false;
+      const { fileName, expectedSize } = parsedHandoff;
       handoffExpectedSize = expectedSize;
       const folderPaths = ensureFolderDirectories(folderId);
       const destinationPath = path.join(folderPaths.tempDir, fileName);
@@ -8370,7 +8393,7 @@ function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferre
     filesToSecure.set(resolved, identity);
     return identity;
   };
-  const readyLedgerSessionEntriesAreSafe = (entries, sessionPath, sessionKey, totalChunks) => {
+  const readyLedgerSessionEntriesAreSafe = (entries, sessionPath, sessionKey, totalChunks, metadata) => {
     const operations = chunkUploadQuota?.operationsForSession(sessionKey) || [];
     const normalizeRelativePath = (relativePath) => {
       const normalized = relativePath.split(/[\\/]/).join("/");
@@ -8417,8 +8440,10 @@ function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferre
         const encodedNameAndSize = segments[2];
         const sizeSeparator = encodedNameAndSize.lastIndexOf("#");
         const encodedName = sizeSeparator > 0 ? encodedNameAndSize.slice(0, sizeSeparator) : "";
-        const sizeText = sizeSeparator > 0 ? encodedNameAndSize.slice(sizeSeparator + 1) : "";
+        const parsedHandoff = parseChunkHandoffDestination(encodedNameAndSize);
+        const sizeText = parsedHandoff?.expectedSize;
         if (!encodedName || !/^(0|[1-9]\d*)$/.test(sizeText)) return false;
+        if (parsedHandoff?.ownerProof !== null && !matchesChunkHandoffOwnerProof(parsedHandoff.ownerProof, metadata?.uploadedBy)) return false;
         const expectedSize = Number(sizeText);
         if (!Number.isSafeInteger(expectedSize) || expectedSize !== operation.chargeBytes) return false;
         let fileName;
@@ -8497,7 +8522,7 @@ function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferre
       const valid = isValidChunkSessionMetadata(metadata, sessionEntry.name, entry.name) || isValidLegacyChunkSessionMetadata(metadata, sessionEntry.name, entry.name);
       const safeEntries = includeOperations
         ? chunkSessionEntriesAreSafe(entries, metadata.totalChunks)
-        : readyLedgerSessionEntriesAreSafe(entries, sessionPath, sessionKey, metadata.totalChunks);
+        : readyLedgerSessionEntriesAreSafe(entries, sessionPath, sessionKey, metadata.totalChunks, metadata);
       if (!valid || !safeEntries) throw new Error("Unattributable legacy chunk session");
       if (!metadata.uploadedBy || typeof metadata.uploadedBy !== "string") throw new Error("Unattributable legacy chunk owner");
       sessions.set(sessionKey, metadata.uploadedBy);
@@ -8658,18 +8683,12 @@ function validateChunkQuotaOperationsBeforeRecovery(operations) {
         segments.length === 3 && segments[0] === "handoff" && segments[1] === sessionParts[0]) {
       const marker = segments[2].lastIndexOf("#");
       const encodedName = marker > 0 ? segments[2].slice(0, marker) : "";
-      const sizeText = marker > 0 ? segments[2].slice(marker + 1) : "";
-      if (!encodedName || encodedName.length > 1024 || !/^(0|[1-9]\d*)$/.test(sizeText)) throw new Error("Invalid chunk handoff quota path");
-      const expectedSize = Number(sizeText);
+      const parsed = parseChunkHandoffDestination(segments[2]);
+      if (!parsed || parsed.encodedName !== encodedName) throw new Error("Invalid chunk handoff quota path");
+      const expectedSize = parsed.expectedSize;
       if (!Number.isSafeInteger(expectedSize) ||
           (operation.state === "handed_off" ? operation.chargeBytes !== 0 : operation.chargeBytes !== expectedSize)) {
         throw new Error("Invalid chunk handoff quota charge");
-      }
-      let fileName;
-      try { fileName = decodeURIComponent(encodedName); }
-      catch { throw new Error("Invalid encoded chunk handoff filename"); }
-      if (!fileName || fileName === "." || fileName === ".." || path.basename(fileName) !== fileName || /[\\/]/.test(fileName) || encodeURIComponent(fileName) !== encodedName) {
-        throw new Error("Unsafe chunk handoff filename");
       }
     } else {
       throw new Error("Chunk quota operation state does not match its owned path");
@@ -8846,15 +8865,9 @@ function recoverChunkUploadHandoff(operation) {
   const [folderId, uploadId] = String(operation.sessionKey || "").split("/");
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(folderId || "") || !/^[a-zA-Z0-9_-]{1,80}$/.test(uploadId || "")) throw new Error("Invalid handoff session identity");
   const handoffParts = operation.relativePath.split(/[\\/]/);
-  const destinationWithSize = handoffParts[2] || "";
-  const sizeSeparator = destinationWithSize.lastIndexOf("#");
-  const encodedName = sizeSeparator < 0 ? destinationWithSize : destinationWithSize.slice(0, sizeSeparator);
-  const expectedSizeText = sizeSeparator < 0 ? String(operation.chargeBytes) : destinationWithSize.slice(sizeSeparator + 1);
-  if (handoffParts.length !== 3 || handoffParts[0] !== "handoff" || handoffParts[1] !== folderId || !encodedName || encodedName.length > 1024 || !/^(0|[1-9]\d*)$/.test(expectedSizeText)) throw new Error("Invalid chunk handoff destination");
-  const expectedSize = Number(expectedSizeText);
-  if (!Number.isSafeInteger(expectedSize)) throw new Error("Invalid chunk handoff size");
-  const fileName = decodeURIComponent(encodedName);
-  if (!fileName || path.basename(fileName) !== fileName || /[\\/]/.test(fileName)) throw new Error("Unsafe chunk handoff filename");
+  const parsed = parseChunkHandoffDestination(handoffParts[2]);
+  if (!parsed || handoffParts.length !== 3 || handoffParts[0] !== "handoff" || handoffParts[1] !== folderId) throw new Error("Invalid chunk handoff destination");
+  const { fileName, expectedSize, ownerProof } = parsed;
   const sessionDir = getChunkSessionDir(folderId, uploadId);
   assertSafeChunkSessionDirectory(sessionDir, { allowMissing: true });
   let sessionExists = true;
@@ -8873,7 +8886,11 @@ function recoverChunkUploadHandoff(operation) {
     const completedDestination = path.join(completedPaths.tempDir, fileName);
     const completedStats = inspectChunkQuotaFile(completedDestination);
     const completedPending = loadPendingUploads()[getPendingKey(folderId, fileName)];
-    if (!completedStats || completedStats.size !== expectedSize || !completedPending || completedPending.folderId !== folderId || String(completedPending.uploadedBy || "").trim().toLowerCase() !== operation.accountKey) throw new Error("Completed chunk handoff cannot be confirmed");
+    // metadata.json can already be unlinked here. The normalized quota key
+    // alone cannot identify case-distinct SQLite principals, including legacy
+    // markers that never persisted the uploader's exact identity.
+    if (!completedStats || completedStats.size !== expectedSize || !completedPending || completedPending.folderId !== folderId ||
+      !matchesChunkHandoffOwnerProof(ownerProof, completedPending.uploadedBy) || completedPending.uploadedBy.trim().toLowerCase() !== operation.accountKey) throw new Error("Completed chunk handoff cannot be confirmed");
     if (sessionExists) {
       fs.rmdirSync(sessionDir);
       if (fs.existsSync(sessionDir)) throw new Error("Empty chunk handoff session directory remains");
@@ -8886,6 +8903,7 @@ function recoverChunkUploadHandoff(operation) {
   if (!metadataFile || metadataFile.links !== 1n) throw new Error("Chunk handoff metadata is missing or unsafe");
   const metadata = JSON.parse(metadataFile.contents);
   if (!isValidChunkSessionMetadata(metadata, uploadId, folderId)) throw new Error("Chunk handoff metadata is invalid");
+  if (ownerProof !== null && !matchesChunkHandoffOwnerProof(ownerProof, metadata.uploadedBy)) throw new Error("Chunk handoff owner proof mismatches metadata");
   const parts = chunkUploadQuota.operations().filter((item) => item.sessionKey === operation.sessionKey && item.state === "part_committed");
   if (operation.state !== "handed_off" && parts.length !== metadata.totalChunks) throw new Error("Chunk handoff source parts are unavailable");
   for (const part of parts) {
@@ -8915,7 +8933,10 @@ function recoverChunkUploadHandoff(operation) {
   const sourceStats = inspectChunkQuotaFile(sourcePath);
   if (destinationStats && sourceStats) throw new Error("Chunk handoff has both source and destination files");
   const pending = loadPendingUploads()[getPendingKey(folderId, fileName)];
-  const pendingConfirmed = Boolean(pending && pending.folderId === folderId && sameUsername(pending.uploadedBy, metadata.uploadedBy));
+  // Quota account keys are lowercased for capacity accounting, but authenticated
+  // SQLite principals are case-sensitive. A pending record from another account
+  // must never complete or release this session's durable handoff on restart.
+  const pendingConfirmed = Boolean(pending && pending.folderId === folderId && pending.uploadedBy === metadata.uploadedBy);
   const encrypted = metadata.encryptionLevel && metadata.encryptionLevel !== "none";
   const encryptedIntent = loadEncryptedFiles()[getEncryptedFileKey(folderId, fileName)];
   const cloudIntent = cloudTempMutationQueue.getRecord(folderId, fileName);
@@ -10001,11 +10022,15 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
         handoffChargeBytes = encryptedStats.size;
         chunkUploadQuota.transition({ operationId: req[CHUNK_UPLOAD_QUOTA_ASSEMBLY_ID], state: "encrypting", chargeBytes: encryptedStats.size });
         const finalPath = path.join(req.uploadFolder.tempDir, finalFileName);
+        // Persist the exact case-sensitive uploader identity before the first
+        // crash boundary that can unlink metadata.json, independently of the
+        // lowercase quota accounting key.
+        const handoffOwnerProof = crypto.createHash("sha256").update(metadata.uploadedBy, "utf8").digest("hex");
         chunkUploadQuota.transition({
           operationId: req[CHUNK_UPLOAD_QUOTA_ASSEMBLY_ID],
           state: "handoff_pending",
           chargeBytes: encryptedStats.size,
-          relativePath: `handoff/${folderId}/${encodeURIComponent(finalFileName)}#${encryptedStats.size}`,
+          relativePath: `handoff/${folderId}/${encodeURIComponent(finalFileName)}#${encryptedStats.size}@${handoffOwnerProof}`,
         });
         fs.linkSync(stagedPath, finalPath);
         chunkHandoffPublished = true;
