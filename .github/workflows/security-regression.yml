@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - Root/main
+      - 'cdx/issue68-owner-recipient-use-w60-20261106'
   pull_request:
     branches:
       - Root/main
