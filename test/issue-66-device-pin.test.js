@@ -793,3 +793,35 @@ test("issue 66 #278 P2 RED: rotated-fileId tombstone cannot delete a pinned file
     path: "docs/a.txt", pinned: true, localPresent: true, objectId: "object-a",
   });
 });
+
+test("issue 66 #278 P2 RED: translateWebDavMutation and _pushPending reject outgoing deletes of pinned files", async (t) => {
+  const { rootDir, open, state } = await fixture(t);
+  const client = await open();
+  assert.equal((await client.pinLocal("docs/a.txt")).pinned, true);
+  // 1. translateWebDavMutation must reject DELETE of a pinned file before journal admission.
+  await fsp.unlink(path.join(rootDir, "docs/a.txt"));
+  await assert.rejects(
+    client.translateWebDavMutation({ operationId: "wd-del-pinned", kind: "delete", path: "docs/a.txt" }),
+    { code: "file_pinned" },
+  );
+  // Restore pinned file and simulate a pre-existing incompatible DELETE queued in outbox.
+  await fsp.writeFile(path.join(rootDir, "docs/a.txt"), "authenticated remote bytes");
+  const prior = client.snapshot.files["docs/a.txt"];
+  const key = await client.fileKeyResolver({ ...prior, path: "docs/a.txt", keyEpoch: client.keyEpoch });
+  const staleDelete = await client.buildOperation({
+    operation: "delete", objectId: prior.objectId, fileId: prior.fileId,
+    versionId: crypto.randomUUID(), operationId: "webdavsolo-stale-del",
+    baseRevision: prior.revision,
+    revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: client.deviceId },
+    metadata: { path: "docs/a.txt" },
+    plaintext: Buffer.alloc(0), fileKey: key,
+  });
+  await client.journal.enqueueMany([staleDelete]);
+  const pushesBefore = state.pushes;
+  await assert.rejects(client.syncOnce(), { code: "file_pinned" });
+  assert.equal(state.pushes, pushesBefore, "_pushPending must not transmit an incompatible pinned DELETE");
+  const reopened = await open();
+  assert.deepEqual(await reopened.pinStatus("docs/a.txt"), {
+    path: "docs/a.txt", pinned: true, localPresent: true, objectId: "object-a",
+  });
+});
