@@ -79,7 +79,11 @@ function runPowerShell(script) {
     ? path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
     : "powershell.exe";
   return execFileSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+    // On native failure execFileSync with implicit stdio can forward the raw
+    // PowerShell diagnostic directly to process stderr before the caller can
+    // classify or sanitize it. Never expose private paths/SIDs in server logs.
     encoding: "utf8", windowsHide: true, timeout: 5_000,
+    stdio: ["ignore", "pipe", "pipe"],
   }).trim().replace(/^\uFEFF/, "");
 }
 

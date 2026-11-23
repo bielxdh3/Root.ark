@@ -100,6 +100,36 @@ test("#65 P2: native PowerShell raw stderr is captured, never forwarded to hoste
   assert.doesNotMatch(messages.join("\n"), /C:\\Users|S-1-5-21|secret-key|credential=|Get-Acl/);
 });
 
+test("#65 P2: production ACL helper never forwards native PowerShell stderr to server logs", {
+  skip: process.platform !== "win32",
+}, () => {
+  const sourceFile = path.join(__dirname, "../services/fileReadHandle.js");
+  const sentinel = "ROOTARK_NATIVE_STDERR_P2_SENTINEL";
+  // Use a real failed powershell.exe command in an isolated Node process.
+  // Synthetic diagnostics contain no private path, ACL, SID, or user data.
+  const childCode = [
+    'const fs = require("node:fs");',
+    'const vm = require("node:vm");',
+    `const source = fs.readFileSync(${JSON.stringify(sourceFile)}, "utf8");`,
+    'const start = source.indexOf("function runPowerShell(");',
+    'const end = source.indexOf("function windowsDirectoryAcl(", start);',
+    'if (start < 0 || end <= start) process.exit(3);',
+    'const run = vm.runInNewContext(source.slice(start, end) + "\\nrunPowerShell", {',
+    '  execFileSync: require("node:child_process").execFileSync, path: require("node:path"), process,',
+    '});',
+    `try { run(${JSON.stringify(`[Console]::Error.WriteLine('${sentinel}'); exit 7`)}); process.stdout.write("UNEXPECTED_SUCCESS"); }`,
+    'catch { process.stdout.write("FAIL_CLOSED"); }',
+  ].join("\n");
+  const child = spawnSync(process.execPath, ["-e", childCode], {
+    encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 10_000,
+  });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0);
+  assert.equal(child.stdout, "FAIL_CLOSED");
+  assert.doesNotMatch(child.stderr, /ROOTARK_NATIVE_STDERR_P2_SENTINEL/,
+    "the production helper must not expose raw native diagnostics to process stderr");
+});
+
 test("#65 P2: malformed native child output and hidden stderr always fail closed", () => {
   const messages = [];
   const result = runIsolatedDiagnostic(() => ({
