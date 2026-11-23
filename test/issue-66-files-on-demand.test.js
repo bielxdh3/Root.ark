@@ -2000,3 +2000,17 @@ test("#263 P2: remote MOVE cannot relocate cached source with a newly pending lo
   assert.equal(await fsp.readFile(path.join(root, "docs", "old.txt"), "utf8"), "cached source for MOVE");
   assert.equal(client.snapshot.files["docs/old.txt"].objectId, original.objectId);
 });
+
+test("#263 P2 RED: evicting last child of hydration-created parent folder does not cause remote_path_collision", async (t) => {
+  const { source, writer, open } = await setup(t, {});
+  await fsp.mkdir(path.join(source, "docs"), { recursive: true });
+  await writer.syncOnce();
+  await fsp.writeFile(path.join(source, "docs", "child.txt"), "child bytes");
+  await writer.syncOnce();
+  const consumer = await open(["docs"]);
+  assert.equal(await consumer.materializeRemote("docs/child.txt"), true);
+  assert.equal(await consumer.evictLocal("docs/child.txt"), true);
+  await consumer.syncOnce();
+  assert.equal((await consumer.journal.recover()).length, 0,
+    "evicting last child of hydration-created parent must not enqueue an orphan directory CREATE");
+});
