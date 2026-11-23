@@ -1216,7 +1216,7 @@ class SyncEngine {
         : operation === "move"
           ? { path: relativePath, sourcePath: source }
           : { path: relativePath, name: path.posix.basename(relativePath), size: content.length, ...(directory ? { contentType: "inode/directory" } : {}) };
-      return protocol.validateOperation(await this.buildOperation({
+      const built = protocol.validateOperation(await this.buildOperation({
         operation,
         objectId: identity.objectId,
         fileId: identity.fileId,
@@ -1228,6 +1228,8 @@ class SyncEngine {
         plaintext: operation === "delete" ? undefined : content,
         fileKey,
       }));
+      await this.assertOutgoingPinnedPolicy(built);
+      return built;
     };
 
     if (kind === "delete") {
@@ -1671,13 +1673,16 @@ class SyncEngine {
       const group = groupedById.get(original.operationId);
       if (group) {
         if (pushedGroups.has(group.deleteId)) continue;
-        await this.pushAtomicSignedOverwritePair([
-          pendingById.get(group.deleteId), pendingById.get(group.moveId),
-        ], summary);
+        const deleteOp = pendingById.get(group.deleteId);
+        const moveOp = pendingById.get(group.moveId);
+        await this.assertOutgoingPinnedPolicy(deleteOp);
+        await this.assertOutgoingPinnedPolicy(moveOp);
+        await this.pushAtomicSignedOverwritePair([deleteOp, moveOp], summary);
         pushedGroups.add(group.deleteId);
         if (summary.offline) break;
         continue;
       }
+      await this.assertOutgoingPinnedPolicy(original);
       const next = recovered[index + 1];
       const event = signedWebDavEventId(original);
       if (event && next && signedWebDavEventId(next) === event) {
