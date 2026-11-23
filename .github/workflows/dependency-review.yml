@@ -36,9 +36,39 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      - name: Review dependencies introduced by this main commit
+      - name: Review only this push interval (incremental, not complete PR delta)
         uses: actions/dependency-review-action@v5
         with:
           base-ref: ${{ github.event.before }}
           head-ref: ${{ github.sha }}
+          fail-on-severity: high
+
+  # #290 has a diverged parent branch. The green incremental push comparison
+  # cannot establish the COMPLETE PR dependency delta. Check actual PR
+  # metadata, verify the named base's fast-forward and unique merge-base,
+  # then feed full-length SHAs to the same dependency-review action.
+  issue68-full-pr-dependency-review:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/cdx/issue68-owner-recipient-use-w60-20261106'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout full history for trustworthy PR merge-base
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve verified full issue68 PR 290 dependency range
+        id: range
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/issue-68-full-pr-dependency-range.js
+
+      - name: Review complete stacked PR 290 dependency delta
+        uses: actions/dependency-review-action@v5
+        with:
+          base-ref: ${{ steps.range.outputs.base-sha }}
+          head-ref: ${{ steps.range.outputs.head-sha }}
           fail-on-severity: high
