@@ -17,6 +17,8 @@ const ERROR_CODES = new Set([
   "FILE_HANDLE_CLOSE_UNCERTAIN",
   "ACL_READ_ANCESTOR", "ACL_READ_PARENT", "ACL_READ_LEAF",
   "ACL_SEAL_SCRIPT_ANCESTOR", "ACL_SEAL_SCRIPT_PARENT", "ACL_SEAL_SCRIPT_LEAF",
+  ...["ANCESTOR", "PARENT", "LEAF"].flatMap((role) =>
+    ["GET_ACL", "OWNER", "RULES", "JSON"].map((step) => `ACL_READ_${role}_${step}`)),
   "EACCES", "EPERM", "ENOENT", "EBUSY", "ETIMEDOUT", "EIO",
 ]);
 
@@ -51,6 +53,40 @@ function classifyNativeAclCommand(args, snapshotDirectory) {
   return role ? `ACL_${action}_${role}` : "OTHER";
 }
 
+// After a native read-script failure, replay only that already-trusted,
+// read-only script with fixed stage labels. This does NOT authorize a directory
+// and does not replace production validation; a changing result remains FAIL.
+// Native exception, stderr, path, ACL and raw PowerShell text are never logged.
+function classifyReadAclSubstep(native, binary, args, options, snapshotDirectory) {
+  const code = classifyNativeAclCommand(args, snapshotDirectory);
+  if (!/^ACL_READ_(?:ANCESTOR|PARENT|LEAF)$/.test(code)) return code;
+  const original = args[args.length - 1];
+  const stages = [
+    ["$acl = Get-Acl -LiteralPath $target", "GET_ACL"],
+    ["$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value", "OWNER"],
+    ["$rules = @($acl.GetAccessRules(", "RULES"],
+    ["[pscustomobject]@{ owner = $owner; current = $current; protected = $acl.AreAccessRulesProtected; rules = $rules } | ConvertTo-Json -Depth 4 -Compress", "JSON"],
+  ];
+  let script = original;
+  for (const [needle, stage] of stages) {
+    const index = script.indexOf(needle);
+    if (index < 0 || script.indexOf(needle, index + needle.length) >= 0) return code;
+    script = script.replace(needle, `$rootarkProbeStage = '${stage}'; ${needle}`);
+  }
+  script = `$rootarkProbeStage = 'GET_ACL'; try { ${script} } catch { `
+    + "[Console]::Out.WriteLine('ROOTARK_ISSUE65_READ_SUBSTEP=' + $rootarkProbeStage); exit 71 }";
+  try {
+    native(binary, [...args.slice(0, -1), script], {
+      ...options, stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    const output = typeof error?.stdout === "string" ? error.stdout : null;
+    const matched = output?.match(/^ROOTARK_ISSUE65_READ_SUBSTEP=(GET_ACL|OWNER|RULES|JSON)\r?\n?$/);
+    if (matched) return `${code}_${matched[1]}`;
+  }
+  return code;
+}
+
 function loadSnapshotApiWithConfinedNativeErrors(snapshotDirectory) {
   const childProcess = require("node:child_process");
   const original = childProcess.execFileSync;
@@ -61,7 +97,7 @@ function loadSnapshotApiWithConfinedNativeErrors(snapshotDirectory) {
   childProcess.execFileSync = function (binary, args, options) {
     try { return original.call(this, binary, args, options); }
     catch (error) {
-      const code = classifyNativeAclCommand(args, snapshotDirectory);
+      const code = classifyReadAclSubstep(original.bind(this), binary, args, options, snapshotDirectory);
       if (code === "OTHER") throw error;
       // This classification is ONLY for the probe subprocess. Production
       // fileReadHandle remains untouched and still rejects unsafe ACLs.
@@ -208,4 +244,5 @@ if (require.main === module) {
   }
 }
 
-module.exports = { runDiagnostic, runIsolatedDiagnostic, classifyNativeAclCommand };
+module.exports = { runDiagnostic, runIsolatedDiagnostic, classifyNativeAclCommand,
+  classifyReadAclSubstep };

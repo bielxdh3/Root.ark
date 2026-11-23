@@ -6,7 +6,8 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 const vm = require("node:vm");
-const { runDiagnostic, runIsolatedDiagnostic, classifyNativeAclCommand } = require("../scripts/issue65-windows-snapshot-acl-probe");
+const { runDiagnostic, runIsolatedDiagnostic, classifyNativeAclCommand,
+  classifyReadAclSubstep } = require("../scripts/issue65-windows-snapshot-acl-probe");
 
 const steps = (override = {}) => ({
   fixture_acl: () => undefined,
@@ -182,6 +183,48 @@ test("#65 ACL classifier recognizes the actual PowerShell scripts from fileReadH
   assert.equal(classifyNativeAclCommand(["-Command", sealScript], root), "ACL_SEAL_SCRIPT_PARENT");
   seal(root);
   assert.equal(classifyNativeAclCommand(["-Command", captures.pop()], root), "ACL_SEAL_SCRIPT_LEAF");
+});
+
+test("#65 read-only ACL failure probe pinpoints a failed production script step without native data", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../services/fileReadHandle.js"), "utf8");
+  const first = source.indexOf("function windowsDirectoryAcl(");
+  const last = source.indexOf("function secureNewWindowsSnapshotDirectory(", first);
+  assert.ok(first > 0 && last > first);
+  const commands = [];
+  const windowsDirectoryAcl = vm.runInNewContext(`${source.slice(first, last)}\nwindowsDirectoryAcl`, {
+    Buffer, runPowerShell: (script) => { commands.push(script); return "{}"; },
+  });
+  const root = "C:\\Users\\runner\\AppData\\Local\\Rootark\\share-snapshots";
+  windowsDirectoryAcl("C:\\Users\\runner\\AppData\\Local");
+  const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", commands.pop()];
+  let called = 0;
+  const native = (_binary, nestedArgs, opts) => {
+    called++;
+    assert.deepEqual(opts.stdio, ["ignore", "pipe", "pipe"]);
+    const transformed = nestedArgs.at(-1);
+    assert.match(transformed, /ROOTARK_ISSUE65_READ_SUBSTEP=/);
+    assert.match(transformed, /Get-Acl -LiteralPath \$target/);
+    assert.match(transformed, /GetOwner\(/);
+    assert.match(transformed, /GetAccessRules\(/);
+    assert.match(transformed, /ConvertTo-Json/);
+    throw { stdout: "ROOTARK_ISSUE65_READ_SUBSTEP=RULES\r\n", stderr: "SID=S-1-5-21 path=C:\\Users\\runner\\secret" };
+  };
+  assert.equal(classifyReadAclSubstep(native, "powershell.exe", args, { encoding: "utf8" }, root), "ACL_READ_ANCESTOR_RULES");
+  assert.equal(called, 1);
+  assert.equal(classifyReadAclSubstep(() => { throw { stdout: "ROOTARK_ISSUE65_READ_SUBSTEP=RULES\nsecret=ABC" }; },
+    "powershell.exe", args, {}, root), "ACL_READ_ANCESTOR");
+});
+
+test("#65 no native substep can be claimed for an untrusted path, seal script or unknown output", () => {
+  const root = "C:\\Users\\runner\\AppData\\Local\\Rootark\\share-snapshots";
+  const encoded = Buffer.from("C:\\outside\\secret", "utf16le").toString("base64");
+  const readScript = `$target = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('${encoded}')); $acl = Get-Acl -LiteralPath $target`;
+  let invoked = 0;
+  const native = () => { invoked++; throw { stdout: "ROOTARK_ISSUE65_READ_SUBSTEP=RULES\n" }; };
+  assert.equal(classifyReadAclSubstep(native, "powershell.exe", ["-Command", readScript], {}, root), "OTHER");
+  const sealScript = readScript.replace("Get-Acl", "Set-Acl");
+  assert.equal(classifyReadAclSubstep(native, "powershell.exe", ["-Command", sealScript], {}, root), "OTHER");
+  assert.equal(invoked, 0);
 });
 
 test("#65 hosted ACL native failure category is allowlisted and omits secret PowerShell details", async () => {
