@@ -34,6 +34,9 @@ internal data class CapturedCiphertextSnapshot(
 /** Exact previously captured GET; local integrity was rechecked before this signal. */
 internal class DuplicateCiphertextCaptureException : SecurityException("Identical signed-envelope already staged")
 
+/** Raised only after inspection of the existing local AES-GCM packet fails. */
+internal class LocalCiphertextCacheIntegrityException : SecurityException("Cached ciphertext corrupted or invalid")
+
 /** One bounded signed-envelope candidate encrypted for one login, never a plaintext cache. */
 internal class SessionCiphertextCache(
     private val root: File,
@@ -70,15 +73,14 @@ internal class SessionCiphertextCache(
         // permitting any replacement; corruption must be surfaced and evicted
         // rather than silently overwritten by an unrelated network response.
         if (previous != null) inspect(requester, previous.objectId)
-        if (previous != null && previous.objectId == snapshot.objectId &&
-            snapshot.revisionCounter <= previous.revisionCounter) {
-            if (snapshot == previous) {
-                // Only an identical byte digest plus a still-intact local AEAD packet
-                // qualifies. Different bytes/revision or corrupted storage still fail.
-                inspect(requester, expectedObjectId)
-                throw DuplicateCiphertextCaptureException()
-            }
-            throw SecurityException("Replay or conflicting revision")
+        if (previous != null) {
+            // A structurally consistent remote envelope is not an independently
+            // verified Ed25519 authorization. Even a higher claimed revision or
+            // a different object must not replace this login's intact capture.
+            // Only an identical packet is idempotent; explicit session/key
+            // teardown is required before staging another unverified candidate.
+            if (snapshot == previous) throw DuplicateCiphertextCaptureException()
+            throw SecurityException("Captured ciphertext replacement requires a new session")
         }
         val encrypted = try {
             Cipher.getInstance("AES/GCM/NoPadding").run {
@@ -140,7 +142,7 @@ internal class SessionCiphertextCache(
         } catch (_: Exception) {
             saved = null
             file.delete()
-            throw SecurityException("Cached ciphertext corrupted or invalid")
+            throw LocalCiphertextCacheIntegrityException()
         }
     }
 

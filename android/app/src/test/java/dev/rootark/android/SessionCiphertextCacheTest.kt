@@ -87,7 +87,7 @@ class SessionCiphertextCacheTest {
         assertEquals("fixture-object-1", cache.inspect(binding, "fixture-object-1").objectId)
     }
 
-    @Test fun identicalReplayKeepsTheUiCaptureAndKeyButChangedBytesDoNot() {
+    @Test fun identicalReplayAndRejectedRemoteBytesDoNotEraseAnIntactCapture() {
         val cache = SessionCiphertextCache(root, binding, key)
         val original = cache.save(binding, "fixture-object-1", body)
         val encrypted = File(root, "packet.bin").readBytes()
@@ -116,9 +116,76 @@ class SessionCiphertextCacheTest {
                 wipes++
                 cache.clear()
             })
-        assertEquals(1, wipes)
-        assertTrue(root.listFiles().isNullOrEmpty())
-        assertThrows(SecurityException::class.java) { cache.inspect(binding, "fixture-object-1") }
+        assertEquals(0, wipes)
+        assertArrayEquals(encrypted, File(root, "packet.bin").readBytes())
+        assertEquals(original, cache.inspect(binding, "fixture-object-1"))
+    }
+
+    @Test fun malformedRemoteGetAndBadAuthorizationCannotWipePreviouslyAuthenticatedCiphertext() {
+        val cache = SessionCiphertextCache(root, binding, key)
+        val original = cache.save(binding, "fixture-object-1", body)
+        val sealed = File(root, "packet.bin").readBytes()
+        var wipes = 0
+        val maliciousPackets = listOf(
+            "{incomplete-json".toByteArray(Charsets.UTF_8),
+            ByteArray(SessionCiphertextCache.MAX_PACKET_BYTES + 1),
+            JSONObject(String(body, Charsets.UTF_8)).apply {
+                getJSONObject("authorization").put("username", "mallory")
+            }.toString().toByteArray(Charsets.UTF_8),
+        )
+        for (candidate in maliciousPackets) {
+            val failure = assertThrows(SecurityException::class.java) {
+                cache.save(binding, "fixture-object-1", candidate)
+            }
+            assertEquals(CiphertextCaptureUiResult.FAILED,
+                CiphertextCaptureFailurePolicy.handle(failure) {
+                    wipes++
+                    cache.clear()
+                })
+            assertEquals(0, wipes)
+            assertArrayEquals(sealed, File(root, "packet.bin").readBytes())
+            assertEquals(original, cache.inspect(binding, "fixture-object-1"))
+        }
+    }
+
+    @Test fun forgedHigherRemoteRevisionCannotReplaceUnverifiedLocalCapture() {
+        val cache = SessionCiphertextCache(root, binding, key)
+        val original = cache.save(binding, "fixture-object-1", body)
+        val sealed = File(root, "packet.bin").readBytes()
+        val forged = JSONObject(String(body, Charsets.UTF_8))
+        // Candidate metadata is self-consistent, but its unchanged Ed25519
+        // signature does not authorize the new revision. Storage integrity
+        // alone is not device authority: do not replace earlier ciphertext.
+        forged.getJSONObject("revision").put("counter", original.revisionCounter + 1)
+        forged.getJSONObject("authorization").getJSONObject("revision")
+            .put("counter", original.revisionCounter + 1)
+        val failure = assertThrows(SecurityException::class.java) {
+            cache.save(binding, "fixture-object-1", forged.toString().toByteArray(Charsets.UTF_8))
+        }
+        var wipes = 0
+        assertEquals(CiphertextCaptureUiResult.FAILED,
+            CiphertextCaptureFailurePolicy.handle(failure) {
+                wipes++
+                cache.clear()
+            })
+        assertEquals(0, wipes)
+        assertArrayEquals(sealed, File(root, "packet.bin").readBytes())
+        assertEquals(original, cache.inspect(binding, "fixture-object-1"))
+    }
+
+    @Test fun genericSecurityExceptionFromRemoteFetchIsNotEvidenceOfLocalCacheCorruption() {
+        val cache = SessionCiphertextCache(root, binding, key)
+        val original = cache.save(binding, "fixture-object-1", body)
+        val sealed = File(root, "packet.bin").readBytes()
+        var wiped = false
+        assertEquals(CiphertextCaptureUiResult.FAILED,
+            CiphertextCaptureFailurePolicy.handle(SecurityException("invalid remote response")) {
+                wiped = true
+                cache.clear()
+            })
+        assertFalse(wiped)
+        assertArrayEquals(sealed, File(root, "packet.bin").readBytes())
+        assertEquals(original, cache.inspect(binding, "fixture-object-1"))
     }
 
     @Test fun corruptedCachedCiphertextCannotBeReusedByAnIdenticalGet() {
