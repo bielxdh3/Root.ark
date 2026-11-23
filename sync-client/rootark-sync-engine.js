@@ -810,6 +810,20 @@ class SyncEngine {
           }
         }
       }
+      if (parsed.pendingHydrations !== undefined) {
+        if (!Array.isArray(parsed.pendingHydrations)) fail("Invalid pending hydrations", "invalid_snapshot");
+        for (const entry of parsed.pendingHydrations) {
+          if (!entry || typeof entry !== "object" || !/^[a-f0-9]{64}$/.test(entry.hash || "")
+            || typeof entry.stagedName !== "string" || !/^[A-Za-z0-9._-]+$/.test(entry.stagedName)
+            || (entry.tempName !== null && entry.tempName !== undefined && (typeof entry.tempName !== "string" || !/^[A-Za-z0-9._-]+$/.test(entry.tempName)))) {
+            fail("Invalid pending hydration entry", "invalid_snapshot");
+          }
+          try {
+            protocol.safeRelativePath(entry.path, "path");
+            if (entry.targetPath) protocol.safeRelativePath(entry.targetPath, "targetPath");
+          } catch { fail("Invalid pending hydration path", "invalid_snapshot"); }
+        }
+      }
       for (const [objectId, item] of Object.entries(parsed.remoteOnly)) {
         if (!item || typeof item !== "object" || item.objectId !== objectId || typeof item.path !== "string") fail("Invalid remote-only sync entry", "invalid_snapshot");
         try {
@@ -821,13 +835,50 @@ class SyncEngine {
       this.snapshot = parsed;
       this.snapshotDiskRevision = snapshotStats;
     }
+    await this.recoverPendingHydrations();
     this.opened = true;
     return this;
   }
 
-  async persistSnapshot() {
+  async recoverPendingHydrations() {
+    const entries = this.snapshot.pendingHydrations;
+    if (!Array.isArray(entries) || !entries.length) return;
+    const trashDir = path.join(this.rootDir, ".rootark-trash");
+    for (const entry of entries) {
+      if (entry.tempName && entry.targetPath) {
+        const tempPath = path.join(trashDir, entry.tempName);
+        const target = await contained(this.rootDir, entry.targetPath, true);
+        if (await exists(tempPath) && await exists(target)) {
+          const [tempStats, targetStats] = await Promise.all([
+            fsp.lstat(tempPath, { bigint: true }),
+            fsp.lstat(target, { bigint: true }),
+          ]);
+          if (sameFileIdentity(tempStats, targetStats)) {
+            await fsp.unlink(target);
+            await fsp.rm(tempPath, { force: true });
+          }
+        }
+      }
+      const stagedPath = path.join(trashDir, entry.stagedName);
+      await containedAbsolute(this.rootDir, stagedPath, true);
+      if (await exists(stagedPath)) {
+        const source = await contained(this.rootDir, entry.path, true);
+        if (!(await exists(source))) {
+          await this.restoreStagedTrackedFile(entry.path, stagedPath);
+        }
+      }
+    }
+    delete this.snapshot.pendingHydrations;
+    await this.persistSnapshot();
+  }
+
+  async writeSnapshotDurable() {
     await durableJson(this.snapshotPath, this.snapshot);
     this.snapshotDiskRevision = await fsp.lstat(this.snapshotPath, { bigint: true });
+  }
+
+  async persistSnapshot() {
+    await this.writeSnapshotDurable();
   }
 
   async keyFor(operation) {
@@ -1396,7 +1447,7 @@ class SyncEngine {
         : operation === "move"
           ? { path: relativePath, sourcePath: source }
           : { path: relativePath, name: path.posix.basename(relativePath), size: content.length, ...(directory ? { contentType: "inode/directory" } : {}) };
-      return protocol.validateOperation(await this.buildOperation({
+      const built = protocol.validateOperation(await this.buildOperation({
         operation,
         objectId: identity.objectId,
         fileId: identity.fileId,
@@ -1408,6 +1459,8 @@ class SyncEngine {
         plaintext: operation === "delete" ? undefined : content,
         fileKey,
       }));
+      await this.assertOutgoingPinnedPolicy(built);
+      return built;
     };
 
     if (kind === "delete") {
@@ -1851,20 +1904,23 @@ class SyncEngine {
       const group = groupedById.get(original.operationId);
       if (group) {
         if (pushedGroups.has(group.deleteId)) continue;
-        const pair = [
-          pendingById.get(group.deleteId), pendingById.get(group.moveId),
-        ];
+        const deleteOp = pendingById.get(group.deleteId);
+        const moveOp = pendingById.get(group.moveId);
+        const pair = [deleteOp, moveOp];
         if (await overlapsIndeterminate(indeterminate, pair, this.snapshot.files, this.rootDir)) {
           // Never dispatch just one side of an overlapping atomic group.
           pushedGroups.add(group.deleteId);
           continue;
         }
+        await this.assertOutgoingPinnedPolicy(deleteOp);
+        await this.assertOutgoingPinnedPolicy(moveOp);
         await this.pushAtomicSignedOverwritePair(pair, summary);
         pushedGroups.add(group.deleteId);
         if (summary.offline) break;
         continue;
       }
       if (await overlapsIndeterminate(indeterminate, [original], this.snapshot.files, this.rootDir)) continue;
+      await this.assertOutgoingPinnedPolicy(original);
       const next = recovered[index + 1];
       const event = signedWebDavEventId(original);
       if (event && next && signedWebDavEventId(next) === event) {
@@ -2098,18 +2154,18 @@ class SyncEngine {
     return crypto.createHash("sha256").update(content).digest("hex");
   }
 
-  async stageExisting(target) {
+  async stageExisting(target, customTrashTarget = null) {
     if (!(await exists(target))) return null;
     const trashDir = path.join(this.rootDir, ".rootark-trash");
     await fsp.mkdir(trashDir, { recursive: true });
     await containedAbsolute(this.rootDir, trashDir, false);
-    const trashTarget = path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(target)}`);
+    const trashTarget = customTrashTarget || path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(target)}`);
     await containedAbsolute(this.rootDir, trashTarget, true);
     await fsp.rename(target, trashTarget);
     return trashTarget;
   }
 
-  async stageCleanTrackedFile(relativePath, tracked) {
+  async stageCleanTrackedFile(relativePath, tracked, customTrashTarget = null) {
     // Checking a path before stageExisting is insufficient: a local writer
     // may change it before the rename. Verify the staged inode and bytes too,
     // restoring the changed file instead of admitting a remote overwrite.
@@ -2125,7 +2181,7 @@ class SyncEngine {
     if (crypto.createHash("sha256").update(contents).digest("hex") !== tracked.hash) {
       fail("Tracked local source has unsynced changes", "local_changes_pending");
     }
-    const staged = await this.stageExisting(source);
+    const staged = await this.stageExisting(source, customTrashTarget);
     if (!staged) fail("Tracked local source disappeared during staging", "local_changes_pending");
     try {
       await containedAbsolute(this.rootDir, staged, false);
@@ -2510,28 +2566,64 @@ class SyncEngine {
           await fsp.mkdir(hydrationTempDir, { recursive: true, mode: 0o700 });
           await containedAbsolute(this.rootDir, hydrationTempDir, false);
         }
+        const hydrationTempName = hydrationTempDir ? `hydrate-${crypto.randomUUID()}.tmp` : null;
         const temporary = hydrationTempDir
-          ? path.join(hydrationTempDir, `hydrate-${crypto.randomUUID()}.tmp`)
+          ? path.join(hydrationTempDir, hydrationTempName)
           : `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
         if (hydrationTempDir) await containedAbsolute(this.rootDir, temporary, true);
         let stagedSource = null;
         let stagedTarget = null;
         try {
           await fsp.writeFile(temporary, plaintext, { mode: 0o600, flag: "wx" });
+          const plannedStages = [];
+          const trackedTarget = beforeHydrationWrite && operation.operation === "update"
+            ? this.snapshot.files[metadata.path] : null;
+          const stageRelocated = Boolean(relocatedSource && !pathsEqual(relocatedSource, metadata.path));
+          const stageTarget = Boolean(
+            beforeHydrationWrite && operation.operation === "update"
+            && trackedTarget && !trackedTarget.deleted && !trackedTarget.directory
+            && trackedTarget.objectId === operation.objectId
+            && trackedTarget.fileId === operation.fileId,
+          );
+          let stagedSourceDest = null;
+          let stagedTargetDest = null;
+          if (hydrationTempDir && (stageRelocated || stageTarget)) {
+            if (stageRelocated) {
+              const stagedName = `stage-${crypto.randomUUID()}.tmp`;
+              stagedSourceDest = path.join(hydrationTempDir, stagedName);
+              plannedStages.push({
+                path: relocatedSource,
+                stagedName,
+                hash: this.snapshot.files[relocatedSource]?.hash || "",
+                tempName: hydrationTempName,
+                targetPath: metadata.path,
+              });
+            }
+            if (stageTarget) {
+              const stagedName = `stage-${crypto.randomUUID()}.tmp`;
+              stagedTargetDest = path.join(hydrationTempDir, stagedName);
+              plannedStages.push({
+                path: metadata.path,
+                stagedName,
+                hash: trackedTarget.hash || "",
+                tempName: hydrationTempName,
+                targetPath: metadata.path,
+              });
+            }
+            this.snapshot.pendingHydrations = plannedStages;
+            await this.writeSnapshotDurable();
+          }
           // Stage AND verify the old identity before publishing the new path.
           // A racing local edit/removal must never leave a destination orphan.
-          if (relocatedSource && !pathsEqual(relocatedSource, metadata.path)) {
+          if (stageRelocated) {
             stagedSource = await this.stageCleanTrackedFile(
-              relocatedSource, this.snapshot.files[relocatedSource]);
+              relocatedSource, this.snapshot.files[relocatedSource], stagedSourceDest);
           }
           if (beforeHydrationWrite && operation.operation === "update") {
-            const trackedTarget = this.snapshot.files[metadata.path];
-            if (trackedTarget && !trackedTarget.deleted && !trackedTarget.directory
-              && trackedTarget.objectId === operation.objectId
-              && trackedTarget.fileId === operation.fileId) {
+            if (stageTarget) {
               // Do not condition this on exists(target): a local deletion
               // between preflight and stage is an unsent change too.
-              stagedTarget = await this.stageCleanTrackedFile(metadata.path, trackedTarget);
+              stagedTarget = await this.stageCleanTrackedFile(metadata.path, trackedTarget, stagedTargetDest);
             } else if (await exists(target)) {
               fail("Untracked local destination cannot be replaced", "local_changes_pending");
             }
@@ -2570,6 +2662,10 @@ class SyncEngine {
             try { await this.restoreStagedTrackedFile(metadata.path, stagedTarget); }
             catch (restoreError) { error = restoreError; }
           }
+          if (this.snapshot.pendingHydrations) {
+            delete this.snapshot.pendingHydrations;
+            await this.writeSnapshotDurable().catch(() => {});
+          }
           throw error;
         } finally {
           // Until persistSnapshot() succeeds, retaining nlink=2 is the only
@@ -2589,6 +2685,7 @@ class SyncEngine {
     } else if (operation.operation === "delete" || operation.tombstone) {
       await this.pruneEmptyUntrackedParents(path.dirname(await contained(this.rootDir, cleanupPath || metadata.path, true)));
     }
+    delete this.snapshot.pendingHydrations;
     await this.persistSnapshot();
     // The durable snapshot now binds the visible bytes to their remote
     // identity. Only now may the private hardlink alias be removed. If
