@@ -226,7 +226,11 @@
         });
         div.append(button, decline);
         $('incoming').append(div);
-      } else if (m.type === 'accept-file' && p.outgoing && m.id === p.outgoing.id) {
+      } else if (m.type === 'accept-file' && p.outgoing && m.id === p.outgoing.id &&
+        p.outgoing.phase === 'offered') {
+        // Claim the offer synchronously before awaiting backpressure. Replayed
+        // accept frames must not start parallel sendChunks loops for one file.
+        p.outgoing.phase = 'sending';
         await sendChunks(p);
       } else if (m.type === 'decline-file' && p.outgoing && m.id === p.outgoing.id) {
         p.outgoing = null;
@@ -287,7 +291,7 @@
     for (const { peer: p, channel } of targets) {
       if (peers.get(p.id) !== p || p.dc !== channel || channel.readyState !== 'open' || p.outgoing) continue;
       const id = crypto.randomUUID();
-      p.outgoing = { id, name: file.name.slice(0, 100), bytes, digest };
+      p.outgoing = { id, name: file.name.slice(0, 100), bytes, digest, phase: 'offered' };
       channel.send(JSON.stringify({ type: 'offer-file', id, name: file.name.slice(0, 100), size: bytes.byteLength, digest }));
       count++;
     }
