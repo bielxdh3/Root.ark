@@ -268,3 +268,81 @@ test("issue 66 P1: malicious signed CREATE echo cannot prove physical admission"
   assert.deepEqual(second.list("alice"), [], "physical backend must still be empty");
   assert.equal(pushCount, 1, "fake receipt must not resend or consume the CREATE");
 });
+
+test("crashing after staging tracked cache for hydration recovers staged identity before reconcileLocal", async (t) => {
+  const { execFileSync } = require("node:child_process");
+  const { storagePath, first, authorize, publicKey } = await fixture(t);
+  const root = path.dirname(storagePath);
+  const rootDir = path.join(root, "client");
+  const syncKey = crypto.randomBytes(32);
+  const makeOp = (kind, counter) => authorize(createOperation({
+    operation: kind, objectId: "obj-hydrate", fileId: "file-obj-hydrate", versionId: crypto.randomUUID(),
+    operationId: crypto.randomUUID(), deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", revision: { counter, deviceId: "device-a" },
+    baseRevision: counter > 1 ? { counter: counter - 1, deviceId: "device-a" } : null,
+    metadata: { path: "notes.txt" },
+    plaintext: Buffer.from(`hydrated content v${counter}`), fileKey: syncKey,
+  }));
+  const initialOp = await makeOp("create", 1);
+  const updateOp = await makeOp("update", 2);
+
+  const openClient = () => new SyncEngine({
+    rootDir, deviceId: "device-a", username: "alice",
+    compartmentId: "private", keyEpoch: "epoch-1",
+    fileKeyResolver: () => syncKey,
+    snapshotPath: path.join(root, "snapshot.json"),
+    journalPath: path.join(root, "journal.json"),
+    requireAuthorization: true,
+    authorizationFactory: async (op) => (await authorize(op)).authorization,
+    verifyIncoming: (op) => verifyAuthorizationProof(
+      op.authorization, op, { username: "alice",
+        trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] }),
+    adapter: { push: async () => [], list: async () => [] },
+  }).open();
+
+  const client = await openClient();
+  // Seed initial hydrated state matching v1 on disk + in snapshot.
+  await client._apply(initialOp);
+  const seededBytes = await fsp.readFile(path.join(rootDir, "notes.txt"), "utf8");
+
+  // Crash abruptly inside a child process right after stageCleanTrackedFile
+  // removes notes.txt and before publication/persistSnapshot completes.
+  const enginePath = path.resolve(__dirname, "../sync-client/rootark-sync-engine.js");
+  const crashScript = `
+    const fsp = require("node:fs/promises");
+    const { SyncEngine } = require(${JSON.stringify(enginePath)});
+    (async () => {
+      const engine = await new SyncEngine({
+        rootDir: ${JSON.stringify(rootDir)},
+        deviceId: "device-a",
+        username: "alice",
+        compartmentId: "private",
+        keyEpoch: "epoch-1",
+        fileKeyResolver: () => Buffer.from(${JSON.stringify(syncKey.toString("hex"))}, "hex"),
+        snapshotPath: ${JSON.stringify(path.join(root, "snapshot.json"))},
+        journalPath: ${JSON.stringify(path.join(root, "journal.json"))},
+        requireAuthorization: false,
+        adapter: { push: async () => [], list: async () => [] },
+      }).open();
+      const origLink = fsp.link;
+      fsp.link = () => process.exit(42);
+      await engine._apply(${JSON.stringify(updateOp)}, null, async () => {});
+    })();
+  `;
+  let exitStatus = 0;
+  try {
+    execFileSync(process.execPath, ["--input-type=commonjs", "-e", crashScript], { stdio: "pipe" });
+  } catch (err) {
+    exitStatus = err.status;
+  }
+  assert.equal(exitStatus, 42, "child must crash at exact post-stage pre-link point");
+  // Clear stale process lock as an operator/restarter would after a crash.
+  await fsp.rmdir(path.join(rootDir, ".rootark-sync.lock")).catch(() => {});
+
+  const restarted = await openClient();
+  await restarted.reconcileLocal();
+  const queued = await restarted.journal.recover();
+  assert.equal(queued.length, 0, "reconcileLocal must not enqueue a DELETE after a hydration-staging crash");
+  assert.equal(await fsp.readFile(path.join(rootDir, "notes.txt"), "utf8"), seededBytes,
+    "staged tracked file must be restored before reconcileLocal");
+});
