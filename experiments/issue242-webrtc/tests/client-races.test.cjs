@@ -95,6 +95,67 @@ test('P2: empty offer IDs cannot create unbounded consent panels; valid offer st
     'repeated pending ID may not create more dialogs');
 });
 
+test('P2: repeated accept-file frames cannot start concurrent send loops during a stalled DataChannel', async () => {
+  const f = clientFixture();
+  f.joinRoom('room', 'invitation');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'host', peerId: 'host' });
+  await f.incoming(f.sockets[0], { type: 'peer-accepted', peerId: 'peer-A' });
+  const channel = f.testChannel(0);
+  const listeners = new Map();
+  channel.addEventListener = (type, callback) => {
+    if (!listeners.has(type)) listeners.set(type, new Set());
+    listeners.get(type).add(callback);
+  };
+  channel.removeEventListener = (type, callback) => listeners.get(type)?.delete(callback);
+  channel.close = () => {
+    channel.readyState = 'closed';
+    channel.onclose?.();
+    for (const callback of [...(listeners.get('close') || [])]) callback();
+  };
+  const originalSend = channel.send.bind(channel);
+  channel.send = value => {
+    originalSend(value);
+    if (value instanceof ArrayBuffer) channel.bufferedAmount = 128 * 1024;
+  };
+  channel.bufferedAmount = 128 * 1024;
+
+  const bytes = new Uint8Array(32 * 1024).fill(7);
+  await f.sendFile({ name: 'replay.bin', size: bytes.byteLength,
+    arrayBuffer: async () => bytes.buffer });
+  const offer = channel.sent.find(message => message.type === 'offer-file');
+  assert.ok(offer, 'positive control: sender has a live offer before consent');
+  const accept = { type: 'accept-file', id: offer.id };
+  let first;
+  let replay;
+  try {
+    first = channel.onmessage({ data: JSON.stringify(accept) });
+    replay = channel.onmessage({ data: JSON.stringify(accept) });
+    assert.equal(listeners.get('bufferedamountlow')?.size || 0, 1,
+      'a repeated accept while the first send is stalled must not register a second send loop');
+
+    const drain = () => {
+      channel.bufferedAmount = 0;
+      for (const callback of [...(listeners.get('bufferedamountlow') || [])]) callback();
+    };
+    drain();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(channel.sent.filter(value => value instanceof ArrayBuffer).length, 1,
+      'one drain must release exactly one first chunk');
+    assert.equal(listeners.get('bufferedamountlow')?.size || 0, 1,
+      'the single sender waits once for the next chunk window');
+
+    drain();
+    await Promise.all([first, replay]);
+    assert.equal(channel.sent.filter(value => value instanceof ArrayBuffer).length, 2,
+      'the file must be emitted as exactly two chunks');
+    assert.equal(channel.sent.filter(value => value.type === 'end-file').length, 1,
+      'the transfer must have exactly one completion frame');
+  } finally {
+    if (channel.readyState === 'open') channel.close();
+    await Promise.all([first, replay].filter(Boolean));
+  }
+});
+
 test('P2: delayed text hash cannot deliver to another room or a newly joined recipient', async () => {
   let blocked = null;
   function holdDigest() {
