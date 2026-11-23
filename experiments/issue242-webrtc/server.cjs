@@ -274,10 +274,17 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     return { status: 200, roomId: room.id, hostKey: room.hostKey, expires: room.expires };
   }
   const server = sharedWss ? null : createHttpServer((req, res) => {
-    const url = new URL(req.url, 'http://127.0.0.1');
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' ws://127.0.0.1:*; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'");
+    let url;
+    try { url = new URL(req.url, 'http://127.0.0.1'); }
+    catch {
+      // Malformed request-targets are attacker input. Return a bounded generic
+      // response without reflecting or logging the raw target.
+      res.writeHead(400, { 'Content-Length': '0' }).end();
+      return;
+    }
     if (req.method === 'POST' && url.pathname === '/rooms' && req.headers.origin === origin) {
       const result = createRoom(req);
       if (result.status !== 200) { res.writeHead(result.status).end(); return; }

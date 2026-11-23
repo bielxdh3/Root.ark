@@ -360,9 +360,14 @@ async function openOwnerAuthorizedFileCek(input) {
     if (cek.length !== 32) deny();
     // Last use: reject a now-expired owner approval/receipt before returning
     // plaintext-equivalent CEK bytes to B, even if HPKE was valid at entry.
-    requireUnexpiredAtRelease(Math.min(core.expires_at,
-      a.approval.expires_at, a.committedReceipt.expires_at));
-    return Object.freeze({ cek: Buffer.from(cek), authorizesProductionRestore: false,
+    // Release the minimum expiration from the exact owner-approved envelope,
+    // committed approval and independently verified witness snapshot, rather
+    // than forcing a later caller to reread mutable untrusted authority.
+    const verifiedReleaseExpiresAt = Math.min(core.expires_at,
+      a.approval.expires_at, a.committedReceipt.expires_at);
+    requireUnexpiredAtRelease(verifiedReleaseExpiresAt);
+    return Object.freeze({ cek: Buffer.from(cek), verifiedReleaseExpiresAt,
+      authorizesProductionRestore: false,
       externalCustodyProven: false });
   } catch (_) { deny(); }
   finally { cek?.fill(0); stable?.deviceHpkePrivateKey?.hpkePrivateRaw?.fill(0); }
