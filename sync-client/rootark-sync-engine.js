@@ -2013,9 +2013,21 @@ class SyncEngine {
     if (pinnedDescendant && !existingAncestorCreate) {
       fail("A pinned file is inside a directory affected by the signed operation", "file_pinned");
     }
-    if (operation.operation === "delete"
-      && this.snapshot.pinnedFiles?.[pinnedKey(operation.objectId)]?.fileId === operation.fileId) {
-      fail("Pinned file must be unpinned before applying a remote delete", "file_pinned");
+    if (operation.operation === "delete" || operation.tombstone) {
+      const pin = this.snapshot.pinnedFiles?.[pinnedKey(operation.objectId)];
+      const deletionSource = tombstoneSourceOverride
+        || (this.snapshot.files[metadata.path] && !this.snapshot.files[metadata.path].deleted
+          && this.snapshot.files[metadata.path].objectId === operation.objectId
+          && this.snapshot.files[metadata.path].fileId === operation.fileId ? metadata.path : null)
+        || activeIdentityPath(this.snapshot.files, operation, metadata.path)
+        || activeFileIdentityPath(this.snapshot.files, operation, metadata.path);
+      const trackedDeletion = deletionSource ? this.snapshot.files[deletionSource] : null;
+      if (pin && (pin.fileId === operation.fileId
+        || (trackedDeletion && !trackedDeletion.deleted
+          && trackedDeletion.objectId === pin.objectId && trackedDeletion.fileId === pin.fileId)
+        || (tombstoneSourceOverride && pathsEqual(pin.path, tombstoneSourceOverride)))) {
+        fail("Pinned file must be unpinned before applying a remote delete", "file_pinned");
+      }
     }
     if (["create", "update", "move"].includes(operation.operation)
       && protectedPaths.some((pin) =>
@@ -2551,9 +2563,11 @@ class SyncEngine {
         ? Boolean(prior.directory)
         : operation.metadata?.contentType === "inode/directory",
     };
-    // A verified MOVE retains object/file identity; carry device-local
-    // retention intent without trusting advisory inventory metadata.
-    if (operation.operation === "move") {
+    // A verified MOVE (or an authenticated UPDATE relocating a cached file)
+    // retains object/file identity; carry device-local retention intent
+    // without trusting advisory inventory metadata.
+    if (operation.operation === "move"
+      || (operation.operation === "update" && sourcePath && sourcePath !== pathName)) {
       const pin = this.snapshot.pinnedFiles?.[pinnedKey(operation.objectId)];
       if (pin && pin.fileId === operation.fileId) {
         this.snapshot.pinnedFiles[pinnedKey(operation.objectId)] = { ...pin, path: pathName };
