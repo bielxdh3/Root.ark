@@ -300,6 +300,20 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   assert.deepEqual(matching.entries.map((entry) => entry.name), ["sensitive/private/account.txt"],
     "manual search must match signed and locally decrypted filenames only");
   assert.equal(matching.totalMatches, 1);
+  const beforeSelectedGetRequests = csrfRequests;
+  const selectedCiphertext = await receiver.readSelectedCiphertext(
+    receiverBefore, matching.entries[0].objectId, matching.entries[0].revision);
+  assert.deepEqual(Buffer.from(selectedCiphertext.ciphertextBase64, "base64url"), firstCipher,
+    "UI selection must invoke the actual recipient device's signed GET and exact digest");
+  assert.equal(selectedCiphertext.verifiedCiphertext, true);
+  assert.equal(selectedCiphertext.plaintextAvailable, false);
+  assert.equal(selectedCiphertext.authorizesMutation, false);
+  assert.ok(csrfRequests > beforeSelectedGetRequests, "selection GET must reach authenticated HTTP");
+  await assert.rejects(receiver.readSelectedCiphertext(receiverBefore, objectId, 2),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "uncommitted revision cannot be selected for read");
+  await assert.rejects(receiver.readSelectedCiphertext(receiverBefore,
+    b64(nodeCrypto.randomBytes(16)), 1), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "other objects outside the exact signed catalog must not cause a GET");
   const missing = await receiver.readPrivateListing(receiverBefore, listingKey, "not-in-this-vault");
   assert.deepEqual(missing.entries, [], "manual search must exclude unrelated names");
   assert.equal(missing.totalMatches, 0);
@@ -364,6 +378,18 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   } });
   await assert.rejects(corruptedRead.readVerifiedCiphertext(listed, objectId, 1),
     /ZK_BROWSER_CATALOG_UNVERIFIED/, "forged GET bytes rejected");
+  const forgedSelectedClient = await syncClient(1, { fetchImpl: async (url, init) => {
+    const response = await fetchImpl(url, init);
+    if (!url.endsWith("/content/read")) return response;
+    const message = await response.json();
+    message.ciphertextBase64 = b64(nodeCrypto.randomBytes(firstCipher.length));
+    return new Response(JSON.stringify(message), { status: 200,
+      headers: { "content-type": "application/json" } });
+  } });
+  const forgedSelectedBaseline = await forgedSelectedClient.readCurrent();
+  await assert.rejects(forgedSelectedClient.readSelectedCiphertext(
+    forgedSelectedBaseline, objectId, 1), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "tampered signed HTTP ciphertext must never be downloaded from search");
   assert.equal(await openZk1CatalogMetadataV1({ scope, objectId, revision: 1, epoch: 1,
     metadataKey, ciphertext: listed.rows[0].metadata_ciphertext }), rowInput.name);
   const secondCipher = nodeCrypto.randomBytes(90);
