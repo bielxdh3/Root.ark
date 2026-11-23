@@ -8,6 +8,9 @@ on:
     branches:
       - Root/main
       - 'cdx/zk65-split-pr*'
+      - 'cdx/issue66-picker-pin-integration-prime-20261107'
+      - 'cdx/issue63-text-batch-prime-20261106'
+      - 'cdx/rootark-roadmap-operational-20261105'
   schedule:
     - cron: "37 11 * * 1"
 

@@ -114,12 +114,16 @@ async function fixture(t, prefix) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const config = path.join(configRoot, "config.json");
+  // The private state is keyed by URL, account and destination. The operating
+  // system can recycle loopback ports while the test runner retains prior
+  // fixture state in the real user's private home across test processes.
+  const username = `fixture-${crypto.randomBytes(16).toString("hex")}`;
   await writePrivateSyncConfig(config, JSON.stringify({
     serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "fixture", token: "test-token", localFolder: selected,
+    username, token: "test-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
   }));
-  return { dir, configRoot, selected, config, uploads,
+  return { dir, configRoot, selected, config, uploads, username,
     serverUrl: `http://127.0.0.1:${server.address().port}` };
 }
 
@@ -188,6 +192,20 @@ test("simultaneous legacy uploads serialize private state without lost entries",
   assert.equal(f.uploads.length, 8);
   const state = JSON.parse(await fsp.readFile(expectedPrivateState(f.config, f.selected, f), "utf8"));
   for (let i = 0; i < 8; i++) assert.equal(state.files[`new-${i}.txt`].lastStatus, "uploaded");
+});
+
+test("recycled loopback ports cannot alias state across disposable server fixtures", async (t) => {
+  const first = await fixture(t, "rootark-state-port-a-");
+  const second = await fixture(t, "rootark-state-port-b-");
+  // A busy Windows test runner can assign the same ephemeral port to later
+  // fixtures. Both synthetic connections below therefore share the exact URL.
+  const recycledServerUrl = "http://127.0.0.1:31337";
+  const firstState = expectedPrivateState(first.config, first.selected,
+    { ...first, serverUrl: recycledServerUrl });
+  const secondState = expectedPrivateState(second.config, second.selected,
+    { ...second, serverUrl: recycledServerUrl });
+  assert.notEqual(firstState, secondState,
+    "disposable servers must never adopt prior fixtures' persisted ACKs");
 });
 
 test("switching remote destination never imports uploaded acknowledgements from prior target", async (t) => {
