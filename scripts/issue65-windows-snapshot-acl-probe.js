@@ -19,6 +19,16 @@ const ERROR_CODES = new Set([
   "ACL_SEAL_SCRIPT_ANCESTOR", "ACL_SEAL_SCRIPT_PARENT", "ACL_SEAL_SCRIPT_LEAF",
   ...["ANCESTOR", "PARENT", "LEAF"].flatMap((role) =>
     ["GET_ACL", "OWNER", "RULES", "JSON"].map((step) => `ACL_READ_${role}_${step}`)),
+  ...["ANCESTOR", "PARENT", "LEAF"].flatMap((role) =>
+    ["CURRENT_USER", "OWNER_READ"].map((step) => "ACL_READ_" + role + "_" + step)),
+  ...["ANCESTOR"].flatMap((role) => [2, 3, 4].flatMap((depth) =>
+    ["GET_ACL", "CURRENT_USER", "OWNER_READ", "RULES", "JSON"].flatMap((step) =>
+      ["ACCESS_DENIED", "SECURITY_EXCEPTION", "PATH_NOT_FOUND", "NOT_FOUND", "ITEM_NOT_FOUND", "OTHER"]
+        .map((failure) => "ACL_READ_" + role + "_D" + depth + "_" + step + "_" + failure)))),
+  ...["PARENT", "LEAF"].flatMap((role) =>
+    ["GET_ACL", "CURRENT_USER", "OWNER_READ", "RULES", "JSON"].flatMap((step) =>
+      ["ACCESS_DENIED", "SECURITY_EXCEPTION", "PATH_NOT_FOUND", "NOT_FOUND", "ITEM_NOT_FOUND", "OTHER"]
+        .map((failure) => "ACL_READ_" + role + "_" + step + "_" + failure))),
   "EACCES", "EPERM", "ENOENT", "EBUSY", "ETIMEDOUT", "EIO",
 ]);
 
@@ -53,17 +63,52 @@ function classifyNativeAclCommand(args, snapshotDirectory) {
   return role ? `ACL_${action}_${role}` : "OTHER";
 }
 
+function classifyNativeAclAncestorDepth(args, snapshotDirectory) {
+  const command = Array.isArray(args) ? args[args.length - 1] : null;
+  if (typeof command !== "string" || typeof snapshotDirectory !== "string"
+    || !command.includes("Get-Acl -LiteralPath $target")) return null;
+  const encoded = command.match(/FromBase64String\('([A-Za-z0-9+/=]{1,8192})'\)/)?.[1];
+  if (!encoded) return null;
+  const bytes = Buffer.from(encoded, "base64");
+  if (bytes.length === 0 || bytes.length % 2 !== 0) return null;
+  const candidate = bytes.toString("utf16le");
+  if (!candidate || /[\u0000-\u001f]/.test(candidate)) return null;
+  const target = path.win32.normalize(candidate).toLowerCase();
+  const root = path.win32.normalize(snapshotDirectory).toLowerCase();
+  if (!root.startsWith(target.replace(/[\\/]+$/, "") + "\\")) return null;
+  const relative = path.win32.relative(target, root);
+  if (!relative || relative === ".." || relative.startsWith("..\\")
+    || path.win32.isAbsolute(relative)) return null;
+  const depth = relative.split(/[\\/]+/).filter(Boolean).length;
+  return [2, 3, 4].includes(depth) ? depth : null;
+}
+
+function buildReadAclFailureScript(script) {
+  return "$rootarkProbeStage = 'GET_ACL'; try { " + script + " } catch { "
+    + "$rootarkProbeError = 'OTHER'; $rootarkProbeException = $_.Exception; "
+    + "if ($null -ne $rootarkProbeException) { "
+    + "if ($rootarkProbeException -is [System.UnauthorizedAccessException] -or $rootarkProbeException.HResult -eq -2147024891) { $rootarkProbeError = 'ACCESS_DENIED' } "
+    + "elseif ($rootarkProbeException -is [System.Security.SecurityException]) { $rootarkProbeError = 'SECURITY_EXCEPTION' } "
+    + "elseif ($rootarkProbeException -is [System.IO.DirectoryNotFoundException] -or $rootarkProbeException.HResult -eq -2147024893) { $rootarkProbeError = 'PATH_NOT_FOUND' } "
+    + "elseif ($rootarkProbeException -is [System.IO.FileNotFoundException] -or $rootarkProbeException.HResult -eq -2147024894) { $rootarkProbeError = 'NOT_FOUND' } "
+    + "elseif ($rootarkProbeException -is [System.Management.Automation.ItemNotFoundException] -or $rootarkProbeException.HResult -eq -2146233087) { $rootarkProbeError = 'ITEM_NOT_FOUND' } }; "
+    + "[Console]::Out.WriteLine('ROOTARK_ISSUE65_READ_SUBSTEP=' + $rootarkProbeStage + ';ERROR=' + $rootarkProbeError); exit 71 }";
+}
+
 // After a native read-script failure, replay only that already-trusted,
 // read-only script with fixed stage labels. This does NOT authorize a directory
 // and does not replace production validation; a changing result remains FAIL.
 // Native exception, stderr, path, ACL and raw PowerShell text are never logged.
 function classifyReadAclSubstep(native, binary, args, options, snapshotDirectory) {
   const code = classifyNativeAclCommand(args, snapshotDirectory);
+  const ancestorDepth = code === "ACL_READ_ANCESTOR"
+    ? classifyNativeAclAncestorDepth(args, snapshotDirectory) : null;
   if (!/^ACL_READ_(?:ANCESTOR|PARENT|LEAF)$/.test(code)) return code;
   const original = args[args.length - 1];
   const stages = [
     ["$acl = Get-Acl -LiteralPath $target", "GET_ACL"],
-    ["$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value", "OWNER"],
+    ["$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value", "CURRENT_USER"],
+    ["$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value", "OWNER_READ"],
     ["$rules = @($acl.GetAccessRules(", "RULES"],
     ["[pscustomobject]@{ owner = $owner; current = $current; protected = $acl.AreAccessRulesProtected; rules = $rules } | ConvertTo-Json -Depth 4 -Compress", "JSON"],
   ];
@@ -73,27 +118,47 @@ function classifyReadAclSubstep(native, binary, args, options, snapshotDirectory
     if (index < 0 || script.indexOf(needle, index + needle.length) >= 0) return code;
     script = script.replace(needle, `$rootarkProbeStage = '${stage}'; ${needle}`);
   }
-  script = `$rootarkProbeStage = 'GET_ACL'; try { ${script} } catch { `
-    + "[Console]::Out.WriteLine('ROOTARK_ISSUE65_READ_SUBSTEP=' + $rootarkProbeStage); exit 71 }";
+  script = buildReadAclFailureScript(script);
   try {
     native(binary, [...args.slice(0, -1), script], {
       ...options, stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (error) {
     const output = typeof error?.stdout === "string" ? error.stdout : null;
-    const matched = output?.match(/^ROOTARK_ISSUE65_READ_SUBSTEP=(GET_ACL|OWNER|RULES|JSON)\r?\n?$/);
-    if (matched) return `${code}_${matched[1]}`;
+    const matched = output?.match(/^ROOTARK_ISSUE65_READ_SUBSTEP=(GET_ACL|CURRENT_USER|OWNER_READ|RULES|JSON);ERROR=(ACCESS_DENIED|SECURITY_EXCEPTION|PATH_NOT_FOUND|NOT_FOUND|ITEM_NOT_FOUND|OTHER)\r?\n?$/);
+    if (matched) {
+      const suffix = matched[1] + "_" + matched[2];
+      if (code === "ACL_READ_ANCESTOR" && ancestorDepth !== null) {
+        return code + "_D" + ancestorDepth + "_" + suffix;
+      }
+      return code + "_" + suffix;
+    }
+    const legacy = output?.match(/^ROOTARK_ISSUE65_READ_SUBSTEP=(GET_ACL|CURRENT_USER|OWNER_READ|RULES|JSON)\r?\n?$/);
+    if (legacy) return code + "_" + legacy[1];
   }
   return code;
 }
 
-function loadSnapshotApiWithConfinedNativeErrors(snapshotDirectory) {
+function getSnapshotAclDirectory(snapshotApi) {
+  if (typeof snapshotApi?.getPrivateShareSnapshotDirectory !== "function") {
+    throw new TypeError("Snapshot API does not expose its effective private directory");
+  }
+  const directory = snapshotApi.getPrivateShareSnapshotDirectory();
+  if (typeof directory !== "string" || !directory
+    || (!path.isAbsolute(directory) && !path.win32.isAbsolute(directory))) {
+    throw new TypeError("Snapshot API returned an invalid private directory");
+  }
+  return directory;
+}
+
+function loadSnapshotApiWithConfinedNativeErrors() {
   const childProcess = require("node:child_process");
   const original = childProcess.execFileSync;
   const moduleName = require.resolve("../services/fileReadHandle");
   if (require.cache[moduleName]) {
     throw new Error("Snapshot ACL diagnostic must load the original implementation in isolation");
   }
+  let snapshotDirectory;
   childProcess.execFileSync = function (binary, args, options) {
     try { return original.call(this, binary, args, options); }
     catch (error) {
@@ -104,7 +169,14 @@ function loadSnapshotApiWithConfinedNativeErrors(snapshotDirectory) {
       throw Object.assign(new Error("Private ACL native step unavailable"), { code });
     }
   };
-  try { return require(moduleName); }
+  try {
+    const snapshotApi = require(moduleName);
+    // Bind classification to the exact path production will validate, including
+    // ROOTARK_PRIVATE_SHARE_SNAPSHOT_DIRECTORY overrides. Never infer a second
+    // default path that can disagree with the module's trusted ancestors.
+    snapshotDirectory = getSnapshotAclDirectory(snapshotApi);
+    return snapshotApi;
+  }
   finally { childProcess.execFileSync = original; }
 }
 
@@ -187,7 +259,7 @@ async function runWindowsProbe() {
   const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
   const {
     ensurePrivateShareSnapshotDirectory, snapshotReadHandle, cleanupReadHandle,
-  } = loadSnapshotApiWithConfinedNativeErrors(path.join(local, "Rootark", "share-snapshots"));
+  } = loadSnapshotApiWithConfinedNativeErrors();
 
   const base = path.resolve(local);
   const folder = path.join(base, `rootark-issue65-acl-probe-${crypto.randomBytes(12).toString("hex")}`);
@@ -245,4 +317,5 @@ if (require.main === module) {
 }
 
 module.exports = { runDiagnostic, runIsolatedDiagnostic, classifyNativeAclCommand,
-  classifyReadAclSubstep };
+  classifyNativeAclAncestorDepth, buildReadAclFailureScript, classifyReadAclSubstep,
+  getSnapshotAclDirectory };

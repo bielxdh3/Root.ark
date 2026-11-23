@@ -7,7 +7,8 @@ const { spawnSync } = require("node:child_process");
 const test = require("node:test");
 const vm = require("node:vm");
 const { runDiagnostic, runIsolatedDiagnostic, classifyNativeAclCommand,
-  classifyReadAclSubstep } = require("../scripts/issue65-windows-snapshot-acl-probe");
+  buildReadAclFailureScript, classifyReadAclSubstep, classifyNativeAclAncestorDepth,
+  getSnapshotAclDirectory } = require("../scripts/issue65-windows-snapshot-acl-probe");
 
 const steps = (override = {}) => ({
   fixture_acl: () => undefined,
@@ -213,6 +214,101 @@ test("#65 read-only ACL failure probe pinpoints a failed production script step 
   assert.equal(called, 1);
   assert.equal(classifyReadAclSubstep(() => { throw { stdout: "ROOTARK_ISSUE65_READ_SUBSTEP=RULES\nsecret=ABC" }; },
     "powershell.exe", args, {}, root), "ACL_READ_ANCESTOR");
+});
+
+test("#65 read ACL probe distinguishes GetOwner failure from current-user SID failure", () => {
+  const root = "C:\\Users\\runner\\AppData\\Local\\Rootark\\share-snapshots";
+  const ancestor = "C:\\Users\\runner\\AppData\\Local";
+  const encoded = Buffer.from(ancestor, "utf16le").toString("base64");
+  const args = ["-NoLogo", "-Command", "$target = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('" + encoded + "')); $acl = Get-Acl -LiteralPath $target; $current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { [pscustomobject]@{ sid = $_.IdentityReference.Value; type = $_.AccessControlType.ToString(); rights = [int]$_.FileSystemRights } }); [pscustomobject]@{ owner = $owner; current = $current; protected = $acl.AreAccessRulesProtected; rules = $rules } | ConvertTo-Json -Depth 4 -Compress"];
+  for (const [marker, expected] of [
+    ["OWNER_READ", "ACL_READ_ANCESTOR_OWNER_READ"],
+    ["CURRENT_USER", "ACL_READ_ANCESTOR_CURRENT_USER"],
+  ]) {
+    const result = classifyReadAclSubstep((_binary, nestedArgs) => {
+      const script = nestedArgs.at(-1);
+      assert.ok(script.includes("$rootarkProbeStage = '" + marker + "'"));
+      throw { stdout: "ROOTARK_ISSUE65_READ_SUBSTEP=" + marker + "\r\n", stderr: "private SID and path" };
+    }, "powershell.exe", args, {}, root);
+    assert.equal(result, expected);
+  }
+});
+
+test("#65 read ACL probe reports only fixed PowerShell error classes and trusted ancestor depth", () => {
+  const root = "C:\\Users\\runner\\AppData\\Local\\Rootark\\share-snapshots";
+  const targets = [
+    ["C:\\Users\\runner\\AppData\\Local", 2],
+    ["C:\\Users\\runner\\AppData", 3],
+    ["C:\\Users\\runner", 4],
+  ];
+  const source = fs.readFileSync(path.join(__dirname, "../services/fileReadHandle.js"), "utf8");
+  const first = source.indexOf("function windowsDirectoryAcl(");
+  const last = source.indexOf("function secureNewWindowsSnapshotDirectory(", first);
+  assert.ok(first > 0 && last > first);
+  const commands = [];
+  const windowsDirectoryAcl = vm.runInNewContext(source.slice(first, last) + "\nwindowsDirectoryAcl", {
+    Buffer, runPowerShell: (script) => { commands.push(script); return "{}"; },
+  });
+  for (const [target, depth] of targets) {
+    windowsDirectoryAcl(target);
+    const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", commands.pop()];
+    for (const errorClass of ["ACCESS_DENIED", "ITEM_NOT_FOUND"]) {
+      let called = 0;
+      let hasDefaultErrorClass = false;
+      let hasHresultClassification = false;
+      let hasItemNotFoundClassification = false;
+      const result = classifyReadAclSubstep((_binary, nestedArgs) => {
+        called++;
+        const script = nestedArgs.at(-1);
+        hasDefaultErrorClass = script.includes("$rootarkProbeError = 'OTHER'");
+        hasHresultClassification = script.includes("$rootarkProbeException.HResult -eq -2147024891");
+        hasItemNotFoundClassification = script.includes("[System.Management.Automation.ItemNotFoundException]");
+        throw { stdout: "ROOTARK_ISSUE65_READ_SUBSTEP=GET_ACL;ERROR=" + errorClass + "\r\n",
+          stderr: "private path=C:\\Users\\runner\\secret SID=S-1-5-21" };
+      }, "powershell.exe", args, {}, root);
+      assert.equal(called, 1);
+      assert.equal(hasDefaultErrorClass, true);
+      assert.equal(hasHresultClassification, true);
+      assert.equal(hasItemNotFoundClassification, true);
+      assert.equal(result, "ACL_READ_ANCESTOR_D" + depth + "_GET_ACL_" + errorClass);
+    }
+  }
+});
+
+test("#65 ACL diagnostic uses the effective production snapshot directory when an override is configured", () => {
+  const override = "C:\\Users\\runner\\AppData\\Local\\Rootark";
+  const defaultDirectory = "C:\\Users\\runner\\AppData\\Local\\Rootark\\share-snapshots";
+  const ancestor = "C:\\Users\\runner\\AppData";
+  const encoded = Buffer.from(ancestor, "utf16le").toString("base64");
+  const args = ["-NoLogo", "-Command", "$target = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('" + encoded + "')); $acl = Get-Acl -LiteralPath $target"];
+  const snapshotApi = { getPrivateShareSnapshotDirectory: () => override };
+  const effectiveDirectory = getSnapshotAclDirectory(snapshotApi);
+
+  assert.equal(effectiveDirectory, override);
+  assert.equal(classifyNativeAclAncestorDepth(args, effectiveDirectory), 2);
+  assert.equal(classifyNativeAclAncestorDepth(args, defaultDirectory), 3);
+
+  const probeSource = fs.readFileSync(path.join(__dirname, "../scripts/issue65-windows-snapshot-acl-probe.js"), "utf8");
+  assert.match(probeSource, /snapshotDirectory = getSnapshotAclDirectory\(snapshotApi\)/);
+  assert.match(probeSource, /loadSnapshotApiWithConfinedNativeErrors\(\)/);
+  assert.doesNotMatch(probeSource, /loadSnapshotApiWithConfinedNativeErrors\(path\.join\(local, "Rootark", "share-snapshots"\)\)/);
+});
+
+test("#65 Windows PowerShell 5.1 maps missing Get-Acl targets to fixed ITEM_NOT_FOUND without leaking paths", {
+  skip: process.platform !== "win32",
+}, () => {
+  const script = buildReadAclFailureScript("$ErrorActionPreference = 'Stop'; $target = Join-Path $env:TEMP ('rootark-missing-' + [Guid]::NewGuid().ToString('N')); $acl = Get-Acl -LiteralPath $target;");
+  const result = spawnSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 10000,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 71);
+  assert.equal(result.stdout.trim(), "ROOTARK_ISSUE65_READ_SUBSTEP=GET_ACL;ERROR=ITEM_NOT_FOUND");
+  assert.equal(result.stderr, "");
+  assert.doesNotMatch(result.stdout, /rootark-missing|[A-Z]:\\\\|S-1-5-/);
 });
 
 test("#65 no native substep can be claimed for an untrusted path, seal script or unknown output", () => {
