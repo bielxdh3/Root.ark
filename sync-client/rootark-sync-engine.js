@@ -2888,10 +2888,9 @@ class SyncEngine {
           // server's claim that it won THIS object's HTTP 409. A compromised
           // transport may replay a genuine, unrelated signed object and make
           // remote-wins discard our still-pending local outbox. Require the
-          // same immutable object, file and compartment before any local
-          // recovery files, summary updates or durable journal ACKs.
+          // same object and compartment before any local recovery files,
+          // summary updates or durable journal ACKs (fileId may rotate).
           if (current.objectId !== operation.objectId
-            || current.fileId !== operation.fileId
             || current.compartmentId !== operation.compartmentId) {
             fail("Unrelated remote winner cannot acknowledge pending operation",
               "remote_authorization_rejected");
@@ -4424,6 +4423,7 @@ class SyncEngine {
     if (matches.length !== 1) fail("Ambiguous tracked object identity", "remote_object_ambiguous");
     const [sourcePath, currentPrior] = matches[0];
     const prior = { ...currentPrior };
+    let operation = null;
     const checkBeforeWrite = async () => {
       const current = this.snapshot.files[sourcePath];
       if (!current || current.deleted || current.directory
@@ -4432,6 +4432,7 @@ class SyncEngine {
         || !/^[a-f0-9]{64}$/.test(current.hash || "")) {
         fail("Tracked local cache changed", "local_changes_pending");
       }
+      if (operation) await this.assertPendingMaterializationDisjoint(operation);
       const pending = await this.journal.recover();
       if (pending.some((item) => item.objectId === inventory.objectId
         || item.metadata?.path === sourcePath || item.metadata?.sourcePath === sourcePath)) {
@@ -4448,7 +4449,7 @@ class SyncEngine {
     const result = await this.adapter.list(inventory.objectId);
     const records = Array.isArray(result) ? result : Array.isArray(result?.objects) ? result.objects : result ? [result] : [];
     if (records.length !== 1) fail("Remote tombstone is unavailable", "remote_object_unavailable");
-    const operation = envelopeCopy(protocol.validateStoredOperation(records[0]));
+    operation = envelopeCopy(protocol.validateStoredOperation(records[0]));
     assertInventoryMatchesEnvelope(operation, inventory);
     if (!operation.tombstone && operation.operation !== "delete") {
       fail("Remote tombstone is not a delete operation", "inventory_changed");

@@ -1752,3 +1752,70 @@ test("issue 66 #278 P2 RED: translateWebDavMutation and _pushPending reject outg
     path: "docs/a.txt", pinned: true, localPresent: true, objectId: "object-a",
   });
 });
+
+test("issue 66 #292 P2 RED: rotated-fileId 409 winner quarantines same-object conflict without blocking disjoint sync", async (t) => {
+  const { rootDir, open, remote, adapter, state } = await fixture(t);
+  const client = await open([], true, false, ["docs"]);
+  adapter.list = async (objectId) => objectId === undefined
+    ? [...state.records.values()].map((record) => structuredClone(record))
+    : [...state.records.values()].filter((record) => record.objectId === objectId)
+      .map((record) => structuredClone(record));
+  await client.pullRemote({ pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false });
+  const initial = state.records.get("object-a");
+  const pending = await remote("update", "object-a", "docs/a.txt", "local uncommitted bytes", 2);
+  state.records.set("object-a", { ...initial, fileId: "file-rotated-a" });
+  const committedCurrent = await remote("update", "object-a", "docs/a.txt",
+    "rotated-fileId committed bytes", 2);
+  assert.notEqual(pending.fileId, committedCurrent.fileId);
+  assert.equal(pending.objectId, committedCurrent.objectId);
+  assert.equal(pending.compartmentId, committedCurrent.compartmentId);
+
+  const unrelatedPending = await remote("create", "object-b", "docs/b.txt", "disjoint local bytes");
+  state.records.delete("object-b");
+  const unrelatedRemote = await remote("create", "object-c", "docs/c.txt", "disjoint remote bytes");
+  await fsp.writeFile(path.join(rootDir, "docs/b.txt"), "disjoint local bytes");
+  await client.journal.enqueue(pending);
+  await client.journal.enqueue(unrelatedPending);
+
+  adapter.push = async (outgoing) => {
+    if (outgoing.operationId === pending.operationId) {
+      return { status: 409, current: structuredClone(committedCurrent),
+        currentRevision: committedCurrent.revision };
+    }
+    state.records.set("object-b", structuredClone(outgoing));
+    return structuredClone(outgoing);
+  };
+
+  const summary = await client.syncOnce();
+  assert.equal(summary.pushed, 1);
+  assert.equal(summary.pulled, 1);
+  assert.equal(summary.indeterminate, 1);
+  assert.deepEqual((await client.journal.recover()).map((item) => item.operationId),
+    [pending.operationId]);
+  assert.equal(client.journal.hasSeen(committedCurrent.operationId), false);
+});
+
+test("issue 66 #292 P2 RED: pending ancestor directory op blocks Files On-Demand tombstone reconciliation", async (t) => {
+  const { rootDir, open, remote, adapter, state } = await fixture(t);
+  const client = await open([], true, true, ["docs"]);
+  adapter.list = async (objectId) => objectId === undefined
+    ? [...state.records.values()].map((record) => structuredClone(record))
+    : [...state.records.values()].filter((record) => record.objectId === objectId)
+      .map((record) => structuredClone(record));
+  await remote("create", "object-child", "docs/sub/child.txt", "cached child bytes", 1);
+  await client.pullRemote({ pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false });
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/sub/child.txt"), "utf8"),
+    "cached child bytes");
+
+  const pendingDirOp = await remote("delete", "dir-sub", "docs/sub", "", 1);
+  state.records.delete("dir-sub");
+  await client.journal.enqueue(pendingDirOp);
+
+  const childTombstone = await remote("delete", "object-child", "docs/sub/child.txt", "", 2);
+  await assert.rejects(client.materializeRemote("docs/sub/child.txt"),
+    { code: "sync_operation_pending" });
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/sub/child.txt"), "utf8"),
+    "cached child bytes", "tombstone must not delete child while ancestor directory op is pending");
+  assert.equal(client.journal.hasSeen(childTombstone.operationId), false,
+    "blocked tombstone must not be marked seen");
+});
