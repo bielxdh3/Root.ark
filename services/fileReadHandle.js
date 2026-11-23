@@ -88,7 +88,11 @@ function windowsDirectoryAcl(directoryPath) {
   const script = [
     "$ErrorActionPreference = 'Stop'",
     `$target = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('${encodedPath}'))`,
-    "$acl = Get-Acl -LiteralPath $target",
+    // Windows hosted runners can report a PowerShell-provider ItemNotFound
+    // for an existing directory. Re-read its same ACL via the native .NET API
+    // only when the filesystem independently confirms the target still exists.
+    // All owner/ACE checks below remain mandatory; any native failure denies.
+    "try { $acl = Get-Acl -LiteralPath $target } catch [System.Management.Automation.ItemNotFoundException] { if (-not [System.IO.Directory]::Exists($target)) { throw }; $acl = [System.IO.Directory]::GetAccessControl($target) }",
     "$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
     "$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { [pscustomobject]@{ sid = $_.IdentityReference.Value; type = $_.AccessControlType.ToString(); rights = [int]$_.FileSystemRights } })",

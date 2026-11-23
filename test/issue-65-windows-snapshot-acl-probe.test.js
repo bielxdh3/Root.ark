@@ -294,6 +294,49 @@ test("#65 ACL diagnostic uses the effective production snapshot directory when a
   assert.doesNotMatch(probeSource, /loadSnapshotApiWithConfinedNativeErrors\(path\.join\(local, "Rootark", "share-snapshots"\)\)/);
 });
 
+test("#65 real Windows ACL reader retries provider ItemNotFound only when the directory physically exists", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../services/fileReadHandle.js"), "utf8");
+  const first = source.indexOf("function windowsDirectoryAcl(");
+  const last = source.indexOf("function secureNewWindowsSnapshotDirectory(", first);
+  assert.ok(first >= 0 && last > first);
+  const commands = [];
+  const read = vm.runInNewContext(`${source.slice(first, last)}\nwindowsDirectoryAcl`, {
+    Buffer, runPowerShell: (script) => { commands.push(script); return "{}"; },
+  });
+  read("C:\\Users\\runner\\AppData\\Local");
+  const script = commands.pop();
+  assert.match(script, /try \{ \$acl = Get-Acl -LiteralPath \$target \} catch \[System\.Management\.Automation\.ItemNotFoundException\]/);
+  assert.match(script, /if \(-not \[System\.IO\.Directory\]::Exists\(\$target\)\) \{ throw \}/);
+  assert.match(script, /\$acl = \[System\.IO\.Directory\]::GetAccessControl\(\$target\)/);
+});
+
+test("#65 Windows PowerShell 5.1 retrieves owner and ACEs when its Get-Acl provider falsely misses an existing directory", {
+  skip: process.platform !== "win32",
+}, () => {
+  const source = fs.readFileSync(path.join(__dirname, "../services/fileReadHandle.js"), "utf8");
+  const first = source.indexOf("function windowsDirectoryAcl(");
+  const last = source.indexOf("function secureNewWindowsSnapshotDirectory(", first);
+  const commands = [];
+  const read = vm.runInNewContext(`${source.slice(first, last)}\nwindowsDirectoryAcl`, {
+    Buffer, runPowerShell: (script) => { commands.push(script); return "{}"; },
+  });
+  const target = process.env.LOCALAPPDATA;
+  assert.ok(target && fs.statSync(target).isDirectory());
+  read(target);
+  const fakeProvider = "function Get-Acl { throw [System.Management.Automation.ItemNotFoundException]::new('simulated provider miss') }; ";
+  const result = spawnSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    fakeProvider + commands.pop()], {
+    encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 10000,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, "native ACL reader must recover without emitting private PowerShell data");
+  const acl = JSON.parse(result.stdout);
+  assert.match(acl.current, /^S-1-/);
+  assert.match(acl.owner, /^S-1-/);
+  assert.ok(acl.rules);
+  assert.equal(result.stderr, "");
+});
+
 test("#65 Windows PowerShell 5.1 maps missing Get-Acl targets to fixed ITEM_NOT_FOUND without leaking paths", {
   skip: process.platform !== "win32",
 }, () => {
