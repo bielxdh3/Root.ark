@@ -3542,17 +3542,16 @@ class SyncEngine {
           if (result.status !== 409) fail("Sync push rejected", "push_rejected");
           throw new SyncConflictError(result);
         }
-        // Persist the exact pre-expiry observation BEFORE snapshot writes. A
-        // later journal fsync failure must not make this verified ciphertext
-        // impossible to authenticate after authorization expires.
-        // The restore branch reached this line only AFTER the independent
-        // physical witness and CURRENT CAS floor both proved exact admission.
-        // Promote its earlier durable pre-observation to an admitted receipt;
-        // otherwise thousands of successful restores strand `observed` slots.
+        // Ordinary exact echoed operations need a pre-observation before
+        // snapshot writes. Historical restores instead have an independently
+        // signed physical witness and CURRENT CAS proof, and are durably
+        // admitted in markSeenExact's single journal transaction below.
+        // Do not consume a bounded observation slot for a proven restore:
+        // the other 10,000 slots may legitimately contain pending evidence.
         const acknowledgedDigest = historicalRestore ? historicalRestoreEnvelope.digest
           : outboundFreshDigest && result?.operationId === operation.operationId
             && signedEnvelopeDigest(result) === outboundFreshDigest ? outboundFreshDigest : null;
-        if (acknowledgedDigest) await nativeReflectApply(journalMethods.observeAdmission, journal,
+        if (!historicalRestore && acknowledgedDigest) await nativeReflectApply(journalMethods.observeAdmission, journal,
           [operation.operationId, acknowledgedDigest]);
         if (operation.operation === "move" || operation.operation === "delete") {
           const hash = operation.operation === "move"
@@ -3710,8 +3709,9 @@ class SyncEngine {
     if (!staged) fail("Historical restore target disappeared", "restore_local_conflict");
     let unchanged = false;
     try {
-      // Hold the staged inode before consulting its mutable pathname. This
-      // prevents a check-then-open from inadvertently reading a substitute.
+      // Bind the moved inode to an open descriptor before pathname checks.
+      // The attacker must never replace a checked pathname to change bytes
+      // chosen for historical restore or to bypass rollback protections.
       await containedAbsolute(this.rootDir, staged, false);
       const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
         | (fs.constants.O_NONBLOCK || 0);
@@ -3719,9 +3719,8 @@ class SyncEngine {
       try {
         const opened = await handle.stat({ bigint: true });
         const after = await fsp.lstat(staged, { bigint: true });
-        // Windows rename may update ctimeNs. Compare stable inode, size,
-        // mtime, birthtime and mode, plus an independently held FD and a
-        // post-read path binding. Never trust same-size/same-mtime bytes alone.
+        // Windows rename may legitimately change ctimeNs. Verify stable
+        // inode, size, mtime, birthtime and mode on both FD and pathname.
         unchanged = opened.isFile() && !opened.isSymbolicLink()
           && after.isFile() && !after.isSymbolicLink()
           && opened.nlink === 1n && after.nlink === 1n
@@ -3792,10 +3791,17 @@ class SyncEngine {
     };
     operation = { ...operation, metadata };
     const target = await contained(this.rootDir, metadata.path, true);
-    // Credential/key/AEAD/path preflight is complete. Fsync the exact verified
-    // envelope before the first filesystem or snapshot mutation; failure here
-    // must not leave an applied object with no restart-safe observation.
-    if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+    // Incoming remote operations require a durable pre-observation before
+    // local mutation. A locally staged historical restore instead has its
+    // exact signed outbox journaled BEFORE this call, and its materialization
+    // is recorded separately. No remote admission has happened yet: only the
+    // later independent physical witness + CURRENT CAS may atomically admit
+    // it. Do not allocate an observation slot for that local materialization.
+    const locallyStagedRestore = historicalRestoreHash !== undefined
+      && stringStartsWith(operation.operationId, "histrestore-");
+    if (verifiedFreshDigest && !locallyStagedRestore) {
+      await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+    }
     let cleanupPath = null;
     if (operation.operation === "delete" || operation.tombstone) {
       const priorAtTarget = this.snapshot.files[metadata.path];
@@ -4459,10 +4465,8 @@ class SyncEngine {
       fail("Remote pull blocked by pending atomic signed WebDAV batch",
         "sync_atomic_batch_indeterminate");
     }
-    // LIST is not a physical admission receipt. If an excluded/offline
-    // historical restore is still queued, an exact echo must never reach an
-    // ordinary markSeen(), which would discard the durable signed outbox and
-    // its local materialization without consulting the independent witness.
+    // LIST cannot certify a pending historical restore. Even an exact
+    // signed echo may not consume its outbox or the pre-admission local bytes.
     const pendingRestoreDigests = nativeObjectCreate(null);
     const pendingRestores = await this.journal.recover();
     for (let index = 0; index < pendingRestores.length; index += 1) {
@@ -4547,8 +4551,8 @@ class SyncEngine {
     for (let index = 0; index < inspected.length; index += 1) {
       const operation = inspected[index];
       if (nativeObjectHasOwn(pendingRestoreDigests, operation.operationId)) {
-        // Only the outbound independent admission flow may consume this ID.
-        // It remains queued even if its destination is currently excluded.
+        // Only the outbound independent physical-admission flow can clear
+        // this identity, whether its destination is selected or excluded.
         continue;
       }
       if (!this.operationDestinationIsSelected(operation)) {

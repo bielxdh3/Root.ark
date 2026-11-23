@@ -25,6 +25,31 @@ imprime ciphertext nem chaves. O campo `signatureVerified: false` informa que
 esses metadados historicos ainda nao possuem verificacao independente de
 assinatura, admissao ou custodia; a consulta **nao** autoriza uma restauracao.
 
+### Revisao de falso positivo e retomada de dispositivo pausado (#67)
+
+Quando a protecao contra alteracoes destrutivas devolve `sync_burst_paused`
+(HTTP 423), revise primeiro o historico e os arquivos afetados. De **outro
+dispositivo confiavel** da mesma conta, o Sync v2 oferece o comando:
+
+```powershell
+node sync-client/rootark-sync-v2.js resume --config <config-v2-privado> --device-id <dispositivo-pausado> --credentials-stdin
+```
+
+`--credentials-stdin` exige um unico objeto JSON UTF-8 fornecido por fluxo
+privado de entrada, `{"password":"...","code":"..."}`. `code` pode ser
+omitido se a conta nao exigir TOTP; se exigir, deve ser TOTP valido ou codigo
+de recuperacao ainda nao usado. Use um gerenciador confiavel para alimentar
+stdin; **nao** passe senha/codigo nos argumentos, nem os coloque em scripts,
+historico do PowerShell ou arquivos sincronizados. A configuracao precisa de
+`serverUrl`, `username`, `token` e `deviceId` do dispositivo que solicita a
+retomada. O cliente recusa auto-retomada declarada e redirects autenticados.
+
+O servidor verifica a sessao, a permissao `upload`, a senha e o segundo fator
+de maneira independente, mantendo suas protecoes contra concorrencia e replay.
+A saida JSON contem apenas `protocolVersion`, `deviceId`, `paused:false` e
+`wasPaused`; erros HTTP nao ecoam credenciais. A retomada nao desfaz arquivos,
+nao altera historico retido nem autoriza uma versao historica como operacao nova.
+
 ## Comandos
 
 ```powershell
