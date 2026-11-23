@@ -188,10 +188,17 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     ws.on('close', () => removePeer(ws));
   });
   const server = createHttpServer((req, res) => {
-    const url = new URL(req.url, 'http://127.0.0.1');
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Security-Policy', "default-src 'self'; connect-src 'self' ws://127.0.0.1:*; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'");
+    let url;
+    try { url = new URL(req.url, 'http://127.0.0.1'); }
+    catch {
+      // Malformed request-targets are attacker input. Return a bounded generic
+      // response without reflecting or logging the raw target.
+      res.writeHead(400, { 'Content-Length': '0' }).end();
+      return;
+    }
     if (req.method === 'POST' && url.pathname === '/rooms' && req.headers.origin === origin) {
       const user = identify(req);
       if (authenticated && !user) { res.writeHead(401).end(); return; }

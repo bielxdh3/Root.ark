@@ -21,6 +21,9 @@ const { Zk1OpaqueCatalog, catalogCasDomain } = require("../src/services/zk1Opaqu
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 const catalogBrowser = require("../public/client/rootark-zk1-browser-opaque-catalog-commit");
 const opaqueSync = require("../public/client/rootark-zk1-opaque-device-delta-sync");
+const fileContent = require("../public/client/rootark-zk1-file-content");
+const selectedLocalPreview = require("../public/client/rootark-zk1-selected-local-preview");
+const protectedTextBatch = require("../public/client/rootark-zk1-protected-text-batch");
 const { openZk1CatalogMetadataV1 } = require("../src/crypto/rootark-zk1-opaque-catalog-client-v1");
 
 const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
@@ -236,7 +239,17 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
     assert.equal(response.status, predecessor === null ? 201 : 200, await response.text());
   };
   const objectId = b64(nodeCrypto.randomBytes(16));
-  const firstCipher = nodeCrypto.randomBytes(100);
+  const offlineCek = nodeCrypto.randomBytes(32);
+  const offlineMetadata = {
+    ...Object.fromEntries(Object.entries(scope).map(([key, value]) => [key, b64(value)])),
+    object_id: objectId, version_id: b64(nodeCrypto.randomBytes(16)),
+    parent_version_id: null, epoch: 1, kind: "file",
+  };
+  const firstCipher = Buffer.from(await fileContent.encryptFile({
+    cek: await fileContent.importFileCek(offlineCek),
+    metadata: offlineMetadata, name: "local.txt", mediaType: "text/plain",
+    data: new TextEncoder().encode("conteúdo assinado local"),
+  }));
   const metadataKey = nodeCrypto.randomBytes(32);
   const cryptoMeta = await crypto.subtle.importKey("raw", metadataKey, "AES-GCM", false,
     ["encrypt", "decrypt"]);
@@ -296,6 +309,77 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   assert.equal(commits, beforePrivateListCommits);
   assert.equal(JSON.stringify(receiverBefore).includes("sensitive/private/account.txt"),
     false, "signed opaque snapshot still exposes no filename");
+  const matching = await receiver.readPrivateListing(receiverBefore, listingKey, "PRIVATE/ACCOUNT");
+  assert.deepEqual(matching.entries.map((entry) => entry.name), ["sensitive/private/account.txt"],
+    "manual search must match signed and locally decrypted filenames only");
+  assert.equal(matching.totalMatches, 1);
+  const beforeSelectedGetRequests = csrfRequests;
+  const selectedCiphertext = await receiver.readSelectedCiphertext(
+    receiverBefore, matching.entries[0].objectId, matching.entries[0].revision);
+  assert.deepEqual(Buffer.from(selectedCiphertext.ciphertextBase64, "base64url"), firstCipher,
+    "UI selection must invoke the actual recipient device's signed GET and exact digest");
+  assert.equal(selectedCiphertext.verifiedCiphertext, true);
+  assert.equal(selectedCiphertext.plaintextAvailable, false);
+  assert.equal(selectedCiphertext.authorizesMutation, false);
+  assert.ok(csrfRequests > beforeSelectedGetRequests, "selection GET must reach authenticated HTTP");
+  const getOnlyCount = csrfRequests;
+  const currentHead = (await clientOptions(1)).pinnedOwnerHead;
+  const openedSelected = await selectedLocalPreview.open({
+    selected: receiverBefore.entries[0], checked: selectedCiphertext,
+    metadata: offlineMetadata, rawCek: offlineCek,
+    cekSha256Pin: b64(digest(offlineCek)),
+    grant: await grant(manifest.devices[1]),
+    ownerHead: { revision: currentHead.revision, epoch: currentHead.epoch,
+      digest: b64(currentHead.digest) },
+    baseline: receiverBefore, assertLive: () => active && csrf === "known-csrf-token",
+  });
+  assert.equal(openedSelected.text, "conteúdo assinado local");
+  assert.equal(openedSelected.plaintextSentToServer, false);
+  assert.equal(csrfRequests, getOnlyCount, "CEK and plaintext must never cross signed HTTP");
+  const batchResult = await protectedTextBatch.search({
+    query: "ASSINADO",
+    items: [{ selected: receiverBefore.entries[0], metadata: offlineMetadata,
+      rawCek: offlineCek, cekSha256Pin: b64(digest(offlineCek)) }],
+    grant: await grant(manifest.devices[1]),
+    ownerHead: { revision: currentHead.revision, epoch: currentHead.epoch,
+      digest: b64(currentHead.digest) },
+    baseline: receiverBefore,
+    assertLive: () => active && csrf === "known-csrf-token",
+    getChecked: (id, revision) =>
+      receiver.readSelectedCiphertext(receiverBefore, id, revision),
+  });
+  assert.equal(batchResult.totalSearched, 1);
+  assert.equal(batchResult.totalMatches, 1);
+  assert.match(batchResult.matches[0].excerpt, /conteúdo assinado local/);
+  assert.equal(batchResult.plaintextSentToServer, false);
+  assert.ok(csrfRequests > getOnlyCount,
+    "local content batch must reissue actual signed GET, never replay old ciphertext proof");
+  assert.equal(putRequests, beforePrivateListPuts,
+    "local content batch is strictly read-only");
+  await assert.rejects(receiver.readSelectedCiphertext(receiverBefore, objectId, 2),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "uncommitted revision cannot be selected for read");
+  await assert.rejects(receiver.readSelectedCiphertext(receiverBefore,
+    b64(nodeCrypto.randomBytes(16)), 1), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "other objects outside the exact signed catalog must not cause a GET");
+  const missing = await receiver.readPrivateListing(receiverBefore, listingKey, "not-in-this-vault");
+  assert.deepEqual(missing.entries, [], "manual search must exclude unrelated names");
+  assert.equal(missing.totalMatches, 0);
+  const searchRequests = [];
+  const privacyReader = await syncClient(1, { fetchImpl: async (url, init) => {
+    searchRequests.push(String(url) + String(init?.body || ""));
+    return fetchImpl(url, init);
+  } });
+  const privacyBefore = await privacyReader.readCurrent();
+  await privacyReader.readPrivateListing(privacyBefore, listingKey, "not-in-this-vault");
+  assert.ok(searchRequests.length > 0, "search must still re-read its signed catalog");
+  assert.ok(searchRequests.every((wire) => !wire.includes("not-in-this-vault")),
+    "the private query must never appear in authenticated catalog HTTP requests");
+  await assert.rejects(receiver.readPrivateListing(receiverBefore, incorrectListingKey,
+    "not-in-this-vault"), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "nonmatching filter must still decrypt every signed row and reject wrong keys");
+  await assert.rejects(receiver.readPrivateListing(receiverBefore, listingKey,
+    "x".repeat(121)), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "browser search must reject unbounded terms");
   const listed = await second.readAll();
   assert.equal(listed.head.sequence, 1);
   assert.equal(listed.rows.length, 1);
@@ -341,6 +425,18 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   } });
   await assert.rejects(corruptedRead.readVerifiedCiphertext(listed, objectId, 1),
     /ZK_BROWSER_CATALOG_UNVERIFIED/, "forged GET bytes rejected");
+  const forgedSelectedClient = await syncClient(1, { fetchImpl: async (url, init) => {
+    const response = await fetchImpl(url, init);
+    if (!url.endsWith("/content/read")) return response;
+    const message = await response.json();
+    message.ciphertextBase64 = b64(nodeCrypto.randomBytes(firstCipher.length));
+    return new Response(JSON.stringify(message), { status: 200,
+      headers: { "content-type": "application/json" } });
+  } });
+  const forgedSelectedBaseline = await forgedSelectedClient.readCurrent();
+  await assert.rejects(forgedSelectedClient.readSelectedCiphertext(
+    forgedSelectedBaseline, objectId, 1), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+  "tampered signed HTTP ciphertext must never be downloaded from search");
   assert.equal(await openZk1CatalogMetadataV1({ scope, objectId, revision: 1, epoch: 1,
     metadataKey, ciphertext: listed.rows[0].metadata_ciphertext }), rowInput.name);
   const secondCipher = nodeCrypto.randomBytes(90);
@@ -523,8 +619,17 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   currentDigest = realHeadDigest;
   const listingAfterTrash = await freshTrashReader.readPrivateListing(
     latestTrash, ownerMetadataKey);
-  assert.equal(listingAfterTrash.entries[2].name, null);
-  assert.equal(listingAfterTrash.entries[2].logicalTrashCandidate, true);
+  assert.equal(listingAfterTrash.totalMatches, 1,
+    "one object with three signed revisions remains one current listing entry");
+  assert.equal(listingAfterTrash.entries.length, 1,
+    "older version names are verified but not displayed as separate live files");
+  assert.equal(listingAfterTrash.entries[0].name, null);
+  assert.equal(listingAfterTrash.entries[0].logicalTrashCandidate, true);
+  const searchedAfterTrash = await freshTrashReader.readPrivateListing(
+    latestTrash, ownerMetadataKey, "Lixeira lógica");
+  assert.equal(searchedAfterTrash.totalMatches, 0,
+    "tombstone status labels must never be searchable filenames");
+  assert.deepEqual(searchedAfterTrash.entries, []);
   const badTombstoneReader = await syncClient(1);
   const badBase = await badTombstoneReader.readCurrent();
   await assert.rejects(badTombstoneReader.readTrash({ previous: badBase, objectId,
