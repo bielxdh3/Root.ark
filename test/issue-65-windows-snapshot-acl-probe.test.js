@@ -5,7 +5,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
-const { runDiagnostic, runIsolatedDiagnostic } = require("../scripts/issue65-windows-snapshot-acl-probe");
+const vm = require("node:vm");
+const { runDiagnostic, runIsolatedDiagnostic, classifyNativeAclCommand } = require("../scripts/issue65-windows-snapshot-acl-probe");
 
 const steps = (override = {}) => ({
   fixture_acl: () => undefined,
@@ -134,6 +135,65 @@ test("#65 P2: even a zero-exit native child with private stderr fails closed", (
     "ROOTARK_ISSUE65_ACL_PROBE stage=cleanup result=PASS",
   ].join("\n") + "\n", stderr: "C:\\Users\\private" }), (line) => messages.push(line)), false);
   assert.deepEqual(messages, ["ROOTARK_ISSUE65_ACL_PROBE stage=isolated_process result=FAIL code=OTHER"]);
+});
+
+test("#65 hosted ACL probe categorizes native read/seal errors by trusted path ROLE, never by path content", () => {
+  const root = "C:\\Users\\runner\\AppData\\Local\\Rootark\\share-snapshots";
+  const parent = "C:\\Users\\runner\\AppData\\Local\\Rootark";
+  const ancestor = "C:\\Users\\runner\\AppData\\Local";
+  const makeArgs = (target, action) => ["-NoLogo", "-Command",
+    `$target = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('${Buffer.from(target, "utf16le").toString("base64")}')); $acl=Get-Acl -LiteralPath $target; ${action === "seal" ? "Set-Acl -LiteralPath $target -AclObject $acl" : "ConvertTo-Json $acl"}`];
+  assert.equal(classifyNativeAclCommand(makeArgs(ancestor, "read"), root), "ACL_READ_ANCESTOR");
+  assert.equal(classifyNativeAclCommand(makeArgs(parent, "seal"), root), "ACL_SEAL_SCRIPT_PARENT");
+  assert.equal(classifyNativeAclCommand(makeArgs(root, "read"), root), "ACL_READ_LEAF");
+  assert.equal(classifyNativeAclCommand(makeArgs(root, "seal"), root), "ACL_SEAL_SCRIPT_LEAF");
+  assert.equal(classifyNativeAclCommand(["-Command", "Write-Output C:\\Users\\runner\\secret"], root), "OTHER");
+});
+
+test("#65 ACL classifier recognizes the actual PowerShell scripts from fileReadHandle", () => {
+  // Exercise the native script constructors from the production source, not a
+  // hand-written approximation that can silently drift from the real commands.
+  const source = fs.readFileSync(path.join(__dirname, "../services/fileReadHandle.js"), "utf8");
+  const extract = (name, next) => {
+    const first = source.indexOf(`function ${name}(`);
+    const last = source.indexOf(`function ${next}(`, first);
+    assert.ok(first >= 0 && last > first, `Production ${name} boundary missing`);
+    return source.slice(first, last);
+  };
+  const root = "C:\\Users\\runner\\AppData\\Local\\Rootark\\share-snapshots";
+  const parent = path.win32.dirname(root);
+  const ancestor = path.win32.dirname(parent);
+  const captures = [];
+  const context = { Buffer, runPowerShell(script) { captures.push(script); return "{}"; } };
+  const read = vm.runInNewContext(`${extract("windowsDirectoryAcl", "secureNewWindowsSnapshotDirectory")}\nwindowsDirectoryAcl`, context);
+  const seal = vm.runInNewContext(`${extract("secureNewWindowsSnapshotDirectory", "validateDirectorySecurity")}\nsecureNewWindowsSnapshotDirectory`, context);
+  read(ancestor);
+  assert.equal(classifyNativeAclCommand(["-Command", captures.pop()], root), "ACL_READ_ANCESTOR");
+  read(parent);
+  assert.equal(classifyNativeAclCommand(["-Command", captures.pop()], root), "ACL_READ_PARENT");
+  read(root);
+  assert.equal(classifyNativeAclCommand(["-Command", captures.pop()], root), "ACL_READ_LEAF");
+  seal(parent);
+  const sealScript = captures.pop();
+  assert.ok(sealScript.indexOf("Get-Acl -LiteralPath $target") < sealScript.indexOf("Set-Acl -LiteralPath $target"),
+    "Production seal script reads the existing ACL before attempting Set-Acl");
+  // Even when the FIRST Get-Acl fails, only the script that was attempted is
+  // observable: it must never be reported as proof that Set-Acl failed.
+  assert.equal(classifyNativeAclCommand(["-Command", sealScript], root), "ACL_SEAL_SCRIPT_PARENT");
+  seal(root);
+  assert.equal(classifyNativeAclCommand(["-Command", captures.pop()], root), "ACL_SEAL_SCRIPT_LEAF");
+});
+
+test("#65 hosted ACL native failure category is allowlisted and omits secret PowerShell details", async () => {
+  const messages = [];
+  const result = await runDiagnostic(steps({
+    snapshot_root_acl: () => {
+      throw Object.assign(new Error("Get-Acl C:\\Users\\runner\\secret.pfx S-1-5-21"), { code: "ACL_SEAL_SCRIPT_PARENT" });
+    },
+  }), (line) => messages.push(line));
+  assert.equal(result, false);
+  assert.ok(messages.includes("ROOTARK_ISSUE65_ACL_PROBE stage=snapshot_root_acl result=FAIL code=ACL_SEAL_SCRIPT_PARENT"));
+  assert.doesNotMatch(messages.join("\n"), /C:\\Users|S-1-5|secret/);
 });
 
 test("#65 diagnostic is a separate exact-branch Windows job; no reduction of canonical suites", () => {

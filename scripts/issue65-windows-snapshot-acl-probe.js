@@ -15,11 +15,61 @@ const ERROR_CODES = new Set([
   "UNTRUSTED_AUTHORITY_TEST_ROOT",
   "FILE_HANDLE_CHANGED",
   "FILE_HANDLE_CLOSE_UNCERTAIN",
+  "ACL_READ_ANCESTOR", "ACL_READ_PARENT", "ACL_READ_LEAF",
+  "ACL_SEAL_SCRIPT_ANCESTOR", "ACL_SEAL_SCRIPT_PARENT", "ACL_SEAL_SCRIPT_LEAF",
   "EACCES", "EPERM", "ENOENT", "EBUSY", "ETIMEDOUT", "EIO",
 ]);
 
 function safeCode(error) {
   return ERROR_CODES.has(error?.code) ? error.code : "OTHER";
+}
+
+// Decode a path only inside the isolated child for classification; NEVER put
+// that path, the native stderr, SID or PowerShell script in its output. The
+// target may be an ancestor, the private parent or the snapshot leaf.
+function classifyNativeAclCommand(args, snapshotDirectory) {
+  const command = Array.isArray(args) ? args[args.length - 1] : null;
+  if (typeof command !== "string" || typeof snapshotDirectory !== "string") return "OTHER";
+  // The seal SCRIPT first executes Get-Acl and other mutations before Set-Acl;
+  // its failure does not prove which individual PowerShell command failed.
+  const action = command.includes("Set-Acl -LiteralPath $target") ? "SEAL_SCRIPT"
+    : command.includes("Get-Acl -LiteralPath $target") ? "READ" : null;
+  const encoded = command.match(/FromBase64String\('([A-Za-z0-9+/=]{1,8192})'\)/)?.[1];
+  if (!action || !encoded) return "OTHER";
+  let candidate;
+  try {
+    const bytes = Buffer.from(encoded, "base64");
+    if (bytes.length === 0 || bytes.length % 2 !== 0) return "OTHER";
+    candidate = bytes.toString("utf16le");
+  } catch { return "OTHER"; }
+  if (!candidate || /[\u0000-\u001f]/.test(candidate)) return "OTHER";
+  const target = path.win32.normalize(candidate).toLowerCase();
+  const root = path.win32.normalize(snapshotDirectory).toLowerCase();
+  const parent = path.win32.dirname(root);
+  const role = target === root ? "LEAF" : target === parent ? "PARENT"
+    : root.startsWith(target.replace(/[\\/]+$/, "") + "\\") ? "ANCESTOR" : null;
+  return role ? `ACL_${action}_${role}` : "OTHER";
+}
+
+function loadSnapshotApiWithConfinedNativeErrors(snapshotDirectory) {
+  const childProcess = require("node:child_process");
+  const original = childProcess.execFileSync;
+  const moduleName = require.resolve("../services/fileReadHandle");
+  if (require.cache[moduleName]) {
+    throw new Error("Snapshot ACL diagnostic must load the original implementation in isolation");
+  }
+  childProcess.execFileSync = function (binary, args, options) {
+    try { return original.call(this, binary, args, options); }
+    catch (error) {
+      const code = classifyNativeAclCommand(args, snapshotDirectory);
+      if (code === "OTHER") throw error;
+      // This classification is ONLY for the probe subprocess. Production
+      // fileReadHandle remains untouched and still rejects unsafe ACLs.
+      throw Object.assign(new Error("Private ACL native step unavailable"), { code });
+    }
+  };
+  try { return require(moduleName); }
+  finally { childProcess.execFileSync = original; }
 }
 
 async function runDiagnostic(steps, emit) {
@@ -101,7 +151,7 @@ async function runWindowsProbe() {
   const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
   const {
     ensurePrivateShareSnapshotDirectory, snapshotReadHandle, cleanupReadHandle,
-  } = require("../services/fileReadHandle");
+  } = loadSnapshotApiWithConfinedNativeErrors(path.join(local, "Rootark", "share-snapshots"));
 
   const base = path.resolve(local);
   const folder = path.join(base, `rootark-issue65-acl-probe-${crypto.randomBytes(12).toString("hex")}`);
@@ -158,4 +208,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { runDiagnostic, runIsolatedDiagnostic };
+module.exports = { runDiagnostic, runIsolatedDiagnostic, classifyNativeAclCommand };
