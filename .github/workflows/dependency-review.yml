@@ -38,9 +38,39 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      - name: Review dependencies introduced by this main commit
+      - name: Review only this push interval (incremental, not complete PR delta)
         uses: actions/dependency-review-action@v5
         with:
           base-ref: ${{ github.event.before }}
           head-ref: ${{ github.sha }}
+          fail-on-severity: high
+
+  # The #300 base has advanced independently. A green incremental push check
+  # cannot prove the full dependency delta of this stacked PR. This gate must
+  # resolve the CURRENT authorized base ref and compare its unique merge-base
+  # to the exact pushed head. It fails closed if the PR was retargeted/moved.
+  issue66-full-pr-dependency-review:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/cdx/issue66-cfapi-native-w8-20261107'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout complete Git history for an unambiguous merge-base
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate official PR 300 base, head, and full dependency range
+        id: range
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/issue-66-full-pr-dependency-range.js
+
+      - name: Review complete stacked PR 300 dependency delta
+        uses: actions/dependency-review-action@v5
+        with:
+          base-ref: ${{ steps.range.outputs.base-sha }}
+          head-ref: ${{ steps.range.outputs.head-sha }}
           fail-on-severity: high
