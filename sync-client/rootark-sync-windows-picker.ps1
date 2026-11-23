@@ -5,13 +5,44 @@ param(
   [string]$Config
 )
 
-$ErrorActionPreference = 'Stop'
 if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
   throw 'Out-GridView requires Windows PowerShell with the GraphicalTools feature.'
 }
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   throw 'Node.js is required to run the Root.ark Windows picker. Ensure node is available on PATH.'
 }
+
+function Resolve-RootArkPath([string]$base, [string]$target) {
+  if ([string]::IsNullOrWhiteSpace($target)) { return $base }
+  $cleanTarget = $target.Replace('/', '\')
+  $isFullyQualified = if ($null -ne [IO.Path].GetMethod('IsPathFullyQualified', [type[]]@([string]))) {
+    [IO.Path]::IsPathFullyQualified($cleanTarget)
+  } else {
+    $cleanTarget -match '^[A-Za-z]:\\' -or $cleanTarget -match '^\\\\'
+  }
+  if ($isFullyQualified) {
+    return [IO.Path]::GetFullPath($cleanTarget)
+  }
+  if ($cleanTarget -match '^\\') {
+    $driveRoot = [IO.Path]::GetPathRoot($base)
+    if ([string]::IsNullOrEmpty($driveRoot)) { $driveRoot = '\' }
+    return [IO.Path]::GetFullPath([IO.Path]::Combine($driveRoot, $cleanTarget.TrimStart('\')))
+  }
+  if ($cleanTarget -match '^([A-Za-z]:)(.*)$') {
+    $drive = $Matches[1]
+    $relativePart = $Matches[2].TrimStart('\')
+    $baseDrive = if ($base -match '^([A-Za-z]:)') { $Matches[1] } else { '' }
+    if ($baseDrive -and $drive.Equals($baseDrive, [System.StringComparison]::OrdinalIgnoreCase)) {
+      return [IO.Path]::GetFullPath([IO.Path]::Combine($base, $relativePart))
+    }
+    return [IO.Path]::GetFullPath([IO.Path]::Combine("$drive\", $relativePart))
+  }
+  return [IO.Path]::GetFullPath([IO.Path]::Combine($base, $cleanTarget))
+}
+
+$Config = Resolve-RootArkPath (Get-Location).ProviderPath $Config
+
+$ErrorActionPreference = 'Stop'
 $previousOutputEncoding = [Console]::OutputEncoding
 try {
 # Windows PowerShell 5.1 otherwise decodes Node's UTF-8 JSON using the OEM
@@ -68,11 +99,8 @@ if ($hydrated.action -ne 'hydrate' -or $hydrated.result -isnot [bool] -or $hydra
 # Reveal only. Opening an associated app automatically could execute remote content.
 $localFolder = [string]((Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json).localFolder)
 if ([string]::IsNullOrWhiteSpace($localFolder)) { throw 'Local sync folder unavailable.' }
-$root = if ([IO.Path]::IsPathRooted($localFolder)) {
-  [IO.Path]::GetFullPath($localFolder)
-} else {
-  [IO.Path]::GetFullPath((Join-Path (Get-Location).ProviderPath $localFolder))
-}
+$configDir = Split-Path -Parent $Config
+$root = Resolve-RootArkPath $configDir $localFolder
 $target = [IO.Path]::GetFullPath((Join-Path $root ([string]$chosen[0].Path -replace '/', '\')))
 $rootPrefix = $root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
 if (-not $target.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -or

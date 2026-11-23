@@ -142,7 +142,7 @@ test(`issue 66 Windows: real signed picker hydrate ${filename}, relativeRoot=${r
     ROOTARK_SYNC_DEVICE_PRIVATE_KEY: keys.privateKey.export({ type: "pkcs8", format: "der" }).toString("base64url"),
     ROOTARK_SYNC_DEVICE_PUBLIC_KEY: publicKey,
     ROOTARK_TEST_CONFIG: config, ROOTARK_TEST_PICKER: picker, ROOTARK_TEST_LAUNCH: launch,
-    ...(relativeRoot ? { ROOTARK_TEST_CWD: root, ROOTARK_TEST_START_CWD: staleCwd } : {}),
+    ...(relativeRoot ? { ROOTARK_TEST_START_CWD: staleCwd } : {}),
   };
 
   const good = await runPowershell(env);
