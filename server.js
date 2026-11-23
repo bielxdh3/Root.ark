@@ -43,7 +43,9 @@ const { getServerMasterKey: readServerMasterKey } = require("./services/serverMa
 const {
   assertSafeChunkUploadAncestors,
   createChunkUploadQuota,
+  isValidQuotaAccountKey,
   parseChunkUploadQuotaConfig,
+  quotaAccountKeyMayBelongToUsername,
 } = require("./services/chunkUploadQuota");
 const dbConfig = require("./db");
 const { runMigrations } = require("./db/migrations");
@@ -196,6 +198,7 @@ const CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY = "__resumeBlocked";
 const CHUNK_UPLOAD_EXPIRED_METADATA_KEY = "__expiredAt";
 const CHUNK_UPLOAD_INCOMING_FILE_PATH = Symbol("rootarkChunkUploadIncomingFilePath");
 const CHUNK_UPLOAD_QUOTA_OPERATION_ID = Symbol("rootarkChunkUploadQuotaOperationId");
+const CHUNK_UPLOAD_LEGACY_SESSION_AUTHORIZED = Symbol("rootarkChunkUploadLegacySessionAuthorized");
 const CHUNK_UPLOAD_QUOTA_ASSEMBLY_ID = Symbol("rootarkChunkUploadQuotaAssemblyId");
 const CHUNK_UPLOAD_QUOTA_BACKUP_ID = Symbol("rootarkChunkUploadQuotaBackupId");
 const CHUNK_UPLOAD_QUOTA_BACKUP_PATH = Symbol("rootarkChunkUploadQuotaBackupPath");
@@ -7116,6 +7119,12 @@ function handleChunkUploadSingle(req, res, next) {
       if (req.file && typeof req[CHUNK_UPLOAD_INCOMING_FILE_PATH] === "string") {
         Object.defineProperty(req.file, CHUNK_UPLOAD_INCOMING_FILE_PATH, { value: req[CHUNK_UPLOAD_INCOMING_FILE_PATH] });
       }
+      const hintedUploadId = req.get("X-Rootark-Upload-Id");
+      if (typeof hintedUploadId === "string" && req.body?.uploadId !== hintedUploadId) {
+        removeAndReleaseChunkUploadIncoming(req);
+        res.status(400).json({ error: "Identificador da sessão de upload inconsistente" });
+        return;
+      }
       if (req.file) {
         try {
           const incomingPath = getChunkUploadIncomingFilePath(req.file);
@@ -7152,9 +7161,30 @@ function reserveChunkUploadBeforeMulter(req, res, next) {
   }
   const operationId = crypto.randomBytes(16).toString("hex");
   try {
+    let legacySessionKey = null;
+    const hintedUploadId = req.get("X-Rootark-Upload-Id");
+    if (typeof hintedUploadId === "string" && /^[a-zA-Z0-9_-]{1,80}$/.test(hintedUploadId)) {
+      const folderId = req.uploadFolder?.id || ROOT_FOLDER_ID;
+      const sessionKey = `${folderId}/${hintedUploadId}`;
+      if (chunkUploadQuota.isLegacySession(sessionKey, req.user?.username)) {
+        const sessionDir = getChunkSessionDir(folderId, hintedUploadId);
+        const metadataFile = sessionDir && readChunkMetadataFile(path.join(sessionDir, "metadata.json"));
+        let metadata = null;
+        try { if (metadataFile?.links === 1n) metadata = JSON.parse(metadataFile.contents); }
+        catch { metadata = null; }
+        const validMetadata = metadata && metadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] !== true && !isChunkSessionExpiredMarker(metadata) &&
+          (isValidChunkSessionMetadata(metadata, hintedUploadId, folderId) || isValidLegacyChunkSessionMetadata(metadata, hintedUploadId, folderId));
+        if (!validMetadata || metadata.uploadedBy !== req.user?.username || metadata.uploaderSessionVersion !== req.user?.sessionVersion) {
+          return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+        }
+        legacySessionKey = sessionKey;
+        req[CHUNK_UPLOAD_LEGACY_SESSION_AUTHORIZED] = true;
+      }
+    }
     chunkUploadQuota.reserve({
       operationId,
       accountKey: req.user?.username,
+      legacySessionKey,
       reservedBytes: SINGLE_UPLOAD_MAX_BYTES,
       relativePath: path.join("incoming", operationId),
     });
@@ -7169,6 +7199,12 @@ function reserveChunkUploadBeforeMulter(req, res, next) {
   } catch (error) {
     if (error.code === "CHUNK_QUOTA_EXCEEDED") {
       return res.status(507).json({ error: "Espaco temporario de upload insuficiente. Tente novamente depois que outros envios forem concluídos.", code: "CHUNK_QUOTA_EXCEEDED" });
+    }
+    if (error.code === "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED") {
+      return res.status(409).json({ error: "Conclua ou remova as sessões antigas de upload antes de iniciar um novo envio.", code: error.code });
+    }
+    if (error.code === "CHUNK_QUOTA_SESSION_OWNER_MISMATCH") {
+      return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
     }
     console.error("[chunk-upload] quota reservation failed:", error.code || error.name || "operation_failed");
     return res.status(503).json({ error: "O armazenamento temporario de blocos esta indisponivel.", code: "CHUNK_QUOTA_UNAVAILABLE" });
@@ -7286,7 +7322,7 @@ function getChunkAssemblySizeIfCompleting(sessionDir, totalChunks, incomingIndex
     }
     if (stats.isSymbolicLink() || !stats.isFile() || stats.nlink !== 1) throw new Error("Unsafe chunk part");
     const operation = operationsByPath.get(path.relative(CHUNK_UPLOAD_DIR, partPath));
-    if (!operation || operation.state !== "part_committed" || operation.accountKey !== accountKey.trim().toLowerCase() || operation.chargeBytes !== stats.size) {
+    if (!operation || operation.state !== "part_committed" || !quotaAccountKeyMayBelongToUsername(operation.accountKey, accountKey) || operation.chargeBytes !== stats.size) {
       throw new Error("Chunk part does not match its quota charge");
     }
     totalBytes += stats.size;
@@ -8498,7 +8534,11 @@ function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferre
       const sessionKey = `${entry.name}/${sessionEntry.name}`;
       if (!entries.length) {
         const existingOperation = chunkUploadQuota?.operationsForSession(sessionKey)[0];
-        sessions.set(sessionKey, existingOperation?.accountKey || CHUNK_UPLOAD_UNATTRIBUTED_ACCOUNT_KEY);
+        sessions.set(sessionKey, {
+          accountKey: existingOperation?.accountKey || CHUNK_UPLOAD_UNATTRIBUTED_ACCOUNT_KEY,
+          accountKeyIsQuotaKey: Boolean(existingOperation),
+          allowLegacySession: false,
+        });
         continue;
       }
       const metadataPath = path.join(sessionPath, "metadata.json");
@@ -8508,7 +8548,11 @@ function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferre
       const metadata = JSON.parse(metadataFile.contents);
       if (isChunkSessionExpiredMarker(metadata)) {
         const existingOperation = chunkUploadQuota?.operationsForSession(sessionKey)[0];
-        sessions.set(sessionKey, existingOperation?.accountKey || CHUNK_UPLOAD_UNATTRIBUTED_ACCOUNT_KEY);
+        sessions.set(sessionKey, {
+          accountKey: existingOperation?.accountKey || CHUNK_UPLOAD_UNATTRIBUTED_ACCOUNT_KEY,
+          accountKeyIsQuotaKey: Boolean(existingOperation),
+          allowLegacySession: false,
+        });
         if (!chunkSessionEntriesAreSafe(entries)) throw new Error("Unsafe expired chunk tombstone contents");
         for (const part of entries) {
           if (part.name === "metadata.json") continue;
@@ -8525,7 +8569,7 @@ function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferre
         : readyLedgerSessionEntriesAreSafe(entries, sessionPath, sessionKey, metadata.totalChunks, metadata);
       if (!valid || !safeEntries) throw new Error("Unattributable legacy chunk session");
       if (!metadata.uploadedBy || typeof metadata.uploadedBy !== "string") throw new Error("Unattributable legacy chunk owner");
-      sessions.set(sessionKey, metadata.uploadedBy);
+      sessions.set(sessionKey, { accountKey: metadata.uploadedBy, allowLegacySession: true, allowLegacySessionCreation: true });
       if (!includeOperations) continue;
       for (const part of entries) {
         if (part.name === "metadata.json") continue;
@@ -8610,7 +8654,7 @@ function readLegacyChunkQuotaOperations({ includeOperations = true, applyDeferre
       }
     }
   }
-  return { operations: rows, sessions: [...sessions].map(([sessionKey, accountKey]) => ({ sessionKey, accountKey })) };
+  return { operations: rows, sessions: [...sessions].map(([sessionKey, owner]) => ({ sessionKey, ...owner })) };
 }
 
 function getChunkQuotaOperationFile(operation, { repairPermissions = true } = {}) {
@@ -8635,7 +8679,7 @@ function validateChunkQuotaOperationsBeforeRecovery(operations) {
   const sessionOperations = new Map();
   for (const operation of operations) {
     if (!operation || !/^[a-zA-Z0-9_-]{1,120}$/.test(operation.operationId || "") ||
-        typeof operation.accountKey !== "string" || operation.accountKey !== operation.accountKey.trim().toLowerCase() || !operation.accountKey ||
+        !isValidQuotaAccountKey(operation.accountKey) ||
         !Number.isSafeInteger(operation.chargeBytes) || operation.chargeBytes < 0 ||
         typeof operation.ownerInstanceId !== "string" || !operation.ownerInstanceId ||
         !Number.isSafeInteger(operation.ownerPid) || operation.ownerPid <= 0) {
@@ -8761,7 +8805,7 @@ function validateChunkQuotaOperationsBeforeRecovery(operations) {
         delete completedMetadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY];
         delete completedMetadata.__chunkQuotaHandoffComplete;
         if (!(isValidChunkSessionMetadata(completedMetadata, uploadId, folderId) || isValidLegacyChunkSessionMetadata(completedMetadata, uploadId, folderId)) ||
-            typeof metadata.uploadedBy !== "string" || metadata.uploadedBy.trim().toLowerCase() !== sessionAccounts.get(sessionKey) ||
+            typeof metadata.uploadedBy !== "string" || !quotaAccountKeyMayBelongToUsername(sessionAccounts.get(sessionKey), metadata.uploadedBy) ||
             handoffRows.length !== 1 || handoffRows[0].state !== "handed_off" ||
             sessionRows.some((operation) => operation.state !== "part_committed" && operation.state !== "handed_off")) {
           throw new Error("Completed chunk handoff metadata does not match its quota owner");
@@ -8771,14 +8815,14 @@ function validateChunkQuotaOperationsBeforeRecovery(operations) {
       const unblockedMetadata = { ...metadata };
       delete unblockedMetadata[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY];
       if (!(isValidChunkSessionMetadata(unblockedMetadata, uploadId, folderId) || isValidLegacyChunkSessionMetadata(unblockedMetadata, uploadId, folderId)) ||
-          typeof metadata.uploadedBy !== "string" || metadata.uploadedBy.trim().toLowerCase() !== sessionAccounts.get(sessionKey) ||
+          typeof metadata.uploadedBy !== "string" || !quotaAccountKeyMayBelongToUsername(sessionAccounts.get(sessionKey), metadata.uploadedBy) ||
           sessionRows.some((operation) => operation.state !== "part_committed")) {
         throw new Error("Blocked chunk session owner cannot be verified before quota recovery");
       }
       continue;
     }
     if (!(isValidChunkSessionMetadata(metadata, uploadId, folderId) || isValidLegacyChunkSessionMetadata(metadata, uploadId, folderId)) ||
-        typeof metadata.uploadedBy !== "string" || metadata.uploadedBy.trim().toLowerCase() !== sessionAccounts.get(sessionKey)) {
+        typeof metadata.uploadedBy !== "string" || !quotaAccountKeyMayBelongToUsername(sessionAccounts.get(sessionKey), metadata.uploadedBy)) {
       throw new Error("Chunk quota ledger ownership does not match session metadata");
     }
     if (handoffRows.length && !isValidChunkSessionMetadata(metadata, uploadId, folderId)) {
@@ -8890,7 +8934,7 @@ function recoverChunkUploadHandoff(operation) {
     // alone cannot identify case-distinct SQLite principals, including legacy
     // markers that never persisted the uploader's exact identity.
     if (!completedStats || completedStats.size !== expectedSize || !completedPending || completedPending.folderId !== folderId ||
-      !matchesChunkHandoffOwnerProof(ownerProof, completedPending.uploadedBy) || completedPending.uploadedBy.trim().toLowerCase() !== operation.accountKey) throw new Error("Completed chunk handoff cannot be confirmed");
+      !matchesChunkHandoffOwnerProof(ownerProof, completedPending.uploadedBy) || !quotaAccountKeyMayBelongToUsername(operation.accountKey, completedPending.uploadedBy)) throw new Error("Completed chunk handoff cannot be confirmed");
     if (sessionExists) {
       fs.rmdirSync(sessionDir);
       if (fs.existsSync(sessionDir)) throw new Error("Empty chunk handoff session directory remains");
@@ -8933,9 +8977,9 @@ function recoverChunkUploadHandoff(operation) {
   const sourceStats = inspectChunkQuotaFile(sourcePath);
   if (destinationStats && sourceStats) throw new Error("Chunk handoff has both source and destination files");
   const pending = loadPendingUploads()[getPendingKey(folderId, fileName)];
-  // Quota account keys are lowercased for capacity accounting, but authenticated
-  // SQLite principals are case-sensitive. A pending record from another account
-  // must never complete or release this session's durable handoff on restart.
+  // Legacy v4 quota buckets deliberately remain shared across case aliases because
+  // their original username casing was irreversibly lost. The pending handoff must
+  // still match the session metadata's exact authenticated owner before recovery.
   const pendingConfirmed = Boolean(pending && pending.folderId === folderId && pending.uploadedBy === metadata.uploadedBy);
   const encrypted = metadata.encryptionLevel && metadata.encryptionLevel !== "none";
   const encryptedIntent = loadEncryptedFiles()[getEncryptedFileKey(folderId, fileName)];
@@ -9748,21 +9792,19 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
   }
 
   try {
-    chunkUploadQuota.registerSession({ sessionKey: `${folderId}/${uploadId}`, accountKey: req.user.username });
-  } catch (error) {
-    removeAndReleaseChunkUploadIncoming(req);
-    if (error.code === "CHUNK_QUOTA_EXCEEDED") {
-      return res.status(507).json({ error: "Espaco temporario de upload insuficiente. Tente novamente depois que outros envios forem concluídos.", code: "CHUNK_QUOTA_EXCEEDED" });
+    let sessionDirExists = true;
+    try { fs.lstatSync(sessionDir); }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      sessionDirExists = false;
     }
-    if (error.code === "CHUNK_QUOTA_SESSION_OWNER_MISMATCH") return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
-    console.error("[chunk-upload] session reservation failed:", error.code || error.name || "operation_failed");
-    return res.status(503).json({ error: "O armazenamento temporario de blocos esta indisponivel.", code: "CHUNK_QUOTA_UNAVAILABLE" });
-  }
-
-  try {
-    fs.mkdirSync(sessionDir, { recursive: true });
-    assertSafeChunkSessionDirectory(sessionDir);
-    let metadata = loadChunkMetadata(sessionDir, uploadId, folderId);
+    let metadata = null;
+    let existingEntries = [];
+    if (sessionDirExists) {
+      assertSafeChunkSessionDirectory(sessionDir);
+      metadata = loadChunkMetadata(sessionDir, uploadId, folderId);
+      existingEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
+    }
 
     if (metadata?.[CHUNK_UPLOAD_RESUME_BLOCKED_METADATA_KEY] === true) {
       removeAndReleaseChunkUploadIncoming(req);
@@ -9786,13 +9828,40 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
       return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
     }
 
-    if (!metadata) {
-      const existingEntries = fs.readdirSync(sessionDir, { withFileTypes: true });
-      if (existingEntries.length) {
-        blockChunkSessionResume(sessionDir);
-        removeAndReleaseChunkUploadIncoming(req);
-        return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+    if (!metadata && existingEntries.length) {
+      blockChunkSessionResume(sessionDir);
+      removeAndReleaseChunkUploadIncoming(req);
+      return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+    }
+
+    try {
+      chunkUploadQuota.registerSession({
+        sessionKey: `${folderId}/${uploadId}`,
+        accountKey: req.user.username,
+        allowLegacySession: metadata !== null && req[CHUNK_UPLOAD_LEGACY_SESSION_AUTHORIZED] === true,
+      });
+    } catch (error) {
+      removeAndReleaseChunkUploadIncoming(req);
+      if (sessionDirExists && !metadata && !existingEntries.length) {
+        try { fs.rmdirSync(sessionDir); } catch {}
       }
+      if (error.code === "CHUNK_QUOTA_EXCEEDED") {
+        return res.status(507).json({ error: "Espaco temporario de upload insuficiente. Tente novamente depois que outros envios forem concluídos.", code: "CHUNK_QUOTA_EXCEEDED" });
+      }
+      if (error.code === "CHUNK_QUOTA_SESSION_OWNER_MISMATCH") return res.status(409).json({ error: "Sessao de upload indisponivel; inicie um novo envio" });
+      if (error.code === "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED") {
+        return res.status(409).json({ error: "Conclua ou remova as sessões antigas de upload antes de iniciar um novo envio.", code: error.code });
+      }
+      console.error("[chunk-upload] session reservation failed:", error.code || error.name || "operation_failed");
+      return res.status(503).json({ error: "O armazenamento temporario de blocos esta indisponivel.", code: "CHUNK_QUOTA_UNAVAILABLE" });
+    }
+
+    if (!sessionDirExists) {
+      fs.mkdirSync(sessionDir, { recursive: true });
+      assertSafeChunkSessionDirectory(sessionDir);
+    }
+
+    if (!metadata) {
       const fileName = getAvailableUploadFileName(originalName, folderId, true);
       const createdAt = new Date().toISOString();
       metadata = {
@@ -9838,7 +9907,7 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
     }
     if (previousPartStats) {
       const previousOperation = chunkUploadQuota.operationForPath(path.relative(CHUNK_UPLOAD_DIR, chunkPath));
-      if (!previousOperation || previousOperation.accountKey !== req.user.username.trim().toLowerCase() || previousOperation.chargeBytes !== previousPartStats.size) {
+      if (!previousOperation || !quotaAccountKeyMayBelongToUsername(previousOperation.accountKey, req.user.username) || previousOperation.chargeBytes !== previousPartStats.size) {
         removeAndReleaseChunkAssembly(req, sessionDir);
         removeAndReleaseChunkUploadIncoming(req);
         return res.status(503).json({ error: "O armazenamento temporario de blocos esta indisponivel.", code: "CHUNK_QUOTA_UNAVAILABLE" });
@@ -9856,6 +9925,7 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
           operationId: assemblyOperationId,
           accountKey: req.user.username,
           sessionKey: `${folderId}/${uploadId}`,
+          allowLegacySession: req[CHUNK_UPLOAD_LEGACY_SESSION_AUTHORIZED] === true,
           relativePath: path.relative(CHUNK_UPLOAD_DIR, path.join(sessionDir, "assembled.upload")),
           reservedBytes: assemblyChargeBytes,
           allowZeroBytes: assemblyChargeBytes === 0,
@@ -9865,6 +9935,9 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
         removeAndReleaseChunkUploadIncoming(req);
         if (error.code === "CHUNK_QUOTA_EXCEEDED") {
           return res.status(507).json({ error: "Espaco temporario de upload insuficiente. Tente novamente depois que outros envios forem concluídos.", code: "CHUNK_QUOTA_EXCEEDED" });
+        }
+        if (error.code === "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED") {
+          return res.status(409).json({ error: "Conclua ou remova as sessões antigas de upload antes de iniciar um novo envio.", code: error.code });
         }
         throw error;
       }
@@ -10023,8 +10096,8 @@ app.post("/upload-chunk", authenticate, requirePermission("upload"), uploadChunk
         chunkUploadQuota.transition({ operationId: req[CHUNK_UPLOAD_QUOTA_ASSEMBLY_ID], state: "encrypting", chargeBytes: encryptedStats.size });
         const finalPath = path.join(req.uploadFolder.tempDir, finalFileName);
         // Persist the exact case-sensitive uploader identity before the first
-        // crash boundary that can unlink metadata.json, independently of the
-        // lowercase quota accounting key.
+        // crash boundary that can unlink metadata.json, independently of any
+        // ambiguous v4 legacy quota bucket shared by case aliases.
         const handoffOwnerProof = crypto.createHash("sha256").update(metadata.uploadedBy, "utf8").digest("hex");
         chunkUploadQuota.transition({
           operationId: req[CHUNK_UPLOAD_QUOTA_ASSEMBLY_ID],

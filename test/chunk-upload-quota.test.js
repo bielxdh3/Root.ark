@@ -8,14 +8,19 @@ const test = require("node:test");
 const {
   assertSafeChunkUploadAncestors,
   assertSupportedChunkUploadFilesystem,
+  canonicalAccountKey,
   classifyProcessOwner,
   createChunkUploadQuota: createChunkUploadQuotaService,
   getCurrentProcessIdentity,
+  isValidQuotaAccountKey,
   parseChunkUploadQuotaConfig,
+  quotaAccountKeyMayBelongToUsername,
 } = require("../services/chunkUploadQuota");
 const { ensureWindowsChunkUploadRoot, getWindowsChunkAclDescriptor } = require("../services/chunkUploadWindowsAcl");
 const QUOTA_TEST_TEMP = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
 const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perAccountEntries: 5000, systemEntries: 10000, ...options });
+const v5AccountKey = (username) => `acct:v5:${Buffer.from(username.trim(), "utf8").toString("base64url")}`;
+const v4QuarantineKey = (username) => `acct:v4:${Buffer.from(username.trim().toLowerCase(), "utf8").toString("base64url")}`;
 
 function withTempDir(callback) {
   const parent = fs.mkdtempSync(path.join(QUOTA_TEST_TEMP, "rootark-chunk-quota-"));
@@ -42,6 +47,71 @@ function createQuotaTestRoot(prefix) {
     throw error;
   }
   return { parent, root };
+}
+
+function createV4QuotaLedger(root, { operations = [], sessions = [] } = {}) {
+  const database = new Database(path.join(root, ".quota.sqlite"));
+  try {
+    database.pragma("journal_mode = DELETE");
+    database.pragma("synchronous = FULL");
+    database.exec(`
+      CREATE TABLE quota_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE quota_operations (
+        operation_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, session_key TEXT, relative_path TEXT NOT NULL,
+        state TEXT NOT NULL, charge_bytes INTEGER NOT NULL CHECK (charge_bytes >= 0),
+        owner_instance_id TEXT NOT NULL, owner_pid INTEGER NOT NULL, owner_process_identity TEXT,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX quota_operations_account ON quota_operations(account_key);
+      CREATE INDEX quota_operations_path ON quota_operations(relative_path);
+      CREATE INDEX quota_operations_session_state ON quota_operations(session_key, state);
+      CREATE TABLE quota_session_locks (
+        session_key TEXT PRIMARY KEY, owner_instance_id TEXT NOT NULL, owner_pid INTEGER NOT NULL,
+        owner_process_identity TEXT, created_at INTEGER NOT NULL
+      );
+      CREATE TABLE quota_usage (account_key TEXT PRIMARY KEY, charge_bytes INTEGER NOT NULL CHECK (charge_bytes >= 0));
+      CREATE TABLE quota_sessions (
+        session_key TEXT PRIMARY KEY, account_key TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX quota_sessions_account ON quota_sessions(account_key);
+    `);
+    const setMeta = database.prepare("INSERT INTO quota_meta(key, value) VALUES (?, ?)");
+    setMeta.run("schema_version", "4");
+    setMeta.run("ready", "1");
+    setMeta.run("usage_version", "1");
+    const insertOperation = database.prepare(`
+      INSERT INTO quota_operations (
+        operation_id, account_key, session_key, relative_path, state, charge_bytes,
+        owner_instance_id, owner_pid, owner_process_identity, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const usage = new Map();
+    let systemBytes = 0;
+    for (const operation of operations) {
+      insertOperation.run(
+        operation.operationId,
+        operation.accountKey,
+        operation.sessionKey ?? null,
+        operation.relativePath,
+        operation.state || "part_committed",
+        operation.chargeBytes,
+        operation.ownerInstanceId || "legacy-owner",
+        operation.ownerPid || 4321,
+        operation.ownerProcessIdentity ?? null,
+        operation.createdAt || 1,
+        operation.updatedAt || 1,
+      );
+      usage.set(operation.accountKey, (usage.get(operation.accountKey) || 0) + operation.chargeBytes);
+      systemBytes += operation.chargeBytes;
+    }
+    const insertSession = database.prepare("INSERT INTO quota_sessions(session_key, account_key, created_at, updated_at) VALUES (?, ?, ?, ?)");
+    for (const session of sessions) insertSession.run(session.sessionKey, session.accountKey, session.createdAt || 1, session.updatedAt || 1);
+    const insertUsage = database.prepare("INSERT INTO quota_usage(account_key, charge_bytes) VALUES (?, ?)");
+    for (const [accountKey, bytes] of usage) insertUsage.run(accountKey, bytes);
+    setMeta.run("system_charge_bytes", String(systemBytes));
+  } finally {
+    database.close();
+  }
 }
 
 test("chunk quota configuration requires positive safe integer byte caps without defaults", () => {
@@ -257,6 +327,443 @@ test("ledger path lookup uses its index and rejects duplicate operation paths", 
   });
 });
 
+test("quota identities keep case-distinct usernames in independent byte and entry buckets", () => {
+  withTempDir((directory) => {
+    const quota = createChunkUploadQuota({
+      rootDir: directory,
+      perAccountBytes: 8,
+      systemBytes: 32,
+      perAccountEntries: 2,
+      systemEntries: 8,
+    });
+    try {
+      quota.initialize();
+      quota.reserve({
+        operationId: "alice-upper-part",
+        accountKey: "Alice",
+        sessionKey: "folder/Alice",
+        reservedBytes: 8,
+        relativePath: "folder/Alice/0.part",
+      });
+      quota.reserve({
+        operationId: "alice-lower-part",
+        accountKey: "alice",
+        sessionKey: "folder/alice",
+        reservedBytes: 1,
+        relativePath: "folder/alice/0.part",
+      });
+
+      assert.deepEqual(quota.totals(), {
+        systemBytes: 9,
+        accounts: { [v5AccountKey("Alice")]: 8, [v5AccountKey("alice")]: 1 },
+      });
+      assert.deepEqual(quota.entryTotals(), {
+        systemEntries: 4,
+        accounts: { [v5AccountKey("Alice")]: 2, [v5AccountKey("alice")]: 2 },
+      });
+      assert.throws(() => quota.registerSession({ sessionKey: "folder/Alice", accountKey: "alice" }), {
+        code: "CHUNK_QUOTA_SESSION_OWNER_MISMATCH",
+      });
+    } finally {
+      quota.close();
+    }
+  });
+});
+
+test("versioned account keys are exact for v5 and explicitly ambiguous for quarantined v4", () => {
+  const upperV5 = v5AccountKey("Alice");
+  const lowerV5 = v5AccountKey("alice");
+  const legacyV4 = v4QuarantineKey("alice");
+  assert.notEqual(upperV5, lowerV5);
+  assert.equal(isValidQuotaAccountKey(upperV5), true);
+  assert.equal(isValidQuotaAccountKey(lowerV5), true);
+  assert.equal(isValidQuotaAccountKey(legacyV4), true);
+  assert.equal(isValidQuotaAccountKey("alice"), false);
+  assert.equal(quotaAccountKeyMayBelongToUsername(upperV5, "Alice"), true);
+  assert.equal(quotaAccountKeyMayBelongToUsername(upperV5, "alice"), false);
+  assert.equal(quotaAccountKeyMayBelongToUsername(legacyV4, "Alice"), true);
+  assert.equal(quotaAccountKeyMayBelongToUsername(legacyV4, "alice"), true, "legacy identity cannot prove which case-distinct account owned the v4 rows");
+});
+
+test("v5 quota identity cannot collapse distinct authenticated usernames with surrounding spaces", () => {
+  // The JSON account store and /auth/login compare raw usernames exactly;
+  // database account writes trim names, but the JSON backend may contain both.
+  // A quota key must not silently group those independently authenticated users.
+  const normal = "Alice";
+  const spaced = " Alice ";
+  assert.notEqual(canonicalAccountKey(normal), canonicalAccountKey(spaced));
+  assert.equal(isValidQuotaAccountKey(canonicalAccountKey(spaced)), true);
+  assert.equal(quotaAccountKeyMayBelongToUsername(canonicalAccountKey(normal), spaced), false);
+  assert.equal(quotaAccountKeyMayBelongToUsername(canonicalAccountKey(spaced), normal), false);
+  withTempDir((directory) => {
+    const quota = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 8, systemBytes: 16 });
+    try {
+      quota.initialize();
+      for (const [index, username] of [normal, spaced].entries()) {
+        quota.reserve({ operationId: `exact-${index}`, accountKey: username,
+          reservedBytes: 8, relativePath: `incoming/exact-${index}` });
+      }
+      assert.deepEqual(quota.totals(), { systemBytes: 16, accounts: {
+        [canonicalAccountKey(normal)]: 8, [canonicalAccountKey(spaced)]: 8,
+      } });
+    } finally { quota.close(); }
+  });
+});
+
+test("schema v4 migration quarantines ambiguous keys until every legacy operation and session drains", () => {
+  withTempDir((directory) => {
+    createV4QuotaLedger(directory, {
+      operations: [{
+        operationId: "legacy-alice-part",
+        accountKey: "alice",
+        sessionKey: "folder/legacy",
+        relativePath: "folder/legacy/0.part",
+        chargeBytes: 4,
+      }],
+      sessions: [{ sessionKey: "folder/legacy", accountKey: "alice" }],
+    });
+
+    const quota = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 30, perAccountEntries: 10, systemEntries: 30 });
+    try {
+      assert.deepEqual(quota.initialize(), { alreadyReady: true, entryCapacityExceeded: false });
+      const legacyKey = v4QuarantineKey("alice");
+      assert.equal(quota.operations()[0].accountKey, legacyKey);
+      assert.deepEqual(quota.sessions().map(({ sessionKey, accountKey }) => ({ sessionKey, accountKey })), [
+        { sessionKey: "folder/legacy", accountKey: legacyKey },
+      ]);
+      assert.deepEqual(quota.totals(), { systemBytes: 4, accounts: { [legacyKey]: 4 } });
+      assert.deepEqual(quota.entryTotals(), { systemEntries: 2, accounts: { [legacyKey]: 2 } });
+
+      const migrated = new Database(path.join(directory, ".quota.sqlite"), { readonly: true });
+      try {
+        assert.equal(migrated.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "5");
+        assert.deepEqual(migrated.prepare("SELECT account_key, charge_bytes FROM quota_usage").all(), [
+          { account_key: legacyKey, charge_bytes: 4 },
+        ]);
+      } finally {
+        migrated.close();
+      }
+
+      for (const username of ["Alice", "alice"]) {
+        assert.throws(() => quota.reserve({
+          operationId: `new-${username}`,
+          accountKey: username,
+          reservedBytes: 1,
+          relativePath: `incoming/new-${username}`,
+        }), { code: "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED" });
+        assert.throws(() => quota.registerSession({
+          sessionKey: `folder/new-${username}`,
+          accountKey: username,
+        }), { code: "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED" });
+      }
+      assert.throws(() => quota.registerSessions([{ sessionKey: "folder/unverified-legacy", accountKey: "Alice" }]), {
+        code: "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED",
+      });
+      assert.equal(quota.registerSessions([{ sessionKey: "folder/discovered-legacy", accountKey: "Alice", allowLegacySession: true, allowLegacySessionCreation: true }]), 1);
+      assert.equal(quota.isLegacySession("folder/discovered-legacy", "Alice"), true);
+      assert.throws(() => quota.reserve({
+        operationId: "legacy-session-creation-bypass",
+        accountKey: "Alice",
+        sessionKey: "folder/new-legacy-bypass",
+        allowLegacySession: true,
+        reservedBytes: 1,
+        relativePath: "incoming/legacy-session-creation-bypass",
+      }), { code: "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED" }, "a reservation cannot create a legacy session from an allow flag alone");
+
+      assert.equal(quota.isLegacySession("folder/legacy", "Alice"), true);
+      assert.equal(quota.registerSession({ sessionKey: "folder/legacy", accountKey: "Alice", allowLegacySession: true }), 1);
+      quota.reserve({
+        operationId: "legacy-incoming",
+        accountKey: "Alice",
+        legacySessionKey: "folder/legacy",
+        reservedBytes: 1,
+        relativePath: "incoming/legacy-incoming",
+      });
+      assert.equal(quota.operations().find((operation) => operation.operationId === "legacy-incoming").accountKey, legacyKey);
+      assert.throws(() => quota.reserve({
+        operationId: "wrong-legacy-session",
+        accountKey: "Bob",
+        legacySessionKey: "folder/legacy",
+        reservedBytes: 1,
+        relativePath: "incoming/wrong-legacy-session",
+      }), { code: "CHUNK_QUOTA_SESSION_OWNER_MISMATCH" });
+      assert.throws(() => quota.reserve({
+        operationId: "unknown-legacy-session",
+        accountKey: "Alice",
+        legacySessionKey: "folder/not-registered",
+        reservedBytes: 1,
+        relativePath: "incoming/unknown-legacy-session",
+      }), { code: "CHUNK_QUOTA_SESSION_OWNER_MISMATCH" });
+      assert.throws(() => quota.reserve({
+        operationId: "cross-session-legacy-bypass",
+        accountKey: "Alice",
+        sessionKey: "folder/new-legacy-bypass",
+        legacySessionKey: "folder/legacy",
+        reservedBytes: 1,
+        relativePath: "incoming/cross-session-legacy-bypass",
+      }), { code: "CHUNK_QUOTA_SESSION_OWNER_MISMATCH" });
+      assert.equal(quota.release("legacy-incoming"), true);
+
+      assert.equal(quota.releaseSessionOperations("folder/legacy"), 1);
+      assert.throws(() => quota.reserve({
+        operationId: "blocked-by-session-row",
+        accountKey: "Alice",
+        reservedBytes: 1,
+        relativePath: "incoming/blocked-by-session-row",
+      }), { code: "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED" }, "the legacy session row keeps both possible aliases quarantined after operations drain");
+      assert.equal(quota.releaseSession("folder/legacy"), 0);
+      assert.equal(quota.releaseSession("folder/discovered-legacy"), 0);
+
+      quota.reserve({ operationId: "new-alice-upper", accountKey: "Alice", reservedBytes: 1, relativePath: "incoming/new-alice-upper" });
+      quota.reserve({ operationId: "new-alice-lower", accountKey: "alice", reservedBytes: 1, relativePath: "incoming/new-alice-lower" });
+      assert.deepEqual(quota.totals(), {
+        systemBytes: 2,
+        accounts: { [v5AccountKey("Alice")]: 1, [v5AccountKey("alice")]: 1 },
+      });
+    } finally {
+      quota.close();
+    }
+  });
+});
+
+test("migrated v4 sessions retain their unknown owner across a cold restart", () => {
+  withTempDir((directory) => {
+    createV4QuotaLedger(directory, {
+      operations: [{
+        operationId: "cold-legacy-part",
+        accountKey: "alice",
+        sessionKey: "folder/cold-legacy",
+        relativePath: "folder/cold-legacy/0.part",
+        chargeBytes: 6,
+      }],
+      sessions: [{ sessionKey: "folder/cold-legacy", accountKey: "alice" }],
+    });
+    const first = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 20 });
+    first.initialize();
+    first.close();
+
+    const recovered = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 20 });
+    try {
+      assert.deepEqual(recovered.initialize(), { alreadyReady: true, entryCapacityExceeded: false });
+      const operation = recovered.operations()[0];
+      assert.equal(operation.accountKey, v4QuarantineKey("alice"));
+      assert.equal(operation.ownerProcessIdentity, null);
+      assert.equal(recovered.ownerStatus(operation), "unknown");
+      assert.equal(recovered.claim(operation), false);
+      assert.equal(recovered.isLegacySession("folder/cold-legacy", "Alice"), true);
+      assert.deepEqual(recovered.totals(), { systemBytes: 6, accounts: { [v4QuarantineKey("alice")]: 6 } });
+    } finally {
+      recovered.close();
+    }
+  });
+});
+
+test("schema v4 to v5 migration rolls back every key and counter when an update fails", () => {
+  withTempDir((directory) => {
+    createV4QuotaLedger(directory, {
+      operations: [{
+        operationId: "rollback-alice-part",
+        accountKey: "alice",
+        sessionKey: "folder/rollback",
+        relativePath: "folder/rollback/0.part",
+        chargeBytes: 5,
+      }],
+      sessions: [{ sessionKey: "folder/rollback", accountKey: "alice" }],
+    });
+    const databasePath = path.join(directory, ".quota.sqlite");
+    const inject = new Database(databasePath);
+    inject.exec(`
+      CREATE TRIGGER fail_quota_v5_session_update
+      BEFORE UPDATE OF account_key ON quota_sessions
+      BEGIN SELECT RAISE(ABORT, 'injected v5 migration failure'); END;
+    `);
+    inject.close();
+
+    const blocked = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 20 });
+    try {
+      assert.throws(() => blocked.initialize(), /injected v5 migration failure/);
+    } finally {
+      blocked.close();
+    }
+
+    const verifyRollback = new Database(databasePath, { readonly: true });
+    try {
+      assert.equal(verifyRollback.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "4");
+      assert.equal(verifyRollback.prepare("SELECT account_key FROM quota_operations WHERE operation_id = 'rollback-alice-part'").get().account_key, "alice");
+      assert.equal(verifyRollback.prepare("SELECT account_key FROM quota_sessions WHERE session_key = 'folder/rollback'").get().account_key, "alice");
+      assert.deepEqual(verifyRollback.prepare("SELECT account_key, charge_bytes FROM quota_usage").all(), [{ account_key: "alice", charge_bytes: 5 }]);
+      assert.equal(verifyRollback.prepare("SELECT value FROM quota_meta WHERE key = 'system_charge_bytes'").get().value, "5");
+    } finally {
+      verifyRollback.close();
+    }
+
+    const removeFailure = new Database(databasePath);
+    removeFailure.exec("DROP TRIGGER fail_quota_v5_session_update");
+    removeFailure.close();
+    const retry = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 20 });
+    try {
+      assert.equal(retry.initialize().alreadyReady, true);
+      assert.equal(retry.operations()[0].accountKey, v4QuarantineKey("alice"));
+      assert.deepEqual(retry.totals(), { systemBytes: 5, accounts: { [v4QuarantineKey("alice")]: 5 } });
+    } finally {
+      retry.close();
+    }
+  });
+});
+
+test("unready v4 ledgers with persisted rows fail closed without resetting ambiguous accounting", () => {
+  withTempDir((directory) => {
+    createV4QuotaLedger(directory, {
+      operations: [{
+        operationId: "unready-alice-part",
+        accountKey: "alice",
+        sessionKey: "folder/unready",
+        relativePath: "folder/unready/0.part",
+        chargeBytes: 7,
+      }],
+      sessions: [{ sessionKey: "folder/unready", accountKey: "alice" }],
+    });
+    const databasePath = path.join(directory, ".quota.sqlite");
+    const markUnready = new Database(databasePath);
+    markUnready.prepare("UPDATE quota_meta SET value = '0' WHERE key = 'ready'").run();
+    markUnready.close();
+
+    const quota = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 20 });
+    try {
+      assert.throws(() => quota.initialize(), /Unready v4 chunk quota ledger contains persisted rows/);
+    } finally {
+      quota.close();
+    }
+
+    const verify = new Database(databasePath, { readonly: true });
+    try {
+      assert.equal(verify.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "4");
+      assert.equal(verify.prepare("SELECT value FROM quota_meta WHERE key = 'ready'").get().value, "0");
+      assert.equal(verify.prepare("SELECT value FROM quota_meta WHERE key = 'system_charge_bytes'").get().value, "7");
+      assert.deepEqual(verify.prepare("SELECT account_key, charge_bytes FROM quota_usage").all(), [{ account_key: "alice", charge_bytes: 7 }]);
+      assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE account_key = 'alice'").get().count, 1);
+      assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM quota_sessions WHERE account_key = 'alice'").get().count, 1);
+    } finally {
+      verify.close();
+    }
+  });
+});
+
+test("v4 and unversioned ledgers with missing readiness markers preserve persisted quota state", () => {
+  for (const removeSchemaVersion of [false, true]) {
+    withTempDir((directory) => {
+      createV4QuotaLedger(directory, {
+        operations: [{
+          operationId: "missing-ready-orphaned-usage",
+          accountKey: "alice",
+          sessionKey: null,
+          relativePath: "incoming/orphaned-usage",
+          chargeBytes: 7,
+        }],
+      });
+      const databasePath = path.join(directory, ".quota.sqlite");
+      const corrupt = new Database(databasePath);
+      corrupt.exec("DELETE FROM quota_operations; DELETE FROM quota_meta WHERE key = 'ready';");
+      if (removeSchemaVersion) corrupt.prepare("DELETE FROM quota_meta WHERE key = 'schema_version'").run();
+      corrupt.close();
+
+      const quota = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 20 });
+      try {
+        assert.throws(() => quota.initialize(), /Unready (?:v4 )?chunk quota ledger contains persisted rows/);
+      } finally {
+        quota.close();
+      }
+
+      const verify = new Database(databasePath, { readonly: true });
+      try {
+        const version = verify.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get();
+        assert.equal(version?.value ?? null, removeSchemaVersion ? null : "4");
+        assert.equal(verify.prepare("SELECT value FROM quota_meta WHERE key = 'ready'").get(), undefined);
+        assert.equal(verify.prepare("SELECT value FROM quota_meta WHERE key = 'system_charge_bytes'").get().value, "7");
+        assert.deepEqual(verify.prepare("SELECT account_key, charge_bytes FROM quota_usage").all(), [
+          { account_key: "alice", charge_bytes: 7 },
+        ]);
+        assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 0);
+      } finally {
+        verify.close();
+      }
+    });
+  }
+});
+
+test("concurrent schema v4 to v5 migration publishes one quarantined ledger without double charging", async () => {
+  const { parent, root } = createQuotaTestRoot("rootark-chunk-quota-v5-migration-race-");
+  createV4QuotaLedger(root, {
+    operations: [
+      { operationId: "race-alice-one", accountKey: "alice", sessionKey: "folder/one", relativePath: "folder/one/0.part", chargeBytes: 3 },
+      { operationId: "race-alice-two", accountKey: "alice", sessionKey: "folder/two", relativePath: "folder/two/0.part", chargeBytes: 2 },
+    ],
+    sessions: [
+      { sessionKey: "folder/one", accountKey: "alice" },
+      { sessionKey: "folder/two", accountKey: "alice" },
+    ],
+  });
+  const readyDirectory = path.join(parent, "ready");
+  fs.mkdirSync(readyDirectory);
+  const gatePath = path.join(parent, "start-migration");
+  const modulePath = path.resolve(__dirname, "../services/chunkUploadQuota.js");
+  const workerSource = `
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const { createChunkUploadQuota } = require(${JSON.stringify(modulePath)});
+    const [root, readyDirectory, gatePath, id] = process.argv.slice(1);
+    const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 10, systemBytes: 20, perAccountEntries: 10, systemEntries: 20 });
+    fs.writeFileSync(path.join(readyDirectory, id), 'ready');
+    const deadline = Date.now() + 10000;
+    while (!fs.existsSync(gatePath) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    try {
+      const result = quota.initialize();
+      process.stdout.write(JSON.stringify({ result, totals: quota.totals(), operations: quota.operations().length }));
+    } finally { quota.close(); }
+  `;
+  const children = [];
+  const workers = [];
+  try {
+    for (const id of ["one", "two"]) {
+      const child = spawn(process.execPath, ["-e", workerSource, root, readyDirectory, gatePath, id], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      children.push(child);
+      workers.push(new Promise((resolve, reject) => {
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => { stdout += chunk; });
+        child.stderr.on("data", (chunk) => { stderr += chunk; });
+        child.once("error", reject);
+        child.once("exit", (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(`v5 migration worker exited ${code}: ${stderr}`)));
+      }));
+    }
+    const deadline = Date.now() + 10000;
+    const readyWorkers = () => fs.readdirSync(readyDirectory).filter((name) => ["one", "two"].includes(name)).length;
+    while (readyWorkers() < children.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(readyWorkers(), children.length, "both workers open the same v4 ledger before migration starts");
+    fs.writeFileSync(gatePath, "go");
+    const results = await Promise.all(workers);
+    assert.deepEqual(results.map((result) => result.totals), [
+      { systemBytes: 5, accounts: { [v4QuarantineKey("alice")]: 5 } },
+      { systemBytes: 5, accounts: { [v4QuarantineKey("alice")]: 5 } },
+    ]);
+    assert.deepEqual(results.map((result) => result.operations), [2, 2]);
+
+    const verify = new Database(path.join(root, ".quota.sqlite"), { readonly: true });
+    try {
+      assert.equal(verify.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "5");
+      assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE account_key = ?").get(v4QuarantineKey("alice")).count, 2);
+      assert.equal(verify.prepare("SELECT COUNT(*) AS count FROM quota_operations").get().count, 2);
+    } finally {
+      verify.close();
+    }
+  } finally {
+    fs.writeFileSync(gatePath, "go");
+    for (const child of children) if (child.exitCode === null) child.kill();
+    await Promise.allSettled(workers);
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test("legacy ledgers preserve charges and never reclaim session locks without verified ownership", async () => {
   const { parent, root } = createQuotaTestRoot("rootark-chunk-quota-v1-migration-");
   const databasePath = path.join(root, ".quota.sqlite");
@@ -290,8 +797,9 @@ test("legacy ledgers preserve charges and never reclaim session locks without ve
     const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 10, systemBytes: 12 });
     try {
       assert.deepEqual(quota.initialize(), { alreadyReady: true, entryCapacityExceeded: false });
-      assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { alice: 5 } });
-      assert.deepEqual(quota.sessions().map((session) => ({ sessionKey: session.sessionKey, accountKey: session.accountKey })), [{ sessionKey: "folder/upload", accountKey: "alice" }]);
+      const legacyKey = v4QuarantineKey("alice");
+      assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { [legacyKey]: 5 } });
+      assert.deepEqual(quota.sessions().map((session) => ({ sessionKey: session.sessionKey, accountKey: session.accountKey })), [{ sessionKey: "folder/upload", accountKey: legacyKey }]);
       const legacyOperation = quota.operations()[0];
       assert.equal(legacyOperation.ownerProcessIdentity, null, "legacy rows do not invent a process identity during migration");
       assert.equal(quota.ownerStatus(legacyOperation), "unknown", "legacy owners remain unrecoverable without verifiable identity");
@@ -301,18 +809,18 @@ test("legacy ledgers preserve charges and never reclaim session locks without ve
       assert.equal(legacyLockEntered, false, "an unverifiable migrated lock continues to protect its session");
       const migrated = new Database(databasePath, { readonly: true });
       try {
-        assert.equal(migrated.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "4");
+        assert.equal(migrated.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "5");
         assert.ok(migrated.pragma("table_info(quota_operations)").some((column) => column.name === "owner_process_identity"));
         assert.ok(migrated.pragma("table_info(quota_session_locks)").some((column) => column.name === "owner_process_identity"));
         assert.equal(migrated.prepare("SELECT owner_process_identity FROM quota_session_locks WHERE session_key = ?").get("handoff-folder/folder").owner_process_identity, null);
       } finally {
         migrated.close();
       }
-      quota.reserve({ operationId: "new-part", accountKey: "alice", reservedBytes: 5, relativePath: "incoming/new-part" });
-      assert.throws(() => quota.reserve({ operationId: "over-account", accountKey: "alice", reservedBytes: 1, relativePath: "incoming/over-account" }), { code: "CHUNK_QUOTA_EXCEEDED" });
-      assert.throws(() => quota.reserve({ operationId: "over-system", accountKey: "bob", reservedBytes: 3, relativePath: "incoming/over-system" }), { code: "CHUNK_QUOTA_EXCEEDED" });
-      assert.equal(quota.release("new-part"), true);
-      assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { alice: 5 } });
+      assert.throws(() => quota.reserve({ operationId: "new-part", accountKey: "Alice", reservedBytes: 1, relativePath: "incoming/new-part" }), { code: "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED" });
+      quota.reserve({ operationId: "new-bob-part", accountKey: "bob", reservedBytes: 7, relativePath: "incoming/new-bob-part" });
+      assert.throws(() => quota.reserve({ operationId: "over-system", accountKey: "bob", reservedBytes: 1, relativePath: "incoming/over-system" }), { code: "CHUNK_QUOTA_EXCEEDED" });
+      assert.equal(quota.release("new-bob-part"), true);
+      assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { [legacyKey]: 5 } });
     } finally {
       quota.close();
     }
@@ -357,7 +865,7 @@ test("schema v3 migration adds nullable process identities without changing exis
     const quota = createChunkUploadQuota({ rootDir: root, perAccountBytes: 10, systemBytes: 12 });
     try {
       assert.deepEqual(quota.initialize(), { alreadyReady: true, entryCapacityExceeded: false });
-      assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { alice: 5 } });
+      assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { [v4QuarantineKey("alice")]: 5 } });
       const migratedOperation = quota.operations()[0];
       assert.equal(migratedOperation.operationId, "existing-part");
       assert.equal(migratedOperation.ownerProcessIdentity, null);
@@ -365,7 +873,7 @@ test("schema v3 migration adds nullable process identities without changing exis
       assert.equal(quota.claim(migratedOperation), false);
       const migrated = new Database(databasePath, { readonly: true });
       try {
-        assert.equal(migrated.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "4");
+        assert.equal(migrated.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "5");
         assert.ok(migrated.pragma("table_info(quota_operations)").some((column) => column.name === "owner_process_identity"));
         assert.ok(migrated.pragma("table_info(quota_session_locks)").some((column) => column.name === "owner_process_identity"));
       } finally {
@@ -388,7 +896,7 @@ test("inconsistent quota usage counters fail closed without changing operations"
 
     const database = new Database(path.join(directory, ".quota.sqlite"));
     try {
-      database.prepare("UPDATE quota_usage SET charge_bytes = 3 WHERE account_key = 'alice'").run();
+      database.prepare("UPDATE quota_usage SET charge_bytes = 3 WHERE account_key = ?").run(v5AccountKey("alice"));
     } finally {
       database.close();
     }
@@ -450,12 +958,12 @@ test("ledger reserves exact per-account and system boundaries atomically across 
     try {
       first.initialize();
       second.initialize();
-      first.reserve({ operationId: "operation-1", accountKey: "alice", reservedBytes: 8, relativePath: "incoming/one" });
-      second.reserve({ operationId: "operation-2", accountKey: "ALICE", reservedBytes: 2, relativePath: "incoming/two" });
+      first.reserve({ operationId: "operation-1", accountKey: "Alice", reservedBytes: 8, relativePath: "incoming/one" });
+      second.reserve({ operationId: "operation-2", accountKey: "Alice", reservedBytes: 2, relativePath: "incoming/two" });
       second.reserve({ operationId: "operation-3", accountKey: "bob", reservedBytes: 2, relativePath: "incoming/three" });
-      assert.throws(() => first.reserve({ operationId: "operation-4", accountKey: "alice", reservedBytes: 1, relativePath: "incoming/four" }), { code: "CHUNK_QUOTA_EXCEEDED" });
+      assert.throws(() => first.reserve({ operationId: "operation-4", accountKey: "Alice", reservedBytes: 1, relativePath: "incoming/four" }), { code: "CHUNK_QUOTA_EXCEEDED" });
       assert.throws(() => first.reserve({ operationId: "operation-5", accountKey: "carol", reservedBytes: 1, relativePath: "incoming/five" }), { code: "CHUNK_QUOTA_EXCEEDED" });
-      assert.deepEqual(first.totals(), { systemBytes: 12, accounts: { alice: 10, bob: 2 } });
+      assert.deepEqual(first.totals(), { systemBytes: 12, accounts: { [v5AccountKey("Alice")]: 10, [v5AccountKey("bob")]: 2 } });
     } finally {
       first.close();
       second.close();
@@ -472,25 +980,25 @@ test("zero-byte operations and session entries share atomic account and system e
       first.initialize();
       second.initialize();
       first.reserve({ operationId: "empty-part-1", accountKey: "alice", sessionKey: "folder/upload-one", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/upload-one/0.part" });
-      second.reserve({ operationId: "empty-part-2", accountKey: "ALICE", sessionKey: "folder/upload-one", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/upload-one/1.part" });
-      assert.deepEqual(first.entryTotals(), { systemEntries: 3, accounts: { alice: 3 } });
+      second.reserve({ operationId: "empty-part-2", accountKey: "alice", sessionKey: "folder/upload-one", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/upload-one/1.part" });
+      assert.deepEqual(first.entryTotals(), { systemEntries: 3, accounts: { [v5AccountKey("alice")]: 3 } });
       assert.throws(() => second.reserve({ operationId: "empty-part-3", accountKey: "alice", reservedBytes: 0, allowZeroBytes: true, relativePath: "incoming/empty-part-3" }), { code: "CHUNK_QUOTA_EXCEEDED" });
       assert.throws(() => second.reserve({ operationId: "bob-part", accountKey: "bob", sessionKey: "folder/upload-bob", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/upload-bob/0.part" }), { code: "CHUNK_QUOTA_EXCEEDED" });
-      assert.deepEqual(first.entryTotals(), { systemEntries: 3, accounts: { alice: 3 } });
+      assert.deepEqual(first.entryTotals(), { systemEntries: 3, accounts: { [v5AccountKey("alice")]: 3 } });
 
       first.close();
       firstOpen = false;
       const reopened = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 12, perAccountEntries: 3, systemEntries: 4 });
       try {
         assert.equal(reopened.isReady(), true);
-        assert.deepEqual(reopened.entryTotals(), { systemEntries: 3, accounts: { alice: 3 } });
+        assert.deepEqual(reopened.entryTotals(), { systemEntries: 3, accounts: { [v5AccountKey("alice")]: 3 } });
         assert.equal(reopened.releaseSessionOperations("folder/upload-one"), 2);
-        assert.deepEqual(reopened.entryTotals(), { systemEntries: 1, accounts: { alice: 1 } }, "expiry releases part rows but retains its tombstone session entry");
+        assert.deepEqual(reopened.entryTotals(), { systemEntries: 1, accounts: { [v5AccountKey("alice")]: 1 } }, "expiry releases part rows but retains its tombstone session entry");
         reopened.reserve({ operationId: "after-expiry", accountKey: "alice", sessionKey: "folder/after-expiry", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/after-expiry/0.part" });
         assert.throws(() => reopened.reserve({ operationId: "system-blocked", accountKey: "bob", sessionKey: "folder/system-blocked", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/system-blocked/0.part" }), { code: "CHUNK_QUOTA_EXCEEDED" });
         assert.equal(reopened.releaseSession("folder/upload-one"), 0, "removing an expired session frees its retained entry after its tombstone expires");
         reopened.reserve({ operationId: "after-tombstone", accountKey: "bob", sessionKey: "folder/after-tombstone", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/after-tombstone/0.part" });
-        assert.deepEqual(reopened.entryTotals(), { systemEntries: 4, accounts: { alice: 2, bob: 2 } });
+        assert.deepEqual(reopened.entryTotals(), { systemEntries: 4, accounts: { [v5AccountKey("alice")]: 2, [v5AccountKey("bob")]: 2 } });
       } finally {
         reopened.close();
       }
@@ -504,20 +1012,36 @@ test("zero-byte operations and session entries share atomic account and system e
 test("migration and restart detect over-cap entries while keeping cleanup available", () => {
   const scenarios = [
     {
+      name: "account-cap",
       accountCap: 2,
       systemCap: 3,
       sessions: ["folder/upload"],
+      legacyOperations: [
+        { operationId: "account-cap-part-1", accountKey: "alice", sessionKey: "folder/upload", relativePath: "folder/upload/0.part", chargeBytes: 1 },
+        { operationId: "account-cap-part-2", accountKey: "alice", sessionKey: "folder/upload", relativePath: "folder/upload/1.part", chargeBytes: 1 },
+      ],
+      legacySessions: [{ sessionKey: "folder/upload", accountKey: "alice" }],
       prepare(quota) {
         quota.reserve({ operationId: "account-cap-part-1", accountKey: "alice", sessionKey: "folder/upload", reservedBytes: 1, relativePath: "folder/upload/0.part" });
         quota.reserve({ operationId: "account-cap-part-2", accountKey: "alice", sessionKey: "folder/upload", reservedBytes: 1, relativePath: "folder/upload/1.part" });
       },
       blockedAccount: "alice",
       blockedId: "account-cap-blocked",
+      migrationBlockCode: "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED",
     },
     {
+      name: "system-cap",
       accountCap: 3,
       systemCap: 3,
       sessions: ["folder/upload-one", "folder/upload-two"],
+      legacyOperations: [
+        { operationId: "system-cap-part-1", accountKey: "alice", sessionKey: "folder/upload-one", relativePath: "folder/upload-one/0.part", chargeBytes: 1 },
+        { operationId: "system-cap-part-2", accountKey: "bob", sessionKey: "folder/upload-two", relativePath: "folder/upload-two/0.part", chargeBytes: 1 },
+      ],
+      legacySessions: [
+        { sessionKey: "folder/upload-one", accountKey: "alice" },
+        { sessionKey: "folder/upload-two", accountKey: "bob" },
+      ],
       prepare(quota) {
         quota.reserve({ operationId: "system-cap-part-1", accountKey: "alice", sessionKey: "folder/upload-one", reservedBytes: 1, relativePath: "folder/upload-one/0.part" });
         quota.reserve({ operationId: "system-cap-part-2", accountKey: "bob", sessionKey: "folder/upload-two", reservedBytes: 1, relativePath: "folder/upload-two/0.part" });
@@ -530,21 +1054,15 @@ test("migration and restart detect over-cap entries while keeping cleanup availa
   for (const mode of ["migration", "restart"]) {
     for (const scenario of scenarios) {
       withTempDir((directory) => {
-        const original = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 20, systemBytes: 20, perAccountEntries: 5, systemEntries: 5 });
-        try {
-          original.initialize();
-          scenario.prepare(original);
-        } finally {
-          original.close();
-        }
-
         if (mode === "migration") {
-          const database = new Database(path.join(directory, ".quota.sqlite"));
+          createV4QuotaLedger(directory, { operations: scenario.legacyOperations, sessions: scenario.legacySessions });
+        } else {
+          const original = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 20, systemBytes: 20, perAccountEntries: 5, systemEntries: 5 });
           try {
-            database.prepare("UPDATE quota_meta SET value = '2' WHERE key = 'schema_version'").run();
-            database.prepare("DELETE FROM quota_sessions").run();
+            original.initialize();
+            scenario.prepare(original);
           } finally {
-            database.close();
+            original.close();
           }
         }
 
@@ -559,7 +1077,7 @@ test("migration and restart detect over-cap entries while keeping cleanup availa
             reservedBytes: 0,
             allowZeroBytes: true,
             relativePath: `folder/${scenario.blockedId}/0.part`,
-          }), { code: "CHUNK_QUOTA_EXCEEDED" });
+          }), { code: mode === "migration" ? (scenario.migrationBlockCode || "CHUNK_QUOTA_EXCEEDED") : "CHUNK_QUOTA_EXCEEDED" });
           assert.deepEqual(reopened.entryTotals(), entriesBefore, "a restart over configured entry capacity must not admit another row");
 
           for (const sessionKey of scenario.sessions) reopened.releaseSession(sessionKey);
@@ -581,7 +1099,7 @@ test("ledger can adjust and release a charge only by its operation identity", ()
       quota.initialize();
       quota.reserve({ operationId: "operation-1", accountKey: "alice", sessionKey: "folder/upload", reservedBytes: 8, relativePath: "incoming/one" });
       quota.transition({ operationId: "operation-1", state: "staged", chargeBytes: 5, relativePath: "incoming/one" });
-      assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { alice: 5 } });
+      assert.deepEqual(quota.totals(), { systemBytes: 5, accounts: { [v5AccountKey("alice")]: 5 } });
       assert.equal(quota.release("missing-operation"), false);
       assert.equal(quota.releaseSession("folder/upload"), 1);
       assert.deepEqual(quota.totals(), { systemBytes: 0, accounts: {} });
@@ -598,7 +1116,7 @@ test("zero-byte assembly markers are explicit while ordinary incoming reservatio
       quota.initialize();
       assert.throws(() => quota.reserve({ operationId: "empty-incoming", accountKey: "alice", reservedBytes: 0, relativePath: "incoming/empty" }), /Invalid chunk quota reservation/);
       quota.reserve({ operationId: "empty-assembly", accountKey: "alice", sessionKey: "folder/upload", reservedBytes: 0, allowZeroBytes: true, relativePath: "folder/upload/assembled.upload" });
-      assert.deepEqual(quota.totals(), { systemBytes: 0, accounts: { alice: 0 } });
+      assert.deepEqual(quota.totals(), { systemBytes: 0, accounts: { [v5AccountKey("alice")]: 0 } });
       assert.equal(quota.operations()[0].chargeBytes, 0);
     } finally {
       quota.close();
@@ -616,7 +1134,7 @@ test("first startup imports operations and publishes readiness in one idempotent
       first.initialize([{ operationId: "legacy-part-1", accountKey: "Alice", sessionKey: "folder/upload", relativePath: "folder/upload/0.part", state: "part_committed", chargeBytes: 4 }]);
       assert.equal(first.isReady(), true);
       assert.deepEqual(second.initialize([{ operationId: "duplicate-import", accountKey: "alice", relativePath: "incoming/x", state: "reserved", chargeBytes: 1 }]), { alreadyReady: true, entryCapacityExceeded: false });
-      assert.deepEqual(second.totals(), { systemBytes: 4, accounts: { alice: 4 } });
+      assert.deepEqual(second.totals(), { systemBytes: 4, accounts: { [v5AccountKey("Alice")]: 4 } });
     } finally {
       first.close();
       second.close();
@@ -667,7 +1185,7 @@ test("concurrent processes publish only one first legacy import", async () => {
     assert.deepEqual(results.map((result) => result.alreadyReady).sort(), [false, true]);
     const verify = createChunkUploadQuota({ rootDir: directory, perAccountBytes: 10, systemBytes: 10 });
     try {
-      assert.deepEqual(verify.totals(), { systemBytes: 4, accounts: { alice: 4 } });
+      assert.deepEqual(verify.totals(), { systemBytes: 4, accounts: { [v5AccountKey("alice")]: 4 } });
       assert.equal(verify.operations().length, 1);
     } finally {
       verify.close();
@@ -687,7 +1205,7 @@ test("failed legacy import rolls back readiness and operations so a valid retry 
       assert.deepEqual(quota.operations(), []);
       quota.initialize([{ operationId: "valid-retry", accountKey: "alice", relativePath: "folder/upload/0.part", state: "part_committed", chargeBytes: 4 }]);
       assert.equal(quota.isReady(), true);
-      assert.deepEqual(quota.totals(), { systemBytes: 4, accounts: { alice: 4 } });
+      assert.deepEqual(quota.totals(), { systemBytes: 4, accounts: { [v5AccountKey("alice")]: 4 } });
     } finally {
       quota.close();
     }
