@@ -846,3 +846,78 @@ test("#67 P2: discarded unsent local-conflict intent stays blocked until clean a
   assert.equal(resumed.completed, 1);
   assert.equal(f.pushes(), 1);
 });
+
+test("#288 P2: resume verifies retained history when historical fileId rotated", async (t) => {
+  const f = await fixture(t);
+  const rotatedCreate = await f.sign(3, {
+    objectId: "object-3", fileId: "file-legacy-3", versionId: "version-3",
+    operationId: "create-3", operation: "create", revision: { counter: 1, deviceId: "device-a" },
+    metadata: { path: "file-3.txt", name: "file-3.txt" },
+    plaintext: Buffer.from("legacy fileId historical bytes"),
+  });
+  const rotatedDelete = await f.sign(3, {
+    objectId: "object-3", fileId: "file-rotated-3", versionId: "deleted-3",
+    operationId: "delete-3", operation: "delete", revision: { counter: 2, deviceId: "device-a" },
+    baseRevision: rotatedCreate.revision, metadata: { path: "file-3.txt" },
+  });
+  await f.store.put("alice", rotatedCreate);
+  await f.store.put("alice", rotatedDelete);
+
+  const preview = await f.engine.previewHistoricalRestorePlan([
+    { objectId: "object-3", versionId: "version-3" },
+    f.requests[1],
+  ]);
+  assert.equal(preview.ready, true);
+
+  f.engine.authorizeOutgoing = (op) => !(op.objectId === "object-2" && op.operationId.startsWith("histrestore-"));
+  const interrupted = await f.engine.restoreHistoricalPlan(preview, { confirm: true });
+  assert.equal(interrupted.completed, 1);
+  assert.equal(interrupted.items[0].status, "committed");
+  assert.equal(interrupted.items[1].status, "blocked");
+
+  const reopened = await new SyncEngine(f.opts).open();
+  const resumed = await reopened.restoreHistoricalPlan(preview, { confirm: true, resume: true });
+  assert.equal(resumed.completed, 2);
+  assert.equal(await fsp.readFile(path.join(f.local, "file-3.txt"), "utf8"), "legacy fileId historical bytes");
+  assert.equal(await fsp.readFile(path.join(f.local, "file-2.txt"), "utf8"), "signed owner bytes 2");
+});
+
+test("#288 P2: materialization flushes .rootark-trash directory after unlinking restore temporary on POSIX", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX directory fsync contract");
+  const f = await fixture(t);
+  const preview = await f.engine.previewHistoricalRestorePlan([f.requests[0]]);
+  const originalUnlink = fsp.unlink;
+  const originalOpen = fsp.open;
+  let unlinkedTemp = false;
+  const syncedDirsAfterUnlink = [];
+  fsp.unlink = async (filePath, ...rest) => {
+    const out = await originalUnlink(filePath, ...rest);
+    if (String(filePath).includes("restore-materialize-")) unlinkedTemp = true;
+    return out;
+  };
+  fsp.open = async (filePath, flags, ...rest) => {
+    const handle = await originalOpen(filePath, flags, ...rest);
+    if (unlinkedTemp && (flags & fs.constants.O_WRONLY) === 0 && (flags & fs.constants.O_RDWR) === 0) {
+      return new Proxy(handle, { get(target, key) {
+        if (key === "sync") return async () => {
+          syncedDirsAfterUnlink.push(String(filePath));
+          return target.sync();
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      } });
+    }
+    return handle;
+  };
+  try {
+    const res = await f.engine.restoreHistoricalPlan(preview, { confirm: true });
+    assert.equal(res.completed, 1);
+  } finally {
+    fsp.unlink = originalUnlink;
+    fsp.open = originalOpen;
+  }
+  const trashDir = path.join(f.local, ".rootark-trash");
+  assert.equal(syncedDirsAfterUnlink.includes(trashDir), true,
+    ".rootark-trash must be flushed after unlinking restore-materialize-* temp");
+  assert.equal(syncedDirsAfterUnlink.includes(f.local), true);
+});

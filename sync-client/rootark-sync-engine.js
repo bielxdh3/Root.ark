@@ -2377,7 +2377,7 @@ class SyncEngine {
     }
     const versions = history.versions.map((entry) => protocol.validateStoredOperation(entry));
     if (versions.some((entry) => entry.objectId !== current.objectId
-      || entry.fileId !== current.fileId || entry.compartmentId !== current.compartmentId)
+      || entry.compartmentId !== current.compartmentId)
       || signedEnvelopeDigest(versions[versions.length - 1]) !== signedEnvelopeDigest(current)) {
       fail("Signed restore history identity or HEAD changed", "restore_plan_indeterminate");
     }
@@ -4859,9 +4859,12 @@ class SyncEngine {
               // barrier. Without this, a crash can resurrect an unflushed
               // tmp name and strand an otherwise valid signed outbox on nlink=2.
               await fsp.unlink(temporary);
-              // Both the target link and temporary unlink, as well as any
-              // freshly created nested parent chain, must become durable
-              // before independently committed restore evidence is allowed.
+              // Both the target link and temporary unlink (including .rootark-trash),
+              // as well as any freshly created nested parent chain, must become
+              // durable before independently committed restore evidence is allowed.
+              if (path.dirname(temporary) !== path.dirname(target)) {
+                await syncDirectoryChain(this.rootDir, path.dirname(temporary));
+              }
               await syncDirectoryChain(this.rootDir, path.dirname(target));
             } catch (error) {
               if (staged) await this.replaceStagedIfVacant(staged, target);
