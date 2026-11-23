@@ -206,13 +206,22 @@ function invalidRestoreStaging(staging, pending) {
     const base = typeof operation?.metadata?.path === "string"
       ? path.posix.basename(operation.metadata.path) : null;
     const prefix = base ? `${base}.tmp-` : "";
+    // #288 materializes historical restores in a private, non-syncable
+    // directory. The alternative prefix is bound to the EXACT signed
+    // operation ID, never inferred from a filename or caller-supplied path.
+    const privatePrefix = `restore-materialize-${sha256Hex(id)}.tmp-`;
+    const stagedName = proof && typeof proof === "object" && typeof proof.name === "string"
+      ? proof.name : "";
+    const legacyNameValid = stringStartsWith(stagedName, prefix)
+      && regexTest(VALID_RESTORE_STAGE_SUFFIX, stringSlice(stagedName, prefix.length));
+    const privateNameValid = stringStartsWith(stagedName, privatePrefix)
+      && regexTest(VALID_RESTORE_STAGE_SUFFIX, stringSlice(stagedName, privatePrefix.length));
     if (!stringStartsWith(id, "histrestore-") || !regexTest(VALID_OPERATION_ID, id)
       || !operation || !base || !proof || typeof proof !== "object"
       || nativeArrayIsArray(proof) || nativeObjectKeys(proof).length !== 4
       || typeof proof.digest !== "string" || !regexTest(VALID_DIGEST, proof.digest)
       || signedEnvelopeDigest(operation) !== proof.digest
-      || typeof proof.name !== "string" || !stringStartsWith(proof.name, prefix)
-      || !regexTest(VALID_RESTORE_STAGE_SUFFIX, stringSlice(proof.name, prefix.length))
+      || typeof proof.name !== "string" || !(legacyNameValid || privateNameValid)
       || !((proof.dev === null && proof.ino === null)
         || (typeof proof.dev === "string" && regexTest(/^[0-9]{1,30}$/, proof.dev)
           && typeof proof.ino === "string" && regexTest(/^[1-9][0-9]{0,29}$/, proof.ino)))) return true;

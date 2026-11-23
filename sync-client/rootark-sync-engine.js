@@ -127,7 +127,7 @@ const canonicalJson = protocol.canonicalJson;
 
 const SNAPSHOT_VERSION = 1;
 const INTERNAL_NAMES = nativeObjectFreeze([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
-const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-"];
+const INTERNAL_NAME_PREFIXES = nativeObjectFreeze([".rootark-sync-lock-init-", ".rootark-recovery-execution-"]);
 const HISTORICAL_RESTORE_TEMP_SUFFIX = /\.tmp-[1-9][0-9]*-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const ROOT_MUTATION_QUEUES = new NativeMap();
 const MAX_EVICTION_ATTEMPTS = 3;
@@ -345,6 +345,15 @@ function assertHistoricalRestorePhysicalAuthority(engine) {
     || !engine.atomicBatchCasFloorPublicKey || !engine.atomicBatchCasFloorReadback) {
     fail("Historical restore requires independently provisioned physical CURRENT authority",
       "restore_remote_admission_unproven");
+  }
+}
+
+function hasHistoricalRestorePhysicalAuthority(engine) {
+  try {
+    assertHistoricalRestorePhysicalAuthority(engine);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -1133,7 +1142,27 @@ async function syncDirectoryChain(rootDir, directoryName) {
   }
 }
 
-async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedHash, staging) {
+function historicalRestoreStagingPath(rootDir, target, staging, operationId) {
+  if (!staging || typeof staging.name !== "string"
+    || typeof operationId !== "string" || !stringStartsWith(operationId, "histrestore-")) {
+    fail("Historical restore staging identity is not proven", "restore_local_materialization_missing");
+  }
+  const legacyBase = path.basename(target);
+  const privateBase = `restore-materialize-${sha256Hex(operationId)}`;
+  const legacy = stringStartsWith(staging.name, `${legacyBase}.tmp-`)
+    && regexTest(HISTORICAL_RESTORE_TEMP_SUFFIX,
+      stringSlice(staging.name, legacyBase.length));
+  const privateStage = stringStartsWith(staging.name, `${privateBase}.tmp-`)
+    && regexTest(HISTORICAL_RESTORE_TEMP_SUFFIX,
+      stringSlice(staging.name, privateBase.length));
+  if (!legacy && !privateStage) {
+    fail("Historical restore staging name is invalid", "restore_local_materialization_missing");
+  }
+  return path.join(privateStage ? path.join(rootDir, ".rootark-trash") : path.dirname(target),
+    staging.name);
+}
+
+async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedHash, staging, operationId) {
   // Never infer staging ownership from a filename pattern, content digest or
   // same-inode hardlink alone: a regular user can create all three. Require
   // the exact temp name + physical identity fsynced in the signed outbox
@@ -1143,6 +1172,7 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
   // Required after the held descriptor closes and the durable hardlink removal
   // has been verified; keep this scope outside the descriptor's try block.
   const directoryName = path.dirname(target);
+  let staged = null;
   // Acquire and pin the target descriptor BEFORE using the pathname to
   // decide whether the old hardlink is eligible for recovery. A concurrent
   // writer may swap a name at any time; only fstat of this held descriptor
@@ -1153,16 +1183,25 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
   const current = await fsp.lstat(target, { bigint: true });
   if (!current.isFile() || current.isSymbolicLink() || current.ino === 0n
     || current.nlink !== 2n) return;
-  const prefix = `${path.basename(target)}.tmp-`;
-  if (!stringStartsWith(staging.name, prefix)
-    || !regexTest(HISTORICAL_RESTORE_TEMP_SUFFIX,
-      stringSlice(staging.name, path.basename(target).length))
-    || bigIntToString(current.dev) !== staging.dev
+  staged = historicalRestoreStagingPath(rootDir, target, staging, operationId);
+  if (bigIntToString(current.dev) !== staging.dev
     || bigIntToString(current.ino) !== staging.ino) {
     fail("Historical restore staging identity is not proven", "restore_local_materialization_missing");
   }
-  const staged = path.join(directoryName, staging.name);
   await containedAbsolute(rootDir, staged, false);
+  const stageDirEntries = await nativeReflectApply(nativePromiseCatch,
+    fsp.readdir(path.dirname(staged)), [(error) => ownDataValue(error, "code") === "ENOENT"
+      ? [] : nativePromiseReject(error)]);
+  let exactCaseFound = false;
+  for (let index = 0; index < stageDirEntries.length; index += 1) {
+    if (stageDirEntries[index] === staging.name) {
+      exactCaseFound = true;
+      break;
+    }
+  }
+  if (!exactCaseFound) {
+    fail("Recorded historical restore staging file missing", "restore_local_materialization_missing");
+  }
   const stagedStats = await nativeReflectApply(nativePromiseCatch,
     fsp.lstat(staged, { bigint: true }), [(error) => {
     if (ownDataValue(error, "code") === "ENOENT") {
@@ -1206,6 +1245,9 @@ async function recoverHistoricalRestoreTempLink(rootDir, relativePath, expectedH
     await fsp.unlink(staged);
   } finally { await handle.close(); }
   await syncDirectoryChain(rootDir, directoryName);
+  if (staged && path.dirname(staged) !== directoryName) {
+    await syncDirectoryChain(rootDir, path.dirname(staged));
+  }
   // The caller now reopens and physically flushes target as nlink=1, and
   // rechecks its signed bytes and pathname *after* this recovery barrier.
 }
@@ -1308,6 +1350,104 @@ async function durableJson(filePath, value) {
   }
 }
 
+async function createDurableRestoreProgress(filePath, value) {
+  // Never publish an incomplete final manifest. Hard-linking a completely
+  // fsynced private temporary inode is atomic and NO-REPLACE on both NTFS and
+  // POSIX, including when another invocation already owns the destination.
+  // A failure before link leaves only an ignored temporary, never a final
+  // empty/partial manifest that would brick an otherwise untouched plan.
+  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const handle = await fsp.open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value)}\n`);
+    await handle.sync();
+  } finally { await handle.close(); }
+  await containedAbsolute(path.dirname(filePath), temporary, false);
+  await fsp.link(temporary, filePath);
+  // Minimize the nlink=2 crash window. A torn process can still leave both
+  // aliases, so readDurableRestoreProgress validates and repairs that exact
+  // known temporary identity under the exclusive root lock.
+  await fsp.unlink(temporary);
+  if (process.platform !== "win32") {
+    const directory = await fsp.open(path.dirname(filePath), fs.constants.O_RDONLY);
+    try { await directory.sync(); } finally { await directory.close(); }
+  }
+}
+
+async function readDurableRestoreProgress(filePath, { expectedPlanDigest, expectedScope }) {
+  let handle;
+  try {
+    // Node on Windows has no O_NOFOLLOW. Refuse a preexisting reparse/symlink
+    // before opening its target, then bind the descriptor to this exact inode.
+    // POSIX retains open-first O_NOFOLLOW to avoid a pathname check/use gap.
+    let windowsBefore;
+    if (process.platform === "win32") {
+      windowsBefore = await fsp.lstat(filePath, { bigint: true });
+      if (!windowsBefore.isFile() || windowsBefore.isSymbolicLink()
+        || (windowsBefore.nlink !== 1n && windowsBefore.nlink !== 2n)
+        || windowsBefore.size > 65536n) throw Error();
+    }
+    handle = await fsp.open(filePath, fs.constants.O_RDONLY
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || opened.isSymbolicLink()
+      || (opened.nlink !== 1n && opened.nlink !== 2n)
+      || opened.size > 65536n
+      || (windowsBefore && !sameFileVersion(windowsBefore, opened))) throw Error();
+    // Bind pathname inspection to the already-open descriptor. No pathname
+    // bytes are trusted before this FD's type, links and version are checked.
+    const before = await fsp.lstat(filePath, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== opened.nlink
+      || !sameFileVersion(opened, before)) throw Error();
+    const contents = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    const pathname = await fsp.lstat(filePath, { bigint: true });
+    if (!after.isFile() || after.nlink !== opened.nlink || !sameFileVersion(opened, after)
+      || !pathname.isFile() || pathname.isSymbolicLink()
+      || pathname.nlink !== opened.nlink || !sameFileVersion(after, pathname)) throw Error();
+    const parsed = JSON.parse(contents.toString("utf8"));
+    if (parsed?.version !== 1 || parsed.planDigest !== expectedPlanDigest
+      || protocol.canonicalJson(parsed.scope) !== protocol.canonicalJson(expectedScope)
+      || !Array.isArray(parsed.items)) throw Error();
+    if (before.nlink === 2n) {
+      // Recover only our own *complete*, pre-fsynced, dual-linked manifest.
+      // Never unlink a foreign hardlink or accept nlink>2. Other unrelated
+      // abandoned temporaries (e.g. older ENOSPC) remain untouched.
+      const basename = path.basename(filePath);
+      if (!/^\.rootark-recovery-execution-[a-f0-9]{64}\.json$/.test(basename)) throw Error();
+      const prefix = `${basename}.tmp-`;
+      const candidates = (await fsp.readdir(path.dirname(filePath)))
+        .filter((name) => name.startsWith(prefix)
+          && /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(name.slice(prefix.length)));
+      const matching = [];
+      for (const name of candidates) {
+        const target = path.join(path.dirname(filePath), name);
+        const stats = await fsp.lstat(target, { bigint: true });
+        if (!stats.isFile() || stats.isSymbolicLink()) continue;
+        if (sameFileIdentity(stats, before)) {
+          if (!sameFileVersion(stats, before)) throw Error();
+          matching.push(target);
+        }
+      }
+      if (matching.length !== 1) throw Error();
+      await containedAbsolute(path.dirname(filePath), matching[0], false);
+      await fsp.unlink(matching[0]);
+      if (process.platform !== "win32") {
+        const directory = await fsp.open(path.dirname(filePath), fs.constants.O_RDONLY);
+        try { await directory.sync(); } finally { await directory.close(); }
+      }
+      const restored = await fsp.lstat(filePath, { bigint: true });
+      if (!restored.isFile() || restored.isSymbolicLink() || restored.nlink !== 1n
+        || !sameFileIdentity(restored, before)
+        || restored.size !== before.size || restored.mtimeNs !== before.mtimeNs
+        || restored.birthtimeNs !== before.birthtimeNs || restored.mode !== before.mode) throw Error();
+    }
+    return parsed;
+  } catch {
+    fail("Controlled restore progress is missing or untrusted", "restore_plan_unavailable");
+  } finally { if (handle) await handle.close(); }
+}
+
 function normalizeWebDavPath(value) {
   let decoded;
   if (typeof value !== "string") fail("Invalid WebDAV path", "unsafe_path");
@@ -1366,6 +1506,10 @@ function sameSnapshotRevision(left, right) {
     && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs);
 }
 
+// The largest accepted plan has 32 independently signed 512-character paths.
+// Use one bound in preview and execution so a ready plan remains executable.
+const MAX_RESTORE_PLAN_BYTES = 128 * 1024;
+const MAX_SERVER_HISTORY_PER_OBJECT = 32;
 function normalizeHistoricalRestorePlan(requests) {
   let length;
   try {
@@ -1673,7 +1817,7 @@ class SyncEngine {
     }
   }
 
-  withMutationLock(work) {
+  withMutationLock(work, { requireExistingState = false } = {}) {
     const queueKey = process.platform === "win32" ? stringToLowerCase(this.rootDir) : this.rootDir;
     if (nativeReflectApply(nativeAsyncLocalStorageGetStore, ROOT_MUTATION_CONTEXT, []) === queueKey) {
       fail("Sync mutations cannot re-enter a root operation", "sync_root_busy");
@@ -1683,11 +1827,11 @@ class SyncEngine {
     const queueGate = new NativePromise((resolve) => { releaseQueue = resolve; });
     nativeReflectApply(nativeMapSet, ROOT_MUTATION_QUEUES, [queueKey, queueGate]);
     const run = async () => {
-      await fsp.mkdir(this.rootDir, { recursive: true });
+      if (!requireExistingState) await fsp.mkdir(this.rootDir, { recursive: true });
       await containedAbsolute(this.rootDir, this.rootDir, false);
       const processLock = await this.acquireProcessLock();
       try {
-        await this._open();
+        await this._open({ readOnly: requireExistingState });
         return await nativeReflectApply(nativeAsyncLocalStorageRun, ROOT_MUTATION_CONTEXT, [queueKey, work]);
       } finally {
         await this.releaseProcessLock(processLock);
@@ -1916,12 +2060,16 @@ class SyncEngine {
   async previewHistoricalRestorePlan(requests) {
     const selected = normalizeHistoricalRestorePlan(requests);
     if (!this.opened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
-    return this.withReadOnlyRoot(async () => {
+    return this.withReadOnlyRoot(() => this._previewHistoricalRestorePlan(selected));
+  }
+
+  async _previewHistoricalRestorePlan(selected) {
       const entries = [];
       const destinations = [];
       const rechecks = [];
       for (const { objectId, versionId } of selected) {
-        const preview = await this._previewHistoricalRestore(objectId, versionId, { rechecks });
+        const preview = await this._previewHistoricalRestore(objectId, versionId,
+          { rechecks, includeDigests: true });
         // Protect mixed Windows/POSIX restore targets, including case aliases
         // and file-vs-descendant collisions, before presenting a ready plan.
         const destination = preview.path.normalize("NFC").toLowerCase();
@@ -1935,16 +2083,350 @@ class SyncEngine {
       // The first destination and HEAD can change while a later history is
       // fetched. Recheck all observed state after the last item; still advisory.
       for (const recheck of rechecks) await recheck();
-      return {
+      const plan = {
         readOnly: true, ready: true, atomic: false,
         objectCount: entries.length,
         localOverwriteCount: entries.filter((entry) => entry.localAction === "replace-clean-tracked").length,
         requiresFreshRestoreCheck: true, entries,
       };
-    });
+      if (Buffer.byteLength(protocol.canonicalJson(plan)) > MAX_RESTORE_PLAN_BYTES) {
+        fail("Historical restore plan is too large", "invalid_restore_plan");
+      }
+      return plan;
   }
 
-  async _previewHistoricalRestore(objectId, versionId, { rechecks = null } = {}) {
+  async _assertRestorablePlanMember(requested) {
+    const actual = await this._previewHistoricalRestore(requested.objectId,
+      requested.sourceVersionId, { includeDigests: true });
+    if (protocol.canonicalJson(actual) !== protocol.canonicalJson(requested)) {
+      fail("Historical restore plan changed before execution", "restore_plan_stale");
+    }
+    return actual;
+  }
+
+  // Explicit execution of a previously reviewed advisory plan. Every first
+  // run re-previews ALL entries before writing any state; every subsequent
+  // mutation re-previews the selected entry and runs the normal signed CAS
+  // restore. The progress file is only a stop/retry journal, never authority.
+  async restoreHistoricalPlan(expectedPlan,
+    { confirm = false, confirmCleanOverwrite = false, resume = false } = {}) {
+    if (confirm !== true || typeof resume !== "boolean") {
+      fail("Controlled historical restore requires explicit confirmation", "restore_plan_confirmation_required");
+    }
+    let detached;
+    try {
+      const serialized = protocol.canonicalJson(expectedPlan);
+      if (Buffer.byteLength(serialized) > MAX_RESTORE_PLAN_BYTES) throw Error();
+      detached = JSON.parse(serialized);
+    } catch { fail("Invalid controlled restore plan", "invalid_restore_plan"); }
+    if (detached?.readOnly !== true || detached.ready !== true
+      || detached.atomic !== false || !Array.isArray(detached.entries)
+      || detached.objectCount !== detached.entries.length
+      || detached.requiresFreshRestoreCheck !== true) {
+      fail("Valid signed historical preview plan is required", "invalid_restore_plan");
+    }
+    const requests = normalizeHistoricalRestorePlan(detached.entries.map((item) =>
+      ({ objectId: item?.objectId, versionId: item?.sourceVersionId })));
+    if (detached.entries.some((item) => item.localAction === "replace-clean-tracked")
+      && confirmCleanOverwrite !== true) {
+      fail("Controlled restore requires separate confirmation to replace clean files",
+        "restore_plan_overwrite_confirmation_required");
+    }
+    if (!this.opened) fail("Historical restore requires initialized sync root", "history_preview_unavailable");
+    const scope = { rootDir: this.rootDir, deviceId: this.deviceId,
+      keyEpoch: this.keyEpoch, compartmentId: this.compartmentId };
+    const planDigest = crypto.createHash("sha256")
+      .update(protocol.canonicalJson({ scope, plan: detached })).digest("hex");
+    const filePath = path.join(this.rootDir, `.rootark-recovery-execution-${planDigest}.json`);
+    return this.withMutationLock(async () => {
+      let lastPersisted = null;
+      const persist = async (state) => {
+        await containedAbsolute(this.rootDir, filePath, true);
+        const onDisk = await readDurableRestoreProgress(filePath,
+          { expectedPlanDigest: planDigest, expectedScope: scope });
+        if (lastPersisted === null
+          || protocol.canonicalJson(onDisk) !== lastPersisted) {
+          fail("Controlled restore progress changed during execution", "restore_plan_unavailable");
+        }
+        await durableJson(filePath, state);
+        lastPersisted = protocol.canonicalJson(state);
+      };
+      let state;
+      if (resume) {
+        state = await readDurableRestoreProgress(filePath,
+          { expectedPlanDigest: planDigest, expectedScope: scope });
+        if (state?.version !== 1 || state.planDigest !== planDigest
+          || protocol.canonicalJson(state.scope) !== protocol.canonicalJson(scope)
+          || !Array.isArray(state.items) || state.items.length !== requests.length
+          || state.items.some((item, index) => item?.objectId !== requests[index].objectId
+            || item?.sourceVersionId !== requests[index].versionId
+            || !["pending", "blocked", "committed", "indeterminate"].includes(item?.status))) {
+          fail("Controlled restore progress does not match this trusted selection", "restore_plan_unavailable");
+        }
+        lastPersisted = protocol.canonicalJson(state);
+        // Only independently verified ALREADY-COMMITTED exact signed heads
+        // may resolve an uncertain ACK. Never re-send a pending operation or
+        // manufacture a new signature from an interrupted progress record.
+        for (const item of state.items.filter((record) => record.status === "indeterminate")) {
+          const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+          try {
+            const pending = await this.journal.recover();
+            if (pending.length > 1 || (pending.length === 1
+              && (pending[0].operationId !== item.operationId
+                || signedEnvelopeDigest(pending[0]) !== item.envelopeDigest))) {
+              fail("Unrelated pending signed operation blocks reconciliation", "restore_plan_indeterminate");
+            }
+            await this._verifyCommittedRestorePlanItem(item, requested);
+            if (pending.length === 1) {
+              const captured = captureHistoricalRestoreEnvelope(pending[0], this);
+              await this.confirmHistoricalRestorePhysicalAdmission(captured);
+              await this.journal.markSeenExact(captured.operationId, captured.digest, captured.digest);
+            }
+            item.status = "committed";
+            delete item.code;
+            await persist(state);
+          } catch {
+            fail("Controlled restore has an unproven signed operation", "restore_plan_indeterminate");
+          }
+        }
+        for (const item of state.items.filter((record) => record.status === "committed")) {
+          const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+          await this._verifyCommittedRestorePlanItem(item, requested);
+        }
+        // An intent whose enqueue was proven never to begin (or whose exact
+        // never-dispatched outbox entry was durably discarded) may be retried.
+        // Require fresh signed remote absence plus an empty authoritative
+        // journal; a bare editable 'blocked' field grants no retry authority.
+        for (const item of state.items.filter((record) => record.status !== "committed")) {
+          if (item.operationId || item.envelopeDigest || item.versionId) {
+            const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+            await this._assertNeverDispatchedRestoreIntent(item, requested);
+          }
+        }
+      } else {
+        let current;
+        try { current = await fsp.lstat(filePath); }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        if (current) fail("Controlled restore plan already has durable progress", "restore_plan_exists");
+        const actual = await this._previewHistoricalRestorePlan(requests);
+        if (protocol.canonicalJson(actual) !== protocol.canonicalJson(detached)) {
+          fail("Historical restore plan changed before execution", "restore_plan_stale");
+        }
+        state = { version: 1, planDigest, scope,
+          items: requests.map(({ objectId, versionId }) => ({
+            objectId, sourceVersionId: versionId, status: "pending",
+          })) };
+        await containedAbsolute(this.rootDir, filePath, true);
+        await createDurableRestoreProgress(filePath, state);
+      }
+      lastPersisted = protocol.canonicalJson(state);
+      const response = () => {
+        const items = state.items.map((item, index) => ({
+          ...item, path: detached.entries[index].path,
+          localAction: detached.entries[index].localAction,
+        }));
+        const completed = items.filter((item) => item.status === "committed").length;
+        return { atomic: false, completed, remaining: items.length - completed,
+          partial: completed !== items.length,
+          localOverwriteCount: detached.localOverwriteCount,
+          planDigest, items };
+      };
+      const safeErrorCode = (error) => typeof error?.code === "string"
+        && /^[a-z0-9_]{1,64}$/.test(error.code)
+        ? error.code : "restore_preflight_failed";
+      const remaining = state.items.filter((item) => item.status !== "committed");
+      // A fully validated selection can go stale while previous items commit.
+      // On resume, check ALL remaining entries before starting a new write;
+      // committed entries were independently re-verified above.
+      for (const item of remaining) {
+        try {
+          const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+          await this._assertRestorablePlanMember(requested);
+        } catch (error) {
+          if (resume && state.items.some((item) => item.status === "committed")) {
+            item.status = "blocked";
+            item.code = safeErrorCode(error);
+            await persist(state);
+            return response();
+          }
+          throw error;
+        }
+      }
+      for (const item of remaining) {
+        const requested = detached.entries.find((entry) => entry.objectId === item.objectId);
+        let intentStored = false;
+        let provenNeverDispatched = false;
+        try {
+          await this._assertRestorablePlanMember(requested);
+          // An unrelated writer's pending outbox cannot be safely pushed by
+          // this execution. The standard restore itself requires an empty one.
+          if ((await this.journal.recover()).length !== 0) {
+            fail("Controlled restore requires settled signed outbox", "sync_operation_pending");
+          }
+          const result = await this._restoreHistoricalVersion(item.objectId, item.sourceVersionId,
+            { reviewedPlanEntry: requested, beforeEnqueue: async (intent) => {
+              item.status = "indeterminate";
+              delete item.neverDispatched;
+              Object.assign(item, intent);
+              await persist(state);
+              intentStored = true;
+            }, onProvenUnsent: async (error) => {
+              // Invoked only when the final authorization gate never called
+              // enqueue OR when discardUnsent fsynced the exact envelope.
+              // This callback itself must commit before retry becomes legal.
+              item.status = "blocked";
+              item.neverDispatched = true;
+              item.code = safeErrorCode(error);
+              await persist(state);
+              provenNeverDispatched = true;
+            } });
+          if (result?.pushed !== true || result.pending === true) {
+            await persist(state);
+            return response();
+          }
+          const committed = await this._verifyCommittedRestorePlanItem(item, requested);
+          item.status = "committed";
+          item.code = undefined;
+          item.operationId = committed.operationId;
+          item.versionId = committed.versionId;
+          item.envelopeDigest = signedEnvelopeDigest(committed);
+          await persist(state);
+        } catch (error) {
+          if (provenNeverDispatched) {
+            // Persisted signed never-dispatched proof is retained for a fresh
+            // journal + remote HEAD check on resume; no new PUT in this turn.
+            item.status = "blocked";
+            item.code = safeErrorCode(error);
+          } else if (!intentStored) {
+            item.status = "blocked";
+            item.code = safeErrorCode(error);
+          } else {
+            // The operation may already have committed remotely. Retain its
+            // signed identity and refuse automatic re-issuance after a crash.
+            item.status = "indeterminate";
+            item.code = "restore_plan_indeterminate";
+          }
+          await persist(state);
+          return response();
+        }
+      }
+      return response();
+    }, { requireExistingState: true });
+  }
+
+  async _assertNeverDispatchedRestoreIntent(item, requested) {
+    if (item.status !== "blocked" || item.neverDispatched !== true
+      || typeof item.operationId !== "string"
+      || !/^histrestore-[A-Za-z0-9-]{36}$/.test(item.operationId)
+      || typeof item.envelopeDigest !== "string"
+      || !/^[a-f0-9]{64}$/.test(item.envelopeDigest)) {
+      fail("Unproven historical restore retry", "restore_plan_indeterminate");
+    }
+    if ((await this.journal.recover()).length || this.journal.hasSeen(item.operationId)
+      || this.journal.hasDurableSignedReceipt(item.operationId)
+      || this.journal.hasLocalAdmission(item.operationId, item.envelopeDigest)) {
+      fail("Signed restore outbox or admission exists", "restore_plan_indeterminate");
+    }
+    const history = await this.adapter.history(item.objectId);
+    const versions = Array.isArray(history?.versions) ? history.versions : [];
+    if (!versions.length || versions.length > 256) {
+      fail("Untrusted historical retry history", "restore_plan_indeterminate");
+    }
+    const validated = versions.map((operation) => protocol.validateStoredOperation(operation));
+    if (validated.some((operation) => operation.operationId === item.operationId)
+      || signedEnvelopeDigest(validated[validated.length - 1]) !== requested.currentEnvelopeDigest) {
+      fail("Signed restore may already have been admitted", "restore_plan_indeterminate");
+    }
+    const head = await this.adapter.list(item.objectId);
+    const records = Array.isArray(head) ? head : Array.isArray(head?.objects)
+      ? head.objects : head ? [head] : [];
+    if (records.length !== 1
+      || signedEnvelopeDigest(protocol.validateStoredOperation(records[0]))
+        !== requested.currentEnvelopeDigest) {
+      fail("Signed restore HEAD is not unchanged", "restore_plan_indeterminate");
+    }
+    await this.verifyIncomingOperation(records[0], { preObserve: false });
+  }
+
+  async _verifyCommittedRestorePlanItem(item, requested) {
+    if (typeof item.operationId !== "string" || !/^histrestore-[A-Za-z0-9-]{36}$/.test(item.operationId)
+      || typeof item.envelopeDigest !== "string" || !/^[a-f0-9]{64}$/.test(item.envelopeDigest)
+      || typeof item.versionId !== "string") {
+      fail("Controlled restore lacks signed outcome identity", "restore_plan_indeterminate");
+    }
+    const remote = await this.adapter.list(item.objectId);
+    const records = Array.isArray(remote) ? remote : Array.isArray(remote?.objects)
+      ? remote.objects : remote ? [remote] : [];
+    if (records.length !== 1) fail("Signed restore HEAD is unavailable", "restore_plan_indeterminate");
+    const current = protocol.validateStoredOperation(records[0]);
+    if (current.objectId !== item.objectId || current.operation !== "update"
+      || current.operationId !== item.operationId
+      || current.versionId !== item.versionId
+      || current.metadata.path !== requested.path
+      || protocol.compareRevisions(current.baseRevision, requested.baseRevision) !== 0
+      || signedEnvelopeDigest(current) !== item.envelopeDigest
+      || this.journal.durableSignedReceiptDigest(item.operationId) !== item.envelopeDigest) {
+      fail("Signed restore HEAD differs from durable progress", "restore_plan_indeterminate");
+    }
+    await this.verifyIncomingOperation(current, { preObserve: false });
+    await this.assertOutgoingAuthorized({ ...current, deviceId: this.deviceId });
+    const history = await this.adapter.history(item.objectId);
+    if (!Array.isArray(history?.versions)
+      || history.versions.length < 1 || history.versions.length > 256) {
+      fail("Bounded signed restore history unavailable", "restore_plan_indeterminate");
+    }
+    const versions = history.versions.map((entry) => protocol.validateStoredOperation(entry));
+    if (versions.some((entry) => entry.objectId !== current.objectId
+      || entry.compartmentId !== current.compartmentId)
+      || signedEnvelopeDigest(versions[versions.length - 1]) !== signedEnvelopeDigest(current)) {
+      fail("Signed restore history identity or HEAD changed", "restore_plan_indeterminate");
+    }
+    for (const entry of versions) await this.verifyIncomingOperation(entry, { preObserve: false });
+    const source = versions.filter((entry) => entry.versionId === item.sourceVersionId);
+    if (source.length !== 1
+      || signedEnvelopeDigest(protocol.validateStoredOperation(source[0]))
+        !== requested.sourceEnvelopeDigest) {
+      fail("Original signed restore source is missing", "restore_plan_indeterminate");
+    }
+    const sourceKey = await this.keyFor(source[0]);
+    const sourceRaw = protocol.decryptPayload(source[0], sourceKey);
+    let sourceBytes = sourceRaw;
+    try {
+      if (source[0].operation === "move") {
+        sourceBytes = protocol.decodeMovePayload(sourceRaw, sourceKey);
+        if (sourceBytes === null) fail("Original signed MOVE is unavailable", "restore_plan_indeterminate");
+      }
+      const key = await this.keyFor(current);
+      const plain = protocol.decryptPayload(current, key);
+      try {
+        if (!crypto.createHash("sha256").update(plain).digest().equals(
+          crypto.createHash("sha256").update(sourceBytes).digest())) {
+          fail("Restored signed content differs from selected history", "restore_plan_indeterminate");
+        }
+        const relative = await canonicalRelativePath(this.rootDir, current.metadata.path);
+        const local = await readContainedFile(this.rootDir, relative);
+        try {
+          const snapshot = this.snapshot.files[relative];
+          if (!snapshot || snapshot.deleted || snapshot.objectId !== current.objectId
+            || snapshot.fileId !== current.fileId || snapshot.versionId !== current.versionId
+            || snapshot.hash !== crypto.createHash("sha256").update(plain).digest("hex")) {
+            fail("Signed restore snapshot is not durable", "restore_plan_indeterminate");
+          }
+          if (crypto.createHash("sha256").update(local).digest("hex")
+            !== crypto.createHash("sha256").update(plain).digest("hex")) {
+            fail("Signed restore local bytes differ from committed contents", "restore_plan_indeterminate");
+          }
+        } finally { local.fill(0); }
+      } finally { plain.fill(0); }
+    } finally {
+      if (sourceBytes && sourceBytes !== sourceRaw) sourceBytes.fill(0);
+      sourceRaw.fill(0);
+    }
+    return current;
+  }
+
+  async _previewHistoricalRestore(objectId, versionId,
+    { rechecks = null, includeDigests = false } = {}) {
     if (!this.requireIndependentHistoricalAdmission || !this.requireAuthorization
       || !this.reverifySeenIncoming || !this.requireCurrentOutgoingAuthorization
       || typeof this.verifyIncoming !== "function"
@@ -1991,6 +2473,10 @@ class SyncEngine {
         path: relative, sizeBytes: bytes.length,
         localAction: existing && !existing.deleted ? "replace-clean-tracked" : "create-from-deleted",
         verifiedRetainedVersions: versions.length, requiresFreshRestoreCheck: true,
+        ...(includeDigests ? {
+          sourceEnvelopeDigest: signedEnvelopeDigest(historical),
+          currentEnvelopeDigest: signedEnvelopeDigest(current),
+        } : {}),
       };
     } finally {
       if (bytes && bytes !== decrypted) bytes.fill(0);
@@ -2057,6 +2543,17 @@ class SyncEngine {
       if (versions[index].versionId === versionId) selected[selected.length] = versions[index];
     }
     if (selected.length !== 1 || selected[0].tombstone) fail("Restorable historical version not found", "history_version_unavailable");
+    // A restore appends one signed revision. Server retention guarantees only
+    // the newest 31 after append; older source rows may be pruned immediately.
+    // With no independent checkpoint/paused-device retention attestation, reject
+    // such selections BEFORE signing, mutating local bytes or sending a PUT.
+    const sourceIndex = versions.findIndex((record) => record.versionId === versionId);
+    const guaranteedAfterAppend = versions.length + 1 - (MAX_SERVER_HISTORY_PER_OBJECT - 1);
+    if (versions.length >= MAX_SERVER_HISTORY_PER_OBJECT
+      && sourceIndex < guaranteedAfterAppend) {
+      fail("Selected signed historical source may be pruned by its restore",
+        "history_source_prune_risk");
+    }
     const remote = await nativeReflectApply(adapterList, adapter, [objectId]);
     assertRestoreRuntime();
     let records;
@@ -2159,6 +2656,11 @@ class SyncEngine {
       }
     };
     await assertCleanDestination();
+    // A stale old-version restore temp (or an ordinary same-shaped local
+    // name) must be detected BEFORE a new signed outbox is fsynced. Otherwise
+    // the later post-enqueue guard turns an otherwise clean restore into a
+    // permanently indeterminate pending operation with no dispatch.
+    await this.assertNoHistoricalRestoreLegacyTempResidue(relative);
     assertRestoreRuntime();
     assertCapturedSignedEnvelope(currentCapture);
     assertCapturedSignedEnvelope(historicalCapture);
@@ -2168,13 +2670,32 @@ class SyncEngine {
       journal, journalMethods, engineMethods };
   }
 
-  async _restoreHistoricalVersion(objectId, versionId) {
+  async _restoreHistoricalVersion(objectId, versionId,
+    { reviewedPlanEntry = null, beforeEnqueue = null, onProvenUnsent = null } = {}) {
     const { historical, current, relative, existing,
       assertCleanDestination, assertNoStaleLocalIdentity,
       currentCapture, historicalCapture, assertRestoreRuntime,
       journal, journalMethods, engineMethods } =
       await this._inspectHistoricalRestore(objectId, versionId);
+    // The execution coordinator signed its reviewed CAS base before this
+    // second asynchronous inspection; reject any unreviewed head.
+    if (reviewedPlanEntry !== null) {
+      if (reviewedPlanEntry.objectId !== objectId
+        || reviewedPlanEntry.sourceVersionId !== versionId
+        || reviewedPlanEntry.currentVersionId !== current.versionId
+        || typeof reviewedPlanEntry.currentEnvelopeDigest !== "string"
+        || !regexTest(/^[a-f0-9]{64}$/, reviewedPlanEntry.currentEnvelopeDigest)
+        || reviewedPlanEntry.currentEnvelopeDigest !== signedEnvelopeDigest(current)
+        || typeof reviewedPlanEntry.sourceEnvelopeDigest !== "string"
+        || !regexTest(/^[a-f0-9]{64}$/, reviewedPlanEntry.sourceEnvelopeDigest)
+        || reviewedPlanEntry.sourceEnvelopeDigest !== signedEnvelopeDigest(historical)
+        || protocol.compareRevisions(current.revision, reviewedPlanEntry.baseRevision) !== 0) {
+        fail("Signed restore HEAD differs from reviewed plan", "restore_plan_stale");
+      }
+    }
+    assertRestoreRuntime();
     assertCapturedSignedEnvelope(historicalCapture);
+    assertCapturedSignedEnvelope(currentCapture);
     const key = await nativeReflectApply(engineMethods.keyFor, this, [historical]);
     assertRestoreRuntime();
     assertCapturedSignedEnvelope(historicalCapture);
@@ -2204,21 +2725,50 @@ class SyncEngine {
     // before the signed outbox can cause a later remote write.
     await assertCleanDestination();
     assertNoStaleLocalIdentity();
+    // An execution coordinator persists an exact signed intent BEFORE the
+    // outbox fsync. A crash afterwards must never create a second signature.
+    if (beforeEnqueue) {
+      await beforeEnqueue({
+        operationId: restored.operationId, versionId: restored.versionId,
+        envelopeDigest: signedEnvelopeDigest(restored),
+      });
+      assertRestoreRuntime();
+      assertCapturedSignedEnvelope(historicalCapture);
+      assertCapturedSignedEnvelope(currentCapture);
+    }
     // The outbox is durable BEFORE local materialization. Failure to send is
     // recoverable by the existing signed journal; no old operation is replayed.
-    await nativeReflectApply(engineMethods.assertOutgoingAuthorized, this, [restored, () => {
-      assertRestoreRuntime();
-      return nativeReflectApply(journalMethods.enqueue, journal, [restored]);
-    }]);
-    assertRestoreRuntime();
+    let enqueueStarted = false;
     try {
+      await nativeReflectApply(engineMethods.assertOutgoingAuthorized, this, [restored, () => {
+        assertRestoreRuntime();
+        enqueueStarted = true;
+        return nativeReflectApply(journalMethods.enqueue, journal, [restored]);
+      }]);
+      assertRestoreRuntime();
+    } catch (error) {
+      // A final authorization denial BEFORE the callback is a proven
+      // never-enqueued envelope. If enqueue even started, its fsync outcome
+      // may be ambiguous: preserve the indeterminate recovery gate instead.
+      if (!enqueueStarted && onProvenUnsent) await onProvenUnsent(error);
+      throw error;
+    }
+    try {
+      // Fail before moving existing user bytes if an older attempt left
+      // unverified plaintext at the restore destination or in private trash.
+      await this.assertNoHistoricalRestoreTempResidue(restored);
+      assertRestoreRuntime();
       await nativeReflectApply(engineMethods._apply, this,
         [restored, null, existing && !existing.deleted ? existing.hash : null]);
       assertRestoreRuntime();
     } catch (error) {
       if (ownDataValue(error, "code") === "restore_local_conflict") {
+        // discardUnsent guarantees this exact signed envelope has never been
+        // admitted or dispatched; report recoverable status only AFTER its
+        // durable removal. Any failure to discard stays indeterminate.
         assertRestoreRuntime();
         await nativeReflectApply(journalMethods.discardUnsent, journal, [restored]);
+        if (onProvenUnsent) await onProvenUnsent(error);
       }
       throw error;
     }
@@ -3623,6 +4173,8 @@ class SyncEngine {
           historicalRestoreEnvelope = captureHistoricalRestoreEnvelope(operation, this);
           operation = historicalRestoreEnvelope.operation;
           assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
+          const staging = nativeReflectApply(historicalRestoreEnvelope.journalMethods.restoreStagingInfo,
+            journal, [operation]);
           // The signed outbox can survive a crash between staging and local
           // materialization. An exact signed-envelope journal observation is
           // recorded only AFTER _apply has durably persisted restored local
@@ -3658,15 +4210,19 @@ class SyncEngine {
           if (durablyMaterialized && expectedKeyError) {
             historicalRestorePayloadHash = snapshot.hash;
           }
+          if (durablyMaterialized || !hasHistoricalRestorePhysicalAuthority(this)
+            || !staging || staging.dev === null || staging.ino === null) {
+            await this.assertNoHistoricalRestoreTempResidue(operation);
+            assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
+          }
           if (!durablyMaterialized) {
             if (expectedKeyError) throw expectedKeyError;
             let observed;
             try {
               const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
               assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
-              const staging = nativeReflectApply(historicalRestoreEnvelope.journalMethods.restoreStagingInfo,
-                journal, [operation]);
-              await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected, staging);
+              await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected,
+                staging, operation.operationId);
               assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
               if (staging) {
                 // pushPending is public and can bypass reconcileLocal. Before
@@ -3674,12 +4230,8 @@ class SyncEngine {
                 // exact recorded temp must no longer exist, even if an
                 // independent target already matches the signed plaintext.
                 const target = await contained(this.rootDir, relative, false);
-                const prefix = `${path.basename(target)}.tmp-`;
-                if (!staging.name.startsWith(prefix)
-                  || !HISTORICAL_RESTORE_TEMP_SUFFIX.test(staging.name.slice(path.basename(target).length))) {
-                  fail("Historical restore staging name is invalid", "restore_local_materialization_missing");
-                }
-                const staged = path.join(path.dirname(target), staging.name);
+                const staged = historicalRestoreStagingPath(this.rootDir, target,
+                  staging, operation.operationId);
                 await containedAbsolute(this.rootDir, staged, true);
                 const remaining = await fsp.lstat(staged, { bigint: true })
                   .catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
@@ -3687,6 +4239,8 @@ class SyncEngine {
                   fail("Historical restore staging remains unresolved", "restore_local_materialization_missing");
                 }
               }
+              await this.assertNoHistoricalRestoreTempResidue(operation);
+              assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
               const local = await readContainedFile(this.rootDir, relative, null, true);
               assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
               try { observed = sha256Hex(local); }
@@ -3947,6 +4501,63 @@ class SyncEngine {
     return sha256Hex(content);
   }
 
+  async assertNoHistoricalRestoreLegacyTempResidue(relativePath) {
+    // Detect old root-level temps without excluding similarly named user
+    // files from normal sync. A restore must not adopt that ambiguity.
+    const relative = await canonicalRelativePath(this.rootDir, relativePath);
+    const segments = stringSplit(relative, "/");
+    let target = this.rootDir;
+    for (let index = 0; index < segments.length; index += 1) {
+      target = path.join(target, segments[index]);
+    }
+    const prefix = `${path.basename(target)}.tmp-`;
+    const suffix = /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    let neighbors;
+    try { neighbors = await fsp.readdir(path.dirname(target)); }
+    catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      neighbors = [];
+    }
+    const normalizedPrefix = process.platform === "win32" ? stringToLowerCase(prefix) : prefix;
+    for (let index = 0; index < neighbors.length; index += 1) {
+      const name = neighbors[index];
+      const candidate = process.platform === "win32" ? stringToLowerCase(name) : name;
+      if (stringStartsWith(candidate, normalizedPrefix)
+        && regexTest(suffix, stringSlice(candidate, normalizedPrefix.length))) {
+        fail("Historical restore has an unresolved syncable temporary", "restore_local_materialization_missing");
+      }
+    }
+  }
+
+  async assertNoHistoricalRestoreTempResidue(operation) {
+    // Recheck after enqueue and before remote POST to catch write races, plus
+    // private leftovers from this exact signed operation's prior attempt.
+    await this.assertNoHistoricalRestoreLegacyTempResidue(operation.metadata.path);
+    const trash = path.join(this.rootDir, ".rootark-trash");
+    let privateNames;
+    try {
+      await containedAbsolute(this.rootDir, trash, false);
+      privateNames = await fsp.readdir(trash);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      privateNames = [];
+    }
+    // Scope private residue to the exact signed outbox operation. A leftover
+    // for another restore must not permanently wedge unrelated pending work.
+    const privatePrefix = `restore-materialize-${sha256Hex(operation.operationId)}.tmp-`;
+    const suffix = /^\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    for (let index = 0; index < privateNames.length; index += 1) {
+      const name = privateNames[index];
+      // NTFS resolves mixed-case aliases. Neither a case-only rename nor a
+      // change to the hexadecimal UUID's case may bypass the pending gate.
+      const candidate = process.platform === "win32" ? stringToLowerCase(name) : name;
+      if (stringStartsWith(candidate, privatePrefix)
+        && regexTest(suffix, stringSlice(candidate, privatePrefix.length))) {
+        fail("Historical restore has an unresolved private temporary", "restore_local_materialization_missing");
+      }
+    }
+  }
+
   async stageExisting(target) {
     if (!(await exists(target))) return null;
     const trashDir = path.join(this.rootDir, ".rootark-trash");
@@ -4158,7 +4769,19 @@ class SyncEngine {
           }
         }
       } else {
-        const temporary = `${target}.tmp-${process.pid}-${nativeRandomUUID()}`;
+        // Restore materialization is journaled before this write. A crash or
+        // failed cleanup must not leave its plaintext temp in the sync scan:
+        // that would look like an independent, unsanctioned CREATE on retry.
+        const restoreTempDir = historicalRestoreHash !== undefined
+          ? path.join(this.rootDir, ".rootark-trash") : null;
+        if (restoreTempDir) {
+          await fsp.mkdir(restoreTempDir, { recursive: true, mode: 0o700 });
+          await containedAbsolute(this.rootDir, restoreTempDir, false);
+        }
+        const temporary = restoreTempDir
+          ? path.join(restoreTempDir, `restore-materialize-${sha256Hex(operation.operationId)}.tmp-${process.pid}-${nativeRandomUUID()}`)
+          : `${target}.tmp-${process.pid}-${nativeRandomUUID()}`;
+        if (restoreTempDir) await containedAbsolute(this.rootDir, temporary, true);
         let restoreHandle = null;
         let restoreTempCreated = false;
         try {
@@ -4253,9 +4876,12 @@ class SyncEngine {
               // barrier. Without this, a crash can resurrect an unflushed
               // tmp name and strand an otherwise valid signed outbox on nlink=2.
               await fsp.unlink(temporary);
-              // Both the target link and temporary unlink, as well as any
-              // freshly created nested parent chain, must become durable
-              // before independently committed restore evidence is allowed.
+              // Both the target link and temporary unlink (including .rootark-trash),
+              // as well as any freshly created nested parent chain, must become
+              // durable before independently committed restore evidence is allowed.
+              if (path.dirname(temporary) !== path.dirname(target)) {
+                await syncDirectoryChain(this.rootDir, path.dirname(temporary));
+              }
               await syncDirectoryChain(this.rootDir, path.dirname(target));
             } catch (error) {
               if (staged) await this.replaceStagedIfVacant(staged, target);
@@ -4278,6 +4904,8 @@ class SyncEngine {
           if (historicalRestoreHash === undefined) {
             await nativeReflectApply(nativePromiseCatch, fsp.rm(temporary, { force: true }), [() => {}]);
           } else if (restoreTempCreated) {
+            // The temp lives in .rootark-trash, outside the ordinary sync
+            // scan. Preserve its signed intent until a verified unlink.
             const current = await nativeReflectApply(nativePromiseCatch,
               fsp.lstat(temporary, { bigint: true }), [(error) => ownDataValue(error, "code") === "ENOENT"
                 ? null : nativePromiseReject(error)]);
@@ -4391,52 +5019,24 @@ class SyncEngine {
 
   async _reconcileLocal() {
     for (const operation of await this.journal.recover()) {
-      if (typeof operation.operationId !== "string"
-        || !stringStartsWith(operation.operationId, "histrestore-")
-        || typeof operation.metadata?.path !== "string") continue;
-      const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
-      const staging = this.journal.restoreStagingInfo(operation);
-      if (!staging) continue;
-      const restoreTarget = await contained(this.rootDir, relative, true);
-      const recordedPath = path.join(path.dirname(restoreTarget), staging.name);
-      await containedAbsolute(this.rootDir, recordedPath, true);
-      const stagedStats = await nativeReflectApply(nativePromiseCatch,
-        fsp.lstat(recordedPath, { bigint: true }), [(error) => ownDataValue(error, "code") === "ENOENT"
-          ? null : nativePromiseReject(error)]);
-      if (stagedStats && (staging.dev === null || staging.ino === null)) {
-        // The durable name intent preceded file creation, but no physical FD
-        // binding ever committed. Never turn that orphan into a user CREATE.
-        fail("Unbound historical restore staging requires explicit recovery",
-          "restore_local_materialization_missing");
-      }
-    if (stagedStats && bigIntToString(stagedStats.dev) === staging.dev
-      && bigIntToString(stagedStats.ino) === staging.ino
-        && stagedStats.nlink === 1n) {
-        // The producer's fsynced temp survived a kill BEFORE link(target).
-        // Do not mistake that plaintext staging file for a user CREATE in
-        // scanFiles. Explicit recovery must choose a safe destination.
-        fail("Unlinked historical restore staging requires explicit recovery",
-          "restore_local_materialization_missing");
-      }
-      // A kill between link(temp,target) and unlink(temp) leaves a legitimate
-      // signed restore with nlink=2. Only the physically recorded exact
-      // inode/name may be cleaned; never hide a filename by its suffix.
-      try {
-        const expected = await this.hashPendingPayload(operation);
-        await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected, staging);
-      } catch (error) {
-        if (ownDataValue(error, "code") !== "ENOENT") throw error;
-      }
-      // recoverHistoricalRestoreTempLink can return early when the target is
-      // absent or no longer has the expected hardlink identity. An ENOENT
-      // target is also swallowed above. Never let a still-present recorded
-      // staging pathname reach scanFiles() as an ordinary user CREATE.
-      const remainingStage = await nativeReflectApply(nativePromiseCatch,
-        fsp.lstat(recordedPath, { bigint: true }), [(error) => ownDataValue(error, "code") === "ENOENT"
-          ? null : nativePromiseReject(error)]);
-      if (remainingStage) {
-        fail("Unresolved historical restore staging file requires explicit recovery",
-          "restore_local_materialization_missing");
+      // Private historical restore temps are never syncable user files. Do
+      // not infer ownership from their names or silently adopt an orphan.
+      if (typeof operation.operationId === "string"
+        && stringStartsWith(operation.operationId, "histrestore-")) {
+        if (hasHistoricalRestorePhysicalAuthority(this) && typeof operation.metadata?.path === "string") {
+          const staging = this.journal.restoreStagingInfo(operation);
+          if (staging && staging.dev !== null && staging.ino !== null) {
+            try {
+              const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
+              const expected = await this.hashPendingPayload(operation);
+              await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected,
+                staging, operation.operationId);
+            } catch (error) {
+              if (ownDataValue(error, "code") !== "ENOENT") throw error;
+            }
+          }
+        }
+        await this.assertNoHistoricalRestoreTempResidue(operation);
       }
     }
     const scanned = await this.scanFiles();

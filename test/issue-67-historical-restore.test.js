@@ -678,6 +678,8 @@ test("#67: restoring a deleted historical ciphertext creates a fresh signed revi
   assert.equal(result.restored, true);
   assert.equal(result.pushed, true);
   assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"), "original authenticated bytes");
+  assert.deepEqual(await fsp.readdir(path.join(f.local, ".rootark-trash")), [],
+    "successful restore must remove its private materialization temporary");
   assert.equal(f.pushes(), 1);
   assert.equal(f.versions.length, 3);
   assert.equal(f.versions[0].versionId, "first");
@@ -1995,13 +1997,23 @@ test("#67 P2: deletion after durable offline restore remains a later signed dele
   assert.deepEqual(await reopened.journal.recover(), []);
 });
 
+function isHistoricalRestoreStageTempPath(name) {
+  return /^(restore-materialize-[a-f0-9]{64}|document\.txt)\.tmp-/.test(path.basename(String(name)));
+}
+
+function resolveHistoricalRestoreStagePath(localDir, stagingName) {
+  return String(stagingName).startsWith("restore-materialize-")
+    ? path.join(localDir, ".rootark-trash", stagingName)
+    : path.join(localDir, stagingName);
+}
+
 test("#67 P2: failing physical file fsync cannot certify a restore as materialized", async (t) => {
   const f = await fixture(t);
   const originalOpen = fsp.open;
   let injected = 0;
   fsp.open = async (name, ...rest) => {
     const handle = await originalOpen(name, ...rest);
-    if (String(name).includes("document.txt.tmp-")) {
+    if (isHistoricalRestoreStageTempPath(name)) {
       Object.defineProperty(handle, "sync", {
         value: async () => {
           injected += 1;
@@ -2088,7 +2100,7 @@ test("#67 P2: failed POSIX directory fsync after link cannot authorize push on r
   let injectionsRemaining = 2;
   fsp.link = async (source, destination) => {
     const result = await originalLink(source, destination);
-    if (destination === target && source.startsWith(`${target}.tmp-`)) linked = true;
+    if (destination === target && isHistoricalRestoreStageTempPath(source)) linked = true;
     return result;
   };
   fsp.open = async (name, flags, ...rest) => {
@@ -2148,14 +2160,14 @@ test("#67 P2: restart recovers an exactly bound crash hardlink or fails closed o
   let interruptedCleanup = 0;
   let suppressedCleanup = 0;
   fsp.unlink = async (name, ...args) => {
-    if (String(name).startsWith(`${target}.tmp-`)) {
+    if (isHistoricalRestoreStageTempPath(name)) {
       interruptedCleanup += 1;
       throw new Error("disposable hard crash after linked staging identity was committed");
     }
     return originalUnlink(name, ...args);
   };
   fsp.rm = async (name, ...args) => {
-    if (String(name).startsWith(`${target}.tmp-`)) {
+    if (isHistoricalRestoreStageTempPath(name)) {
       suppressedCleanup += 1;
       return;
     }
@@ -2173,7 +2185,7 @@ test("#67 P2: restart recovers an exactly bound crash hardlink or fails closed o
   assert.equal(f.engine.journal.hasMaterializedRestore(pending), false);
   const staging = f.engine.journal.restoreStagingInfo(pending);
   assert.ok(staging, "crash recovery needs a durable exact staged inode/name bound to signed envelope");
-  const orphan = path.join(f.local, staging.name);
+  const orphan = resolveHistoricalRestoreStagePath(f.local, staging.name);
   assert.equal(fs.existsSync(orphan), true, "the original producer-created temporary hardlink remains");
   assert.equal((await fsp.lstat(target)).nlink, 2);
   assert.equal((await fsp.lstat(orphan)).ino, (await fsp.lstat(target)).ino);
@@ -2400,7 +2412,7 @@ test("#262 P2: failed restore staging cleanup preserves signed provenance", asyn
   let temporary = null;
   let cleanupAttempted = false;
   fsp.link = async (source, destination) => {
-    if (destination === target && source.startsWith(`${target}.tmp-`)) {
+    if (destination === target && isHistoricalRestoreStageTempPath(source)) {
       temporary = source;
       await fsp.writeFile(target, competing, { flag: "wx" });
     }
@@ -2479,7 +2491,7 @@ test("#67 P2: pre-link crash cannot silently upload the durable staging temp", a
     throw new Error("disposable crash before hardlink to target");
   };
   fsp.rm = async (name, ...args) => {
-    if (String(name).startsWith(`${target}.tmp-`)) {
+    if (isHistoricalRestoreStageTempPath(name)) {
       skippedCleanup += 1;
       return;
     }
@@ -2495,7 +2507,7 @@ test("#67 P2: pre-link crash cannot silently upload the durable staging temp", a
   assert.equal(await verifyAuthorizationProof(signed.authorization, signed, f.trusted), true);
   const intent = f.engine.journal.restoreStagingInfo(signed);
   assert.ok(intent, "signed outbox must preserve its physically pinned staging intent");
-  const staged = path.join(f.local, intent.name);
+  const staged = resolveHistoricalRestoreStagePath(f.local, intent.name);
   assert.equal((await fsp.lstat(staged, { bigint: true })).ino.toString(), intent.ino);
   assert.equal(fs.existsSync(target), false);
   const originalList = f.adapter.list;
@@ -2526,7 +2538,7 @@ test("#67 P2: crash after staging name intent but before inode bind cannot uploa
     throw new Error("disposable kill after file data fsync before inode intent bind");
   };
   fsp.rm = async (name, ...args) => {
-    if (String(name).startsWith(`${target}.tmp-`)) return;
+    if (isHistoricalRestoreStageTempPath(name)) return;
     return originalRemove(name, ...args);
   };
   try {
@@ -2542,7 +2554,7 @@ test("#67 P2: crash after staging name intent but before inode bind cannot uploa
   assert.equal(await verifyAuthorizationProof(signed.authorization, signed, f.trusted), true);
   const intent = f.engine.journal.restoreStagingInfo(signed);
   assert.ok(intent && intent.name && intent.dev === null && intent.ino === null);
-  const staged = path.join(f.local, intent.name);
+  const staged = resolveHistoricalRestoreStagePath(f.local, intent.name);
   assert.equal((await fsp.lstat(staged)).nlink, 1);
   assert.equal(fs.existsSync(target), false);
   const originalList = f.adapter.list;
@@ -2568,7 +2580,7 @@ test("#67 P2: O_EXCL staging collision cannot delete another user's file", async
   const foreign = Buffer.from("FOREIGN_STAGING_COLLISION_MUST_SURVIVE");
   let collided = null;
   fsp.open = async (name, flags, ...args) => {
-    if (!collided && typeof name === "string" && name.startsWith(`${target}.tmp-`)
+    if (!collided && typeof name === "string" && isHistoricalRestoreStageTempPath(name)
       && typeof flags === "number" && (flags & fs.constants.O_EXCL)) {
       collided = name;
       await fsp.writeFile(name, foreign, { flag: "wx" });
@@ -2595,7 +2607,7 @@ test("#67 P2: staging bytes changed immediately before signed hardlink cannot ga
   const foreign = Buffer.from("FOREIGN_EDIT_REPLACES_AUTHENTICATED_STAGED_BYTES");
   let edited = 0;
   fsp.link = async (source, destination) => {
-    if (destination === target && source.startsWith(`${target}.tmp-`)) {
+    if (destination === target && isHistoricalRestoreStageTempPath(source)) {
       edited += 1;
       // Genuine on-disk edit through the same pathname after the outbox
       // bound its name/inode but immediately before the filesystem link.
@@ -2668,6 +2680,192 @@ test("#67: hardlink permission failure preserves local bytes and blocks remote r
   assert.equal((await f.engine.journal.recover()).length, 1);
   await assert.rejects(f.engine.syncOnce(), (error) => error.code === "restore_local_materialization_missing");
   assert.equal(f.pushes(), 0);
+});
+
+test("#67: failed restore temp cleanup cannot dispatch or become an ordinary CREATE", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const originalUnlink = fsp.unlink;
+  const originalRm = fsp.rm;
+  let injected = 0;
+  const failCleanup = async (file) => {
+    if (isHistoricalRestoreStageTempPath(file)) {
+      injected += 1;
+      throw Object.assign(new Error("simulated restore temporary cleanup failure"), { code: "EPERM" });
+    }
+    return false;
+  };
+  fsp.unlink = async (file, ...rest) => {
+    await failCleanup(file);
+    return originalUnlink(file, ...rest);
+  };
+  fsp.rm = async (file, options) => {
+    await failCleanup(file);
+    return originalRm(file, options);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "EPERM");
+  } finally {
+    fsp.unlink = originalUnlink;
+    fsp.rm = originalRm;
+  }
+  assert.ok(injected >= 1, "the actual restore-temp cleanup must be exercised");
+  assert.equal(f.pushes(), 0, "cleanup failure must stop the first remote POST");
+  assert.equal((await f.engine.journal.recover()).length, 1,
+    "the exact signed outbox must remain pending");
+  const signedPending = (await f.engine.journal.recover())[0];
+  const privatePrefix = `restore-materialize-${crypto.createHash("sha256")
+    .update(signedPending.operationId).digest("hex")}.tmp-`;
+  assert.equal(await fsp.readFile(target, "utf8"), "original authenticated bytes");
+  const trash = await fsp.readdir(path.join(f.local, ".rootark-trash"));
+  assert.equal(trash.filter((name) => name.startsWith(privatePrefix)).length, 1,
+    "preserved plaintext temp must be confined to excluded local trash");
+  if (process.platform === "win32") {
+    // NTFS permits a case-only rename of the same physical file. A pending
+    // signed restore must not treat the renamed residue as a missing temp.
+    const physicalName = trash.find((name) => name.startsWith(privatePrefix));
+    const renamed = physicalName.replace(/^restore-materialize-/, "RESTORE-MATERIALIZE-")
+      .replace(".tmp-", ".TMP-");
+    const trashDir = path.join(f.local, ".rootark-trash");
+    await fsp.rename(path.join(trashDir, physicalName), path.join(trashDir, renamed));
+    assert.ok((await fsp.readdir(trashDir)).includes(renamed),
+      "test must physically reproduce mixed-case private residue on Windows");
+  }
+  // The private temp still hardlinks the destination (nlink=2), so the
+  // existing inode-bound scanner must reject the destination fail-closed.
+  // Its private alias must never be promoted as an ordinary CREATE.
+  await assert.rejects(f.engine.scanFiles(), (error) => error.code === "unsafe_path");
+  assert.deepEqual((await fsp.readdir(f.local)).filter((name) => name.includes(".tmp-")), []);
+  const reopened = await new SyncEngine({
+    rootDir: f.local, adapter: f.adapter, deviceId: f.engine.deviceId,
+    keyEpoch: f.engine.keyEpoch, compartmentId: f.engine.compartmentId,
+    fileKeyResolver: f.engine.fileKeyResolver, requireAuthorization: true,
+    authorize: f.engine.authorize, authorizeOutgoing: f.engine.authorizeOutgoing,
+    verifyIncoming: f.engine.verifyIncoming, authorizationFactory: f.engine.authorizationFactory,
+  }).open();
+  await assert.rejects(reopened.reconcileLocal(),
+    (error) => error.code === "restore_local_materialization_missing");
+  await assert.rejects(reopened.pushPending({ pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false }),
+    (error) => error.code === "restore_local_materialization_missing");
+  const afterRestart = await reopened.journal.recover();
+  assert.equal(afterRestart.length, 1, "restart must not enqueue the private temp as CREATE");
+  assert.match(afterRestart[0].operationId, /^histrestore-/);
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67: interrupted restore temp write remains outside scan after restart", async (t) => {
+  const f = await fixture(t);
+  const originalOpen = fsp.open;
+  const originalRm = fsp.rm;
+  let interrupted = 0;
+  fsp.open = async (file, ...rest) => {
+    const handle = await originalOpen(file, ...rest);
+    if (isHistoricalRestoreStageTempPath(file)) {
+      const originalWrite = handle.writeFile.bind(handle);
+      Object.defineProperty(handle, "writeFile", {
+        value: async (data, options) => {
+          await originalWrite(data, options);
+          interrupted += 1;
+          throw new Error("simulated abrupt stop after temp write");
+        },
+        configurable: true,
+      });
+    }
+    return handle;
+  };
+  fsp.rm = async (file, options) => {
+    if (interrupted > 0 && isHistoricalRestoreStageTempPath(file)) return;
+    return originalRm(file, options);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+      (error) => error.code === "restore_local_materialization_missing");
+  } finally {
+    fsp.open = originalOpen;
+    fsp.rm = originalRm;
+  }
+  assert.equal(interrupted, 1, "must interrupt actual plaintext temp materialization");
+  assert.equal(f.pushes(), 0);
+  const [signedPending] = await f.engine.journal.recover();
+  assert.match(signedPending.operationId, /^histrestore-/);
+  assert.deepEqual((await fsp.readdir(f.local)).filter((name) => name.includes(".tmp-")), []);
+  const trash = await fsp.readdir(path.join(f.local, ".rootark-trash"));
+  const privatePrefix = `restore-materialize-${crypto.createHash("sha256")
+    .update(signedPending.operationId).digest("hex")}.tmp-`;
+  assert.equal(trash.filter((name) => name.startsWith(privatePrefix)).length, 1);
+  assert.deepEqual(Object.keys(await f.engine.scanFiles()), [],
+    "orphaned temp must not be visible to local reconciliation");
+  await assert.rejects(f.engine.reconcileLocal(),
+    (error) => error.code === "restore_local_materialization_missing");
+  assert.equal((await f.engine.journal.recover()).length, 1,
+    "only the original signed restore may remain after recovery");
+  assert.equal(f.pushes(), 0);
+});
+
+test("#67: legacy root-level restore temp cannot become a CREATE or bypass direct pushPending", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const originalLink = fsp.link;
+  fsp.link = async (source, destination) => {
+    if (destination === target && source.includes(".tmp-")) {
+      throw Object.assign(new Error("simulated pre-link crash"), { code: "EACCES" });
+    }
+    return originalLink(source, destination);
+  };
+  try {
+    await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"), /pre-link crash/);
+  } finally { fsp.link = originalLink; }
+  const pending = await f.engine.journal.recover();
+  assert.equal(pending.length, 1);
+  const bytes = protocol.decryptPayload(f.original, f.privateFileKey);
+  await fsp.writeFile(target, bytes);
+  const legacyTemp = `${target}.tmp-4242-${crypto.randomUUID()}`;
+  await fsp.writeFile(legacyTemp, bytes);
+  assert.deepEqual(await fsp.readFile(legacyTemp), bytes);
+  await assert.rejects(f.engine.pushPending({ pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false }),
+    (error) => error.code === "restore_local_materialization_missing");
+  await assert.rejects(f.engine.reconcileLocal(),
+    (error) => error.code === "restore_local_materialization_missing");
+  assert.equal(f.pushes(), 0);
+  assert.deepEqual((await f.engine.journal.recover()).map((item) => item.operationId),
+    [pending[0].operationId], "no unsanctioned CREATE may be enqueued");
+  assert.deepEqual(await fsp.readFile(legacyTemp), bytes, "original residue preserved for investigation");
+});
+
+test("#67: preexisting legacy temp must fail before signing or enqueueing a new restore", async (t) => {
+  const f = await fixture(t);
+  const target = path.join(f.local, "document.txt");
+  const other = `${target}.tmp-4242-${crypto.randomUUID()}`;
+  await fsp.writeFile(other, "preexisting independent bytes");
+  await assert.rejects(f.engine.restoreHistoricalVersion("file-1", "first"),
+    (error) => error.code === "restore_local_materialization_missing");
+  assert.equal(f.pushes(), 0, "never dispatch a restore whose temp evidence is unresolved");
+  assert.deepEqual(await f.engine.journal.recover(), [],
+    "preflight must not create a newly stranded signed outbox");
+  assert.equal(fs.existsSync(target), false, "preflight must not materialize the destination");
+  assert.equal(await fsp.readFile(other, "utf8"), "preexisting independent bytes");
+});
+
+test("#67: unrelated legitimate tmp-shaped file remains visible and cannot block a restore", async (t) => {
+  const f = await fixture(t);
+  const unrelated = `notes.txt.tmp-999-${crypto.randomUUID()}`;
+  const unrelatedPath = path.join(f.local, unrelated);
+  await fsp.writeFile(unrelatedPath, "owner-authored temporary name");
+  const trashDir = path.join(f.local, ".rootark-trash");
+  await fsp.mkdir(trashDir, { recursive: true });
+  const unrelatedResidue = path.join(trashDir,
+    `restore-materialize-${"0".repeat(64)}.tmp-999-${crypto.randomUUID()}`);
+  await fsp.writeFile(unrelatedResidue, "unrelated restore incident evidence");
+  const initial = await f.engine.scanFiles();
+  assert.equal(initial[unrelated]?.directory, false,
+    "the scanner must not blanket-ignore user files by a .tmp naming pattern");
+  const restored = await f.engine.restoreHistoricalVersion("file-1", "first");
+  assert.equal(restored.pushed, true);
+  assert.equal(f.pushes(), 1);
+  assert.equal(await fsp.readFile(unrelatedPath, "utf8"), "owner-authored temporary name");
+  assert.equal(await fsp.readFile(unrelatedResidue, "utf8"),
+    "unrelated restore incident evidence", "another incident's private evidence is preserved");
 });
 
 test("#67: an untracked file created after enqueue is never replaced by restore", async (t) => {
