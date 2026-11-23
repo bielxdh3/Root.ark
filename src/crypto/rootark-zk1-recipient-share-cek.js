@@ -175,8 +175,7 @@ function snapshotAuthority(value) {
     || !nativeIsSafeInteger(h.revision.value) || h.revision.value < 0
     || !nativeIsSafeInteger(h.epoch.value) || h.epoch.value < 0
     || isNativeProxy(h.digest.value)
-    || !(h.digest.value instanceof Uint8Array)
-    || h.digest.value.length !== 32) denyOffer();
+    || !nativeIsUint8Array(h.digest.value)) denyOffer();
   const head = { revision: h.revision.value, epoch: h.epoch.value,
     digest: copyNativeBytes32(h.digest.value) };
   const sourceDevices = fields.devices.value;
@@ -199,8 +198,7 @@ function snapshotAuthority(value) {
     if (!allOwnData(d, ["deviceId", "authorizationPublicKey",
       "enrolledEpoch", "revokedAtEpoch"])
       || isNativeProxy(d.authorizationPublicKey.value)
-      || !(d.authorizationPublicKey.value instanceof Uint8Array)
-      || d.authorizationPublicKey.value.length !== 32
+      || !nativeIsUint8Array(d.authorizationPublicKey.value)
       || !nativeIsSafeInteger(d.enrolledEpoch.value) || d.enrolledEpoch.value < 0
       || !(d.revokedAtEpoch.value === null
         || (nativeIsSafeInteger(d.revokedAtEpoch.value)

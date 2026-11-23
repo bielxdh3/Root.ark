@@ -393,3 +393,42 @@ test("issue 68 P2: openPortableProtectedRecipientShareFile rejects getter reentr
 
   assert.equal(getterRan, false, "getter on redeemInput must never be executed");
 });
+
+test("issue 68 P2: independent roster snapshots never execute hostile native byte-view properties", async () => {
+  const f = await createMinimalOfferFixture();
+  for (const target of ["recipient-key", "head-digest"]) {
+    let lengthReads = 0;
+    let valueOfReads = 0;
+    let iteratorReads = 0;
+    let authorityReads = 0;
+    const issuer = { ...f.baseAuthority.devices[0], revokedAtEpoch: f.epoch };
+    const recipient = { ...f.baseAuthority.devices[1] };
+    const head = { ...f.baseAuthority.head };
+    const bytes = target === "head-digest"
+      ? Uint8Array.from(head.digest)
+      : Uint8Array.from(recipient.authorizationPublicKey);
+    Object.defineProperties(bytes, {
+      length: { get() { lengthReads++; issuer.revokedAtEpoch = null; return 32; } },
+      valueOf: { value() { valueOfReads++; issuer.revokedAtEpoch = null; return bytes; } },
+      [Symbol.iterator]: { value() { iteratorReads++; issuer.revokedAtEpoch = null; return [][Symbol.iterator](); } },
+    });
+    if (target === "head-digest") head.digest = bytes;
+    else recipient.authorizationPublicKey = bytes;
+
+    await assert.rejects(createProtectedRecipientShareOffer({
+      grant: f.grant, recipientPin: f.recipientPin, issuerPin: f.issuerPin,
+      readIndependentAuthority: async () => {
+        authorityReads++;
+        return { scope: f.baseAuthority.scope, head, devices: [issuer, recipient] };
+      },
+      ownerPrivateKey: f.owner.privateKey, ownerHeldCek: f.ownerHeldCek,
+      metadata: f.metadata, objectRevision: 1, ciphertext: f.ciphertext,
+      ciphertextRoot: f.ciphertextRoot, authority: f.baseAuthority, nowSeconds: f.now,
+    }), /ZK_SHARE_OFFER_DENIED/);
+    assert.equal(authorityReads, 1, `${target}: independent roster must be checked`);
+    assert.equal(lengthReads, 0, `${target}: getter must not run`);
+    assert.equal(valueOfReads, 0, `${target}: valueOf must not run`);
+    assert.equal(iteratorReads, 0, `${target}: iterator must not run`);
+    assert.equal(issuer.revokedAtEpoch, f.epoch, `${target}: issuer must remain revoked`);
+  }
+});
