@@ -346,3 +346,46 @@ test("crashing after staging tracked cache for hydration recovers staged identit
   assert.equal(await fsp.readFile(path.join(rootDir, "notes.txt"), "utf8"), seededBytes,
     "staged tracked file must be restored before reconcileLocal");
 });
+
+test("hydration crash recovery preserves locally edited published bytes instead of restoring old staged cache", async (t) => {
+  const { storagePath, authorize, publicKey } = await fixture(t);
+  const root = path.dirname(storagePath);
+  const rootDir = path.join(root, "client");
+  const syncKey = crypto.randomBytes(32);
+  const makeOp = (kind, counter, text) => authorize(createOperation({
+    operation: kind, objectId: "obj-edit-crash", fileId: "file-obj-edit-crash", versionId: crypto.randomUUID(),
+    operationId: crypto.randomUUID(), deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", revision: { counter, deviceId: "device-a" },
+    baseRevision: counter > 1 ? { counter: counter - 1, deviceId: "device-a" } : null,
+    metadata: { path: "notes.txt" },
+    plaintext: Buffer.from(text), fileKey: syncKey,
+  }));
+  const v1 = await makeOp("create", 1, "v1 clean bytes");
+  const v2 = await makeOp("update", 2, "v2 hydrated bytes");
+  const openClient = () => new SyncEngine({
+    rootDir, deviceId: "device-a", username: "alice",
+    compartmentId: "private", keyEpoch: "epoch-1",
+    fileKeyResolver: () => syncKey,
+    snapshotPath: path.join(root, "snapshot.json"),
+    journalPath: path.join(root, "journal.json"),
+    requireAuthorization: true,
+    authorizationFactory: async (op) => (await authorize(op)).authorization,
+    verifyIncoming: (op) => verifyAuthorizationProof(
+      op.authorization, op, { username: "alice",
+        trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] }),
+    adapter: { push: async () => [], list: async () => [] },
+  }).open();
+
+  const client = await openClient();
+  await client._apply(v1);
+  // Fail persistSnapshot after hard-link publication of v2.
+  client.persistSnapshot = async () => { throw Object.assign(new Error("simulated crash"), { code: "EIO" }); };
+  await assert.rejects(client._apply(v2, null, async () => {}), { code: "EIO" });
+  // Local user edits the published file before recovery runs.
+  await fsp.writeFile(path.join(rootDir, "notes.txt"), "user edited bytes after publish");
+
+  await openClient();
+  assert.equal(await fsp.readFile(path.join(rootDir, "notes.txt"), "utf8"),
+    "user edited bytes after publish",
+    "recovery must not delete and overwrite locally edited published bytes");
+});
