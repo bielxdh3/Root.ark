@@ -263,6 +263,19 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
     function chunks(){const dt=new DataTransfer();v.chunks.forEach((chunk,i)=>dt.items.add(new File([decode(chunk)],"chunk-"+i+".bin")));document.getElementById("portable-chunks").files=dt.files;}
     const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
     const status=()=>document.getElementById("status").textContent;
+    const restoreButton=document.getElementById("portable-restore");
+    // The UI runs an async action with a disabled-button guard. Never click
+    // the next security step until the previous async action has settled:
+    // a fixed sleep can race with owner signature or SQLite chunk verification
+    // on overloaded Windows CI and silently discard the next click.
+    async function settled(predicate,stage,maxMs=25000){
+      const deadline=performance.now()+maxMs;
+      while(performance.now()<deadline){
+        if(predicate()&&!restoreButton.disabled)return;
+        await pause(45);
+      }
+      throw Error(stage);
+    }
     let downloads=0;const originalClick=HTMLAnchorElement.prototype.click;
     HTMLAnchorElement.prototype.click=function(){if(this.hasAttribute("download"))downloads++;return originalClick.call(this);};
     let lastError="";const original=window.RootarkZk1BrowserRecoveryHttp;
@@ -287,33 +300,51 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
       document.getElementById("portable-source-chunk-root").value=v.sourceRoot;
       document.getElementById("portable-offline-opt-in").checked=true;
     }
+    let phase="MISSING_OWNER_PIN";
     try {
       document.getElementById("portable-offline-opt-in").checked=true;
-      document.getElementById("portable-restore").click();
-      await pause(120);
-      if(!status().includes("faltam pins externos")||downloads!==0)throw Error("MISSING_PIN_NOT_CLOSED:"+status());
+      restoreButton.click();
+      await settled(()=>status().includes("faltam pins externos"),"MISSING_PIN_SETTLE_TIMEOUT");
+      if(downloads!==0)throw Error("MISSING_PIN_NOT_CLOSED");
       prepare();
+      phase="MISSING_NATIVE_PIN";
       const ownerKey=await crypto.subtle.importKey("raw",decode(v.ownerKey),"Ed25519",true,["verify"]);
       await window.RootarkZk1NormalBrowserTrustFloor.provisionOffline({
         ownerPublicKey:ownerKey,independentOwnerSpkiSha256:decode(v.ownerSpki),
         pinnedCurrentHead:{revision:v.ownerHead.revision,digest:decode(v.ownerHead.digest),epoch:v.ownerHead.epoch},
         signedDeviceGrant:v.grant,ownerHistoryCheckpoint:v.ownerHistory,previousOwnerHistoryProof:null});
       document.getElementById("portable-source-chunk-root").value="";
-      document.getElementById("portable-restore").click();await pause(130);
-      if(!status().includes("faltam pins externos")||downloads!==0)
-        throw Error("MISSING_NATIVE_PIN_NOT_CLOSED:"+status()+":"+downloads);
+      restoreButton.click();
+      await settled(()=>status().includes("faltam pins externos"),"MISSING_NATIVE_PIN_SETTLE_TIMEOUT");
+      if(downloads!==0)throw Error("MISSING_NATIVE_PIN_NOT_CLOSED");
       // A rejected restore deliberately clears local File inputs, so a
       // second attempt must explicitly reselect those offline files.
+      phase="SIGNED_LOCAL_RECOVERY";
       prepare();
-      document.getElementById("portable-restore").click();
-      for(let i=0;i<100;i++){await pause(70);if(status().includes("Recuperação local concluída")||lastError)break;}
+      restoreButton.click();
+      await settled(()=>status().includes("Recuperação local concluída")||lastError,"LOCAL_RECOVER_SETTLE_TIMEOUT");
       if(!status().includes("Recuperação local concluída")||downloads!==1)
-        throw Error("LOCAL_RECOVER_FAILED:"+status()+":"+lastError+":"+downloads);
+        throw Error("LOCAL_RECOVER_FAILED");
+      phase="ROLLBACK_DENIAL";
+      // Adversarially delay the first local file read of the rollback attempt.
+      // The UI must wait for the actual denial, not accidentally check the
+      // previous success message while the async credential import is pending.
+      const originalRead=File.prototype.arrayBuffer;let delayedRollbackRead=false;
+      File.prototype.arrayBuffer=async function(...args){
+        if(!delayedRollbackRead){delayedRollbackRead=true;await pause(800);}
+        return originalRead.apply(this,args);
+      };
       prepare();document.getElementById("head-revision").value=String(v.ownerHead.revision+1);
-      document.getElementById("portable-restore").click();await pause(350);
-      if(downloads!==1||status().includes("Recuperação local concluída"))throw Error("ROLLBACK_EXPORTED:"+status());
+      const previousStatus=status();
+      restoreButton.click();
+      await settled(()=>status()!==previousStatus,"ROLLBACK_SETTLE_TIMEOUT");
+      if(downloads!==1||status().includes("Recuperação local concluída"))throw Error("ROLLBACK_EXPORTED");
       output.textContent="EDGE_LOCAL_PASS";
-    }catch(error){output.textContent="EDGE_LOCAL_FAIL:"+error.message;}
+    }catch(_error){
+      // Failure output reaches the test runner. Report only fixed categories,
+      // never raw browser exception text, signed owner material or UI data.
+      output.textContent="EDGE_LOCAL_FAIL:"+phase;
+    }
   });`;
   const server = http.createServer((request, response) => {
     if (request.url === "/zk1-protected-file-lab.html") {
