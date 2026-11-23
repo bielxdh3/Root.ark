@@ -1583,3 +1583,33 @@ test("issue 66 #278 P2: pinStatus listing passes known pins without quadratic re
     Object.values = realValues;
   }
 });
+
+test("issue 66 #278 P2 RED: relocating UPDATE carries device pin forward without invalid_snapshot", async (t) => {
+  const { rootDir, open, remote } = await fixture(t);
+  const client = await open();
+  assert.equal((await client.pinLocal("docs/a.txt")).pinned, true);
+  await remote("move", "object-a", "docs/b.txt", "authenticated remote bytes", 2, "docs/a.txt");
+  await remote("update", "object-a", "docs/b.txt", "relocated updated bytes", 3);
+  assert.equal(await client.materializeRemote("docs/b.txt"), true);
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/b.txt"), "utf8"), "relocated updated bytes");
+  const reopened = await open();
+  assert.deepEqual(await reopened.pinStatus("docs/b.txt"), {
+    path: "docs/b.txt", pinned: true, localPresent: true, objectId: "object-a",
+  });
+});
+
+test("issue 66 #278 P2 RED: rotated-fileId tombstone cannot delete a pinned file", async (t) => {
+  const { rootDir, open, state, remote } = await fixture(t);
+  const client = await open();
+  assert.equal((await client.pinLocal("docs/a.txt")).pinned, true);
+  const previous = state.records.get("object-a");
+  state.records.set("object-a", { ...previous, fileId: "file-rotated-a" });
+  const tombstone = await remote("delete", "object-a", "docs/a.txt", "", 2);
+  await assert.rejects(client._reconcileOnDemandTombstone(tombstone), { code: "file_pinned" });
+  assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
+    "authenticated remote bytes");
+  const reopened = await open();
+  assert.deepEqual(await reopened.pinStatus("docs/a.txt"), {
+    path: "docs/a.txt", pinned: true, localPresent: true, objectId: "object-a",
+  });
+});
