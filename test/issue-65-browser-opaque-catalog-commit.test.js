@@ -23,6 +23,7 @@ const catalogBrowser = require("../public/client/rootark-zk1-browser-opaque-cata
 const opaqueSync = require("../public/client/rootark-zk1-opaque-device-delta-sync");
 const fileContent = require("../public/client/rootark-zk1-file-content");
 const selectedLocalPreview = require("../public/client/rootark-zk1-selected-local-preview");
+const protectedTextBatch = require("../public/client/rootark-zk1-protected-text-batch");
 const { openZk1CatalogMetadataV1 } = require("../src/crypto/rootark-zk1-opaque-catalog-client-v1");
 
 const b64 = (bytes) => Buffer.from(bytes).toString("base64url");
@@ -335,6 +336,26 @@ test("browser UMD: two-device signed commit, exact GET, additive delta, ACK loss
   assert.equal(openedSelected.text, "conteúdo assinado local");
   assert.equal(openedSelected.plaintextSentToServer, false);
   assert.equal(csrfRequests, getOnlyCount, "CEK and plaintext must never cross signed HTTP");
+  const batchResult = await protectedTextBatch.search({
+    query: "ASSINADO",
+    items: [{ selected: receiverBefore.entries[0], metadata: offlineMetadata,
+      rawCek: offlineCek, cekSha256Pin: b64(digest(offlineCek)) }],
+    grant: await grant(manifest.devices[1]),
+    ownerHead: { revision: currentHead.revision, epoch: currentHead.epoch,
+      digest: b64(currentHead.digest) },
+    baseline: receiverBefore,
+    assertLive: () => active && csrf === "known-csrf-token",
+    getChecked: (id, revision) =>
+      receiver.readSelectedCiphertext(receiverBefore, id, revision),
+  });
+  assert.equal(batchResult.totalSearched, 1);
+  assert.equal(batchResult.totalMatches, 1);
+  assert.match(batchResult.matches[0].excerpt, /conteúdo assinado local/);
+  assert.equal(batchResult.plaintextSentToServer, false);
+  assert.ok(csrfRequests > getOnlyCount,
+    "local content batch must reissue actual signed GET, never replay old ciphertext proof");
+  assert.equal(putRequests, beforePrivateListPuts,
+    "local content batch is strictly read-only");
   await assert.rejects(receiver.readSelectedCiphertext(receiverBefore, objectId, 2),
     /ZK_OPAQUE_DELTA_SYNC_DENIED/, "uncommitted revision cannot be selected for read");
   await assert.rejects(receiver.readSelectedCiphertext(receiverBefore,
