@@ -166,7 +166,8 @@ function args(argv, strict = false) {
       continue;
     }
     const key = stringSlice(item, 2);
-    if (strict && nativeObjectHasOwn(result, key)) {
+    if (strict && ((key !== "config" && key !== "device-id" && key !== "credentials-stdin")
+      || nativeObjectHasOwn(result, key))) {
       throw new Error("Unsupported resume option or argument");
     }
     const value = argv[index + 1];
@@ -264,13 +265,17 @@ function assertPinnedStrictLocalDeviceIdentity(config, independentlyPinnedPolicy
 
 async function start(options = {}) {
   assertPlainDataObject(options, "Sync v2 options");
-  if (options.restore === true) {
+  if (ownDataValue(options, "restore") === true || ownDataValue(options, "preview") === true) {
     for (const key of ["object-id", "version-id"]) {
       if (typeof ownDataValue(options, key) !== "string"
         || !regexTest(/^[A-Za-z0-9._:-]{1,160}$/, ownDataValue(options, key))) {
-        throw new Error(`Valid --${key} is required for historical restore`);
+        throw new Error(`Valid --${key} is required for historical restore or preview`);
       }
     }
+  }
+  if (options.preview === true && options.requireIndependentHistoricalAdmission !== true
+    && process.env.ROOTARK_SYNC_REQUIRE_INDEPENDENT_HISTORY !== "1") {
+    throw new Error("Historical preview requires externally enforced independent custody");
   }
   const configPath = path.resolve(options.config || DEFAULT_CONFIG);
   const config = await readConfig(configPath);
@@ -441,7 +446,14 @@ async function start(options = {}) {
     authorizationFactory: (operation) => createAuthorizationProof(operation, { username: config.username, privateKey: config.privateKey, publicKey: config.publicKey }),
     requireAuthorization: true,
     reverifySeenIncoming: strictHistorical,
-  }).open();
+    requireIndependentHistoricalAdmission: strictHistorical,
+  }).open({ readOnly: options.preview === true });
+  if (options.preview === true) {
+    const outcome = await engine.previewHistoricalRestore(options["object-id"], options["version-id"]);
+    // Advisory metadata only, no recovered plaintext or decrypted key bytes.
+    console.log(JSON.stringify(outcome));
+    return engine;
+  }
   if (options.restore === true) {
     const outcome = await engine.restoreHistoricalVersion(options["object-id"], options["version-id"]);
     // Never print recovered plaintext, ciphertext, signing material or bearer.
@@ -611,12 +623,15 @@ if (require.main === module) {
     [(error) => { console.error(`Sync v2 failed: ${error.message}`); process.exitCode = 1; }]);
   else if (command === "history") nativeReflectApply(nativePromiseCatch, history(args(rest)),
     [(error) => { console.error(`Sync history failed: ${error.message}`); process.exitCode = 1; }]);
+  else if (command === "preview") nativeReflectApply(nativePromiseCatch,
+    start(nativeObjectAssign(args(rest), { preview: true })),
+    [(error) => { console.error(`Sync preview failed: ${error.message}`); process.exitCode = 1; }]);
   else if (command === "restore") nativeReflectApply(nativePromiseCatch,
     start(nativeObjectAssign(args(rest), { restore: true })),
     [(error) => { console.error(`Sync restore failed: ${error.message}`); process.exitCode = 1; }]);
   else if (command === "resume") nativeReflectApply(nativePromiseCatch, resumeFromCli(rest),
     [(error) => { console.error(`Sync resume failed: ${error.message}`); process.exitCode = 1; }]);
-  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)");
+  else console.log("Root.ark Sync v2\n\nUse: npm run sync:start -- --config .rootark-sync.json --once\nOr: node sync-client/rootark-sync-v2.js history --config <private-config> --object-id <id>\nOr: node sync-client/rootark-sync-v2.js preview --config <private-config> --object-id <id> --version-id <id> (requires independently injected custody and current grant; never mutates files)\nOr: node sync-client/rootark-sync-v2.js restore --config <private-config> --object-id <id> --version-id <id> (requires signing keys and authorized historical evidence)\nOr: node sync-client/rootark-sync-v2.js resume --config <private-config> --device-id <paused-device-id> --credentials-stdin (pipe private JSON {password,code?} from a separate trusted device)");
 }
 
 module.exports = { fileKeyResolver, normalizeTrustedDevicePolicy,

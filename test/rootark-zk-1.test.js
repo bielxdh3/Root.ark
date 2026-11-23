@@ -461,11 +461,9 @@ test("Ed25519 authorization rejects altered signatures and substitutions", async
   const signature = await z.signAuthorization(manifest, keys.privateKey);
   assert.equal(signature.length, 64);
   assert.equal(await z.verifyAuthorization(manifest, signature, keys.publicKey), true);
-  // Integer normalization makes 7 and 7n the same signed scope. Only a
-  // different epoch must fail the independently pinned expected-scope check.
   assert.equal(await z.verifyAuthorization(manifest, signature, keys.publicKey, {
     epoch: BigInt(manifest.epoch),
-  }), true);
+  }), true, "a v1 numeric epoch and an equivalent bigint match the signed scope");
   await assert.rejects(z.verifyAuthorization(manifest, signature, keys.publicKey, {
     epoch: BigInt(manifest.epoch) + 1n,
   }), (error) => error.code === "SCOPE_MISMATCH");

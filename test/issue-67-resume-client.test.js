@@ -34,7 +34,7 @@ function runResume(config, target, credentials, extraArgs = []) {
     child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
     child.stdin.on("error", (error) => {
-      // Invalid argv may exit before the test fixture completes its stdin write.
+      // Rejected argv can close stdin before this fixture finishes writing.
       if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") reject(error);
     });
     child.once("error", (error) => { clearTimeout(timeout); reject(error); });
@@ -109,17 +109,36 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
   assert.doesNotMatch(denied.stderr + denied.stdout, /wrong-password|test-resume-token/);
   assert.equal(routes.store.pauseFence("alice", "device-a") !== null, true);
 
-  // With duplicate --device-id, the previous parser silently selected the
-  // second target and lifted a real paused-device fence with valid stdin.
+  // On the original parser, a second --device-id overrides the visible first
+  // target and releases the wrong durable pause with otherwise valid stdin.
   const beforeAmbiguousRequests = resumeHttpRequests;
   const ambiguous = await runResume(config, "device-b", credentials, ["--device-id", "device-a"]);
   assert.notEqual(routes.store.pauseFence("alice", "device-a"), null,
-    "ambiguous CLI arguments must not lift the pause on the unexpected device");
+    "ambiguous targets must not lift the unexpected device's pause");
   assert.equal(resumeHttpRequests, beforeAmbiguousRequests,
-    "ambiguous target must be rejected before HTTP");
+    "ambiguous argv must be rejected before any HTTP request");
   assert.notEqual(ambiguous.status, 0);
   assert.match(ambiguous.stderr, /Unsupported resume option/i);
-  assert.doesNotMatch(ambiguous.stdout + ambiguous.stderr, /secret-resume-password|test-resume-token/);
+  assert.doesNotMatch(ambiguous.stdout + ambiguous.stderr,
+    /secret-resume-password|test-resume-token/);
+
+  const stray = await runResume(config, "device-a", credentials, ["unexpected-positional"]);
+  assert.notEqual(stray.status, 0, "extra positional arguments must be rejected");
+  assert.match(stray.stderr, /Unsupported resume option/i);
+  assert.equal(resumeHttpRequests, beforeAmbiguousRequests,
+    "stray positional arguments must not trigger HTTP or consume credentials");
+
+  for (const extras of [["--password=secret-on-argv"], ["--code=123456"],
+    ["--credentialsStream", "secret-json-on-argv"], ["--path", "other-file"],
+    ["--once"], ["--plan-stdin"], ["--unrecognized"]]) {
+    const forbidden = await runResume(config, "device-a", credentials, extras);
+    assert.notEqual(forbidden.status, 0, "unsupported CLI options must fail");
+    assert.match(forbidden.stderr, /Unsupported resume option/i);
+    assert.doesNotMatch(forbidden.stdout + forbidden.stderr,
+      /secret-on-argv|123456|secret-json-on-argv|secret-resume-password|test-resume-token/);
+    assert.equal(resumeHttpRequests, beforeAmbiguousRequests,
+      "unsupported CLI options must not contact the server");
+  }
 
   const resumed = await runResume(config, "device-a", credentials);
   assert.equal(resumed.status, 0, resumed.stderr);
@@ -135,64 +154,7 @@ test("#67: real burst pause can be reviewed and resumed by other device through 
     credentialsStream: Readable.from([JSON.stringify({ password: PASSWORD })]),
   });
   assert.equal(embedded.wasPaused, false,
-    "the exported programmatic stream contract must still work");
-});
-
-test("#67: resume CLI rejects secret flags and ambiguous arguments before stdin or HTTP", async (t) => {
-  const root = createPrivateAuthorityFixture("rootark-67-resume-argv-");
-  let requests = 0;
-  const server = http.createServer((_request, response) => {
-    requests += 1;
-    response.writeHead(500).end();
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(async () => {
-    await new Promise((resolve) => server.close(resolve));
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-  const config = path.join(root, "sync-config.json");
-  await writePrivateSyncConfig(config, JSON.stringify({
-    serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "alice", token: "test-resume-token", deviceId: "device-b",
-  }));
-
-  const validArgs = ["--config", config, "--device-id", "device-a", "--credentials-stdin"];
-  for (const { argv, provideStdin = false } of [
-    { argv: [...validArgs, "--password=secret"] },
-    { argv: [...validArgs, "--code=123456"] },
-    { argv: [...validArgs, "--credentialsStream", "secret-json-on-argv"] },
-    { argv: ["unexpected-positional", ...validArgs], provideStdin: true },
-    { argv: ["--config", config, "--device-id", "device-a", "--device-id", "device-b", "--credentials-stdin"], provideStdin: true },
-  ]) {
-    const result = await new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [CLI, "resume", ...argv], {
-        windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
-      });
-      let stdout = "";
-      let stderr = "";
-      let timedOut = false;
-      const timeout = setTimeout(() => { timedOut = true; child.kill(); }, 8000);
-      child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-      child.stdin.on("error", (error) => {
-        // Immediate argv rejection may close the pipe before the fixture writes.
-        if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") reject(error);
-      });
-      child.once("error", (error) => { clearTimeout(timeout); reject(error); });
-      child.once("close", (status) => {
-        clearTimeout(timeout);
-        resolve({ status, stdout, stderr, timedOut });
-      });
-      if (provideStdin) child.stdin.end(JSON.stringify({ password: "synthetic-test-only" }));
-      // For secret-bearing options, deliberately leave stdin open. Rejection
-      // must occur before stdin is read. Ambiguous targets also must not POST.
-    });
-    assert.equal(result.timedOut, false, "invalid argv must not wait for credentials on stdin");
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /Unsupported resume option/i);
-    assert.doesNotMatch(result.stdout + result.stderr, /secret|123456/i);
-    assert.equal(requests, 0, "invalid argv cannot contact the resume endpoint");
-  }
+    "the existing programmatic credentials stream must remain supported");
 });
 
 test("#67: resume adapter refuses self-resume, unsafe ids, missing password and forged success", async () => {

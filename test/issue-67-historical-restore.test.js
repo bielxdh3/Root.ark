@@ -2232,8 +2232,8 @@ test("#262 P2: unresolved restore staging pathname cannot become a scanned CREAT
   const staged = path.join(f.local, name);
   await fsp.writeFile(staged, payload, { flag: "wx", mode: 0o600 });
   const stats = await fsp.lstat(staged, { bigint: true });
-  // The durable inode binding no longer matches this pathname. The target is
-  // absent, so recovery's target lstat raises ENOENT while plaintext remains.
+  // A signed staging intent points to a different inode; the target is gone.
+  // ENOENT from recovery must not turn this recorded temp into a local CREATE.
   await f.engine.journal.bindRestoreStagingIdentity(operation, name, {
     dev: stats.dev.toString(), ino: (stats.ino + 1n).toString(),
   });
@@ -2242,9 +2242,77 @@ test("#262 P2: unresolved restore staging pathname cannot become a scanned CREAT
     (error) => error.code === "restore_local_materialization_missing");
   assert.deepEqual(await readHeldRegularFile(staged, stats), payload);
   assert.equal((await f.engine.journal.recover()).length, 1,
-    "the signed outbox and staging provenance must remain for explicit recovery");
+    "the signed outbox and staging provenance remain for explicit recovery");
   assert.equal(f.engine.snapshot.files[name], undefined,
-    "an unresolved staging file must never enter the ordinary CREATE snapshot");
+    "unresolved restore staging must never enter the ordinary CREATE snapshot");
+});
+
+test("#262 P2: direct pushPending preserves residual staging provenance before offline POST", async (t) => {
+  const f = await fixture(t);
+  const payload = Buffer.from("signed bytes also present in an independent target");
+  const operation = await f.sign({
+    operation: "update", operationId: `histrestore-${crypto.randomUUID()}`,
+    versionId: "direct-push-residual-stage", baseRevision: f.deleted.revision,
+    revision: { counter: 3, deviceId: "device-a" },
+    metadata: { path: "document.txt", name: "document.txt", size: payload.length },
+    plaintext: payload,
+  });
+  const target = path.join(f.local, "document.txt");
+  const name = `document.txt.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const staged = path.join(f.local, name);
+  await f.engine.journal.enqueue(operation);
+  await f.engine.journal.recordRestoreStagingIntent(operation, name);
+  await fsp.writeFile(staged, payload, { flag: "wx", mode: 0o600 });
+  const pinned = await fsp.lstat(staged, { bigint: true });
+  await f.engine.journal.bindRestoreStagingIdentity(operation, name, {
+    dev: pinned.dev.toString(), ino: pinned.ino.toString(),
+  });
+  await fsp.writeFile(target, payload, { flag: "wx", mode: 0o600 });
+  const independent = await fsp.lstat(target, { bigint: true });
+  assert.equal(pinned.nlink, 1n, "the recorded temp was never linked into the target");
+  assert.equal(independent.nlink, 1n, "matching target bytes are an independent file");
+  assert.notEqual(`${pinned.dev}:${pinned.ino}`, `${independent.dev}:${independent.ino}`);
+  assert.equal(await f.engine.hashPendingPayload(operation),
+    crypto.createHash("sha256").update(payload).digest("hex"),
+    "the signed payload itself is valid and matches the standalone target");
+  assert.deepEqual(await readHeldRegularFile(target, independent), payload);
+
+  const originalPush = f.adapter.push;
+  const originalWitness = f.engine.journal.recordRestoreMaterialization;
+  let postAttempts = 0;
+  let witnessAttempts = 0;
+  f.adapter.push = async () => {
+    postAttempts += 1;
+    throw Object.assign(new Error("offline adapter POST"), { code: "offline" });
+  };
+  f.engine.journal.recordRestoreMaterialization = async (...args) => {
+    witnessAttempts += 1;
+    return originalWitness.apply(f.engine.journal, args);
+  };
+  const summary = { pushed: 0, conflicts: [], offline: false };
+  try {
+    await assert.rejects(f.engine.pushPending(summary),
+      (error) => error.code === "restore_local_materialization_missing",
+      "public pushPending must guard the exact recorded staging name without reconcileLocal");
+  } finally {
+    f.adapter.push = originalPush;
+    f.engine.journal.recordRestoreMaterialization = originalWitness;
+  }
+  assert.equal(postAttempts, 0, "the offline adapter must receive no POST attempt");
+  assert.equal(witnessAttempts, 0, "staging provenance must not be cleared by a witness commit");
+  assert.equal(summary.pushed, 0);
+  assert.equal(summary.offline, false);
+  assert.equal(f.pushes(), 0);
+  const [pending] = await f.engine.journal.recover();
+  assert.equal(pending.operationId, operation.operationId);
+  assert.equal(f.engine.journal.hasMaterializedRestore(pending), false);
+  assert.equal(f.engine.journal.restoreStagingInfo(pending).name, name);
+  assert.deepEqual(await readHeldRegularFile(staged, pinned), payload, "recorded staging plaintext remains for recovery");
+  await assert.rejects(f.engine.reconcileLocal(),
+    (error) => error.code === "restore_local_materialization_missing");
+  assert.equal((await f.engine.journal.recover()).length, 1);
+  assert.equal(f.engine.snapshot.files[name], undefined,
+    "a later reconcile must fail before recording the staged temp as CREATE");
 });
 
 test("#262 P2: recovered restore records snapshot and materialization witness before retry push", async (t) => {
@@ -2323,7 +2391,6 @@ test("#262 P2: recovery witness commit cannot bless a replaced transport method"
   assert.equal((await f.engine.journal.recover()).length, 1,
     "the signed operation remains durably pending for explicit retry");
 });
-
 test("#262 P2: failed restore staging cleanup preserves signed provenance", async (t) => {
   const f = await fixture(t);
   const target = path.join(f.local, "document.txt");
@@ -2784,6 +2851,29 @@ test(`#67 P1: real atomic device registry ${mode} historical restore only after 
   assert.equal(reopened.list("alice", "file-1")[0].versionId, restored.versionId);
 });
 }
+test("#67 P2: restore succeeds across signed fileId rotation create(oldId) -> update(newId) -> delete(newId)", async (t) => {
+  const f = await fixture(t);
+  const oldId = "old-file-id";
+  const newId = "rotated-file-id";
+  const originalBytes = Buffer.from("original authenticated bytes");
+  const updatedBytes = Buffer.from("updated authenticated bytes");
+  const created = await f.sign({ operation: "create", fileId: oldId, versionId: "v1-created", operationId: "op1",
+    revision: { counter: 1, deviceId: "device-a" }, metadata: { path: "document.txt", name: "document.txt" },
+    plaintext: originalBytes });
+  const updated = await f.sign({ operation: "update", fileId: newId, versionId: "v2-updated", operationId: "op2",
+    baseRevision: created.revision, revision: { counter: 2, deviceId: "device-a" },
+    metadata: { path: "document.txt", name: "document.txt" }, plaintext: updatedBytes });
+  const deleted = await f.sign({ operation: "delete", fileId: newId, versionId: "v3-deleted", operationId: "op3",
+    baseRevision: updated.revision, revision: { counter: 3, deviceId: "device-a" },
+    metadata: { path: "document.txt" } });
+  f.versions.splice(0, f.versions.length, created, updated, deleted);
+  f.setCurrent(deleted);
+  const restored = await f.engine.restoreHistoricalVersion("file-1", "v1-created");
+  assert.equal(restored.pushed, true);
+  assert.equal(restored.sourceVersionId, "v1-created");
+  assert.equal(await fsp.readFile(path.join(f.local, "document.txt"), "utf8"), "original authenticated bytes");
+  assert.equal(f.current().fileId, newId, "restored revision inherits current rotated fileId");
+});
 
 test("#67 P1: file-key resolver cannot replace historical signed A with another signed B", async (t) => {
   const f = await fixture(t);

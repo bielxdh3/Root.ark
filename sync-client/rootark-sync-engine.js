@@ -1576,6 +1576,9 @@ class SyncEngine {
     }
     this.verifyIncoming = verifyIncomingOption || null;
     this.reverifySeenIncoming = option("reverifySeenIncoming") === true;
+    // Preview and restore require independent custody supplied by trusted
+    // embedding code, never by a mutable sync config or journal.
+    this.requireIndependentHistoricalAdmission = option("requireIndependentHistoricalAdmission") === true;
     this.authorizationFactory = authorizationFactoryOption || null;
     this.requireAuthorization = option("requireAuthorization") === true;
     this.translateWebDavOperation = translateWebDavOperationOption || null;
@@ -1653,8 +1656,61 @@ class SyncEngine {
     }]);
   }
 
-  async open() {
-    return this.withMutationLock(async () => this);
+  withReadOnlyRoot(work, { allowUnopened = false } = {}) {
+    // Join the same in-process writer queue without creating the on-disk
+    // exclusive writer marker. Preview is advisory; restore always rechecks.
+    const queueKey = process.platform === "win32" ? this.rootDir.toLowerCase() : this.rootDir;
+    if (ROOT_MUTATION_CONTEXT.getStore() === queueKey) {
+      fail("Sync root operation cannot be re-entered", "sync_root_busy");
+    }
+    const previous = ROOT_MUTATION_QUEUES.get(queueKey) || Promise.resolve();
+    let releaseQueue;
+    const queueGate = new Promise((resolve) => { releaseQueue = resolve; });
+    ROOT_MUTATION_QUEUES.set(queueKey, queueGate);
+    const checkDiskState = async () => {
+      try {
+        await fsp.lstat(path.join(this.rootDir, ".rootark-sync.lock"));
+        fail("Another sync writer may own this root", "sync_root_busy");
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      const stamps = [];
+      for (const filePath of [this.snapshotPath, this.journal.filePath]) {
+        let stats;
+        try { stats = await fsp.lstat(filePath, { bigint: true }); }
+        catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          fail("Required read-only preview state is missing", "history_preview_unavailable");
+        }
+        if (!stats.isFile() || stats.isSymbolicLink()) {
+          fail("Read-only preview state is not a regular file", "history_preview_unavailable");
+        }
+        stamps.push(stats);
+      }
+      return stamps;
+    };
+    const run = async () => {
+      if (!this.opened && !allowUnopened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
+      const before = await checkDiskState();
+      await this._open({ readOnly: true });
+      const result = await ROOT_MUTATION_CONTEXT.run(queueKey, work);
+      const after = await checkDiskState();
+      if (before.some((stamp, index) => !sameSnapshotRevision(stamp, after[index]))) {
+        fail("Sync state changed during read-only historical preview", "history_preview_stale");
+      }
+      return result;
+    };
+    const operation = previous.then(run, run);
+    return operation.finally(() => {
+      releaseQueue();
+      if (ROOT_MUTATION_QUEUES.get(queueKey) === queueGate) ROOT_MUTATION_QUEUES.delete(queueKey);
+    });
+  }
+
+  async open({ readOnly = false } = {}) {
+    return readOnly
+      ? this.withReadOnlyRoot(() => this, { allowUnopened: true })
+      : this.withMutationLock(async () => this);
   }
 
   async acquireProcessLock() {
@@ -1684,12 +1740,13 @@ class SyncEngine {
     }
   }
 
-  async _open() {
-    await fsp.mkdir(this.rootDir, { recursive: true });
+  async _open({ readOnly = false } = {}) {
+    if (!readOnly) await fsp.mkdir(this.rootDir, { recursive: true });
     await containedAbsolute(this.rootDir, this.rootDir, false);
     const journal = ownDataValue(this, "journal");
     const journalOpen = captureDataMethod(journal, "open");
-    const openedJournal = await nativeReflectApply(journalOpen, journal, []);
+    const openedJournal = await nativeReflectApply(journalOpen, journal,
+      [{ requireExisting: readOnly }]);
     if (openedJournal !== journal) fail("Sync journal identity changed while opening", "invalid_sync_options");
     const journalDescriptor = nativeObjectGetOwnPropertyDescriptor(this, "journal");
     if (journalDescriptor?.writable) {
@@ -1703,7 +1760,9 @@ class SyncEngine {
     try {
       snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
     } catch (error) {
-      if (ownDataValue(error, "code") !== "ENOENT" || this.opened) fail("Sync snapshot is unavailable", "invalid_snapshot");
+      if (ownDataValue(error, "code") !== "ENOENT" || this.opened || readOnly) {
+        fail("Sync snapshot is unavailable", "invalid_snapshot");
+      }
       await durableJson(this.snapshotPath, this.snapshot);
       snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
     }
@@ -1797,7 +1856,58 @@ class SyncEngine {
     return this.withMutationLock(() => this._restoreHistoricalVersion(objectId, versionId));
   }
 
-  async _restoreHistoricalVersion(objectId, versionId) {
+  // An advisory, read-only preflight. It does NOT reserve the current head or
+  // grant permission for a later restore; restore rechecks every condition.
+  async previewHistoricalRestore(objectId, versionId) {
+    // Opening a new engine would create a journal/snapshot. Require an
+    // initialized root so preview itself never creates durable state.
+    if (!this.opened) fail("Historical preview requires an initialized sync root", "history_preview_unavailable");
+    return this.withReadOnlyRoot(() => this._previewHistoricalRestore(objectId, versionId));
+  }
+
+  async _previewHistoricalRestore(objectId, versionId) {
+    if (!this.requireIndependentHistoricalAdmission || !this.requireAuthorization
+      || !this.reverifySeenIncoming || !this.requireCurrentOutgoingAuthorization
+      || typeof this.verifyIncoming !== "function"
+      || typeof this.currentDeviceAuthorization !== "function"
+      || typeof this.authorizationFactory !== "function") {
+      fail("Independent historical custody and current device grant are required",
+        "authorization_required");
+    }
+    const { historical, current, relative, existing, versions, assertCleanDestination } =
+      await this._inspectHistoricalRestore(objectId, versionId, { verifyRetained: true });
+    const proposed = { ...current, deviceId: this.deviceId, keyEpoch: this.keyEpoch };
+    // This validates the live grant but never signs/enqueues a new envelope.
+    await this.assertOutgoingAuthorized(proposed);
+    const key = await this.keyFor(historical);
+    const decrypted = protocol.decryptPayload(historical, key);
+    let bytes = decrypted;
+    try {
+      if (historical.operation === "move") {
+        bytes = protocol.decodeMovePayload(decrypted, key);
+        if (bytes === null) fail("Historical MOVE has no recoverable content", "history_version_unavailable");
+      }
+      // The current head must also have decryptable signed AEAD, including
+      // deleted heads. A signature over corrupted ciphertext is insufficient.
+      const headKey = await this.keyFor(current);
+      const headBytes = protocol.decryptPayload(current, headKey);
+      headBytes.fill(0);
+      await assertCleanDestination();
+      await this.assertOutgoingAuthorized(proposed);
+      return {
+        readOnly: true, ready: true, objectId, sourceVersionId: versionId,
+        currentVersionId: current.versionId, baseRevision: { ...current.revision },
+        path: relative, sizeBytes: bytes.length,
+        localAction: existing && !existing.deleted ? "replace-clean-tracked" : "create-from-deleted",
+        verifiedRetainedVersions: versions.length, requiresFreshRestoreCheck: true,
+      };
+    } finally {
+      if (bytes && bytes !== decrypted) bytes.fill(0);
+      decrypted.fill(0);
+    }
+  }
+
+  async _inspectHistoricalRestore(objectId, versionId, { verifyRetained = false } = {}) {
     if (!this.opened) await this._open();
     const journal = this.journal;
     const journalMethods = captureMethodSet(journal, HISTORICAL_JOURNAL_METHODS);
@@ -1826,9 +1936,10 @@ class SyncEngine {
     };
     const validId = (value) => typeof value === "string" && regexTest(/^[A-Za-z0-9._:-]{1,160}$/, value);
     if (!validId(objectId) || !validId(versionId)) fail("Invalid historical restore identifier", "invalid_restore_id");
-    // Without separately provisioned physical witness and CURRENT CAS, do
-    // not start a restore that could stage local bytes and strand its outbox.
-    assertHistoricalRestorePhysicalAuthority(this);
+    // Read-only preview verification does not mutate state or enqueue an outbox
+    // entry, whereas restore execution requires separately provisioned physical
+    // witness and CURRENT CAS authority before staging local bytes.
+    if (verifyRetained !== true) assertHistoricalRestorePhysicalAuthority(this);
     if (typeof adapterHistory !== "function" || typeof adapterList !== "function"
       || typeof adapterPush !== "function") fail("Sync history is unavailable", "history_unavailable");
     if ((await nativeReflectApply(journalMethods.recover, journal, [])).length) {
@@ -1870,7 +1981,9 @@ class SyncEngine {
     if (records.length !== 1) fail("Current sync version unavailable", "history_version_unavailable");
     const currentCandidate = protocol.validateStoredOperation(records[0]);
     const historicalCandidate = selected[0];
-    if (currentCandidate.objectId !== objectId || currentCandidate.fileId !== historicalCandidate.fileId
+    // File identifiers can rotate between signed versions. The objectId and
+    // compartment remain the security identity, including across MOVE.
+    if (currentCandidate.objectId !== objectId
       || currentCandidate.compartmentId !== historicalCandidate.compartmentId
       || signedEnvelopeDigest(versions[versions.length - 1]) !== signedEnvelopeDigest(currentCandidate)) {
       fail("Current signed version does not match history", "invalid_history");
@@ -1881,14 +1994,35 @@ class SyncEngine {
     const historicalCapture = captureSignedEnvelope(historicalCandidate);
     const current = currentCapture.operation;
     const historical = historicalCapture.operation;
-    await nativeReflectApply(engineMethods.verifyIncomingOperation, this,
-      [historical, { preObserve: false }]);
-    assertRestoreRuntime();
-    assertCapturedSignedEnvelope(historicalCapture);
-    await nativeReflectApply(engineMethods.verifyIncomingOperation, this,
-      [current, { preObserve: false }]);
-    assertRestoreRuntime();
-    assertCapturedSignedEnvelope(currentCapture);
+    if (verifyRetained) {
+      // Validate every retained signature for a read-only preview. Each
+      // envelope must be detached before the first callback can run.
+      const retainedCaptures = new NativeArray(versions.length);
+      for (let index = 0; index < versions.length; index += 1) {
+        const record = versions[index];
+        if (record.objectId !== objectId
+          || record.compartmentId !== historical.compartmentId) {
+          fail("Retained history mixes file or compartment identities", "invalid_history");
+        }
+        retainedCaptures[index] = captureSignedEnvelope(record);
+      }
+      for (let index = 0; index < retainedCaptures.length; index += 1) {
+        const capture = retainedCaptures[index];
+        await nativeReflectApply(engineMethods.verifyIncomingOperation, this,
+          [capture.operation, { preObserve: false }]);
+        assertRestoreRuntime();
+        assertCapturedSignedEnvelope(capture);
+      }
+    } else {
+      await nativeReflectApply(engineMethods.verifyIncomingOperation, this,
+        [historical, { preObserve: false }]);
+      assertRestoreRuntime();
+      assertCapturedSignedEnvelope(historicalCapture);
+      await nativeReflectApply(engineMethods.verifyIncomingOperation, this,
+        [current, { preObserve: false }]);
+      assertRestoreRuntime();
+      assertCapturedSignedEnvelope(currentCapture);
+    }
     if (historical.metadata.contentType === "inode/directory"
       || (!current.tombstone && current.metadata.contentType === "inode/directory")) {
       fail("Directory restoration is not supported", "history_version_unavailable");
@@ -1934,6 +2068,21 @@ class SyncEngine {
       }
     };
     await assertCleanDestination();
+    assertRestoreRuntime();
+    assertCapturedSignedEnvelope(currentCapture);
+    assertCapturedSignedEnvelope(historicalCapture);
+    return { historical, current, relative, existing, versions,
+      assertCleanDestination, assertNoStaleLocalIdentity,
+      currentCapture, historicalCapture, assertRestoreRuntime,
+      journal, journalMethods, engineMethods };
+  }
+
+  async _restoreHistoricalVersion(objectId, versionId) {
+    const { historical, current, relative, existing,
+      assertCleanDestination, assertNoStaleLocalIdentity,
+      currentCapture, historicalCapture, assertRestoreRuntime,
+      journal, journalMethods, engineMethods } =
+      await this._inspectHistoricalRestore(objectId, versionId);
     assertCapturedSignedEnvelope(historicalCapture);
     const key = await nativeReflectApply(engineMethods.keyFor, this, [historical]);
     assertRestoreRuntime();
@@ -3424,10 +3573,29 @@ class SyncEngine {
             try {
               const relative = await canonicalRelativePath(this.rootDir, operation.metadata.path);
               assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
-              await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected,
-                nativeReflectApply(historicalRestoreEnvelope.journalMethods.restoreStagingInfo,
-                  journal, [operation]));
+              const staging = nativeReflectApply(historicalRestoreEnvelope.journalMethods.restoreStagingInfo,
+                journal, [operation]);
+              await recoverHistoricalRestoreTempLink(this.rootDir, relative, expected, staging);
               assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
+              if (staging) {
+                // pushPending is public and can bypass reconcileLocal. Before
+                // the materialization witness clears staging provenance, the
+                // exact recorded temp must no longer exist, even if an
+                // independent target already matches the signed plaintext.
+                const target = await contained(this.rootDir, relative, false);
+                const prefix = `${path.basename(target)}.tmp-`;
+                if (!staging.name.startsWith(prefix)
+                  || !HISTORICAL_RESTORE_TEMP_SUFFIX.test(staging.name.slice(path.basename(target).length))) {
+                  fail("Historical restore staging name is invalid", "restore_local_materialization_missing");
+                }
+                const staged = path.join(path.dirname(target), staging.name);
+                await containedAbsolute(this.rootDir, staged, true);
+                const remaining = await fsp.lstat(staged, { bigint: true })
+                  .catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+                if (remaining) {
+                  fail("Historical restore staging remains unresolved", "restore_local_materialization_missing");
+                }
+              }
               const local = await readContainedFile(this.rootDir, relative, null, true);
               assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
               try { observed = sha256Hex(local); }
@@ -3453,6 +3621,18 @@ class SyncEngine {
             // recordRestoreMaterialization commits a new journal state object;
             // capture that exact pending envelope again before transport.
             historicalRestoreEnvelope = captureHistoricalRestoreEnvelope(operation, this);
+            const refreshedPending = await nativeReflectApply(historicalRestoreEnvelope.journalMethods.recover,
+              journal, []);
+            const refreshed = refreshedPending.find((queued) =>
+              queued.operationId === operation.operationId);
+            if (!refreshed || signedEnvelopeDigest(protocol.validateStoredOperation(refreshed))
+              !== signedEnvelopeDigest(operation)
+              || !nativeReflectApply(historicalRestoreEnvelope.journalMethods.hasMaterializedRestore,
+                journal, [refreshed])) {
+              fail("Recovered restore lost its exact durable signed outbox",
+                "restore_local_materialization_missing");
+            }
+            assertCapturedHistoricalRestorePending(this, historicalRestoreEnvelope);
           }
         }
         const outboundFreshDigest = historicalRestoreEnvelope
