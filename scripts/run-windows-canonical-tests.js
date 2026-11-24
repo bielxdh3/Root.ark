@@ -221,14 +221,9 @@ function createTapProgressRecorder(write) {
           if (moduleExit && Number(moduleExit[1]) <= 255)
             pending.moduleExitCode = Number(moduleExit[1]);
         }
-        // Legacy bounded TAP breadcrumbs (location/failureType/code) can occur
-        // without a "---" YAML header; they never establish test-file process
-        // identity or a module exit code.
+        // Legacy bounded TAP code breadcrumbs can occur without YAML; they
+        // never establish test-file process identity or a module exit code.
         if (!pending.moduleYamlSeen) {
-          const standaloneLocation = /^  location: ['"](.{1,2048})['"]$/.exec(line);
-          if (standaloneLocation) pending.pathHash = fileLocation(standaloneLocation[1]);
-          const standaloneKind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
-          if (standaloneKind && SAFE_FAILURE_TYPES.has(standaloneKind[1])) pending.failureType = standaloneKind[1];
           const standaloneCode = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
           if (standaloneCode && SAFE_CODES.has(standaloneCode[1])) pending.code = standaloneCode[1];
         }
