@@ -142,7 +142,7 @@ test(`issue 66 Windows: real signed picker hydrate ${filename}, relativeRoot=${r
     ROOTARK_SYNC_DEVICE_PRIVATE_KEY: keys.privateKey.export({ type: "pkcs8", format: "der" }).toString("base64url"),
     ROOTARK_SYNC_DEVICE_PUBLIC_KEY: publicKey,
     ROOTARK_TEST_CONFIG: config, ROOTARK_TEST_PICKER: picker, ROOTARK_TEST_LAUNCH: launch,
-    ...(relativeRoot ? { ROOTARK_TEST_CWD: root, ROOTARK_TEST_START_CWD: staleCwd } : {}),
+    ...(relativeRoot ? { ROOTARK_TEST_START_CWD: staleCwd } : {}),
   };
 
   const good = await runPowershell(env);
@@ -152,8 +152,8 @@ test(`issue 66 Windows: real signed picker hydrate ${filename}, relativeRoot=${r
   const reveal = JSON.parse((await fsp.readFile(launch, "utf8")).replace(/^\uFEFF/, ""));
   assert.match(reveal.executable, /explorer\.exe$/i);
   assert.ok(reveal.args.join(" ").includes(filename));
-    assert.deepEqual(reveal.args, [`/select,"${path.join(localFolder, remotePath)}"`],
-      "Explorer must receive the selected file in one argument without a space after the comma");
+  assert.deepEqual(reveal.args, [`/select,"${path.join(localFolder, remotePath)}"`],
+    "Explorer must receive /select,\"<target>\" without a space after the comma under Node's resolved root");
   if (relativeRoot) {
     assert.equal((await fsp.readFile(path.join(staleCwd, "sync-data", remotePath), "utf8")), "UNVERIFIED STALE FILE");
   }

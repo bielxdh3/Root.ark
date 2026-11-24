@@ -7,7 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
-const { createAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { createAuthorizationProof, verifyAuthorizationProof } =
+  require("../sync-client/rootark-sync-authorization");
 const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
 const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { SyncObjectStore } = require("../src/routes/sync");
@@ -137,4 +138,254 @@ test("issue 66 P2 atomic: losing Files On-Demand client preserves outbox when ri
   assert.equal((await client.journal.recover())[0].metadata.path, relative);
   assert.equal((await fsp.readFile(filename, "utf8")), "local bytes must survive the race");
   assert.deepEqual(second.list("alice").map((record) => record.objectId), ["object-rival"]);
+});
+
+test("issue 66 P1: even stored signed CREATE remains pending without independent receipt", async (t) => {
+  const { first, second, authorize, publicKey, storagePath } = await fixture(t);
+  const rootDir = path.join(path.dirname(storagePath), "lost-ack-client");
+  const relative = "docs/own-create.txt";
+  const filename = path.join(rootDir, "docs", "own-create.txt");
+  const bytes = "owner file survives unknown server acknowledgement";
+  await fsp.mkdir(path.dirname(filename), { recursive: true });
+  await fsp.writeFile(filename, bytes);
+  const key = crypto.randomBytes(32);
+  let calls = 0;
+  let fullReads = 0;
+  const adapter = {
+    async push(operation) {
+      calls++;
+      const stored = await first.put("alice", operation);
+      assert.equal(stored.kind, "stored", "remote commits the exact signed CREATE first");
+      throw Object.assign(new Error("HTTP ACK lost after fsync"), { code: "offline" });
+    },
+    async list(objectId = "") {
+      fullReads++;
+      return second.list("alice", objectId || null);
+    },
+    async listInventory() {
+      const records = second.list("alice").map(({ ciphertext, nonce, tag, aad,
+        authorization, ...record }) => record);
+      return { protocolVersion: 2, view: "metadata", objects: records,
+        nextCursor: null };
+    },
+  };
+  const open = () => new SyncEngine({
+    rootDir, adapter, deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    filesOnDemand: true, selectedPaths: ["docs"], maxRetries: 1,
+    requireAuthorization: true,
+    authorizationFactory: async (operation) => (await authorize(operation)).authorization,
+    verifyIncoming: (operation) => verifyAuthorizationProof(
+      operation.authorization, operation, { username: "alice",
+        trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] }),
+    requireCurrentOutgoingAuthorization: true,
+    currentDeviceAuthorization: () => true,
+  }).open();
+  const started = await open();
+  assert.equal((await started.syncOnce()).offline, true);
+  assert.equal(calls, 1);
+  assert.equal((await started.journal.recover()).length, 1);
+  const authentic = second.list("alice")[0];
+  assert.equal(await verifyAuthorizationProof(authentic.authorization, authentic, {
+    username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+    revokedDeviceIds: [] }), true);
+  assert.equal(fullReads, 0,
+    "the first attempt has not yet fetched the full remote ciphertext");
+
+  const restarted = await open();
+  await assert.rejects(restarted.syncOnce(), { code: "remote_admission_unproven" },
+    "even genuine signed remote bytes do not constitute an independent physical CAS receipt");
+  assert.equal((await restarted.journal.recover()).length, 1,
+    "a stored but unproven CREATE must remain queued");
+  assert.equal(calls, 1, "unproven admission must not send a second destructive CREATE");
+  assert.equal(fullReads, 0,
+    "a second server-controlled GET cannot establish physical admission");
+  assert.equal(second.list("alice").length, 1);
+  assert.equal(await fsp.readFile(filename, "utf8"), bytes);
+});
+
+test("issue 66 P1: malicious signed CREATE echo cannot prove physical admission", async (t) => {
+  const { first, second, authorize, publicKey, storagePath } = await fixture(t);
+  const rootDir = path.join(path.dirname(storagePath), "malicious-echo-client");
+  const relative = "docs/phantom-create.txt";
+  const filename = path.join(rootDir, "docs", "phantom-create.txt");
+  const bytes = "local bytes cannot disappear behind a fake ACK";
+  await fsp.mkdir(path.dirname(filename), { recursive: true });
+  await fsp.writeFile(filename, bytes);
+  const key = crypto.randomBytes(32);
+  let echoed = null;
+  let pushCount = 0;
+  const adapter = {
+    async push(operation) {
+      pushCount++;
+      // Deliberately DO NOT call store.put. The server only remembers the
+      // genuine signed request, and lies to every later read endpoint.
+      echoed = JSON.parse(JSON.stringify(operation));
+      assert.equal(await verifyAuthorizationProof(echoed.authorization, echoed, {
+        username: "alice", trustedDevicePublicKeys: { "device-a": publicKey },
+        revokedDeviceIds: [],
+      }), true, "the echoed CREATE has a genuine Ed25519 signature");
+      throw Object.assign(new Error("HTTP ACK lost, no physical COMMIT"), { code: "offline" });
+    },
+    async list() { return echoed ? [echoed] : []; },
+    async listInventory() {
+      const objects = echoed ? [(({ ciphertext, nonce, tag, aad, authorization, ...record }) =>
+        record)(echoed)] : [];
+      return { protocolVersion: 2, view: "metadata", objects, nextCursor: null };
+    },
+  };
+  const open = () => new SyncEngine({
+    rootDir, adapter, deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", fileKeyResolver: () => key,
+    filesOnDemand: true, selectedPaths: ["docs"], maxRetries: 1,
+    requireAuthorization: true,
+    authorizationFactory: async (operation) => (await authorize(operation)).authorization,
+    verifyIncoming: (operation) => verifyAuthorizationProof(
+      operation.authorization, operation, { username: "alice",
+        trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] }),
+    requireCurrentOutgoingAuthorization: true,
+    currentDeviceAuthorization: () => true,
+  }).open();
+  const interrupted = await open();
+  assert.equal((await interrupted.syncOnce()).offline, true);
+  const pending = await interrupted.journal.recover();
+  assert.equal(pending.length, 1);
+  assert.equal(pushCount, 1);
+  assert.deepEqual(first.list("alice"), [], "no CREATE reached the physical backend");
+  assert.deepEqual(second.list("alice"), [], "independent backend view remains empty");
+  assert.equal(pending[0].operationId, echoed.operationId);
+  const originalSnapshot = JSON.stringify(interrupted.snapshot.files);
+
+  const restarted = await open();
+  await assert.rejects(restarted.syncOnce(), { code: "remote_admission_unproven" },
+    "self-echoed signed CREATE cannot clear outbox without an independent physical CAS receipt");
+  const preserved = await restarted.journal.recover();
+  assert.equal(preserved.length, 1, "markSeen must not consume locally pending CREATE");
+  assert.equal(preserved[0].operationId, pending[0].operationId);
+  assert.equal(JSON.stringify(restarted.snapshot.files), originalSnapshot,
+    "the forged readback must not create a remotely acknowledged snapshot");
+  assert.equal(await fsp.readFile(filename, "utf8"), bytes);
+  assert.deepEqual(second.list("alice"), [], "physical backend must still be empty");
+  assert.equal(pushCount, 1, "fake receipt must not resend or consume the CREATE");
+});
+
+test("crashing after staging tracked cache for hydration recovers staged identity before reconcileLocal", async (t) => {
+  const { execFileSync } = require("node:child_process");
+  const { storagePath, first, authorize, publicKey } = await fixture(t);
+  const root = path.dirname(storagePath);
+  const rootDir = path.join(root, "client");
+  const syncKey = crypto.randomBytes(32);
+  const makeOp = (kind, counter) => authorize(createOperation({
+    operation: kind, objectId: "obj-hydrate", fileId: "file-obj-hydrate", versionId: crypto.randomUUID(),
+    operationId: crypto.randomUUID(), deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", revision: { counter, deviceId: "device-a" },
+    baseRevision: counter > 1 ? { counter: counter - 1, deviceId: "device-a" } : null,
+    metadata: { path: "notes.txt" },
+    plaintext: Buffer.from(`hydrated content v${counter}`), fileKey: syncKey,
+  }));
+  const initialOp = await makeOp("create", 1);
+  const updateOp = await makeOp("update", 2);
+
+  const openClient = () => new SyncEngine({
+    rootDir, deviceId: "device-a", username: "alice",
+    compartmentId: "private", keyEpoch: "epoch-1",
+    fileKeyResolver: () => syncKey,
+    snapshotPath: path.join(root, "snapshot.json"),
+    journalPath: path.join(root, "journal.json"),
+    requireAuthorization: true,
+    authorizationFactory: async (op) => (await authorize(op)).authorization,
+    verifyIncoming: (op) => verifyAuthorizationProof(
+      op.authorization, op, { username: "alice",
+        trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] }),
+    adapter: { push: async () => [], list: async () => [] },
+  }).open();
+
+  const client = await openClient();
+  // Seed initial hydrated state matching v1 on disk + in snapshot.
+  await client._apply(initialOp);
+  const seededBytes = await fsp.readFile(path.join(rootDir, "notes.txt"), "utf8");
+
+  // Crash abruptly inside a child process right after stageCleanTrackedFile
+  // removes notes.txt and before publication/persistSnapshot completes.
+  const enginePath = path.resolve(__dirname, "../sync-client/rootark-sync-engine.js");
+  const crashScript = `
+    const fsp = require("node:fs/promises");
+    const { SyncEngine } = require(${JSON.stringify(enginePath)});
+    (async () => {
+      const engine = await new SyncEngine({
+        rootDir: ${JSON.stringify(rootDir)},
+        deviceId: "device-a",
+        username: "alice",
+        compartmentId: "private",
+        keyEpoch: "epoch-1",
+        fileKeyResolver: () => Buffer.from(${JSON.stringify(syncKey.toString("hex"))}, "hex"),
+        snapshotPath: ${JSON.stringify(path.join(root, "snapshot.json"))},
+        journalPath: ${JSON.stringify(path.join(root, "journal.json"))},
+        requireAuthorization: false,
+        adapter: { push: async () => [], list: async () => [] },
+      }).open();
+      const origLink = fsp.link;
+      fsp.link = () => process.exit(42);
+      await engine._apply(${JSON.stringify(updateOp)}, null, async () => {});
+    })();
+  `;
+  let exitStatus = 0;
+  try {
+    execFileSync(process.execPath, ["--input-type=commonjs", "-e", crashScript], { stdio: "pipe" });
+  } catch (err) {
+    exitStatus = err.status;
+  }
+  assert.equal(exitStatus, 42, "child must crash at exact post-stage pre-link point");
+  // Clear stale process lock as an operator/restarter would after a crash.
+  await fsp.rmdir(path.join(rootDir, ".rootark-sync.lock")).catch(() => {});
+
+  const restarted = await openClient();
+  await restarted.reconcileLocal();
+  const queued = await restarted.journal.recover();
+  assert.equal(queued.length, 0, "reconcileLocal must not enqueue a DELETE after a hydration-staging crash");
+  assert.equal(await fsp.readFile(path.join(rootDir, "notes.txt"), "utf8"), seededBytes,
+    "staged tracked file must be restored before reconcileLocal");
+});
+
+test("hydration crash recovery preserves locally edited published bytes instead of restoring old staged cache", async (t) => {
+  const { storagePath, authorize, publicKey } = await fixture(t);
+  const root = path.dirname(storagePath);
+  const rootDir = path.join(root, "client");
+  const syncKey = crypto.randomBytes(32);
+  const makeOp = (kind, counter, text) => authorize(createOperation({
+    operation: kind, objectId: "obj-edit-crash", fileId: "file-obj-edit-crash", versionId: crypto.randomUUID(),
+    operationId: crypto.randomUUID(), deviceId: "device-a", keyEpoch: "epoch-1",
+    compartmentId: "private", revision: { counter, deviceId: "device-a" },
+    baseRevision: counter > 1 ? { counter: counter - 1, deviceId: "device-a" } : null,
+    metadata: { path: "notes.txt" },
+    plaintext: Buffer.from(text), fileKey: syncKey,
+  }));
+  const v1 = await makeOp("create", 1, "v1 clean bytes");
+  const v2 = await makeOp("update", 2, "v2 hydrated bytes");
+  const openClient = () => new SyncEngine({
+    rootDir, deviceId: "device-a", username: "alice",
+    compartmentId: "private", keyEpoch: "epoch-1",
+    fileKeyResolver: () => syncKey,
+    snapshotPath: path.join(root, "snapshot.json"),
+    journalPath: path.join(root, "journal.json"),
+    requireAuthorization: true,
+    authorizationFactory: async (op) => (await authorize(op)).authorization,
+    verifyIncoming: (op) => verifyAuthorizationProof(
+      op.authorization, op, { username: "alice",
+        trustedDevicePublicKeys: { "device-a": publicKey }, revokedDeviceIds: [] }),
+    adapter: { push: async () => [], list: async () => [] },
+  }).open();
+
+  const client = await openClient();
+  await client._apply(v1);
+  // Fail persistSnapshot after hard-link publication of v2.
+  client.persistSnapshot = async () => { throw Object.assign(new Error("simulated crash"), { code: "EIO" }); };
+  await assert.rejects(client._apply(v2, null, async () => {}), { code: "EIO" });
+  // Local user edits the published file before recovery runs.
+  await fsp.writeFile(path.join(rootDir, "notes.txt"), "user edited bytes after publish");
+
+  await openClient();
+  assert.equal(await fsp.readFile(path.join(rootDir, "notes.txt"), "utf8"),
+    "user edited bytes after publish",
+    "recovery must not delete and overwrite locally edited published bytes");
 });

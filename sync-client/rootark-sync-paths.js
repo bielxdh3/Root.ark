@@ -10,6 +10,7 @@ const INTERNAL = new Set([
 const INTERNAL_PREFIXES = [
   ".rootark-sync-lock-init-", ".rootark-sync-evictions-archive-",
   ".rootark-sync-index.json.tmp-", ".rootark-sync-journal.json.tmp-",
+  ".rootark-recovery-execution-",
 ];
 
 function isInternalSegment(segment) {

@@ -135,35 +135,35 @@ async function captureSync(responses) {
     responses["sync.get.404"] = expectStatus(await call(base, "GET", "/sync/v1/objects/missing-object", undefined), 404, "get missing");
 
     const update = protocol.createOperation({
-      ...common, operation: "update", operationId: "fixture-op-update", revision: { counter: 2, deviceId },
+      ...common, versionId: "fixture-version-2", operation: "update", operationId: "fixture-op-update", revision: { counter: 2, deviceId },
       baseRevision: { counter: 1, deviceId }, metadata: { path: "docs/readme.txt", name: "readme.txt", contentType: "text/plain", size: 6 },
       plaintext: Buffer.from("hello!"),
     });
     responses["sync.put.200.update"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", await signed(update)), 200, "update");
 
     const stale = protocol.createOperation({
-      ...common, operation: "update", operationId: "fixture-op-stale", revision: { counter: 2, deviceId },
+      ...common, versionId: "fixture-version-stale", operation: "update", operationId: "fixture-op-stale", revision: { counter: 2, deviceId },
       baseRevision: { counter: 2, deviceId }, metadata: { path: "docs/readme.txt", name: "readme.txt", contentType: "text/plain", size: 6 },
       plaintext: Buffer.from("stale"),
     });
     responses["sync.put.409.stale"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", await signed(stale)), 409, "stale");
 
     const conflict = protocol.createOperation({
-      ...common, operation: "update", operationId: "fixture-op-conflict", revision: { counter: 3, deviceId },
+      ...common, versionId: "fixture-version-base-conflict", operation: "update", operationId: "fixture-op-conflict", revision: { counter: 3, deviceId },
       baseRevision: { counter: 1, deviceId }, metadata: { path: "docs/readme.txt", name: "readme.txt", contentType: "text/plain", size: 6 },
       plaintext: Buffer.from("conflict"),
     });
     responses["sync.put.409.base"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", await signed(conflict)), 409, "base conflict");
 
     const move = protocol.createOperation({
-      ...common, operation: "move", operationId: "fixture-op-move", revision: { counter: 3, deviceId },
+      ...common, versionId: "fixture-version-3", operation: "move", operationId: "fixture-op-move", revision: { counter: 3, deviceId },
       baseRevision: { counter: 2, deviceId }, metadata: { path: "docs/moved.txt", sourcePath: "docs/readme.txt" },
       plaintext: Buffer.from(""),
     });
     responses["sync.put.200.move"] = expectStatus(await call(base, "PUT", "/sync/v1/objects/fixture-object-1", await signed(move)), 200, "move");
 
     const remove = protocol.createOperation({
-      ...common, operation: "delete", operationId: "fixture-op-delete", revision: { counter: 4, deviceId },
+      ...common, versionId: "fixture-version-4", operation: "delete", operationId: "fixture-op-delete", revision: { counter: 4, deviceId },
       baseRevision: { counter: 3, deviceId }, metadata: { path: "docs/moved.txt" }, plaintext: Buffer.from(""),
     });
     responses["sync.delete.200"] = expectStatus(await call(base, "DELETE", "/sync/v1/objects/fixture-object-1", await signed(remove)), 200, "delete");

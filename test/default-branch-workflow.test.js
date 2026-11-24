@@ -27,6 +27,14 @@ test("issue 66 CFAPI head pushes trigger the real Windows canonical suite", () =
   assert.ok(fs.existsSync(path.join(root, "test/issue-66-windows-cfapi-native.test.js")));
 });
 
+test("issue 66 CFAPI exact head push also executes dependency review without changing main coverage", () => {
+  const pushBranches = dependencyWorkflow.match(/\n  push:\s*\n    branches:\s*\n((?:      - [^\n]+\n)+)/)?.[1];
+  assert.ok(pushBranches, "Dependency Review must declare an explicit push branch filter");
+  assert.match(pushBranches, /      - Root\/main/);
+  assert.ok(pushBranches.split(/\r?\n/).includes("      - 'cdx/issue66-cfapi-native-w8-20261107'"),
+    "the exact #300 push must have a hosted dependency review job");
+});
+
 test("Security Regression does not cancel per-SHA default-branch validation", () => {
   assert.match(securityWorkflow, /group:\s*security-regression-\$\{\{\s*github\.event\.pull_request\.number\s*\|\|\s*format\('run-\{0\}',\s*github\.run_id\)\s*\}\}/);
   assert.match(securityWorkflow, /cancel-in-progress:\s*\$\{\{\s*github\.event_name\s*==\s*'pull_request'\s*\}\}/);
