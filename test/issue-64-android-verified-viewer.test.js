@@ -39,7 +39,6 @@ test("native protected text view requires provisioned trust, authenticated fetch
   assert.match(activity, /securePreviewText\.clear\(\)/, "protected preview must clear on close and lifecycle");
   assert.match(activity, /previewText\.text\s*=\s*""/,
     "clear must remove the TextView's reference to the old backing buffer");
-  const buffer = read("android/app/src/main/java/dev/rootark/android/SecurePreviewBuffer.kt");
   assert.match(buffer, /previous\?\.fill\('\\u0000'\)/,
     "clear must wipe the actual retained CharArray before the TextView is replaced");
   assert.doesNotMatch(activity, /text\(view,\s*String\(characters\)\)/, "must not wrap characters in String");
