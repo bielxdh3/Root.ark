@@ -125,15 +125,17 @@ function secureNewWindowsSnapshotDirectory(directoryPath) {
   const script = [
     "$ErrorActionPreference = 'Stop'",
     `$target = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('${encodedPath}'))`,
-    "$acl = Get-Acl -LiteralPath $target",
+    // Use the same filesystem ACL API as the reader. Windows PowerShell's
+    // filesystem provider is not required to resolve the directory.
+    "$acl = [System.IO.Directory]::GetAccessControl($target)",
     "$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
     "$acl.SetAccessRuleProtection($true, $false)",
-    "foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }",
+    "foreach ($rule in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) { [void]$acl.RemoveAccessRuleSpecific($rule) }",
     "$acl.SetOwner($current)",
     "$inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit",
     "$principals = @($current, [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'), [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))",
     "foreach ($principal in $principals) { $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($principal, [System.Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow); [void]$acl.AddAccessRule($rule) }",
-    "Set-Acl -LiteralPath $target -AclObject $acl",
+    "[System.IO.Directory]::SetAccessControl($target, $acl)",
   ].join("; ");
   runPowerShell(script);
 }

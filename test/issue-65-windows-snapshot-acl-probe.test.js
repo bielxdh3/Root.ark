@@ -279,10 +279,13 @@ test("#65 ACL classifier recognizes the actual PowerShell scripts from fileReadH
   assert.equal(classifyNativeAclCommand(["-Command", captures.pop()], root), "ACL_READ_LEAF");
   seal(parent);
   const sealScript = captures.pop();
-  assert.ok(sealScript.indexOf("Get-Acl -LiteralPath $target") < sealScript.indexOf("Set-Acl -LiteralPath $target"),
-    "Production seal script reads the existing ACL before attempting Set-Acl");
-  // Even when the FIRST Get-Acl fails, only the script that was attempted is
-  // observable: it must never be reported as proof that Set-Acl failed.
+  const readAt = sealScript.indexOf("[System.IO.Directory]::GetAccessControl($target)");
+  const writeAt = sealScript.indexOf("[System.IO.Directory]::SetAccessControl($target, $acl)");
+  assert.ok(readAt >= 0 && writeAt > readAt,
+    "Production sealing must read and write native directory security independently of the provider");
+  assert.doesNotMatch(sealScript, /(?:Get|Set)-Acl -LiteralPath/);
+  // A failing seal is classified as an attempted script, never as proof that
+  // a particular native read or write operation failed.
   assert.equal(classifyNativeAclCommand(["-Command", sealScript], root), "ACL_SEAL_SCRIPT_PARENT");
   seal(root);
   assert.equal(classifyNativeAclCommand(["-Command", captures.pop()], root), "ACL_SEAL_SCRIPT_LEAF");
@@ -463,6 +466,44 @@ test("#65 Windows ACL reading never depends on the PowerShell Get-Acl provider",
   assert.match(acl.owner, /^S-1-/);
   assert.ok(acl.rules);
   assert.equal(result.stderr, "");
+});
+
+test("#65 Windows snapshot sealing uses the native ACL API and verifies the resulting private directory", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const source = fs.readFileSync(path.join(__dirname, "../services/fileReadHandle.js"), "utf8");
+  const first = source.indexOf("function windowsDirectoryAcl(");
+  const last = source.indexOf("function validateDirectorySecurity(", first);
+  const executable = path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
+  const root = createPrivateAuthorityFixture("rootark-snapshot-seal-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, "new-private-directory");
+  fs.mkdirSync(target);
+  const context = {
+    Buffer,
+    runPowerShell(script) {
+      const result = spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        "function Get-Acl { throw 'provider unavailable' }; function Set-Acl { throw 'provider unavailable' }; " + script], {
+        encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 10000,
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, 0, "native ACL operation must succeed without the PowerShell provider");
+      assert.equal(Boolean(result.stderr), false, "native ACL operation must not emit stderr");
+      return result.stdout.trim().replace(/^\uFEFF/, "");
+    },
+  };
+  const api = vm.runInNewContext(source.slice(first, last)
+    + "\n({ windowsDirectoryAcl, secureNewWindowsSnapshotDirectory })", context);
+  api.secureNewWindowsSnapshotDirectory(target);
+  const acl = api.windowsDirectoryAcl(target);
+  assert.equal(acl.owner, acl.current);
+  assert.equal(acl.protected, true);
+  const allowed = new Set([acl.current, "S-1-5-18", "S-1-5-32-544"]);
+  assert.ok(acl.rules.every((rule) => allowed.has(rule.sid) && rule.type === "Allow"));
+  for (const sid of allowed) {
+    assert.ok(acl.rules.some((rule) => rule.sid === sid && (Number(rule.rights) & 0x001f01ff) === 0x001f01ff));
+  }
 });
 
 test("#65 Windows PowerShell 5.1 maps missing Get-Acl targets to fixed ITEM_NOT_FOUND without leaking paths", {

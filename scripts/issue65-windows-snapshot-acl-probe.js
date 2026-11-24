@@ -42,9 +42,10 @@ function safeCode(error) {
 function classifyNativeAclCommand(args, snapshotDirectory) {
   const command = Array.isArray(args) ? args[args.length - 1] : null;
   if (typeof command !== "string" || typeof snapshotDirectory !== "string") return "OTHER";
-  // The seal SCRIPT first executes Get-Acl and other mutations before Set-Acl;
-  // its failure does not prove which individual PowerShell command failed.
-  const action = command.includes("Set-Acl -LiteralPath $target") ? "SEAL_SCRIPT"
+  // The seal SCRIPT reads the ACL and mutates it before writing. A failure
+  // does not prove which individual operation failed. Never replay a write.
+  const action = (command.includes("Set-Acl -LiteralPath $target")
+      || command.includes("[System.IO.Directory]::SetAccessControl($target, $acl)")) ? "SEAL_SCRIPT"
     : (command.includes("Get-Acl -LiteralPath $target")
       || command.includes("[System.IO.Directory]::GetAccessControl($target)")) ? "READ" : null;
   const encoded = command.match(/FromBase64String\('([A-Za-z0-9+/=]{1,8192})'\)/)?.[1];
