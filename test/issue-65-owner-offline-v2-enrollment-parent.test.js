@@ -16,6 +16,27 @@ const cekTransfer = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
+// A fresh instance pins a controllable *native-release* clock before it loads.
+// Restore Date.now and the module cache immediately, so the real entry-time
+// approval, witness, signature and <=30-second skew checks still run against
+// real time. Only the final post-HPKE release boundary sees elapsed time.
+function releaseClockTransfer() {
+  const moduleId = require.resolve("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer");
+  const previousModule = require.cache[moduleId];
+  const actualNow = Date.now;
+  let nowMs = actualNow();
+  let transfer;
+  try {
+    Date.now = () => nowMs;
+    delete require.cache[moduleId];
+    transfer = require(moduleId);
+  } finally {
+    Date.now = actualNow;
+    if (previousModule) require.cache[moduleId] = previousModule;
+    else delete require.cache[moduleId];
+  }
+  return { transfer, advanceTo(ms) { nowMs = ms; } };
+}
 const cekBatch = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-versioned-cek-batch"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
@@ -640,8 +661,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.equal(safe.core.owner_digest, committed.digest,
         `${label}: signed owner head pinned before await`);
     }
-    // A caller callback cannot forge global wall-clock passage after a real
-    // file AEAD; it must not prematurely expire the pinned owner lease.
+    // A hostile callback must not replace the module's wall clock after the
+    // real AEAD await. The signed owner lease remains authoritative.
     const originalWallClock = Date.now;
     let ownerDecryptFinished = false;
     subtle.decrypt = async function (...args) {
@@ -651,19 +672,40 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       return result;
     };
     try {
-      const pinnedEnvelope = await cekTransfer.sealOwnerAuthorizedFileCek({
+      const clockPinnedEnvelope = await cekTransfer.sealOwnerAuthorizedFileCek({
         ownerPrivateKey: owner.privateKey, ownerHeldCek,
         metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
         authority: publicAuthority,
       });
-      assert.equal(pinnedEnvelope.core.expires_at, envelope.core.expires_at,
-        "post-AEAD global clock mutation must not alter the signed owner CEK lease");
+      assert.equal(clockPinnedEnvelope.core.expires_at, envelope.core.expires_at,
+        "an AEAD callback may not spoof a later wall clock or extend the signed owner lease");
     } finally {
       Date.now = originalWallClock;
       delete subtle.decrypt;
     }
     assert.equal(ownerDecryptFinished, true,
-      "test must reach genuine file AEAD before attempted global clock spoofing");
+      "test must reach genuine file AEAD before rebinding the global clock");
+    const sealClock = releaseClockTransfer();
+    const validSealInput = { ownerPrivateKey: owner.privateKey, ownerHeldCek,
+      metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
+      authority: publicAuthority };
+    const baselineSeal = await sealClock.transfer.sealOwnerAuthorizedFileCek(validSealInput);
+    assert.equal(baselineSeal.core.expires_at, envelope.core.expires_at,
+      "the same signed authority must pass every entry-time gate before expiry");
+    const nativeSeal = z.hpkeSeal;
+    let realSealCompleted = false;
+    z.hpkeSeal = async (...args) => {
+      const value = await nativeSeal(...args);
+      realSealCompleted = true;
+      sealClock.advanceTo((envelope.core.expires_at + 1) * 1000);
+      return value;
+    };
+    try {
+      await assert.rejects(sealClock.transfer.sealOwnerAuthorizedFileCek(validSealInput),
+        /ZK_OWNER_FILE_CEK_DENIED/,
+        "an actually elapsed signed CEK lease must deny at the final post-HPKE seal fence");
+    } finally { z.hpkeSeal = nativeSeal; }
+    assert.equal(realSealCompleted, true, "real HPKE sealing must finish before the clock expires");
     for (const label of ["request", "metadata", "head", "opened envelope"]) {
       let accessed = 0;
       const accessor = { enumerable: true, configurable: true,
@@ -710,7 +752,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       ciphertextRoot: root, deviceHpkePrivateKey: bRecipient,
       nowSeconds: now + 9, ...overrides,
     });
-    // A mutable global clock is not proof of actual wall-clock passage.
+    // Rebind the mutable global clock after real HPKE; the pinned clock must
+    // not treat an attacker-supplied timestamp as wall-clock passage.
     const realHpkeOpen = z.hpkeOpen;
     const realDateNow = Date.now;
     let hpkeFinishedBeforeExpiry = false;
@@ -721,17 +764,45 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       return result;
     };
     try {
-      const pinned = await open();
-      assert.equal(pinned.verifiedReleaseExpiresAt,
+      const clockPinnedCek = await open();
+      assert.equal(clockPinnedCek.verifiedReleaseExpiresAt,
         Math.min(envelope.core.expires_at, issued.approval.expires_at,
-          signedCommittedHead.expires_at));
-      pinned.cek.fill(0);
+          signedCommittedHead.expires_at),
+      "B returns exactly the original signed lease despite a forged Date.now callback");
+      clockPinnedCek.cek.fill(0);
     } finally {
       z.hpkeOpen = realHpkeOpen;
       Date.now = realDateNow;
     }
     assert.equal(hpkeFinishedBeforeExpiry, true,
-      "test must reach actual HPKE decrypt before the attempted clock spoof");
+      "test must reach actual HPKE decrypt before the forged clock changes");
+    const openClock = releaseClockTransfer();
+    const validOpenInput = {
+      envelope, authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      metadata, objectRevision: 1, ciphertext: recoveredCiphertext,
+      ciphertextRoot: root, deviceHpkePrivateKey: bRecipient,
+      nowSeconds: now + 9,
+    };
+    const baselineOpen = await openClock.transfer.openOwnerAuthorizedFileCek(validOpenInput);
+    assert.equal(baselineOpen.verifiedReleaseExpiresAt,
+      Math.min(envelope.core.expires_at, issued.approval.expires_at,
+        signedCommittedHead.expires_at));
+    baselineOpen.cek.fill(0);
+    const originalHpkeOpen = z.hpkeOpen;
+    let realOpenCompleted = false;
+    z.hpkeOpen = async (...args) => {
+      const value = await originalHpkeOpen(...args);
+      realOpenCompleted = true;
+      openClock.advanceTo((baselineOpen.verifiedReleaseExpiresAt + 1) * 1000);
+      return value;
+    };
+    try {
+      await assert.rejects(openClock.transfer.openOwnerAuthorizedFileCek(validOpenInput),
+        /ZK_OWNER_FILE_CEK_DENIED/,
+        "an actually elapsed signed CEK lease must deny at the final post-HPKE open fence");
+    } finally { z.hpkeOpen = originalHpkeOpen; }
+    assert.equal(realOpenCompleted, true, "real HPKE opening must finish before the clock expires");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
     assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(

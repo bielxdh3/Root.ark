@@ -11,9 +11,9 @@ const committedApproval = require("../../public/client/rootark-zk1-v2-committed-
 const browserPop = require("../../public/client/rootark-zk1-v2-browser-pop");
 const fileContent = require("../../public/client/rootark-zk1-file-content");
 const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
-// Capture release-time intrinsics before any caller-controlled owner, roster,
-// witness or HPKE callback can replace Date.now/Math.floor/Math.min. A valid
-// signed grant cannot extend a shorter owner-approved file CEK lease.
+// Snapshot the release clock and lease intrinsics before caller-controlled
+// cryptographic callbacks can replace globals. A forged callback must neither
+// extend a signed owner-approved CEK lease nor force premature CEK release.
 const nativeReleaseNow = Date.now;
 const nativeReleaseFloor = Math.floor;
 const nativeReleaseMin = Math.min;

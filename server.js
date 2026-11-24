@@ -4078,6 +4078,9 @@ function canAccessEncryptedFile(req, metadata) {
   }
 
   if (level === "user-key" || level === "dual") {
+    // The stored key owner is an exact SQLite account principal. Case-folding
+    // here would let a distinct account with file ACL read access decrypt
+    // another principal's user-key ciphertext using that stored owner key.
     return Array.from(getEncryptedAuthorizedUsers(metadata)).some((username) => username === req.user?.username);
   }
 
@@ -5426,6 +5429,8 @@ async function findPendingApprovalTarget(req, requestedFolder, fileName, { allow
 function canAccessPendingFile(req, folderId, fileName) {
   if (req.user?.permissions?.listPending) return true;
   const owner = getPendingUploadOwner(folderId, fileName);
+  // Account principals are case-sensitive in login and SQLite. A user with
+  // upload permission must not preview a case-colliding owner's pending bytes.
   return Boolean(owner && owner === req.user?.username);
 }
 
