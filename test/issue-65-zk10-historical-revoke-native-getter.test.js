@@ -311,7 +311,7 @@ test("P2 historical: signed witness floor A cannot replace independently retaine
     .authorizesHistoricalRead, true);
 });
 
-test("P2 strict Sync v2: evidence-provider callback cannot replay signed old challenge A by replacing crypto.randomBytes", async () => {
+test("P2 strict Sync v2: disabled historical admission rejects signed evidence before invoking the provider", async () => {
   const f = await genuineHistoricalEvidence({ expiredDeviceAuthorization: true });
   assert.ok(f.input.envelope.authorization.expiresAt < Date.now());
   assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input)).authorizesHistoricalRead,
@@ -367,7 +367,7 @@ test("P2 strict Sync v2: evidence-provider callback cannot replay signed old cha
     delete require.cache[clientId];
     const { start } = require(clientId);
     console.log = () => {};
-    const engine = await start({ once: true, requireIndependentHistoricalAdmission: true,
+    await assert.rejects(start({ once: true, requireIndependentHistoricalAdmission: true,
       trustedHistoricalAdmission: {
         localTrustedDevicePolicy: f.allowed,
         trustedCurrentDevicePolicyProvider: () => f.allowed,
@@ -392,12 +392,12 @@ test("P2 strict Sync v2: evidence-provider callback cannot replay signed old cha
         offered++;
         return proof;
       },
-    });
-    assert.equal(engine.incomingAllowed, false,
-      "historical signed nonce A must not be replayable by poisoning client crypto.randomBytes");
-    assert.equal(challenges, 3, "fresh challenge must be generated on each recovery/issue attempt");
-    assert.equal(replayed, 0, "post-callback randomBytes replacement must never issue a challenge");
-    assert.equal(offered, 2, "real signed replay was presented twice and denied");
+    }), /Independent historical admission is temporarily disabled pending full provider-chain hardening/);
+    // The direct historical verifier retains its independent challenge checks.
+    // The standalone provider must not be called while this feature is off.
+    assert.equal(challenges, 0, "disabled provider must not issue challenges");
+    assert.equal(replayed, 0, "disabled provider must not access its callback");
+    assert.equal(offered, 0, "disabled provider must not request evidence");
   } finally {
     crypto.randomBytes = originalRandom;
     console.log = oldLog;

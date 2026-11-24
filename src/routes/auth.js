@@ -487,6 +487,9 @@ function registerAuthRoutes(app, context) {
       username: req.user.username,
       role: req.user.role,
       permissions: normalizeUserPermissions(req.user),
+      ...(process.env.ROOTARK_P2P_EXPERIMENTAL === "true" &&
+        ["development", "test"].includes(process.env.NODE_ENV)
+        ? { experimentalP2pEnabled: true } : {}),
     });
   });
 
