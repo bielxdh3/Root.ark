@@ -45,8 +45,7 @@ test("P2: native owner rotation cannot use a dynamically rebound JS public-key f
     .find((symbol) => String(symbol) === "Symbol(kHandle)");
   assert.ok(sym, "real native Ed25519 KeyObject exposes original kHandle");
   let getterCalls = 0, retargetCalls = 0;
-  Object.defineProperty(fakeRoot, sym, { configurable: true, get() {
-    getterCalls += 1;
+  const poison = () => {
     crypto.createPublicKey = (arg) => {
       retargetCalls += 1;
       const requested = arg?.key;
@@ -56,15 +55,25 @@ test("P2: native owner rotation cannot use a dynamically rebound JS public-key f
       }
       return nativeCreatePublicKey(arg);
     };
+  };
+  Object.defineProperty(fakeRoot, sym, { configurable: true, get() {
+    getterCalls += 1;
+    poison();
     return A.publicKey[sym];
   } });
   try {
     assert.throws(() => verifyOwnerRotationKeys([forged], fakeRoot, id(1)),
       { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
       "a getter must not turn claimed B into actually verified A");
-    assert.ok(getterCalls > 0, "attack must execute real caller-owned handle getter");
+    assert.equal(getterCalls, 0, "inherited kHandle getter must not execute");
+    assert.equal(crypto.createPublicKey, nativeCreatePublicKey,
+      "early rejection must not install a hostile global factory");
+    poison();
     assert.notEqual(crypto.createPublicKey, nativeCreatePublicKey,
-      "the caller executed its hostile global-factory replacement");
+      "the fixture must install the original global-factory replacement");
+    assert.throws(() => verifyOwnerRotationKeys([forged], A.publicKey, id(1)),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "a genuine owner key must still refuse A signing for advertised B");
     assert.equal(retargetCalls, 0,
       "the verifier must never consume the injected JS factory");
   } finally {
@@ -82,17 +91,25 @@ test("P2: inherited kHandle getter cannot replace native Ed25519 verification", 
   const poisoned = Object.create(A.publicKey);
   const nativeVerify = crypto.verify;
   let getterCalls = 0, fakeVerifyCalls = 0;
+  const poisonVerify = () => {
+    crypto.verify = () => { fakeVerifyCalls += 1; return true; };
+  };
   Object.defineProperty(poisoned, handleSymbol, { get() {
     getterCalls += 1;
-    crypto.verify = () => { fakeVerifyCalls += 1; return true; };
+    poisonVerify();
     return A.publicKey[handleSymbol];
   } });
   try {
     assert.throws(() => verifyOwnerRotationKeys([bad], poisoned, id(1)),
       { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
       "caller must not approve an unowned next signer by swapping crypto.verify");
-    assert.ok(getterCalls > 0, "real caller-owned KeyObject getter was exercised");
-    assert.notEqual(crypto.verify, nativeVerify, "the hostile verifier override was installed");
+    assert.equal(getterCalls, 0, "inherited kHandle getter must be rejected before execution");
+    assert.equal(crypto.verify, nativeVerify, "a rejected key cannot mutate the global verifier");
+    poisonVerify();
+    assert.notEqual(crypto.verify, nativeVerify, "the fixture must install the original verifier override");
+    assert.throws(() => verifyOwnerRotationKeys([bad], A.publicKey, id(1)),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "a genuine owner key must never trust a rebound global verifier");
     assert.equal(fakeVerifyCalls, 0, "no injected JS verify implementation may be used");
   } finally {
     crypto.verify = nativeVerify;

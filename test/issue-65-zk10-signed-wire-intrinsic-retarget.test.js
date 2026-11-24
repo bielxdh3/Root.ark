@@ -53,7 +53,7 @@ test("P2: captured signed owner A cannot become unsigned inventory B via Array.p
   const f = fixture();
   const originalJoin = Array.prototype.join;
   let forgedJoins = 0;
-  const root = getterBoundPublicKey(f.owner, () => {
+  const poison = () => {
     Array.prototype.join = function(joiner) {
       if (joiner === "," && this.length === OWNER_FIELDS.length
         && typeof this[0] === "string" && this[0].startsWith('"type":')) {
@@ -62,20 +62,22 @@ test("P2: captured signed owner A cannot become unsigned inventory B via Array.p
       }
       return originalJoin.call(this, joiner);
     };
-  });
+  };
+  const root = getterBoundPublicKey(f.owner, poison);
   try {
-    const result = verifyOwnerCutoverHistory([f.forgedB], [root.inherited], account);
-    assert.equal(result.statement.inventory_head, f.forgedB.inventory_head,
-      "returned untrusted statement must be physically the B inventory");
-    assert.equal(result.digest, f.digestA,
-      "the accepted forged B must have reused real owner A's signed digest");
-    assert.fail("owner A signature accepted for forged B inventory; digest=" + result.digest);
-  } catch (err) {
-    if (err.code !== "ZK10_ACCOUNT_CUTOVER_UNVERIFIED") throw err;
+    assert.throws(() => verifyOwnerCutoverHistory([f.forgedB], [root.inherited], account),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "an inherited native handle must fail closed before its getter");
+    assert.equal(root.reads(), 0, "untrusted native handle getter must never execute");
+    poison();
+    assert.throws(() => verifyOwnerCutoverHistory([f.forgedB], [f.owner.publicKey], account),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "even a genuine key cannot accept B with A's signature under a hostile Array.join");
+    assert.equal(verifyOwnerCutoverHistory([f.validA], [f.owner.publicKey], account).digest,
+      f.digestA, "the legitimate owner A must remain accepted under a rebound join");
   } finally {
     Array.prototype.join = originalJoin;
   }
-  assert.ok(root.reads() > 0, "native handle getter must have been invoked");
   assert.equal(forgedJoins, 0,
     "serialized signed data must never dispatch to attacker-rebound Array.join");
   assert.equal(verifyOwnerCutoverHistory([f.validA], [f.owner.publicKey], account).digest, f.digestA);
@@ -85,7 +87,7 @@ test("P2: captured signed owner A cannot become unsigned inventory B via Buffer.
   const f = fixture();
   const originalFrom = Buffer.from;
   let forgedConversions = 0;
-  const root = getterBoundPublicKey(f.owner, () => {
+  const poison = () => {
     Buffer.from = function(input, encoding, ...rest) {
       if (typeof input === "string" && encoding === "utf8"
         && input.includes('"inventory_head":"' + f.forgedB.inventory_head + '"')) {
@@ -94,20 +96,22 @@ test("P2: captured signed owner A cannot become unsigned inventory B via Buffer.
       }
       return originalFrom.call(Buffer, input, encoding, ...rest);
     };
-  });
+  };
+  const root = getterBoundPublicKey(f.owner, poison);
   try {
-    const result = verifyOwnerCutoverHistory([f.forgedB], [root.inherited], account);
-    assert.equal(result.statement.inventory_head, f.forgedB.inventory_head,
-      "returned untrusted statement must be physically the B inventory");
-    assert.equal(result.digest, f.digestA,
-      "the accepted forged B must have reused real owner A's signed digest");
-    assert.fail("owner A signature accepted for forged B inventory; digest=" + result.digest);
-  } catch (err) {
-    if (err.code !== "ZK10_ACCOUNT_CUTOVER_UNVERIFIED") throw err;
+    assert.throws(() => verifyOwnerCutoverHistory([f.forgedB], [root.inherited], account),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "an inherited native handle must fail closed before its getter");
+    assert.equal(root.reads(), 0, "untrusted native handle getter must never execute");
+    poison();
+    assert.throws(() => verifyOwnerCutoverHistory([f.forgedB], [f.owner.publicKey], account),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "a genuine key must refuse unsigned inventory B despite hostile Buffer.from");
+    assert.equal(verifyOwnerCutoverHistory([f.validA], [f.owner.publicKey], account).digest,
+      f.digestA, "genuine signed A remains accepted under a rebound Buffer.from");
   } finally {
     Buffer.from = originalFrom;
   }
-  assert.ok(root.reads() > 0, "native handle getter must have been invoked");
   assert.equal(forgedConversions, 0,
     "signed message bytes must use a pre-captured native Buffer.from");
   assert.equal(verifyOwnerCutoverHistory([f.validA], [f.owner.publicKey], account).digest, f.digestA);
