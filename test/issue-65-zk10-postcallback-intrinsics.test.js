@@ -59,7 +59,7 @@ test("P2: late Function.prototype.call rebind cannot authenticate unsigned owner
   const signedA = Object.fromEntries(OWNER_FIELDS.map((name) => [name, f.A[name]]));
   const realAJson = JSON.stringify(signedA);
   let forgedJoins = 0;
-  const key = evilNativeKey(f.owner.publicKey, () => {
+  const poison = () => {
     Function.prototype.call = function(receiver, ...args) {
       if (this === nativeJoin && args[0] === "," && receiver?.length === OWNER_FIELDS.length
         && typeof receiver[0] === "string" && receiver[0].startsWith('"type":')) {
@@ -68,12 +68,21 @@ test("P2: late Function.prototype.call rebind cannot authenticate unsigned owner
       }
       return Reflect.apply(this, receiver, args);
     };
-  });
+  };
+  const key = evilNativeKey(f.owner.publicKey, poison);
   try {
     assert.throws(() => verifyOwnerCutoverHistory([f.B], [key.inherited], account),
       /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/);
+    assert.equal(key.reads, 0, "inherited native handle getter must not execute");
+    assert.equal(Function.prototype.call, realCall,
+      "early rejection must not install an altered call dispatcher");
+    poison();
+    assert.throws(() => verifyOwnerCutoverHistory([f.B], [f.owner.publicKey], account),
+      /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/,
+      "forged B must remain rejected with a real key under hostile .call");
+    assert.equal(verifyOwnerCutoverHistory([f.A], [f.owner.publicKey], account).digest,
+      f.digestA, "signed A must remain accepted under hostile .call");
   } finally { Function.prototype.call = realCall; }
-  assert.ok(key.reads > 0, "real native callback must execute");
   assert.equal(forgedJoins, 0, "post-callback .call dispatch must be immutable");
   assert.equal(verifyOwnerCutoverHistory([f.A], [f.owner.publicKey], account).digest, f.digestA);
 });
@@ -82,7 +91,7 @@ test("P2: late Object.freeze cannot swap verified Ed25519 A statement to B with 
   const f = ownerFixture();
   const realFreeze = Object.freeze;
   let mutated = 0;
-  const key = evilNativeKey(f.owner.publicKey, () => {
+  const poison = () => {
     Object.freeze = (value) => {
       if (value?.type === f.A.type && !Object.hasOwn(value, "signature")
         && value.inventory_head === f.A.inventory_head) {
@@ -91,13 +100,19 @@ test("P2: late Object.freeze cannot swap verified Ed25519 A statement to B with 
       }
       return realFreeze(value);
     };
-  });
+  };
+  const key = evilNativeKey(f.owner.publicKey, poison);
   try {
-    const result = verifyOwnerCutoverHistory([f.A], [key.inherited], account);
+    assert.throws(() => verifyOwnerCutoverHistory([f.A], [key.inherited], account),
+      /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/,
+      "the inherited native handle must fail closed before mutation");
+    assert.equal(key.reads, 0, "untrusted native handle getter must not execute");
+    assert.equal(Object.freeze, realFreeze, "early denial must not rewrite Object.freeze");
+    poison();
+    const result = verifyOwnerCutoverHistory([f.A], [f.owner.publicKey], account);
     assert.equal(result.statement.inventory_head, f.A.inventory_head);
     assert.equal(result.digest, f.digestA);
   } finally { Object.freeze = realFreeze; }
-  assert.ok(key.reads > 0);
   assert.equal(mutated, 0, "frozen verified statement must bypass mutable Object.freeze");
   assert.equal(verifyOwnerCutoverHistory([f.A], [f.owner.publicKey], account).digest, f.digestA);
 });
