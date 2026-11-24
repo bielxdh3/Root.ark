@@ -39,6 +39,37 @@ function isCanonicalNpmTestInvocation(executable, args) {
     || /(?:^|\s)npm(?:\.cmd)?\s+test(?:\s|$)/i.test(command);
 }
 
+// vm.runInNewContext creates fixture maps in a foreign realm. The actual
+// sync protocol (required from this test's realm) correctly rejects them.
+// Rebuild ONLY the owned synthetic fixture data before calling the real
+// createOperation; never mock its signature/ciphertext security checks.
+function releaseGateFixtureToHost(value) {
+  if (Buffer.isBuffer(value)) return Buffer.from(value);
+  if (Array.isArray(value)) return Array.from(value, releaseGateFixtureToHost);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) =>
+      [key, releaseGateFixtureToHost(item)]));
+  }
+  return value;
+}
+
+function releaseGateVmRequire(gateRequire, spawnSyncMock) {
+  const protocolPath = path.join(ROOT, "sync-client", "rootark-sync-protocol");
+  const resiliencePath = path.join(ROOT, "src", "services", "deploymentResilience");
+  return (name) => {
+    if (name === "node:child_process") return { spawnSync: spawnSyncMock };
+    const module = gateRequire(name);
+    if (name === protocolPath) return { ...module, createOperation: (fixture) =>
+      module.createOperation(releaseGateFixtureToHost(fixture)) };
+    // The release-gate VM also creates the input array and its deliberately
+    // leaked-field object in the foreign realm. Keep the actual attestor, but
+    // reconstruct those test fixtures before its strict host-realm checks.
+    if (name === resiliencePath) return { ...module, attestCiphertextOnlyRecords: (records) =>
+      module.attestCiphertextOnlyRecords(releaseGateFixtureToHost(records)) };
+    return module;
+  };
+}
+
 test("release gate mock identifies native Windows and POSIX npm test calls", () => {
   assert.equal(isCanonicalNpmTestInvocation("npm", ["test", "--", "--test-reporter=tap"]), true);
   assert.equal(isCanonicalNpmTestInvocation("C:\\Windows\\System32\\cmd.exe", ["/d", "/s", "/c", "npm.cmd test -- --test-reporter=tap"]), true);
@@ -80,9 +111,11 @@ test("release gate reports categorical failed-child telemetry and skips redundan
     __dirname: path.dirname(gatePath),
     process: simulatedProcess,
     console: { log: (value) => printed.push(String(value)) },
-    require: (name) => name === "node:child_process" ? { spawnSync: simulatedSpawnSync } : gateRequire(name),
+    require: releaseGateVmRequire(gateRequire, simulatedSpawnSync),
   }, { filename: gatePath });
   const output = printed.join("\n");
+  assert.match(output, /PASS: ciphertext-only release evidence/,
+    "the synthetic upload failure, not a cross-realm crypto fixture, must block the gate");
   assert.match(output, /FAIL: Upload security boundary — exit 1/);
   assert.match(output, /CHILD_DIAG_V1 exit=1 signal=none spawn=none footer=missing progress=none reporter=none/,
     "only allowlisted child status metadata is visible in CI");
@@ -117,9 +150,10 @@ test("release gate emits bounded categorical TAP failure metadata from canonical
     __dirname: path.dirname(gatePath),
     process: simulatedProcess,
     console: { log: (line) => printed.push(String(line)) },
-    require: (name) => name === "node:child_process" ? { spawnSync: simulatedSpawnSync } : gateRequire(name),
+    require: releaseGateVmRequire(gateRequire, simulatedSpawnSync),
   }, { filename: gatePath });
   const output = printed.join("\n");
+  assert.match(output, /PASS: ciphertext-only release evidence/);
   assert.ok(commands.some((line) => /(?:^|\s)(?:npm(?:\.cmd)?\s+)?test -- --test-reporter=tap(?:\s|$)/.test(line)), "canonical npm still runs every test with a deterministic TAP reporter");
   assert.match(output, /FAIL diagnostics \(final-head canonical npm test\):/);
   assert.match(output, /CHILD_DIAG_V1 exit=1 signal=none spawn=none footer=missing progress=327:327 reporter=tap/);
@@ -146,12 +180,13 @@ test("release gate preserves early TAP failure ordinals, not names, after long d
     __dirname: path.dirname(gatePath),
     process: simulatedProcess,
     console: { log: (line) => printed.push(String(line)) },
-    require: (name) => name === "node:child_process" ? { spawnSync: (executable, args) =>
+    require: releaseGateVmRequire(gateRequire, (executable, args) =>
       isCanonicalNpmTestInvocation(executable, args)
         ? { status: 1, stdout: `TAP version 13\n${names.join("\n")}\n${trailing.join("\n")}\n# fail 7\n`, stderr: "" }
-        : { status: 0, stdout: "", stderr: "" } } : gateRequire(name),
+        : { status: 0, stdout: "", stderr: "" }),
   }, { filename: gatePath });
   const output = printed.join("\n");
+  assert.match(output, /PASS: ciphertext-only release evidence/);
   assert.match(output, /FAIL: final-head canonical npm test — exit 1/);
   assert.match(output, /CHILD_DIAG_V1 exit=1 signal=none spawn=none footer=missing progress=1:7 reporter=tap/,
     "bounded first/last TAP ordinals remain visible without test names");
@@ -173,11 +208,12 @@ test("release gate prints metadata-only failure diagnostics for unknown npm outp
     __dirname: path.dirname(gatePath),
     process: { execPath: process.execPath, exitCode: 0 },
     console: { log: (line) => printed.push(String(line)) },
-    require: (name) => name === "node:child_process" ? { spawnSync: (executable, args) => isCanonicalNpmTestInvocation(executable, args)
+    require: releaseGateVmRequire(gateRequire, (executable, args) => isCanonicalNpmTestInvocation(executable, args)
       ? { status: 1, stdout: `unknown-format ${secret}\n`, stderr: "", error: { code: "ENOBUFS" } }
-      : { status: 0, stdout: "", stderr: "" } } : gateRequire(name),
+      : { status: 0, stdout: "", stderr: "" }),
   }, { filename: gatePath });
   const output = printed.join("\n");
+  assert.match(output, /PASS: ciphertext-only release evidence/);
   assert.match(output, /FAIL diagnostics \(final-head canonical npm test\):/);
   assert.match(output, /ENOBUFS/);
   assert.match(output, /stdoutBytes=/);

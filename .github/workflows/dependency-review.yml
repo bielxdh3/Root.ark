@@ -4,45 +4,13 @@ on:
   push:
     branches:
       - Root/main
-      - 'cdx/issue68-owner-recipient-use-w60-20261106'
   pull_request:
     branches:
       - Root/main
       - 'cdx/zk65-split-pr*'
-      - 'cdx/issue68-*'
-      - 'cdx/issue242-p2p-grant-w47-20261106'
-      - 'cdx/issue63-auth-browser-select-w21-20261106'
-      - 'cdx/issue63-local-encrypted-index-w21-20261106'
-      - 'cdx/issue63-local-preview-w48-20261106'
-      - 'cdx/issue63-protected-search-bounded-20261106'
-      - 'cdx/issue63-protected-selected-get-w21-20261106'
-      - 'cdx/issue63-text-batch-prime-20261106'
-      - 'cdx/issue64-offline-w50-20261106'
       - 'cdx/issue66-picker-pin-integration-prime-20261107'
-      - 'cdx/issue66-pinned-move-preobserve-w68-20261106'
-      - 'cdx/issue66-pinned-w20-20261106'
-      - 'cdx/issue67-multi-recovery-w45-v2-20261106'
-      - 'cdx/issue68-owner-recipient-use-w60-20261106'
-      - 'cdx/issue68-portable-cli-w60-20261106'
-      - 'cdx/issue68-recipient-enrollment-worker43-20261106'
-      - 'cdx/issue68-scoped-capabilities-worker22-20261106'
-      - 'cdx/issue68-zk-recipient-w32-20261106'
-      - 'cdx/issue68-zk-share-w32-20261106'
-      - 'cdx/rootark-android-paged-protected-w16-20261106'
-      - 'cdx/rootark-android-strict-json-prime-20261106'
-      - 'cdx/rootark-issue242-app-session-worker33-20261106'
-      - 'cdx/rootark-issue242-large-file-worker33-20261106'
-      - 'cdx/rootark-issue242-poc-20261106'
-      - 'cdx/rootark-issue242-research-20261106'
-      - 'cdx/rootark-issue242-session-w13-20261106'
-      - 'cdx/rootark-issue64-filelist-20261106'
-      - 'cdx/rootark-issue64-protected-fetch-worker28-20261106'
-      - 'cdx/rootark-issue66-ondemand-worker20-20261106'
-      - 'cdx/rootark-issue67-restore-20261106'
-      - 'cdx/rootark-issue67-resume-cli-20261106'
+      - 'cdx/issue63-text-batch-prime-20261106'
       - 'cdx/rootark-roadmap-operational-20261105'
-      - 'feature/issue66-inventory-20261106'
-      - 'issue67-restore-preview-w25-20261106'
 
 permissions:
   contents: read
@@ -69,39 +37,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      - name: Review only this push interval (incremental, not complete PR delta)
+      - name: Review dependencies introduced by this main commit
         uses: actions/dependency-review-action@v5
         with:
           base-ref: ${{ github.event.before }}
           head-ref: ${{ github.sha }}
-          fail-on-severity: high
-
-  # #290 has a diverged parent branch. The green incremental push comparison
-  # cannot establish the COMPLETE PR dependency delta. Check actual PR
-  # metadata, verify the named base's fast-forward and unique merge-base,
-  # then feed full-length SHAs to the same dependency-review action.
-  issue68-full-pr-dependency-review:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/cdx/issue68-owner-recipient-use-w60-20261106'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-
-    steps:
-      - name: Checkout full history for trustworthy PR merge-base
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Resolve verified full issue68 PR 290 dependency range
-        id: range
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: node scripts/issue-68-full-pr-dependency-range.js
-
-      - name: Review complete stacked PR 290 dependency delta
-        uses: actions/dependency-review-action@v5
-        with:
-          base-ref: ${{ steps.range.outputs.base-sha }}
-          head-ref: ${{ steps.range.outputs.head-sha }}
           fail-on-severity: high

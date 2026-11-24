@@ -1681,7 +1681,9 @@ test("separate Node processes cannot oversubscribe the shared system quota", asy
       child.stdout.on("data", (chunk) => { stdout += chunk; });
       child.stderr.on("data", (chunk) => { stderr += chunk; });
       child.once("error", reject);
-      child.once("exit", (code) => code === 0 ? resolve(stdout) : reject(new Error(`Quota child failed (${code}): ${stderr}`)));
+      // exit can fire before stdout has drained on a busy Windows runner.
+      // close confirms the child and its stdio pipes have all finished.
+      child.once("close", (code) => code === 0 ? resolve(stdout) : reject(new Error(`Quota child failed (${code}): ${stderr}`)));
     })));
     assert.deepEqual(results.sort(), ["accepted", "rejected"]);
   } finally {

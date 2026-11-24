@@ -53,6 +53,59 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  p2p-lifecycle-and-stall:
+    name: P2P Node 22 - room lifecycle and 1:N stall
+    if: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'cdx/issue242-p2p-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install disposable WebRTC dependencies
+        run: npm ci --ignore-scripts
+        working-directory: experiments/issue242-webrtc
+      - name: Require valid broker, client and transfer syntax
+        run: |
+          node --check experiments/issue242-webrtc/client.js
+          node --check experiments/issue242-webrtc/server.cjs
+          node --check experiments/issue242-webrtc/transfer-protocol.js
+      - name: Require full 1:N transport, security and lifecycle suite
+        run: npm test
+        working-directory: experiments/issue242-webrtc
+
+  p2p-edge-lifecycle:
+    name: P2P Windows Edge - 1:N and lifecycle
+    if: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'cdx/issue242-p2p-') }}
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Require Microsoft Edge
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe')) {
+            throw 'Microsoft Edge required for P2P browser lifecycle checks'
+          }
+      - name: Install Root.ark dependencies
+        run: npm ci --ignore-scripts
+      - name: Install disposable WebRTC dependencies
+        run: npm ci --ignore-scripts
+        working-directory: experiments/issue242-webrtc
+      - name: Require real standalone Edge DataChannel scenarios
+        run: npm run test:browser
+        working-directory: experiments/issue242-webrtc
+      - name: Require real Root.ark signed-session Edge lifecycle
+        run: node experiments/issue242-webrtc/tests/app-browser.cjs
+
   ubuntu-validation:
     name: Ubuntu Node 22 - full validation
     runs-on: ubuntu-latest

@@ -1,0 +1,97 @@
+name: Issue 242 disposable WebRTC
+
+on:
+  pull_request:
+    paths:
+      - 'experiments/issue242-webrtc/**'
+      - 'server.js'
+      - 'src/routes/auth.js'
+      - 'public/client/rootark-ui.js'
+      - 'test/issue-242-app-session.test.js'
+      - 'test/issue-242-bound-object.test.js'
+      - 'test/support/issue242-app-fixture.js'
+      - '.github/workflows/issue242-webrtc-focused.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  p2p-codeql:
+    name: P2P CodeQL security-extended
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: '/language:javascript-typescript/issue242'
+
+  wire-and-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts
+        working-directory: experiments/issue242-webrtc
+      - run: npm test
+        working-directory: experiments/issue242-webrtc
+
+  edge-datachannel:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Require Microsoft Edge
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe')) {
+            throw 'Microsoft Edge unavailable; browser coverage must not silently skip'
+          }
+      - run: npm ci --ignore-scripts
+        working-directory: experiments/issue242-webrtc
+      - run: npm run test:browser
+        working-directory: experiments/issue242-webrtc
+
+  rootark-app-auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts
+      - run: node --test test/issue-242-app-session.test.js test/issue-242-bound-object.test.js
+
+  rootark-app-edge:
+    runs-on: windows-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Require Microsoft Edge
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe')) {
+            throw 'Microsoft Edge required for real app P2P validation'
+          }
+      - run: npm ci --ignore-scripts
+      - run: node --test --test-concurrency=1 test/issue-242-app-session.test.js test/issue-242-bound-object.test.js
+      - run: node experiments/issue242-webrtc/tests/app-browser.cjs
