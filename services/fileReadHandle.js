@@ -88,7 +88,7 @@ function windowsDirectoryAcl(directoryPath) {
   const script = [
     "$ErrorActionPreference = 'Stop'",
     `$target = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('${encodedPath}'))`,
-    "$acl = Get-Acl -LiteralPath $target",
+    "$acl = [System.IO.Directory]::GetAccessControl($target)",
     "$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$isAdmin = ([System.Security.Principal.WindowsPrincipal]::new([System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)",
     "$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
@@ -106,7 +106,7 @@ function secureNewWindowsSnapshotDirectory(directoryPath) {
   const script = [
     "$ErrorActionPreference = 'Stop'",
     `$target = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('${encodedPath}'))`,
-    "$acl = Get-Acl -LiteralPath $target",
+    "$acl = [System.IO.Directory]::GetAccessControl($target)",
     "$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
     "$acl.SetAccessRuleProtection($true, $false)",
     "foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }",
