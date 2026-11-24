@@ -3,7 +3,8 @@
 // DEV-OFF recipient-side bridge. Requires separately provisioned owner/V2
 // custody and a real owner-approved, recipient-specific HPKE file CEK.
 const crypto = require("node:crypto");
-const { isProxy: nativeIsProxy, isUint8Array: nativeIsUint8Array } = require("node:util").types;
+const { isProxy: nativeIsProxy, isSharedArrayBuffer: nativeIsSharedArrayBuffer,
+  isUint8Array: nativeIsUint8Array } = require("node:util").types;
 const nativeNumberIsFinite = Number.isFinite;
 const nativeNumberIsSafeInteger = Number.isSafeInteger;
 const nativeMathFloor = Math.floor;
@@ -25,6 +26,13 @@ const nativeFreeze = Object.freeze;
 const nativeAssign = Object.assign;
 const nativeOwnKeys = Reflect.ownKeys;
 const nativeArrayIsArray = Array.isArray;
+const NativeUint8Array = Uint8Array;
+const nativeTypedArrayPrototype = nativeGetPrototypeOf(Uint8Array.prototype);
+const nativeTypedLength = nativeGetOwnPropertyDescriptor(nativeTypedArrayPrototype, "length").get;
+const nativeTypedByteLength = nativeGetOwnPropertyDescriptor(nativeTypedArrayPrototype, "byteLength").get;
+const nativeTypedByteOffset = nativeGetOwnPropertyDescriptor(nativeTypedArrayPrototype, "byteOffset").get;
+const nativeTypedBuffer = nativeGetOwnPropertyDescriptor(nativeTypedArrayPrototype, "buffer").get;
+const nativeTypedSet = Uint8Array.prototype.set;
 const nativeBufferFrom = Buffer.from.bind(Buffer);
 const nativeTypedFill = Uint8Array.prototype.fill;
 const nativeBufferConcat = Buffer.concat.bind(Buffer);
@@ -73,6 +81,18 @@ function deny() { throw Error("ZK_SHARE_FILE_OPEN_DENIED"); }
 function denyOffer() { throw Error("ZK_SHARE_OFFER_DENIED"); }
 function isProxy(value) { return value !== null && (typeof value === "object" || typeof value === "function")
   && nativeIsProxy(value); }
+function copyNativeBytes32(value, reject = deny) {
+  if (isProxy(value) || !nativeIsUint8Array(value)) reject();
+  const length = nativeApply(nativeTypedLength, value, []);
+  const byteLength = nativeApply(nativeTypedByteLength, value, []);
+  const offset = nativeApply(nativeTypedByteOffset, value, []);
+  const backing = nativeApply(nativeTypedBuffer, value, []);
+  if (length !== 32 || byteLength !== 32 || !nativeNumberIsSafeInteger(offset)
+    || offset < 0 || nativeIsSharedArrayBuffer(backing)) reject();
+  const privateCopy = new NativeUint8Array(32);
+  nativeApply(nativeTypedSet, privateCopy, [value]);
+  return nativeBufferFrom(nativeApply(nativeTypedBuffer, privateCopy, []), 0, 32);
+}
 function wipeOwnedBytes(value) {
   // Independent owner/recipient authority callbacks are executable. They can
   // replace Buffer.prototype.fill and Uint8Array.prototype.fill after the CEK
@@ -193,11 +213,9 @@ function snapshotAuthority(value) {
   const h = nativeGetOwnPropertyDescriptors(headValue);
   if (!hasOwnDataFields(h, ["revision", "epoch", "digest"])) denyOffer();
   if (!nativeNumberIsSafeInteger(h.revision.value) || h.revision.value < 0
-    || !nativeNumberIsSafeInteger(h.epoch.value) || h.epoch.value < 0
-    || isProxy(h.digest.value) || !(h.digest.value instanceof Uint8Array)
-    || h.digest.value.length !== 32) denyOffer();
+    || !nativeNumberIsSafeInteger(h.epoch.value) || h.epoch.value < 0) denyOffer();
   const head = { revision: h.revision.value, epoch: h.epoch.value,
-    digest: nativeBufferFrom(h.digest.value) };
+    digest: copyNativeBytes32(h.digest.value, denyOffer) };
   const sourceDevices = fields.devices.value;
   if (isProxy(sourceDevices) || !nativeArrayIsArray(sourceDevices) || sourceDevices.length > 128) denyOffer();
   const slots = nativeGetOwnPropertyDescriptors(sourceDevices);
@@ -214,16 +232,13 @@ function snapshotAuthority(value) {
     const d = nativeGetOwnPropertyDescriptors(device);
     if (!hasOwnDataFields(d, ["deviceId", "authorizationPublicKey",
       "enrolledEpoch", "revokedAtEpoch"])
-      || isProxy(d.authorizationPublicKey.value)
-      || !(d.authorizationPublicKey.value instanceof Uint8Array)
-      || d.authorizationPublicKey.value.length !== 32
       || !nativeNumberIsSafeInteger(d.enrolledEpoch.value)
       || d.enrolledEpoch.value < 0
       || !(d.revokedAtEpoch.value === null
         || (nativeNumberIsSafeInteger(d.revokedAtEpoch.value)
           && d.revokedAtEpoch.value >= d.enrolledEpoch.value))) denyOffer();
     devices[index] = { deviceId: d.deviceId.value,
-      authorizationPublicKey: nativeBufferFrom(d.authorizationPublicKey.value),
+      authorizationPublicKey: copyNativeBytes32(d.authorizationPublicKey.value, denyOffer),
       enrolledEpoch: d.enrolledEpoch.value, revokedAtEpoch: d.revokedAtEpoch.value };
   }
   return { scope, head, devices };
