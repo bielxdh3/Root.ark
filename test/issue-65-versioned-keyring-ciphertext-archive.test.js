@@ -8,6 +8,8 @@ const path = require("node:path");
 const vm = require("node:vm");
 const os = require("node:os");
 const { spawn, execFileSync } = require("node:child_process");
+const { readReadyEdgeDevToolsPort, fetchReadyEdgeDevToolsPage } =
+  require("../scripts/edge-devtools-ready");
 const express = require("express");
 const { rateLimit } = require("express-rate-limit");
 const z = require("../src/crypto/rootark-zk-1");
@@ -636,42 +638,13 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     }
     throw Error("EDGE_V2_TIMEOUT_" + label);
   };
-  const wait = async (callback, label) => {
-    for (let i = 0; i < 150; i++) {
-      const result = await callback();
-      if (result) return result;
-      await new Promise((resolve) => setTimeout(resolve, 60));
-    }
-    throw Error("EDGE_V2_TIMEOUT_" + label);
-  };
-  const port = await retryCdp("debug-port", async () => {
-    const activePort = fs.readFileSync(path.join(profile, "DevToolsActivePort"), "utf8")
-      .split(/\r?\n/, 1)[0];
-    const parsed = Number(activePort);
-    return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : null;
-  });
-  const debuggerUrl = await retryCdp("page-target", async (attemptTimeout) => {
-    const response = await fetch("http://127.0.0.1:" + port + "/json/list", {
-      signal: AbortSignal.timeout(attemptTimeout),
-    });
-    if (!response.ok) {
-      await response.body?.cancel();
-      return null;
-    }
-    const pages = await response.json();
-    if (!Array.isArray(pages)) return null;
-    const page = pages.find((item) => item?.type === "page"
-      && typeof item.id === "string" && item.id.length > 0
-      && typeof item.webSocketDebuggerUrl === "string");
-    if (!page) return null;
-    let target;
-    try { target = new URL(page.webSocketDebuggerUrl); } catch (_) { return null; }
-    if (target.protocol !== "ws:"
-      || !["127.0.0.1", "localhost", "[::1]", "::1"].includes(target.hostname.toLowerCase())
-      || Number(target.port) !== port
-      || !target.pathname.startsWith("/devtools/page/")) return null;
-    return target.href;
-  });
+  // Keep the parent's strict/partial-port and loopback target validation,
+  // plus this PR's bounded, retrying CDP connection and cleanup semantics.
+  const port = await retryCdp("debug-port",
+    async () => readReadyEdgeDevToolsPort(profile));
+  const page = await retryCdp("page-target",
+    async () => fetchReadyEdgeDevToolsPage(port));
+  const debuggerUrl = page.webSocketDebuggerUrl;
   socket = await retryCdp("websocket-open", async (attemptTimeout) => {
     const candidate = new WebSocket(debuggerUrl);
     try {

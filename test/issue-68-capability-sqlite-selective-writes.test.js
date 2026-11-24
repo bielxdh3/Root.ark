@@ -37,12 +37,34 @@ test("issue 68: stale legacy snapshots never revoke newer capability or erase ad
 
   repository.savePublicLinks({ [a]: entry() });
   const staleSnapshot = repository.loadPublicLinks();
+  // The public-share alias index is initialized before the first exchange;
+  // admitting a session must update it without a full public_links scan.
+  repository.initializeCapabilitySessionIndex();
   const alias = "1".repeat(32);
   const session = { alias, hash: "f".repeat(64), expiresAt: new Date(Date.now() + 2 * 60_000).toISOString(),
     expectedResourceBinding: binding, expectedFileName: "safe.txt", expectedFolderId: "root" };
   assert.equal(repository.addCapabilitySession(a, session).status, "ok",
     "genuinely committed session exists before stale writer replays its old snapshot");
   assert.ok(repository.loadPublicLinks()[a].capabilitySessions[alias]);
+  const db = require("../db").getDb();
+  const originalPrepare = db.prepare.bind(db);
+  let fullPublicLinkScans = 0;
+  db.prepare = (sql, ...args) => {
+    if (/FROM\s+public_links\s+WHERE\s+revoked_at\s+IS\s+NULL/i.test(String(sql))) fullPublicLinkScans++;
+    return originalPrepare(sql, ...args);
+  };
+  try {
+    for (let index = 0; index < 20; index++) {
+      const indexed = repository.findCapabilitySessionByAlias(alias);
+      assert.equal(indexed?.token, a, "alias lookup must resolve its unique capability token");
+      assert.equal(indexed?.session?.hash, session.hash);
+      assert.equal(repository.getPublicLinkByToken(a)?.shareKind, "capability-v1");
+    }
+  } finally {
+    db.prepare = originalPrepare;
+  }
+  assert.equal(fullPublicLinkScans, 0,
+    "repeated alias and token lookups must use the in-memory alias index and SQLite token primary key");
   repository.savePublicLinks({ ...staleSnapshot, [b]: entry() });
   repository.savePublicLinks(staleSnapshot);
 
@@ -51,18 +73,88 @@ test("issue 68: stale legacy snapshots never revoke newer capability or erase ad
     "legacy whole-map write must not roll back the independently committed session");
   assert.ok(afterLegacyWrite[b],
     "stale whole-map write must not silently revoke newly inserted capability B");
+  assert.equal(repository.findCapabilitySessionByAlias(alias)?.token, a,
+    "bulk reconciliation invalidates and rebuilds the alias index without losing the committed session");
+  assert.equal(repository.addCapabilitySession(b, { ...session, expectedResourceBinding: binding }).status, "collision",
+    "one alias cannot resolve to two capability tokens");
   assert.equal(repository.createCapability(c, entry()).status, "ok");
   assert.ok(repository.loadPublicLinks()[c]);
+  const expiredSessionAlias = "3".repeat(32);
+  assert.equal(repository.addCapabilitySession(b, { ...session, alias: expiredSessionAlias }).status, "ok");
+  const expiredSessionRow = db.prepare("SELECT metadata_json FROM public_links WHERE token = ?").get(b);
+  const expiredSessionMetadata = JSON.parse(expiredSessionRow.metadata_json);
+  expiredSessionMetadata.capabilitySessions[expiredSessionAlias].expiresAt = new Date(Date.now() - 1000).toISOString();
+  db.prepare("UPDATE public_links SET metadata_json = ? WHERE token = ?")
+    .run(JSON.stringify(expiredSessionMetadata), b);
+  assert.equal(repository.findCapabilitySessionByAlias(expiredSessionAlias), null,
+    "an alias indexed before expiry must stop resolving as soon as its durable session expires");
+
+  const expiredLinkAlias = "4".repeat(32);
+  assert.equal(repository.addCapabilitySession(b, { ...session, alias: expiredLinkAlias }).status, "ok");
+  db.prepare("UPDATE public_links SET expires_at = ? WHERE token = ?")
+    .run(new Date(Date.now() - 1000).toISOString(), b);
+  assert.equal(repository.findCapabilitySessionByAlias(expiredLinkAlias), null,
+    "a live session alias must stop resolving when its parent capability expires");
   assert.equal(repository.revokeCapability(a, "outsider").status, "forbidden");
   assert.ok(repository.loadPublicLinks()[a]);
   assert.equal(repository.revokeCapability(a, "tester").status, "ok");
   assert.equal(repository.loadPublicLinks()[a], undefined, "revoke must persist as tombstone");
+  assert.equal(repository.findCapabilitySessionByAlias(alias), null,
+    "revoking the token must remove its aliases from the process-local index");
   assert.ok(repository.loadPublicLinks()[b], "revoking A may not revoke unrelated B");
   assert.ok(repository.loadPublicLinks()[c], "revoking A may not revoke independently created C");
   assert.equal(repository.addCapabilitySession(a, session).status, "missing",
     "revoked capability cannot acquire another session");
   assert.equal(repository.createCapability(a, entry()).status, "collision",
     "revoked token cannot be reissued by stale database insert");
+});
+
+test("issue 68: expired duplicate legacy alias is pruned without hiding its unique live session", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-capability-alias-prune-"));
+  const previous = { DB_ENABLED: process.env.DB_ENABLED, DATABASE_URL: process.env.DATABASE_URL };
+  process.env.DB_ENABLED = "true";
+  process.env.DATABASE_URL = path.join(dir, "aliases.sqlite");
+  const { closeDb, getDb } = require("../db");
+  const { runMigrations } = require("../db/migrations");
+  const repository = require("../repositories/publicLinksRepository");
+  t.after(() => {
+    closeDb();
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  runMigrations({ backup: false });
+  const binding = { version: 2, folderId: "root", fileName: "safe.txt", identity: "e".repeat(64) };
+  const entry = () => ({ fileName: "safe.txt", folderId: "root", shareKind: "capability-v1",
+    resourceBinding: binding, createdBy: "tester", createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    permissions: ["download"], maxViews: 0, maxDownloads: 3, views: 0, downloads: 0,
+    capabilitySessions: {}, activeViewers: {} });
+  const liveToken = `C${"a".repeat(47)}`;
+  const staleToken = `C${"b".repeat(47)}`;
+  assert.equal(repository.createCapability(liveToken, entry()).status, "ok");
+  assert.equal(repository.createCapability(staleToken, entry()).status, "ok");
+  const db = getDb();
+  const alias = "9".repeat(32);
+  for (const [token, hash] of [[liveToken, "a".repeat(64)], [staleToken, "b".repeat(64)]]) {
+    const row = db.prepare("SELECT metadata_json FROM public_links WHERE token = ?").get(token);
+    const metadata = JSON.parse(row.metadata_json);
+    metadata.capabilitySessions[alias] = {
+      hash, expiresAt: new Date(Date.now() + 2 * 60_000).toISOString(),
+    };
+    db.prepare("UPDATE public_links SET metadata_json = ? WHERE token = ?")
+      .run(JSON.stringify(metadata), token);
+  }
+  repository.initializeCapabilitySessionIndex();
+  const staleRow = db.prepare("SELECT metadata_json FROM public_links WHERE token = ?").get(staleToken);
+  const staleMetadata = JSON.parse(staleRow.metadata_json);
+  staleMetadata.capabilitySessions[alias].expiresAt = new Date(Date.now() - 1000).toISOString();
+  db.prepare("UPDATE public_links SET metadata_json = ? WHERE token = ?")
+    .run(JSON.stringify(staleMetadata), staleToken);
+  assert.equal(repository.findCapabilitySessionByAlias(alias)?.token, liveToken,
+    "a stale duplicate candidate must be revalidated and pruned before resolving the sole live session");
 });
 
 test("issue 68 P1: explicit file and folder trash revokes only affected SQLite capabilities", (t) => {
@@ -212,6 +304,40 @@ test("issue 68 Windows Unicode alias cannot select a different physical director
     "real file must survive");
 });
 
+test("issue 68 Windows physical-name scan skips a sibling removed after readdir", (t) => {
+  if (process.platform !== "win32") return t.skip("NTFS-specific name equivalence");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-physical-enoent-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const physicalName = "File.txt";
+  const requestedAlias = "file.txt";
+  const sibling = path.join(dir, "unrelated.txt");
+  fs.writeFileSync(path.join(dir, physicalName), "physical identity survives");
+  fs.writeFileSync(sibling, "removed during directory scan");
+  if (!fs.existsSync(path.join(dir, requestedAlias))) {
+    return t.skip("this NTFS directory is case-sensitive");
+  }
+  const { resolvePhysicalFileName } = require("../services/trashService");
+  const originalLstat = fs.lstatSync;
+  let injected = false;
+  fs.lstatSync = function (target, ...args) {
+    if (!injected && path.resolve(target) === path.resolve(sibling)) {
+      injected = true;
+      fs.unlinkSync(sibling);
+      const error = new Error("simulated concurrent sibling unlink");
+      error.code = "ENOENT";
+      throw error;
+    }
+    return originalLstat.call(this, target, ...args);
+  };
+  try {
+    assert.equal(resolvePhysicalFileName(dir, requestedAlias), physicalName);
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
+  assert.equal(injected, true, "the sibling must disappear during the identity scan");
+  assert.equal(fs.readFileSync(path.join(dir, physicalName), "utf8"), "physical identity survives");
+});
+
 test("issue 68 Windows non-exact hardlink alias is ambiguous and cannot select a victim", (t) => {
   if (process.platform !== "win32") return t.skip("NTFS-specific hardlink names");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-physical-hardlink-"));
@@ -333,4 +459,157 @@ test("issue 68 Windows trash does not rescan the directory per legacy capability
     timeout: 30_000, windowsHide: true, encoding: "utf8",
   });
   assert.match(result, /LINEAR_ALIAS_SCAN_PASS/);
+});
+
+test("issue 68 Windows trash skips a sibling removed during capability identity verification", (t) => {
+  if (process.platform !== "win32") return t.skip("Windows capability alias enumeration");
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-alias-enoent-"));
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
+  const script = `
+    "use strict";
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const root = ${JSON.stringify(path.resolve(__dirname, ".."))};
+    const repository = require(path.join(root, "repositories/publicLinksRepository"));
+    const trash = require(path.join(root, "services/trashService"));
+    require(path.join(root, "db/migrations")).runMigrations({ backup: false });
+    const dir = path.join(process.cwd(), "uploads");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "File.txt"), "known physical bytes");
+    const sibling = path.join(dir, "unrelated.txt");
+    fs.writeFileSync(sibling, "removed during identity verification");
+    if (!fs.existsSync(path.join(dir, "file.txt"))) {
+      console.log("CASE_SENSITIVE_DIRECTORY");
+      process.exit(0);
+    }
+    const folder = { id: "root", name: "Root", uploadDir: dir };
+    const token = "C" + "a".repeat(47);
+    const entry = { folderId: "root", fileName: "file.txt",
+      shareKind: "capability-v1", createdBy: "tester",
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 600000).toISOString(),
+      resourceBinding: { version: 2, folderId: "root",
+        fileName: "file.txt", identity: "e".repeat(64) },
+      permissions: ["download"] };
+    assert.equal(repository.createCapability(token, entry).status, "ok");
+    const empty = () => ({});
+    const loaders = {
+      loadFilePermissions: empty, saveFilePermissions: () => {},
+      loadFileExpirations: empty, saveFileExpirations: () => {},
+      loadFileVersions: empty, saveFileVersions: () => {},
+      loadEncryptedFiles: empty, saveEncryptedFiles: () => {},
+      loadPublicLinks: () => repository.loadPublicLinks(),
+      savePublicLinks: (entries, options) => repository.savePublicLinks(entries, options),
+    };
+    const originalLstat = fs.lstatSync;
+    let injected = false;
+    fs.lstatSync = function (target, ...args) {
+      if (!injected && path.resolve(target) === path.resolve(sibling)) {
+        injected = true;
+        fs.unlinkSync(sibling);
+        const error = new Error("simulated concurrent sibling unlink");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return originalLstat.call(this, target, ...args);
+    };
+    let item;
+    try {
+      item = trash.moveFileToTrash({ folder, fileName: "File.txt",
+        deletedBy: "tester", loaders });
+    } finally { fs.lstatSync = originalLstat; }
+    assert.ok(injected, "the sibling must disappear during capability identity verification");
+    assert.equal(fs.existsSync(path.join(dir, "File.txt")), false);
+    assert.equal(item.status, "trashed");
+    assert.equal(fs.readFileSync(path.join(process.cwd(), "data", "trash", item.trashPath), "utf8"),
+      "known physical bytes");
+    assert.equal(repository.loadPublicLinks()[token], undefined);
+    console.log("TRASH_ALIAS_ENOENT_PASS");
+  `;
+  const result = execFileSync(process.execPath, ["-e", script], {
+    cwd: sandbox,
+    env: { ...process.env, DB_ENABLED: "true",
+      DATABASE_URL: path.join(sandbox, "rootark.sqlite") },
+    timeout: 30_000, windowsHide: true, encoding: "utf8",
+  });
+  if (result.includes("CASE_SENSITIVE_DIRECTORY")) return t.skip("NTFS directory is case-sensitive");
+  assert.match(result, /TRASH_ALIAS_ENOENT_PASS/);
+});
+
+test("issue 68 Windows trash treats a source removed during identity pinning as missing", (t) => {
+  if (process.platform !== "win32") return t.skip("Windows capability alias enumeration");
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-trash-source-enoent-"));
+  t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
+  const script = `
+    "use strict";
+    const assert = require("node:assert/strict");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const root = ${JSON.stringify(path.resolve(__dirname, ".."))};
+    const trash = require(path.join(root, "services/trashService"));
+    const dir = path.join(process.cwd(), "uploads");
+    fs.mkdirSync(dir, { recursive: true });
+    const sourcePath = path.join(dir, "File.txt");
+    fs.writeFileSync(sourcePath, "source bytes");
+    const folder = { id: "root", name: "Root", uploadDir: dir };
+    const empty = () => ({});
+    const loaders = {
+      loadFilePermissions: empty, saveFilePermissions: () => {},
+      loadFileExpirations: empty, saveFileExpirations: () => {},
+      loadFileVersions: empty, saveFileVersions: () => {},
+      loadEncryptedFiles: empty, saveEncryptedFiles: () => {},
+      loadPublicLinks: empty, savePublicLinks: () => {},
+    };
+    const originalLstat = fs.lstatSync;
+    let injected = false;
+    fs.lstatSync = function (target, ...args) {
+      if (!injected && path.resolve(target) === path.resolve(sourcePath)) {
+        injected = true;
+        fs.unlinkSync(sourcePath);
+        const error = new Error("simulated concurrent source unlink");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return originalLstat.call(this, target, ...args);
+    };
+    let failure;
+    try {
+      try { trash.moveFileToTrash({ folder, fileName: "File.txt", deletedBy: "tester", loaders }); }
+      catch (error) { failure = error; }
+    } finally { fs.lstatSync = originalLstat; }
+    assert.equal(injected, true, "the source must disappear at the identity-pin boundary");
+    assert.equal(failure?.code, "TRASH_SOURCE_MISSING");
+    assert.equal(fs.existsSync(sourcePath), false);
+    assert.equal(fs.existsSync(path.join(process.cwd(), "data", "trash", "files")), false,
+      "a missing source must not create a trash item directory");
+    fs.writeFileSync(sourcePath, "source removed at rename");
+    const originalRename = fs.renameSync;
+    let renameInjected = false;
+    fs.renameSync = function (from, to) {
+      if (!renameInjected && path.resolve(from) === path.resolve(sourcePath)) {
+        renameInjected = true;
+        fs.unlinkSync(sourcePath);
+        const missing = new Error("source vanished before rename");
+        missing.code = "ENOENT";
+        throw missing;
+      }
+      return originalRename.call(this, from, to);
+    };
+    let renameFailure;
+    try {
+      try { trash.moveFileToTrash({ folder, fileName: "File.txt", deletedBy: "tester", loaders }); }
+      catch (error) { renameFailure = error; }
+    } finally { fs.renameSync = originalRename; }
+    assert.equal(renameInjected, true, "the late source race must reach the rename boundary");
+    assert.equal(renameFailure?.code, "TRASH_SOURCE_MISSING");
+    assert.equal(fs.existsSync(sourcePath), false);
+    console.log("TRASH_SOURCE_ENOENT_PASS");
+  `;
+  const result = execFileSync(process.execPath, ["-e", script], {
+    cwd: sandbox,
+    env: { ...process.env, DB_ENABLED: "false" },
+    timeout: 30_000, windowsHide: true, encoding: "utf8",
+  });
+  assert.match(result, /TRASH_SOURCE_ENOENT_PASS/);
 });

@@ -241,6 +241,20 @@
       if (!authorityDescriptor || !Object.hasOwn(authorityDescriptor, "value")
         || typeof authorityDescriptor.value !== "function") deny();
       const readIndependentAuthority = authorityDescriptor.value.bind(input);
+      // The independent trust source may be an offline hardware/witness
+      // provider. A stalled provider must not keep a redemption open forever,
+      // either before verification or after ciphertext has been fetched.
+      const readAuthorityWithinDeadline = async () => {
+        let timeout;
+        try {
+          return await Promise.race([
+            Promise.resolve().then(() => readIndependentAuthority()),
+            new Promise((_, reject) => {
+              timeout = setTimeout(() => reject(new Error("ZK_SHARE_AUTHORITY_TIMEOUT")), 15000);
+            }),
+          ]);
+        } finally { clearTimeout(timeout); }
+      };
       if (!crypto?.subtle || !protectedHttp?.signProtectedContentOperation
         || typeof input.recipientUsername !== "string"
         || !/^[A-Za-z0-9_.@-]{1,128}$/.test(input.recipientUsername)
@@ -269,7 +283,7 @@
         if (value >= statement.expires_at) deny();
         return value;
       };
-      const first = trustedSnapshot(await readIndependentAuthority(),
+      const first = trustedSnapshot(await readAuthorityWithinDeadline(),
         statement, recipientDeviceId);
       const issuer = await crypto.subtle.importKey("raw", first.issuerKey,
         "Ed25519", false, ["verify"]);
@@ -323,7 +337,7 @@
         ciphertext = from64(response.ciphertextBase64, 16, MAX_CIPHERTEXT);
         const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", ciphertext));
         if (!equals(digest, statement.ciphertext_digest)) deny();
-        const final = trustedSnapshot(await readIndependentAuthority(),
+        const final = trustedSnapshot(await readAuthorityWithinDeadline(),
           statement, recipientDeviceId);
         if (!equals(final.issuerKey, first.issuerKey)
           || !equals(final.recipientKey, first.recipientKey)) deny();

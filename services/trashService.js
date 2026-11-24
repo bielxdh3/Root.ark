@@ -343,6 +343,14 @@ function safeName(name) {
   return path.basename(String(name || ""));
 }
 
+function lstatIfPresentSync(target, options) {
+  try { return fs.lstatSync(target, options); }
+  catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 // Resolve Windows aliases by the actual filesystem entry, not JS Unicode case
 // folding: an NTFS directory may be case-sensitive or have distinct hardlinks.
 function resolvePhysicalFileName(directory, name) {
@@ -363,8 +371,8 @@ function resolvePhysicalFileName(directory, name) {
   }
   if (identity.ino === 0n) throw new Error("Identidade fisica indisponivel");
   const matches = names.filter((entry) => {
-    const actual = fs.lstatSync(path.join(directory, entry), { bigint: true });
-    return actual.dev === identity.dev && actual.ino === identity.ino;
+    const actual = lstatIfPresentSync(path.join(directory, entry), { bigint: true });
+    return actual !== null && actual.dev === identity.dev && actual.ino === identity.ino;
   });
   if (matches.length !== 1) throw new Error("Nome fisico ambiguo para exclusao");
   return matches[0];
@@ -503,12 +511,22 @@ function moveFileToTrash({ folder, fileName, deletedBy, loaders, expectedCanonic
     throw new Error("Arquivo mudou de identidade antes da exclusao");
   }
   const sourcePath = ensureInside(folder.uploadDir, path.join(folder.uploadDir, cleanName));
-  if (!fs.existsSync(sourcePath)) throw new Error("Arquivo nao encontrado");
+  const missingSource = () => {
+    const error = new Error("Arquivo nao encontrado");
+    error.code = "TRASH_SOURCE_MISSING";
+    return error;
+  };
+  if (!fs.existsSync(sourcePath)) throw missingSource();
   const id = crypto.randomUUID();
   const trashRelative = path.posix.join("files", id, cleanName);
   const trashPath = path.join(TRASH_STORAGE_DIR, "files", id, cleanName);
   const metadata = buildFileMetadata({ folder, fileName: cleanName, loaders });
-  const size = fs.statSync(sourcePath).size;
+  let size;
+  try { size = fs.statSync(sourcePath).size; }
+  catch (error) {
+    if (error.code === "ENOENT") throw missingSource();
+    throw error;
+  }
   // The old database may contain valid grants under a filename alias. Prove
   // each alias resolves to THIS live NTFS entry before moving the source; after
   // rename there is no pathname evidence left to classify Unicode spellings.
@@ -518,7 +536,8 @@ function moveFileToTrash({ folder, fileName, deletedBy, loaders, expectedCanonic
     // pathname using OS file identity, not a per-grant full directory scan.
     const physicalNames = fs.readdirSync(folder.uploadDir);
     const exactNames = new Set(physicalNames);
-    const sourceIdentity = fs.lstatSync(sourcePath, { bigint: true });
+    const sourceIdentity = lstatIfPresentSync(sourcePath, { bigint: true });
+    if (!sourceIdentity) throw missingSource();
     if (sourceIdentity.ino === 0n) throw new Error("Identidade fisica indisponivel");
     const aliases = new Set();
     for (const link of Object.values(loaders.loadPublicLinks())) {
@@ -540,8 +559,8 @@ function moveFileToTrash({ folder, fileName, deletedBy, loaders, expectedCanonic
       // Multiple real directory entries may be hardlinks to the same inode.
       // A non-exact alias cannot safely select one of them for revocation.
       const identityEntries = physicalNames.filter((name) => {
-        const entry = fs.lstatSync(path.join(folder.uploadDir, name), { bigint: true });
-        return entry.dev === sourceIdentity.dev && entry.ino === sourceIdentity.ino;
+        const entry = lstatIfPresentSync(path.join(folder.uploadDir, name), { bigint: true });
+        return entry !== null && entry.dev === sourceIdentity.dev && entry.ino === sourceIdentity.ino;
       });
       if (identityEntries.length !== 1 || identityEntries[0] !== cleanName) {
         throw new Error("Nome fisico ambiguo para exclusao");
@@ -550,7 +569,14 @@ function moveFileToTrash({ folder, fileName, deletedBy, loaders, expectedCanonic
     }
   }
 
-  movePath(sourcePath, trashPath);
+  try { movePath(sourcePath, trashPath); }
+  catch (error) {
+    // The source may disappear after identity pinning but before the atomic
+    // rename. Do not turn this normal concurrent delete into HTTP 500, and
+    // never mutate metadata or create a trash item without a successful move.
+    if (error.code === "ENOENT") throw missingSource();
+    throw error;
+  }
   removeFileMetadata({ folder, fileName: cleanName, loaders }, capabilityAliases);
 
   return trashRepository.saveTrashItem({

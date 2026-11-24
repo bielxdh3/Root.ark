@@ -3,6 +3,7 @@
 
   const NAV_ITEMS = [
     { key: "files", label: "Arquivos", href: "/index.html", permission: "listFiles", section: "workspace" },
+    { key: "p2p", label: "Transferência experimental", href: "/p2p/", permission: "listFiles", section: "workspace" },
     { key: "history", label: "Histórico", href: "/index.html#/history", permission: "listFiles", section: "workspace" },
     { key: "trash", label: "Lixeira", href: "/index.html#/trash", permission: "listFiles", section: "workspace" },
     { key: "analytics", label: "Visão geral", href: "/dashboard.html", permission: "viewAnalytics", section: "insights" },
@@ -92,6 +93,7 @@
   }
 
   function canSee(item, user) {
+    if (item.key === "p2p") return Boolean(user.experimentalP2pEnabled && user.permissions?.listFiles);
     if (item.key === "files" || item.key === "history" || item.key === "trash") return Boolean(user.permissions && user.permissions[item.permission]);
     if (user.role === "admin" || user.role === "superadmin") return true;
     if (item.key === "admin") return Boolean(user.permissions && user.permissions.manageUsers);

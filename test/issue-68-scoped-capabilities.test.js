@@ -48,6 +48,8 @@ function request(port, requestPath, { method = "GET", headers = {}, body = "", s
 async function startFixture(t, mode, extraEnv = {}, options = {}) {
   const sandbox = createPrivateAuthorityFixture(`rootark-share-permissions-${mode}-`);
   const dataDir = path.join(sandbox, "data");
+  const snapshotDirectory = extraEnv.ROOTARK_PRIVATE_SHARE_SNAPSHOT_DIRECTORY
+    || path.join(sandbox, "share-snapshots");
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(path.join(sandbox, "uploads"), { recursive: true });
   fs.cpSync(path.join(ROOT, "public"), path.join(sandbox, "public"), { recursive: true });
@@ -55,12 +57,17 @@ async function startFixture(t, mode, extraEnv = {}, options = {}) {
   fs.writeFileSync(path.join(sandbox, "uploads", PNG_NAME), Buffer.from(PNG_BASE64, "base64"));
 
   const password = crypto.randomBytes(24).toString("base64url");
-  fs.writeFileSync(path.join(dataDir, "users.local.json"), JSON.stringify([
-    { username: "tester", password: bcrypt.hashSync(password, 4),
+  const passwordRounds = options.nodeEnv === "production" ? 10 : 4;
+  const fixtureUsers = [
+    { username: "tester", password: bcrypt.hashSync(password, passwordRounds),
       role: options.caseDistinctAccounts ? "user" : "admin",
       permissions: { listFiles: true }, sessionVersion: 0 },
-    { username: "other", password: bcrypt.hashSync(password, 4), role: "admin", permissions: { listFiles: true }, sessionVersion: 0 },
-  ]));
+    { username: "other", password: bcrypt.hashSync(password, passwordRounds), role: "admin", permissions: { listFiles: true }, sessionVersion: 0 },
+  ];
+  fs.writeFileSync(path.join(dataDir, "users.local.json"), JSON.stringify(fixtureUsers));
+  if (options.nodeEnv === "production") {
+    fs.writeFileSync(path.join(dataDir, "users.json"), JSON.stringify(fixtureUsers));
+  }
   fs.writeFileSync(path.join(dataDir, "folders.json"), JSON.stringify([
     { id: "root", name: "Root", createdBy: "tester", allowedUsers: [], isRoot: true },
   ]));
@@ -99,22 +106,28 @@ async function startFixture(t, mode, extraEnv = {}, options = {}) {
   const pauseMarker = path.join(sandbox, "share-exchange-read-complete.marker");
   const pauseRelease = path.join(sandbox, "share-exchange-read-release.marker");
   const env = { ...process.env, ...dbEnv, ...extraEnv,
-    ...(extraEnv.ROOTARK_TEST_SHARE_PAUSE_POINT === "exchange-commit"
+    ROOTARK_PRIVATE_SHARE_SNAPSHOT_DIRECTORY: snapshotDirectory,
+    ...(["exchange-commit", "reserve"].includes(extraEnv.ROOTARK_TEST_SHARE_PAUSE_POINT)
       ? { ROOTARK_TEST_SHARE_PAUSE_MARKER: pauseMarker,
         ROOTARK_TEST_SHARE_PAUSE_RELEASE: pauseRelease } : {}),
-    NODE_ENV: "test", UPLOAD_SCAN_ENABLED: "true", UPLOAD_SCAN_PROVIDER: "disabled",
+    NODE_ENV: options.nodeEnv || "test", UPLOAD_SCAN_ENABLED: "true",
+    UPLOAD_SCAN_PROVIDER: options.nodeEnv === "production" ? "clamav" : "disabled",
     CLOUD_STORAGE_PROVIDER: "local", ROOTARK_DEV_BOOTSTRAP_DEFAULTS: "true", JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
+  if (options.nodeEnv === "production") env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED = "true";
   for (const key of Object.keys(env)) if (/^(AWS_|GOOGLE_DRIVE_)/.test(key)) delete env[key];
   delete env.TRUSTED_PROXIES;
+  if (typeof options.trustedProxies === "string") env.TRUSTED_PROXIES = options.trustedProxies;
   const port = await getUnusedPort();
   const swapAfterOpen = extraEnv.ROOTARK_TEST_SHARE_SWAP_AFTER_OPEN === "1";
+  const mutateAfterBeforeSend = extraEnv.ROOTARK_TEST_SHARE_MUTATE_AFTER_BEFORE_SEND === "1";
   const swapFile = path.join(sandbox, "uploads", FILE_NAME);
   const foreignFdPath = `${swapFile}.foreign-descriptor`;
   if (swapAfterOpen && extraEnv.ROOTARK_TEST_SHARE_FOREIGN_FD_ONLY === "1") {
     fs.writeFileSync(foreignFdPath, "FOREIGN_DESCRIPTOR_BYTES_NOT_AUTHORIZED\n");
   }
   const child = spawn(process.execPath, [
-    ...(swapAfterOpen ? ["--require", path.join(ROOT, "test", "support", "issue-68-share-after-open-swap.js")] : []),
+    ...(swapAfterOpen || mutateAfterBeforeSend
+      ? ["--require", path.join(ROOT, "test", "support", "issue-68-share-after-open-swap.js")] : []),
     SERVER,
   ], {
     cwd: sandbox,
@@ -127,10 +140,19 @@ async function startFixture(t, mode, extraEnv = {}, options = {}) {
         ROOTARK_TEST_SHARE_SWAP_MARKER: path.join(sandbox, "swap-after-open.marker"),
         ROOTARK_TEST_SHARE_FOREIGN_FD_PATH: foreignFdPath,
       } : {}),
+      ...(mutateAfterBeforeSend ? {
+        ROOTARK_TEST_SHARE_MUTATE_FILE: swapFile,
+        ROOTARK_TEST_SHARE_MUTATE_MARKER: path.join(sandbox, "mutated-after-before-send.marker"),
+      } : {}),
     },
-    stdio: "ignore",
+    stdio: options.captureOutput ? ["ignore", "pipe", "pipe"] : "ignore",
     windowsHide: true,
   });
+  let childOutput = "";
+  if (options.captureOutput) {
+    child.stdout.on("data", (chunk) => { childOutput += chunk.toString(); });
+    child.stderr.on("data", (chunk) => { childOutput += chunk.toString(); });
+  }
 
   t.after(async () => {
     if (child.exitCode === null && child.signalCode === null) {
@@ -145,7 +167,7 @@ async function startFixture(t, mode, extraEnv = {}, options = {}) {
   let ready = null;
   let lastProbeErrorCode = null;
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) throw new Error(`disposable server exited (${child.exitCode})`);
+    if (child.exitCode !== null) throw new Error(`disposable server exited (${child.exitCode}): ${childOutput.slice(-4000)}`);
     try {
       // Bound each localhost probe too: an accepted but stalled HTTP socket
       // must not hold readiness past its finite startup budget.
@@ -164,11 +186,13 @@ async function startFixture(t, mode, extraEnv = {}, options = {}) {
   // SQLite mode stores users in the database, so it uses the non-production bootstrap admin (NODE_ENV=test).
   const credentials = mode === "sqlite" ? { username: "admin", password: "admin123" } : { username: "tester", password };
   const body = JSON.stringify(credentials);
-  const login = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
-  assert.equal(login.status, 200, login.body);
-  const cookies = login.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+  const login = options.skipLogin
+    ? { status: 200, headers: { "set-cookie": [] }, body: "" }
+    : await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
+  if (!options.skipLogin) assert.equal(login.status, 200, login.body);
+  const cookies = (login.headers["set-cookie"] || []).map((value) => value.split(";", 1)[0]);
   const cookie = cookies.join("; ");
-  const csrf = cookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+  const csrf = cookies.find((value) => value.startsWith("rootark_csrf="))?.split("=", 2)[1] || "";
   const origin = `http://127.0.0.1:${port}`;
 
   const authed = (url, value, method = "POST") => {
@@ -221,7 +245,18 @@ async function startFixture(t, mode, extraEnv = {}, options = {}) {
     });
   };
 
-  return { port, origin, authed, publicPost, exchangeCapability, legacyToken, dataDir, password, pauseMarker, pauseRelease };
+  return { port, origin, authed, publicPost, exchangeCapability, legacyToken, dataDir, snapshotDirectory,
+    password, pauseMarker, pauseRelease,
+    getChildOutput: () => childOutput };
+}
+
+async function waitForPauseMarker(markerPath) {
+  const deadline = Date.now() + 12_000;
+  while (!fs.existsSync(markerPath) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(fs.existsSync(markerPath), true,
+    "the disposable server must reach its actual pause before the attack is released");
 }
 
 test("P2 SQLite WebDAV Basic: case-distinct users authenticate against their exact stored account", {
@@ -684,7 +719,7 @@ for (const mode of ["json", "sqlite"]) {
 
 for (const mode of ["json", "sqlite"]) {
   test(`download checks the actual opened descriptor before stream (${mode})`, { timeout: 60_000 }, async (t) => {
-    const { authed, publicPost, dataDir } = await startFixture(t, mode, {
+    const { authed, publicPost, dataDir, pauseMarker, pauseRelease } = await startFixture(t, mode, {
       ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve",
       ROOTARK_TEST_SHARE_PAUSE_MS: "1800",
       ROOTARK_TEST_SHARE_SWAP_AFTER_OPEN: "1",
@@ -700,7 +735,7 @@ for (const mode of ["json", "sqlite"]) {
     assert.equal(viewer.status, 200, viewer.body);
 
     const pending = publicPost(token, "download", viewerCookieFrom(viewer));
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await waitForPauseMarker(pauseMarker);
 
     const originalPath = path.join(path.dirname(dataDir), "uploads", FILE_NAME);
     const grantedPath = `${originalPath}.granted`;
@@ -708,6 +743,7 @@ for (const mode of ["json", "sqlite"]) {
     fs.writeFileSync(originalPath, "FORBIDDEN_AFTER_OPEN_BYTES\n");
     const marker = path.join(path.dirname(dataDir), "swap-after-open.marker");
     fs.writeFileSync(marker, "swap once after verified open");
+    fs.writeFileSync(pauseRelease, "resume after substitution");
 
     const response = await pending;
     assert.equal(fs.existsSync(marker), false, "hook must have restored the pathname after fd open");
@@ -741,7 +777,7 @@ for (const mode of ["json", "sqlite"]) {
 for (const mode of ["json", "sqlite"]) {
   test(`download rejects foreign descriptor even when original pathname identity is unchanged (${mode})`,
     { timeout: 60_000 }, async (t) => {
-      const { authed, publicPost, dataDir } = await startFixture(t, mode, {
+      const { authed, publicPost, dataDir, pauseMarker, pauseRelease } = await startFixture(t, mode, {
         ROOTARK_TEST_SHARE_PAUSE_POINT: "reserve",
         ROOTARK_TEST_SHARE_PAUSE_MS: "1800",
         ROOTARK_TEST_SHARE_SWAP_AFTER_OPEN: "1",
@@ -759,9 +795,10 @@ for (const mode of ["json", "sqlite"]) {
       const originalPath = path.join(path.dirname(dataDir), "uploads", FILE_NAME);
       const before = fs.statSync(originalPath);
       const pending = publicPost(token, "download", viewerCookieFrom(viewer));
-      await new Promise((resolve) => setTimeout(resolve, 400));
+      await waitForPauseMarker(pauseMarker);
       const marker = path.join(path.dirname(dataDir), "swap-after-open.marker");
       fs.writeFileSync(marker, "substitute only the opened file descriptor");
+      fs.writeFileSync(pauseRelease, "resume after substitution");
       const refused = await pending;
       assert.equal(fs.existsSync(marker), false,
         "test must reach the actual already-verified-open handle substitution");
@@ -1238,4 +1275,142 @@ test("issue 68 P2 Windows: mixed-case deletion revokes the physical file capabil
     "SQLite must also revoke the case-alias bearer for that same Windows inode");
   assert.equal((await exchange()).status, 404,
     "post-trash exchange cannot reactivate the revoked original-cased capability");
+});
+
+test("issue 68 P2: a trusted loopback reverse proxy cannot claim the direct-loopback capability fallback", {
+  timeout: 60_000,
+}, async (t) => {
+  const { port } = await startFixture(t, "sqlite", {}, { trustedProxies: "127.0.0.1" });
+  const response = await request(port, "/share/c", { headers: {
+    host: `public.example:${port}`,
+    "x-forwarded-host": `localhost:${port}`,
+    "x-forwarded-proto": "http",
+    "x-forwarded-arbitrary": "spoofed",
+  } });
+  assert.equal(response.status, 403,
+    "an external request forwarded by a trusted loopback proxy must not inherit the local-development exception");
+});
+
+test("issue 68 P2: an untrusted loopback reverse proxy cannot claim the direct-loopback capability fallback", {
+  timeout: 60_000,
+}, async (t) => {
+  const { port } = await startFixture(t, "sqlite", {}, { trustedProxies: "10.0.0.0/8" });
+  const response = await request(port, "/share/c", { headers: {
+    host: `localhost:${port}`,
+    "x-forwarded-host": `localhost:${port}`,
+    "x-forwarded-proto": "http",
+    forwarded: "for=127.0.0.1;host=localhost;proto=http",
+    "x-real-ip": "127.0.0.1",
+  } });
+  assert.equal(response.status, 403,
+    "forwarding headers must not turn an untrusted loopback proxy into a direct local request");
+});
+
+test("issue 68 P2: production without the canonical HTTPS origin never gets the loopback fallback", {
+  timeout: 60_000,
+}, async (t) => {
+  const { port } = await startFixture(t, "sqlite", {}, { nodeEnv: "production", captureOutput: true, skipLogin: true });
+  const response = await request(port, "/share/c", { headers: { host: `localhost:${port}` } });
+  assert.equal(response.status, 403,
+    "production capability routes must fail closed without ROOTARK_CAPABILITY_PUBLIC_ORIGIN even on loopback");
+});
+
+test("issue 68 P2: in-place mutation after final beforeSend cannot alter capability egress bytes", {
+  timeout: 60_000,
+}, async (t) => {
+  const { authed, publicPost, dataDir, getChildOutput } = await startFixture(t, "sqlite", {
+    ROOTARK_TEST_SHARE_MUTATE_AFTER_BEFORE_SEND: "1",
+  }, { captureOutput: true });
+  const created = await authed("/share/capabilities", {
+    name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+    permissions: ["download"], maxDownloads: 2,
+  });
+  assert.equal(created.status, 201, created.body);
+  const { token } = JSON.parse(created.body);
+  const viewer = await publicPost(token, "view");
+  assert.equal(viewer.status, 200, viewer.body);
+
+  let downloaded;
+  try { downloaded = await publicPost(token, "download", viewerCookieFrom(viewer)); }
+  catch (error) { throw new Error(`${error.message}\n${getChildOutput().slice(-6000)}`); }
+  assert.equal(fs.existsSync(path.join(path.dirname(dataDir), "mutated-after-before-send.marker")), true,
+    "the attack must mutate the original inode after beforeSend and immediately before stream creation");
+  assert.equal(downloaded.status, 200, downloaded.body);
+  assert.equal(downloaded.body, FILE_CONTENT,
+    "the response must stream the bytes snapshotted before the final authorization callback");
+  const filePath = path.join(path.dirname(dataDir), "uploads", FILE_NAME);
+  assert.equal(fs.readFileSync(filePath, "utf8"), "F".repeat(FILE_CONTENT.length),
+    "the same physical file was mutated in place after authorization");
+  const retry = await publicPost(token, "download", viewerCookieFrom(viewer));
+  assert.equal(retry.status, 404,
+    "the in-place mutation must still invalidate subsequent use of the original capability generation");
+});
+
+test("issue 68 P2: invalid Range is rejected before creating a private capability snapshot", {
+  timeout: 60_000,
+}, async (t) => {
+  const { port, origin, authed, exchangeCapability, dataDir } = await startFixture(t, "sqlite", {
+    ROOTARK_TEST_SHARE_MUTATE_AFTER_BEFORE_SEND: "1",
+  });
+  const created = await authed("/share/capabilities", {
+    name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+    permissions: ["download"], maxDownloads: 2,
+  });
+  assert.equal(created.status, 201, created.body);
+  const { token } = JSON.parse(created.body);
+  const capability = await exchangeCapability(token);
+  const viewer = await request(port, `/share/${capability.handle}/view`, {
+    method: "POST", headers: { origin, cookie: capability.cookie },
+  });
+  assert.equal(viewer.status, 200, viewer.body);
+  const response = await request(port, `/share/${capability.handle}/download`, {
+    method: "POST",
+    headers: { origin, cookie: capability.cookie, range: "bytes=999999-" },
+  });
+  assert.equal(response.status, 416);
+  assert.equal(fs.existsSync(path.join(path.dirname(dataDir), "mutated-after-before-send.marker")), false,
+    "invalid ranges must be rejected before snapshot creation and before the mutation hook");
+});
+
+test("issue 68 P2: aborted capability egress destroys its stream and removes the private snapshot", {
+  timeout: 60_000,
+}, async (t) => {
+  const { port, origin, authed, exchangeCapability, dataDir, snapshotDirectory } = await startFixture(t, "sqlite");
+  const largeContent = Buffer.alloc(32 * 1024 * 1024, 0x61);
+  fs.writeFileSync(path.join(path.dirname(dataDir), "uploads", FILE_NAME), largeContent);
+  const created = await authed("/share/capabilities", {
+    name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+    permissions: ["download"], maxDownloads: 2,
+  });
+  assert.equal(created.status, 201, created.body);
+  const { token } = JSON.parse(created.body);
+  const capability = await exchangeCapability(token);
+  const viewer = await request(port, `/share/${capability.handle}/view`, {
+    method: "POST", headers: { origin, cookie: capability.cookie },
+  });
+  assert.equal(viewer.status, 200, viewer.body);
+
+  const prefix = "rootark-share-egress-";
+  const before = fs.existsSync(snapshotDirectory)
+    ? fs.readdirSync(snapshotDirectory).filter((name) => name.startsWith(prefix)).length : 0;
+  await new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, path: `/share/${capability.handle}/download`,
+      method: "POST", headers: { origin, cookie: capability.cookie } }, (res) => {
+      res.once("data", () => {
+        req.destroy();
+        resolve();
+      });
+      res.once("error", (error) => error.code === "ECONNRESET" ? resolve() : reject(error));
+    });
+    req.once("error", (error) => error.code === "ECONNRESET" ? resolve() : reject(error));
+    req.end();
+  });
+  const deadline = Date.now() + 5_000;
+  let remaining = before + 1;
+  while (Date.now() < deadline && remaining > before) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    remaining = fs.existsSync(snapshotDirectory)
+      ? fs.readdirSync(snapshotDirectory).filter((name) => name.startsWith(prefix)).length : 0;
+  }
+  assert.equal(remaining, before, "the response close path must remove the temporary snapshot after client abort");
 });
