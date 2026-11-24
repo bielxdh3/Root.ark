@@ -318,6 +318,15 @@ function createChildProcessProgress() {
   };
 }
 
+// Only the canonical test reporter's stdout may establish TAP success.
+// Diagnostic stderr is untrusted: accepting synthetic `1..N` and `# fail 0`
+// there would let a child that produced no TAP stdout pass the release gate.
+function createCanonicalTapLineAcceptor(tracker, fromStderr) {
+  return (line) => {
+    if (!fromStderr) tracker.accept(line);
+  };
+}
+
 function run() {
   // The split branch does not export #228's canonicalTestArgs helper.
   // Preserve its exact Windows invocation without changing the release gate:
@@ -350,13 +359,14 @@ function run() {
   function consume(stream, streamName) {
     const decoder = new StringDecoder("utf8");
     let pending = "";
+    const acceptLine = createCanonicalTapLineAcceptor(tracker, streamName === "stderr");
     stream.on("data", (chunk) => {
       lastOutput = Date.now();
       childProgress.bytes(streamName, chunk.length);
       pending += decoder.write(chunk);
       let newline;
       while ((newline = pending.indexOf("\n")) >= 0) {
-        tracker.accept(pending.slice(0, newline).replace(/\r$/, ""));
+        acceptLine(pending.slice(0, newline).replace(/\r$/, ""));
         pending = pending.slice(newline + 1);
       }
       // Untrusted test output is never forwarded verbatim or retained without a bound.
@@ -365,7 +375,7 @@ function run() {
     stream.on("end", () => {
       childProgress.ended(streamName);
       pending += decoder.end();
-      if (pending) tracker.accept(pending);
+      if (pending) acceptLine(pending);
     });
     stream.on("error", (error) => childProgress.errored(streamName, error));
     stream.on("close", (hadError) => childProgress.closed(streamName, hadError));
@@ -436,4 +446,5 @@ function run() {
 
 if (require.main === module) run();
 
-module.exports = { createTapProgressRecorder, createChildProcessProgress, canonicalWindowsTestEnvironment };
+module.exports = { createTapProgressRecorder, createCanonicalTapLineAcceptor,
+  createChildProcessProgress, canonicalWindowsTestEnvironment };
