@@ -246,6 +246,7 @@ async function startFixture(t, mode, extraEnv = {}, options = {}) {
   };
 
   return { port, origin, authed, publicPost, exchangeCapability, legacyToken, dataDir, snapshotDirectory,
+    getChildOutput: () => childOutput,
     password, pauseMarker, pauseRelease,
     getChildOutput: () => childOutput };
 }
@@ -1413,4 +1414,54 @@ test("issue 68 P2: aborted capability egress destroys its stream and removes the
       ? fs.readdirSync(snapshotDirectory).filter((name) => name.startsWith(prefix)).length : 0;
   }
   assert.equal(remaining, before, "the response close path must remove the temporary snapshot after client abort");
+});
+
+test("issue 68 P2: capability creation rejects files exceeding PRIVATE_SHARE_SNAPSHOT_MAX_BYTES before issuing links", {
+  timeout: 60_000,
+}, async (t) => {
+  const { authed, dataDir } = await startFixture(t, "sqlite", {
+    PRIVATE_SHARE_SNAPSHOT_MAX_BYTES: String(1024 * 1024),
+  });
+  fs.writeFileSync(path.join(path.dirname(dataDir), "uploads", FILE_NAME), Buffer.alloc(2 * 1024 * 1024, 0x61));
+  const created = await authed("/share/capabilities", {
+    name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+    permissions: ["download"], maxDownloads: 2,
+  });
+  assert.equal(created.status, 413, `expected 413 for oversized capability, got ${created.status}: ${created.body}`);
+});
+
+test("issue 68 P1: snapshot preparation errors never log absolute private snapshot paths", {
+  timeout: 60_000,
+}, async (t) => {
+  const { port, origin, authed, exchangeCapability, snapshotDirectory, getChildOutput } = await startFixture(
+    t,
+    "sqlite",
+    {},
+    { captureOutput: true },
+  );
+  const created = await authed("/share/capabilities", {
+    name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+    permissions: ["download"], maxDownloads: 2,
+  });
+  assert.equal(created.status, 201, created.body);
+  const { token } = JSON.parse(created.body);
+  const capability = await exchangeCapability(token);
+  const viewer = await request(port, `/share/${capability.handle}/view`, {
+    method: "POST", headers: { origin, cookie: capability.cookie },
+  });
+  assert.equal(viewer.status, 200, viewer.body);
+
+  // Replace the private snapshot directory with a regular file after startup so
+  // snapshot preparation fails outside the ENOENT/ENOTDIR/ELOOP allowlist.
+  fs.rmSync(snapshotDirectory, { recursive: true, force: true });
+  fs.writeFileSync(snapshotDirectory, "not-a-directory");
+  const download = await request(port, `/share/${capability.handle}/download`, {
+    method: "POST", headers: { origin, cookie: capability.cookie },
+  });
+  assert.equal(download.status, 500);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const logs = getChildOutput();
+  assert.equal(logs.includes(snapshotDirectory), false,
+    "snapshot error logs must never contain the absolute private snapshot directory path");
+  assert.match(logs, /Erro ao preparar snapshot para transmissao: (PRIVATE_SNAPSHOT_DIRECTORY_INVALID|EACCES|EPERM|ENAMETOOLONG|ENOSPC|EMFILE|ENFILE|EIO|EROFS|EBUSY|EEXIST|PRIVATE_SNAPSHOT_BUDGET_EXCEEDED|FILE_HANDLE_ABORTED|UNKNOWN_SNAPSHOT_ERROR)/);
 });
