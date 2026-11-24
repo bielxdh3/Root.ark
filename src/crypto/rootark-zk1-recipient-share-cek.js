@@ -81,18 +81,20 @@ function deny() { throw Error("ZK_SHARE_FILE_OPEN_DENIED"); }
 function denyOffer() { throw Error("ZK_SHARE_OFFER_DENIED"); }
 function isProxy(value) { return value !== null && (typeof value === "object" || typeof value === "function")
   && nativeIsProxy(value); }
-function copyNativeBytes32(value, reject = deny) {
+function copyNativeBytes(value, minLength, maxLength, reject = deny) {
   if (isProxy(value) || !nativeIsUint8Array(value)) reject();
   const length = nativeApply(nativeTypedLength, value, []);
   const byteLength = nativeApply(nativeTypedByteLength, value, []);
   const offset = nativeApply(nativeTypedByteOffset, value, []);
   const backing = nativeApply(nativeTypedBuffer, value, []);
-  if (length !== 32 || byteLength !== 32 || !nativeNumberIsSafeInteger(offset)
+  if (!nativeNumberIsSafeInteger(length) || length < minLength || length > maxLength
+    || byteLength !== length || !nativeNumberIsSafeInteger(offset)
     || offset < 0 || nativeIsSharedArrayBuffer(backing)) reject();
-  const privateCopy = new NativeUint8Array(32);
+  const privateCopy = new NativeUint8Array(length);
   nativeApply(nativeTypedSet, privateCopy, [value]);
-  return nativeBufferFrom(nativeApply(nativeTypedBuffer, privateCopy, []), 0, 32);
+  return nativeBufferFrom(nativeApply(nativeTypedBuffer, privateCopy, []), 0, length);
 }
+const copyNativeBytes32 = (value, reject = deny) => copyNativeBytes(value, 32, 32, reject);
 function wipeOwnedBytes(value) {
   // Independent owner/recipient authority callbacks are executable. They can
   // replace Buffer.prototype.fill and Uint8Array.prototype.fill after the CEK
@@ -107,12 +109,28 @@ function currentSeconds(wallClock, reject = deny) {
   if (!nativeNumberIsFinite(milliseconds) || milliseconds < 0) reject();
   return nativeMathFloor(milliseconds / 1000);
 }
-const b64 = nativeBase64Url;
+const BASE64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+function b64(value) {
+  const bytes = copyNativeBytes(value, 1, 128);
+  const size = nativeApply(nativeTypedLength, bytes, []);
+  let encoded = "";
+  for (let index = 0; index < size; index += 3) {
+    const a = bytes[index];
+    const b = index + 1 < size ? bytes[index + 1] : 0;
+    const c = index + 2 < size ? bytes[index + 2] : 0;
+    encoded += BASE64URL[a >>> 2];
+    encoded += BASE64URL[((a & 3) << 4) | (b >>> 4)];
+    if (index + 1 < size) encoded += BASE64URL[((b & 15) << 2) | (c >>> 6)];
+    if (index + 2 < size) encoded += BASE64URL[c & 63];
+  }
+  return encoded;
+}
 function from64(value, length) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)
     || value.length > nativeMathCeil(length * 4 / 3) + 4) denyOffer();
   const bytes = nativeBufferFrom(value, "base64url");
-  if (bytes.length !== length || b64(bytes) !== value) denyOffer();
+  if (bytes.length !== length
+    || nativeApply(nativeBufferToString, bytes, ["base64url"]) !== value) denyOffer();
   return bytes;
 }
 function same(a, b) {
@@ -425,10 +443,8 @@ function currentAuthority(snapshotValue, statement, shareSignature, statementByt
     }
     if (!device) deny();
     if (device.revokedAtEpoch !== null || !nativeNumberIsSafeInteger(device.enrolledEpoch)
-      || device.enrolledEpoch < 1 || device.enrolledEpoch > statement.epoch
-      || !(device.authorizationPublicKey instanceof Uint8Array)
-      || device.authorizationPublicKey.length !== 32) deny();
-    return nativeBufferFrom(device.authorizationPublicKey);
+      || device.enrolledEpoch < 1 || device.enrolledEpoch > statement.epoch) deny();
+    return device.authorizationPublicKey;
   };
   active(statement.recipient_device_id);
   const issuer = active(statement.issuer_device_id);
