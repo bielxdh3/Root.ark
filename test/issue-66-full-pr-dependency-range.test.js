@@ -7,7 +7,7 @@ const test = require("node:test");
 const { resolveRange } = require("../scripts/issue-66-full-pr-dependency-range");
 
 const HEAD_BRANCH = "cdx/issue66-cfapi-native-w8-20261107";
-const BASE_BRANCH = "cdx/issue66-picker-pin-integration-prime-20261107";
+const BASE_BRANCH = "feature/issue66-inventory-20261106";
 const HEAD = "7a1154dc7ccb35335def7f7766716481db97f046";
 const BASE = "5bac9e8e20656634c83cccefbaf7b5450b02a273";
 const LIVE_BASE = "781eac0a58fd0d1f8aa22596f393d9b01ffc94f7";

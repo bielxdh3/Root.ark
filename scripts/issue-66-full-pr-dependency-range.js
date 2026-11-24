@@ -7,7 +7,7 @@ const { execFileSync, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 
 const HEAD_BRANCH = "cdx/issue66-cfapi-native-w8-20261107";
-const BASE_BRANCH = "cdx/issue66-picker-pin-integration-prime-20261107";
+const BASE_BRANCH = "feature/issue66-inventory-20261106";
 const REPOSITORY = "bielxdh3/Root.ark";
 const SHA = /^[a-f0-9]{40}$/;
 
