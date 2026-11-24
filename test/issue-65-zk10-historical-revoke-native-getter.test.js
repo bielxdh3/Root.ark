@@ -155,7 +155,7 @@ test("P2 physical: native witness getter cannot rewind verification time for gen
     }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
     "rewinding a JS callback clock cannot revive real signed old PG bytes");
   } finally { Date.now = realNow; }
-  assert.ok(old.reads > 0, "attacker's native getter must execute");
+  assert.equal(old.reads, 0, "inherited handle getter must be rejected before execution");
   assert.equal(rewinds, 0, "verification must not use callback-rebound Date.now");
   const good = await genuineHistoricalEvidence();
   assert.equal((await verifySyncV2HistoricalWitnessAdmission(good.input)).authorizesHistoricalRead, true);
@@ -179,7 +179,7 @@ test("P2 physical: native witness getter cannot suppress stale PG detection with
     }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
     "post-getter Math.abs cannot claim a 120-second-old Ed25519 PG is fresh");
   } finally { Math.abs = originalAbs; }
-  assert.ok(poison.reads > 0);
+  assert.equal(poison.reads, 0, "inherited handle getter must not execute");
   assert.equal(bypassCalls, 0, "signed issue-time delta must use a captured numeric primitive");
   assert.equal((await verifySyncV2HistoricalWitnessAdmission((await genuineHistoricalEvidence()).input)).authorizesHistoricalRead, true);
 });
@@ -208,7 +208,7 @@ test("P2 physical: native witness getter cannot retarget Math.floor for real sig
     }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
     "post-key Math.floor must not shift the trusted now-seconds into stale A's window");
   } finally { Math.floor = originalFloor; }
-  assert.ok(poison.reads > 0);
+  assert.equal(poison.reads, 0, "inherited handle getter must not execute");
   assert.equal(bypassCalls, 0, "current clock conversion must use captured Math.floor");
   assert.equal((await verifySyncV2HistoricalWitnessAdmission((await genuineHistoricalEvidence()).input)).authorizesHistoricalRead, true);
 });
@@ -238,7 +238,7 @@ test("P2 physical: witness getter cannot redirect dynamic device crypto.createPu
       ...f.input, pinnedWitnessPublicKey: poison.publicKey,
     }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
   } finally { crypto.createPublicKey = original; }
-  assert.ok(poison.reads > 0);
+  assert.equal(poison.reads, 0, "inherited handle getter must not execute");
   assert.equal(replaced, 0, "device Ed25519 verifier must use captured native key decoder");
   assert.equal((await verifySyncV2HistoricalWitnessAdmission((await genuineHistoricalEvidence()).input)).authorizesHistoricalRead, true);
 });
@@ -259,7 +259,7 @@ test("P2 physical: witness getter cannot turn invalid device Ed25519 signature B
       ...f.input, pinnedWitnessPublicKey: poison.publicKey,
     }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
   } finally { crypto.verify = original; }
-  assert.ok(poison.reads > 0);
+  assert.equal(poison.reads, 0, "inherited handle getter must not execute");
   assert.equal(faked, 0, "post-getter mutable crypto.verify must never validate device authorization");
   assert.equal((await verifySyncV2HistoricalWitnessAdmission((await genuineHistoricalEvidence()).input)).authorizesHistoricalRead, true);
 });
@@ -282,7 +282,8 @@ test("P2 historical: witness native getter cannot mutate externally retained rev
     ...rejected, pinnedWitnessPublicKey: evil.publicKey,
   }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
   "operator-pinned local revocation must be snapshotted before native witness getters");
-  assert.ok(evil.reads > 0 && tampered > 0);
+  assert.equal(evil.reads, 0, "untrusted witness getter must not mutate operator policy");
+  assert.equal(tampered, 0, "revoked-device policy must remain unchanged");
   assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input))
     .authorizesHistoricalRead, true, "independently allowed genuine device remains valid");
 });
@@ -306,7 +307,8 @@ test("P2 historical: signed witness floor A cannot replace independently retaine
     ...f.input, trustedMinimumFloor: floorB, pinnedWitnessPublicKey: evil.publicKey,
   }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" },
   "operator-retained floor B must be captured before hostile witness native key getter");
-  assert.ok(evil.reads > 0 && mutated > 0);
+  assert.equal(evil.reads, 0, "untrusted witness getter must not mutate the floor");
+  assert.equal(mutated, 0, "trusted minimum floor must remain unchanged");
   assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input))
     .authorizesHistoricalRead, true);
 });
@@ -465,7 +467,7 @@ test("P2 physical: native witness getter must not substitute a foreign device SP
       ...forged, pinnedWitnessPublicKey: evil.publicKey,
     }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
   } finally { Buffer.from = originalFrom; }
-  assert.ok(evil.reads > 0);
+  assert.equal(evil.reads, 0, "inherited witness getter must not execute");
   assert.equal(substituted, 0, "verifier must use the pre-getter Buffer decoder");
   const good = await genuineHistoricalEvidence();
   assert.equal((await verifySyncV2HistoricalWitnessAdmission(good.input))
@@ -503,7 +505,7 @@ test("P2 physical: post-key Buffer.from cannot launder a forged floor signature 
       ...forged, pinnedWitnessPublicKey: evil.publicKey,
     }), { code: "SYNC_ZK1_HISTORICAL_ADMISSION_DENIED" });
   } finally { Buffer.from = originalFrom; }
-  assert.ok(evil.reads > 0);
+  assert.equal(evil.reads, 0, "inherited witness getter must not execute");
   assert.equal(substitutions, 0, "signature decoding must retain native Buffer.from");
   assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input))
     .authorizesHistoricalRead, true);
@@ -583,7 +585,7 @@ test("P2 historical: real signed valid read survives, revoked device never becom
     Array.prototype.push = nativePush;
     Array.prototype.includes = nativeIncludes;
   }
-  assert.ok(reads > 0, "physical native witness getter must be exercised");
+  assert.equal(reads, 0, "invalid inherited witness getter must not execute");
   assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input))
     .authorizesHistoricalRead, true, "valid historical signer and device remain accepted");
 });
@@ -618,7 +620,7 @@ test("P2 historical: witness cannot impersonate inventory signer via poisoned ar
   } finally {
     Array.prototype[Symbol.iterator] = oldIterator;
   }
-  assert.ok(invoked > 0, "real inherited native kHandle was reached");
+  assert.equal(invoked, 0, "invalid inherited native handle must not execute");
   assert.equal(skipped, 0, "the verifier must never consult the poisoned pin iterator");
 });
 
@@ -668,7 +670,7 @@ test("P2 historical: signed witness floor nonce A cannot be replayed for new cha
   } finally {
     Buffer.prototype.toString = originalToString;
   }
-  assert.ok(invoked > 0, "real inherited native kHandle was reached");
+  assert.equal(invoked, 0, "invalid inherited native handle must not execute");
   assert.equal(altered, 0, "the verifier must use the captured Buffer serializer");
   assert.equal((await verifySyncV2HistoricalWitnessAdmission(f.input))
     .authorizesHistoricalRead, true);
