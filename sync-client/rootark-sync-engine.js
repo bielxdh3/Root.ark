@@ -2615,7 +2615,7 @@ class SyncEngine {
           // Cold admission can create the journal/genesis snapshot. It must
           // hold the SAME lease as the following mutation, not run before
           // the AsyncLocalStorage context exists.
-          await openEngineBuiltIn.call(this);
+          await openEngineBuiltIn.call(this, { readOnly: requireExistingState });
           lease.coldAdmissionUncertain = false;
           return await work();
         });
@@ -2746,20 +2746,20 @@ class SyncEngine {
     }
   }
 
-  async _open() {
+  async _open({ readOnly = false } = {}) {
     denyIndeterminateInbound(this);
     requireNativeRootMutationContext(this);
     const configuredMetadata = internalRootMetadata(
       this.rootDir, this.snapshotPath, this.journal?.filePath);
     noteColdAdmissionWrite(this.rootDir, true);
-    await fsp.mkdir(this.rootDir, { recursive: true });
+    if (!readOnly) await fsp.mkdir(this.rootDir, { recursive: true });
     noteColdAdmissionWrite(this.rootDir, false);
     await containedAbsolute(this.rootDir, this.rootDir, false);
     // Always recheck, including previously opened non-FOD instances whose
     // snapshot cache looks unchanged after another instance marked the root.
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     noteColdAdmissionWrite(this.rootDir, true);
-    this.journal = await this.journal.open();
+    this.journal = await this.journal.open({ requireExisting: readOnly });
     noteColdAdmissionWrite(this.rootDir, false);
     // A rejected native-required cold open must never let a later open use
     // public, mutable this.snapshot as if it were still the disk contents.
@@ -2777,7 +2777,7 @@ class SyncEngine {
       // by readFile(path) could open a different, attacker-rebound snapshot.
       snapshotHandle = await fsp.open(this.snapshotPath, snapshotOpenFlags);
     } catch (error) {
-      if (error.code !== "ENOENT" || this.opened) fail("Sync snapshot is unavailable", "invalid_snapshot");
+      if (error.code !== "ENOENT" || this.opened || readOnly) fail("Sync snapshot is unavailable", "invalid_snapshot");
       noteColdAdmissionWrite(this.rootDir, true);
       await durableJson(this.snapshotPath, this.snapshot);
       noteColdAdmissionWrite(this.rootDir, false);
@@ -5432,7 +5432,7 @@ class SyncEngine {
     return this.withMutationLock(() => this._apply(operation, summary));
   }
 
-  async _apply(operation, summary = null, beforeHydrationWrite = null) {
+  async _apply(operation, summary = null, beforeHydrationWrite = null, tombstoneSourceOverride = null, historicalRestoreHash = undefined) {
     denyIndeterminateInbound(this);
     requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
@@ -5766,6 +5766,75 @@ class SyncEngine {
         // durable snapshot must authenticate the new remote identity first.
         // A later failed checkpoint leaves ambiguous cache ancestry.
         inboundCacheChanged = true;
+      } else if (historicalRestoreHash !== undefined) {
+        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        const tempHandle = await fsp.open(temporary, "wx", 0o600);
+        let tempStat;
+        try {
+          await tempHandle.writeFile(plaintext);
+          await tempHandle.sync();
+          tempStat = await tempHandle.stat({ bigint: true });
+        } finally {
+          await tempHandle.close();
+        }
+        try {
+          if (this.options?.requireNativeRootSession) {
+            fail("Native root session required for historical restore", "restore_local_conflict");
+          }
+          await this.stageHistoricalRestore(target, metadata.path, historicalRestoreHash);
+          try {
+            // Atomic no-replace materialization; do not clobber files
+            // created by another process after the last restore preflight.
+            await fsp.link(temporary, target);
+          } catch (error) {
+            // Never publish a possibly substituted staged pathname as a
+            // rollback. Preserve its current inode for manual recovery.
+            if (error?.code === "EEXIST") fail("Historical restore path was recreated", "restore_local_conflict");
+            throw error;
+          }
+          let targetHandle;
+          let verified = false;
+          try {
+            targetHandle = await fsp.open(target, fs.constants.O_RDONLY
+              | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+            try {
+              const openedStat = await targetHandle.stat({ bigint: true });
+              const pathStat = await fsp.lstat(target, { bigint: true });
+              if (openedStat.isFile() && !openedStat.isSymbolicLink()
+                && pathStat.isFile() && !pathStat.isSymbolicLink()
+                && openedStat.nlink >= 2n
+                && sameFileVersion(openedStat, pathStat)
+                && sameFileIdentity(tempStat, openedStat)
+                && openedStat.size === BigInt(plaintext.length)) {
+                const materializedBytes = await targetHandle.readFile();
+                try {
+                  const endStat = await targetHandle.stat({ bigint: true });
+                  const pathAfterRead = await fsp.lstat(target, { bigint: true });
+                  if (sameFileVersion(openedStat, endStat)
+                    && sameFileVersion(endStat, pathAfterRead)
+                    && crypto.createHash("sha256").update(materializedBytes).digest("hex")
+                      === crypto.createHash("sha256").update(plaintext).digest("hex")) {
+                    verified = true;
+                  }
+                } finally {
+                  materializedBytes.fill(0);
+                }
+              }
+            } finally {
+              await targetHandle.close();
+            }
+          } catch {
+            /* Reject on descriptor open, stat, or read failure */
+          }
+          if (!verified) {
+            // No portable Node API can unlink or rename only if a pathname
+            // still names a previously observed inode. Even stageExisting()
+            // could move a different writer's replacement after our last
+            // lstat. The pre-restore bytes are already staged in .rootark-trash;
+            // leave the current target occupant exactly where it is.
+            fail("Historical restore materialization identity mismatch", "restore_local_conflict");
+          }
+        } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
       } else {
         // A failed target preflight must not quarantine a clean existing
         // parent merely because an inert reserved temporary was created.
