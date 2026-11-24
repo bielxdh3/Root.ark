@@ -10,10 +10,32 @@ const http = require("node:http");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { sealZk1CatalogMetadataV1 } = require("../src/crypto/rootark-zk1-opaque-catalog-client-v1");
+const realCatalog = require("../public/client/rootark-zk1-browser-opaque-catalog-commit");
 const sourceFile = path.join(__dirname,
   "../public/client/rootark-zk1-opaque-device-delta-sync.js");
 const probeFile = path.join(__dirname, "support/issue-65-opaque-delta-browser-probe.js");
 const restoreProbeFile = path.join(__dirname, "support/issue-65-opaque-restore-probe.js");
+
+test("fresh protected catalog listing clears stale UI before asynchronous trust or key loading", () => {
+  const source = fs.readFileSync(path.join(__dirname,
+    "../public/client/rootark-zk1-authenticated-workspace.js"), "utf8");
+  const start = source.indexOf("async function perform(action)");
+  const end = source.indexOf("function showEntry()", start);
+  assert.ok(start >= 0 && end > start, "authenticated workspace action handler must exist");
+  const perform = source.slice(start, end);
+  const clearBranch = perform.indexOf('if (action === "catalog-delta-list") {');
+  const listReset = perform.indexOf('field("catalog-delta-private-list")?.replaceChildren()', clearBranch);
+  const summaryReset = perform.indexOf('summary.textContent = ""', clearBranch);
+  const scriptLoad = perform.indexOf("await ensureScripts()", clearBranch);
+  const capabilityLoad = perform.indexOf('await api.get("/zk-1/v1/workspace-capability")', clearBranch);
+  const grantLoad = perform.indexOf("await grantAndOwner()", clearBranch);
+  assert.ok(clearBranch >= 0 && listReset > clearBranch && summaryReset > clearBranch,
+    "a new catalog listing must synchronously clear the prior list and summary");
+  for (const reset of [listReset, summaryReset]) {
+    assert.ok(reset < scriptLoad && reset < capabilityLoad && reset < grantLoad,
+      "stale local results must be cleared before any asynchronous prerequisite can fail");
+  }
+});
 
 test("independently authorized opaque delta client boots without generic sync-v2", () => {
   const source = fs.readFileSync(path.join(__dirname,
@@ -26,6 +48,357 @@ test("independently authorized opaque delta client boots without generic sync-v2
   vm.runInNewContext(source, context);
   assert.equal(typeof context.RootarkZk1OpaqueDeviceDeltaSync.createClient, "function");
   assert.doesNotMatch(source, /sync-client\/|rootark-sync-v2|rootark-sync-adapter/);
+});
+
+test("local filename filter caps display, counts all matches, and rejects a corrupt row after the cap", async () => {
+  // Controlled signed-reader contract for the display cap. Real signatures and
+  // AES-GCM decryption are exercised by browser-opaque-catalog-commit.test.js.
+  const rows = Array.from({ length: 105 }, (_, index) => ({
+    object_id: `opaque-${String(index).padStart(3, "0")}`,
+    revision: 1, epoch: 1, ciphertext_digest: new Uint8Array(32).fill(8),
+    metadata_ciphertext: new Uint8Array(284).fill(9),
+  }));
+  const snapshot = { head: { sequence: 1, digest: new Uint8Array(32).fill(7) }, rows };
+  let decrypted = 0;
+  let rejectLast = false;
+  const catalog = {
+    createClient: () => ({ readAll: async () => snapshot }),
+    openMetadata: async ({ objectId }) => {
+      decrypted++;
+      if (rejectLast && objectId === rows[104].object_id) throw Error("BAD_METADATA");
+      if (objectId === rows[0].object_id) return "report-relato\u0301rio [2026].txt";
+      return `report-${objectId}.txt`;
+    },
+  };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    RootarkZk1BrowserOpaqueCatalogCommit: catalog,
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, "utf8"), context);
+  const client = vm.runInContext(`RootarkZk1OpaqueDeviceDeltaSync.createClient({
+    authority: { signedDeviceGrant: {}, pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => "fixture-csrf", isSessionCurrent: () => true },
+    assertLive() {},
+  })`, context);
+  const baseline = await client.readCurrent();
+  const key = await crypto.webcrypto.subtle.importKey("raw", crypto.randomBytes(32),
+    "AES-GCM", false, ["decrypt"]);
+  const result = await client.readPrivateListing(baseline, key, "REPORT-");
+  assert.equal(result.totalMatches, 105);
+  assert.equal(result.entries.length, 100);
+  assert.equal(decrypted, 105, "the cap must never skip verification of the remaining rows");
+  const unfiltered = await client.readPrivateListing(baseline, key, "");
+  assert.equal(unfiltered.totalMatches, 105,
+    "unfiltered workspace listing must count all current signed object heads");
+  assert.equal(unfiltered.entries.length, 105,
+    "100-hit limit applies to search results, never to unfiltered workspace listing");
+  assert.equal(unfiltered.entries[104].objectId, rows[104].object_id,
+    "the 105th current object must remain visible for browsing");
+  assert.equal(decrypted, 210,
+    "all signed rows are decrypted before display for both query modes");
+  const normalized = await client.readPrivateListing(baseline, key, "RELATÓRIO [2026]");
+  assert.equal(normalized.totalMatches, 1,
+    "casefold and NFC normalization must preserve literal special characters");
+  assert.equal(normalized.entries[0].objectId, rows[0].object_id);
+  rejectLast = true;
+  await assert.rejects(client.readPrivateListing(baseline, key, "REPORT-"),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "a corrupt row past the cap must fail the whole listing");
+});
+
+test("cached local search requires fresh signed catalog and never decrypts on a matching head", async () => {
+  const head = { sequence: 3, digest: new Uint8Array(32).fill(4) };
+  let requested = 0, opened = 0;
+  const rows = [{ object_id: "opaque-current", revision: 1, epoch: 2,
+    ciphertext_digest: new Uint8Array(32).fill(9),
+    metadata_ciphertext: new Uint8Array(284).fill(8) }];
+  const snapshot = { head, rows };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    RootarkZk1BrowserOpaqueCatalogCommit: {
+      createClient: () => ({ readAll: async () => { requested++; return snapshot; } }),
+      openMetadata: async () => { opened++; return "private.txt"; },
+    },
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, "utf8"), context);
+  const client = vm.runInContext(`RootarkZk1OpaqueDeviceDeltaSync.createClient({
+    authority: { signedDeviceGrant: { account_id: "a", compartment_id: "c", keyring_id: "k" },
+      pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => "csrf", isSessionCurrent: () => true },
+    assertLive() {},
+  })`, context);
+  const baseline = await client.readCurrent();
+  const verified = await client.verifyPrivateListingHead(baseline);
+  assert.equal(verified.head.sequence, 3);
+  assert.equal(verified.scope.compartment_id, "c");
+  assert.equal(requested, 2);
+  assert.equal(opened, 0, "ciphertext stays sealed when the local index is valid");
+  snapshot.head = { ...head, sequence: 4 };
+  await assert.rejects(client.verifyPrivateListingHead(baseline), /ZK_OPAQUE_DELTA_SYNC_DENIED/);
+  snapshot.head = head;
+  snapshot.rows = [{ ...rows[0], revision: 2 }];
+  await assert.rejects(client.verifyPrivateListingHead(baseline), /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+    "a same-head but altered signed row must not release cached plaintext");
+});
+
+test("selected protected object GET is exact, ciphertext-only and fenced before and after transport", async () => {
+  const objectId = Buffer.alloc(16, 3).toString("base64url");
+  const ciphertext = Buffer.alloc(64, 11);
+  const digest = crypto.createHash("sha256").update(ciphertext).digest();
+  const row = { object_id: objectId, revision: 2, epoch: 4,
+    ciphertext_digest: digest, metadata_ciphertext: new Uint8Array(284).fill(3) };
+  const base = { head: { sequence: 2, digest: new Uint8Array(32).fill(7) },
+    rows: [row] };
+  let current = base, reads = 0, gets = 0, onGet = null;
+  const writer = {
+    async readAll() { reads++; return current; },
+    async readVerifiedCiphertext(snapshot, id, revision) {
+      gets++;
+      assert.equal(snapshot, base, "use the internally verified signed snapshot");
+      assert.equal(id, objectId);
+      assert.equal(revision, 2);
+      onGet?.();
+      return { objectId: id, revision, epoch: row.epoch,
+        ciphertextDigestBase64: Buffer.from(digest).toString("base64url"),
+        ciphertextBase64: ciphertext.toString("base64url") };
+    },
+  };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    RootarkZk1BrowserOpaqueCatalogCommit: { createClient: () => writer },
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, "utf8"), context);
+  let active = true;
+  const client = vm.runInContext(`RootarkZk1OpaqueDeviceDeltaSync.createClient({
+    authority: { signedDeviceGrant: { account_id: "a", compartment_id: "b",
+        keyring_id: "c" }, pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => "valid-csrf",
+      isSessionCurrent: () => true },
+    assertLive: () => { if (!globalTestActive) throw Error("STALE"); },
+  })`, Object.assign(context, { globalTestActive: true }));
+  const baseline = await client.readCurrent();
+  assert.equal(typeof client.readSelectedCiphertext, "function");
+  const output = await client.readSelectedCiphertext(baseline, objectId, 2);
+  assert.equal(output.ciphertextBase64, ciphertext.toString("base64url"));
+  assert.equal(output.ciphertextDigestBase64, digest.toString("base64url"));
+  assert.equal(output.plaintextAvailable, false);
+  assert.equal(output.verifiedCiphertext, true);
+  assert.equal(JSON.stringify(output).includes("metadata"), false);
+  assert.equal(gets, 1);
+  assert.ok(reads >= 3, "signed catalog must be re-read around GET");
+  await assert.rejects(client.readSelectedCiphertext(baseline,
+    Buffer.alloc(16, 9).toString("base64url"), 2), /ZK_OPAQUE_DELTA_SYNC_DENIED/);
+  await assert.rejects(client.readSelectedCiphertext(baseline, objectId, 1),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/);
+  assert.equal(gets, 1, "non-matching object or revision never reaches GET");
+  onGet = () => { current = { ...base, head: { ...base.head, sequence: 3 } }; };
+  await assert.rejects(client.readSelectedCiphertext(baseline, objectId, 2),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "head advancing during GET blocks content release");
+  current = base; onGet = null;
+  context.globalTestActive = false;
+  await assert.rejects(client.readSelectedCiphertext(baseline, objectId, 2),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/, "logout must block every release");
+});
+
+test("P2 review: signed historical names cannot resurrect a trashed object's search hit", async () => {
+  const row = (object_id, revision) => ({ object_id, revision, epoch: 1,
+    ciphertext_digest: new Uint8Array(32).fill(8),
+    metadata_ciphertext: new Uint8Array(284).fill(9) });
+  const rows = [row('deleted-object', 1), row('live-object', 1), row('deleted-object', 2)];
+  const snapshot = { head: { sequence: 3, digest: new Uint8Array(32).fill(7) }, rows };
+  const seen = [];
+  const catalog = { createClient: () => ({ readAll: async () => snapshot }),
+    openMetadata: async ({ objectId, revision }) => {
+      seen.push(`${objectId}:${revision}`);
+      return objectId === 'deleted-object'
+        ? revision === 1 ? 'deleted-report.txt' : '\uE000rootark-zk1-logical-trash/v1'
+        : 'unrelated-current.txt';
+    } };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    RootarkZk1BrowserOpaqueCatalogCommit: catalog,
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, 'utf8'), context);
+  const client = vm.runInContext(`RootarkZk1OpaqueDeviceDeltaSync.createClient({
+    authority: { signedDeviceGrant: {}, pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => 'fixture-csrf', isSessionCurrent: () => true },
+    assertLive() {},
+  })`, context);
+  const baseline = await client.readCurrent();
+  const key = await crypto.webcrypto.subtle.importKey('raw', crypto.randomBytes(32),
+    'AES-GCM', false, ['decrypt']);
+  const match = await client.readPrivateListing(baseline, key, 'report');
+  assert.equal(match.totalMatches, 0,
+    'an earlier append-only name must not resurrect a newer signed trash tombstone');
+  assert.equal(match.entries.length, 0);
+  const full = await client.readPrivateListing(baseline, key, '');
+  assert.equal(full.totalMatches, 2, 'display and total count must use current object heads, not history rows');
+  assert.equal(full.entries.find(x => x.objectId === 'deleted-object')?.logicalTrashCandidate, true);
+  assert.equal(full.entries.find(x => x.objectId === 'deleted-object')?.name, null);
+  assert.equal(seen.length, 6,
+    'all three immutable signed rows are still decrypted and checked on each read');
+});
+
+test("P2: independent CAS changing during real filename AEAD denies all local search results", async () => {
+  const scopeBytes = { account_id: crypto.randomBytes(16),
+    compartment_id: crypto.randomBytes(16), keyring_id: crypto.randomBytes(16) };
+  const scope = Object.fromEntries(Object.entries(scopeBytes)
+    .map(([key, value]) => [key, value.toString("base64url")]));
+  const objectId = crypto.randomBytes(16).toString("base64url");
+  const rawKey = crypto.randomBytes(32);
+  const sealedName = await sealZk1CatalogMetadataV1({ scope: scopeBytes,
+    objectId, revision: 1, epoch: 1, metadataKey: rawKey,
+    name: "private-authenticated-current.txt" });
+  const row = { object_id: objectId, revision: 1, epoch: 1,
+    ciphertext_digest: new Uint8Array(32).fill(8),
+    metadata_ciphertext: Uint8Array.from(sealedName) };
+  const old = { head: { sequence: 5, digest: new Uint8Array(32).fill(7) }, rows: [row] };
+  // A real CAS successor appends an immutable catalog row: the old row and its
+  // already-authenticated plaintext are no longer a complete current listing.
+  const advanced = { head: { sequence: 6, digest: new Uint8Array(32).fill(9) },
+    rows: [row, { ...row, object_id: crypto.randomBytes(16).toString("base64url") }] };
+  let active = old, advanceDuringAead = false, reads = 0, realOpens = 0;
+  const catalog = {
+    createClient: () => ({ readAll: async () => { reads++; return active; } }),
+    openMetadata: async (input) => {
+      // The signed-reader provider is simulated; metadata opening is genuine
+      // AES-256-GCM over the 284-byte filename envelope and exact scope AAD.
+      const name = await realCatalog.openMetadata({
+        scope: Object.fromEntries(Object.entries(input.scope)),
+        objectId: input.objectId, revision: input.revision, epoch: input.epoch,
+        metadataKey: input.metadataKey,
+        ciphertext: Uint8Array.from(input.ciphertext),
+      });
+      realOpens++;
+      if (advanceDuringAead) active = advanced;
+      return name;
+    },
+  };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    RootarkZk1BrowserOpaqueCatalogCommit: catalog,
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, "utf8"), context);
+  const client = vm.runInContext(`RootarkZk1OpaqueDeviceDeltaSync.createClient({
+    authority: { signedDeviceGrant: ${JSON.stringify(scope)},
+      pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => "fixture-csrf", isSessionCurrent: () => true },
+    assertLive() {},
+  })`, context);
+  const baseline = await client.readCurrent();
+  const key = await crypto.webcrypto.subtle.importKey("raw", rawKey,
+    "AES-GCM", false, ["decrypt"]);
+  const positive = await client.readPrivateListing(baseline, key, "authenticated");
+  assert.equal(positive.totalMatches, 1,
+    "the same real signed-metadata AEAD must yield a valid local match before rotation");
+  assert.equal(positive.entries[0].name, "private-authenticated-current.txt");
+  assert.equal(realOpens, 1);
+
+  const before = reads;
+  advanceDuringAead = true;
+  await assert.rejects(client.readPrivateListing(baseline, key, "authenticated"),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+    "private names must not be released after CAS changes during an awaited AEAD open");
+  assert.equal(realOpens, 2, "the second genuine AES-GCM open must complete before CAS changes");
+  assert.equal(active, advanced, "the independent catalog head really advanced");
+  assert.equal(reads, before + 2,
+    "the final signed CAS readback must be performed after filename AEAD");
+});
+
+test("P2 RED: caller cannot replace the original session guard during genuine private-name AES-GCM", async () => {
+  const scopeBytes = { account_id: crypto.randomBytes(16),
+    compartment_id: crypto.randomBytes(16), keyring_id: crypto.randomBytes(16) };
+  const scope = Object.fromEntries(Object.entries(scopeBytes)
+    .map(([key, value]) => [key, value.toString("base64url")]));
+  const objectId = crypto.randomBytes(16).toString("base64url");
+  const rawKey = crypto.randomBytes(32);
+  const sealedName = await sealZk1CatalogMetadataV1({
+    scope: scopeBytes, objectId, revision: 1, epoch: 1,
+    metadataKey: rawKey, name: "private-revoked-filename.txt",
+  });
+  const row = { object_id: objectId, revision: 1, epoch: 1,
+    ciphertext_digest: crypto.randomBytes(32),
+    metadata_ciphertext: Uint8Array.from(sealedName) };
+  const snapshot = { head: { sequence: 9, digest: crypto.randomBytes(32) },
+    rows: [row] };
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const serial = () => Buffer.from(JSON.stringify({
+    head: { sequence: snapshot.head.sequence,
+      digest: Buffer.from(snapshot.head.digest).toString("base64url") },
+    entries: snapshot.rows.map(x => [x.object_id, x.revision, x.epoch,
+      Buffer.from(x.metadata_ciphertext).toString("base64url")]),
+  }));
+  const proof = crypto.sign(null, serial(), signer.privateKey);
+  let signedReads = 0, opened = 0;
+  let fixtureInput;
+  const catalog = {
+    createClient: () => ({ async readAll() {
+      signedReads++;
+      assert.ok(crypto.verify(null, serial(), signer.publicKey, proof),
+        "a real Ed25519-signed catalog snapshot is checked on each read");
+      return snapshot;
+    } }),
+    async openMetadata(input) {
+      const name = await realCatalog.openMetadata({
+        scope: Object.fromEntries(Object.entries(input.scope)),
+        objectId: input.objectId, revision: input.revision,
+        epoch: input.epoch, metadataKey: input.metadataKey,
+        ciphertext: Uint8Array.from(input.ciphertext),
+      });
+      opened++;
+      if (opened === 2) {
+        // Revocation is reported by the ORIGINAL session generation guard.
+        // Replacing its caller-owned method is not an authority update.
+        context.sessionActive = false;
+        fixtureInput.assertLive = () => true;
+      }
+      return name;
+    },
+  };
+  const context = { crypto: crypto.webcrypto, TextEncoder, TextDecoder, btoa, atob,
+    sessionActive: true,
+    RootarkZk1BrowserOpaqueCatalogCommit: catalog,
+    RootarkZk1ProtectedHttpClient: { signProtectedContentOperation() {} },
+    RootarkZk1CiphertextRoot: { computeCiphertextRoot() {} },
+    RootarkZk1FileContent: {} };
+  context.globalThis = context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(sourceFile, "utf8"), context);
+  fixtureInput = vm.runInContext(`({
+    authority: { signedDeviceGrant: ${JSON.stringify(scope)},
+      pinnedOwnerHead: { digest: new Uint8Array(32) },
+      signerGrants: [], csrfToken: () => "fixture-csrf",
+      isSessionCurrent: () => true },
+    assertLive() { if (!sessionActive) throw Error("REVOKED_SESSION"); }
+  })`, context);
+  const client = context.RootarkZk1OpaqueDeviceDeltaSync.createClient(fixtureInput);
+  const baseline = await client.readCurrent();
+  const key = await crypto.webcrypto.subtle.importKey("raw", rawKey,
+    "AES-GCM", false, ["decrypt"]);
+  const positive = await client.readPrivateListing(baseline, key, "private");
+  assert.equal(positive.entries[0].name, "private-revoked-filename.txt",
+    "positive control must decrypt genuine AES-GCM filename before revocation");
+  await assert.rejects(client.readPrivateListing(baseline, key, "private"),
+    /ZK_OPAQUE_DELTA_SYNC_DENIED/,
+    "a replaced guard cannot expose the private filename after revocation");
+  assert.equal(opened, 2, "the attack must occur after the second genuine AES-GCM open");
+  assert.equal(context.sessionActive, false);
+  assert.ok(signedReads >= 4 && signedReads <= 5,
+    "the baseline and both genuine signed checks of the positive listing must execute");
 });
 
 test("normal workspace routes historical restore through all three existing authorization gates", () => {
@@ -239,6 +612,10 @@ test("real Edge CSP exposes normal authenticated manual delta import, but no unc
         if(!dlg.querySelector('[data-zk1-action="'+name+'"]'))
           throw Error("MISSING_ACTION_"+name);
       }
+      const localQuery=dlg.querySelector('[data-zk1-field="catalog-delta-query"]');
+      if(!localQuery||localQuery.type!=="search"||localQuery.maxLength!==120)
+        throw Error("MISSING_BOUNDED_LOCAL_FILENAME_QUERY");
+      localQuery.value="secret-local-only-term";
       if(!dlg.querySelector('[data-zk1-field="catalog-restore-epoch-opt-in"]')
         || !dlg.querySelector('[data-zk1-field="catalog-restore-rekey-grant"]')
         || !dlg.querySelector('[data-zk1-field="catalog-restore-current-cek"]')
