@@ -152,8 +152,8 @@ test(`issue 66 Windows: real signed picker hydrate ${filename}, relativeRoot=${r
   const reveal = JSON.parse((await fsp.readFile(launch, "utf8")).replace(/^\uFEFF/, ""));
   assert.match(reveal.executable, /explorer\.exe$/i);
   assert.ok(reveal.args.join(" ").includes(filename));
-    assert.deepEqual(reveal.args, [`/select,"${path.join(localFolder, remotePath)}"`],
-      "Explorer must receive the selected file in one argument without a space after the comma");
+  assert.deepEqual(reveal.args, [`/select,"${path.join(localFolder, remotePath)}"`],
+    "Explorer must receive /select,\"<target>\" without a space after the comma under Node's resolved root");
   if (relativeRoot) {
     assert.equal((await fsp.readFile(path.join(staleCwd, "sync-data", remotePath), "utf8")), "UNVERIFIED STALE FILE");
   }

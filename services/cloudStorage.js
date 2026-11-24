@@ -55,6 +55,13 @@ function validZk1S3VersionId(value) {
     && /^[A-Za-z0-9_.+\-=/]{1,1024}$/.test(value);
 }
 
+// ListObjectsV2 has no immutable S3 version ID, but its ETag can be bound to
+// GetObject IfMatch. Only allow a quoted, single opaque entity tag: no weak
+// validators, HTTP list syntax or header control characters.
+function validS3BackupEtag(value) {
+  return typeof value === "string" && /^"[A-Za-z0-9_.+\-=/]{1,1022}"$/.test(value);
+}
+
 // A bounded ZK GET is a security assertion about the *selected* destination,
 // not permission to follow a local junction/symlink into an unrelated tree.
 // The caller creates a private cache directory first; unlike legacy downloads,
@@ -386,7 +393,14 @@ function createCloudStorage(options = {}) {
     if (!enabled()) return [];
     // The opt-in owner-scoped migration probe MUST bound remote pages before
     // accumulating provider metadata; normal historical callers are unchanged.
-    const bounded = readOnlyBounds !== undefined;
+    // The backup must certify the full selected namespace, while historical
+    // direct inventory callers may still ignore objects moved to an old parent.
+    const backupComplete = readOnlyBounds !== null
+      && typeof readOnlyBounds === "object" && !Array.isArray(readOnlyBounds)
+      && Object.getPrototypeOf(readOnlyBounds) === Object.prototype
+      && Reflect.ownKeys(readOnlyBounds).length === 1
+      && readOnlyBounds.backupComplete === true;
+    const bounded = readOnlyBounds !== undefined && !backupComplete;
     if (bounded && (!readOnlyBounds || typeof readOnlyBounds !== "object"
       || Array.isArray(readOnlyBounds)
       || Reflect.ownKeys(readOnlyBounds).length !== 3
@@ -406,6 +420,7 @@ function createCloudStorage(options = {}) {
     };
     const objects = [];
     const identities = new Set();
+    const logicalKeys = new Set();
     const add = (entry) => {
       fence();
       if (bounded && objects.length >= readOnlyBounds.maxEntries) {
@@ -413,7 +428,12 @@ function createCloudStorage(options = {}) {
       }
       const identity = `${entry.provider}:${entry.providerIdentity || entry.key}`;
       if (identities.has(identity)) throw cloudError("duplicate_inventory_identity", "Cloud inventory contains a duplicate identity");
+      // Drive can return different physical IDs with the same rootArkKey.
+      // A whole backup cannot represent both through one logical path: the
+      // downloader would repeatedly select one ID and omit the other bytes.
+      if (logicalKeys.has(entry.key)) throw cloudError("duplicate_inventory_identity", "Cloud inventory contains a duplicate logical key");
       identities.add(identity);
+      logicalKeys.add(entry.key);
       objects.push(entry);
     };
     if (provider === "s3") {
@@ -429,20 +449,43 @@ function createCloudStorage(options = {}) {
           ...(bounded ? { MaxKeys: 1000 } : {}) }),
         bounded ? { abortSignal: readOnlyBounds.abortSignal } : undefined);
         fence();
-        if (bounded && (!page || (page.Contents !== undefined && !Array.isArray(page.Contents))
-          || (page.Contents || []).length > 1000
-          || typeof page.IsTruncated !== "boolean"
+        if (!page || typeof page.IsTruncated !== "boolean") {
+          throw cloudError("provider_error", "Incomplete S3 inventory page");
+        }
+        // A malformed Contents value must not masquerade as an empty bucket
+        // in the ordinary unbounded backup path and certify cloud_complete.
+        // AWS can omit Contents for a genuinely empty page.
+        if (page.Contents !== undefined && !Array.isArray(page.Contents)) {
+          throw cloudError("provider_error", "Incomplete S3 inventory page");
+        }
+        if (bounded && ((page.Contents || []).length > 1000
           || (page.IsTruncated !== Boolean(page.NextContinuationToken)))) {
           throw cloudError("provider_error", "Incomplete S3 inventory page");
         }
+        // Ordinary backup inventories also certify whole-account coverage.
+        // Never treat an explicitly truncated page with no continuation token
+        // as the final page: that would mark an incomplete ZIP cloud_complete.
+        const nextToken = page?.NextContinuationToken;
+        if (!page || (page.IsTruncated === true && !nextToken)
+          || (page.IsTruncated === false && Boolean(nextToken))) {
+          throw cloudError("provider_error", "Incomplete S3 inventory page");
+        }
+        if (nextToken != null && (typeof nextToken !== "string" || !nextToken
+          || nextToken.length > 4096)) {
+          throw cloudError("provider_error", "Invalid S3 inventory token");
+        }
+        if (nextToken && visited.has(nextToken)) throw cloudError("provider_error", "Repeated S3 inventory token");
         for (const object of page.Contents || []) {
           const parsed = parseInventoryKey(object.Key);
-          add({ provider, providerIdentity: parsed.key, ...parsed });
+          if (backupComplete && (!validS3BackupEtag(object.ETag)
+            || !Number.isSafeInteger(object.Size) || object.Size < 0)) {
+            throw cloudError("provider_error", "S3 backup inventory is missing an object ETag or byte length");
+          }
+          add({ provider, providerIdentity: parsed.key, ...parsed,
+            ...(backupComplete ? { providerEtag: object.ETag, providerSize: object.Size } : {}) });
         }
-        token = page.NextContinuationToken;
-        if (bounded && token && (typeof token !== "string" || token.length > 4096
-          || visited.has(token))) throw cloudError("provider_error", "Repeated S3 inventory token");
-        if (bounded && token) visited.add(token);
+        token = nextToken;
+        if (token) visited.add(token);
       } while (token);
       return objects;
     }
@@ -460,14 +503,20 @@ function createCloudStorage(options = {}) {
         pageSize: 100,
       }, bounded ? { signal: readOnlyBounds.abortSignal } : undefined);
       fence();
-      if (bounded && (!Array.isArray(page?.data?.files) || page.data.files.length > 100)) {
+      // Whole-backup inventory also certifies cloud_complete. A missing or
+      // malformed provider page must never look like an empty last page.
+      if (!Array.isArray(page?.data?.files) || page.data.files.length > 100) {
         throw cloudError("provider_error", "Incomplete Google Drive inventory page");
       }
-      for (const file of page.data.files || []) {
+      for (const file of page.data.files) {
         if (!Array.isArray(file.parents)) {
           throw cloudError("invalid_inventory_identity", "Drive object is missing its parent metadata");
         }
         if (!file.parents.includes(folder())) {
+          // The backup query selects this parent. A contradictory response
+          // cannot certify cloud_complete, even if a legacy inventory reader
+          // is allowed to ignore stale objects from a previous Drive parent.
+          if (backupComplete) throw cloudError("outside_configured_parent", "Drive backup inventory returned a foreign parent");
           if (bounded) throw cloudError("provider_error", "Foreign Drive parent in bounded inventory");
           continue;
         }
@@ -488,10 +537,16 @@ function createCloudStorage(options = {}) {
         if (!file.id) throw cloudError("invalid_inventory_identity", "Drive object is missing its identity");
         add({ provider, providerIdentity: String(file.id), id: String(file.id), ...parsed });
       }
-      token = page.data.nextPageToken;
-      if (bounded && token && (typeof token !== "string" || token.length > 4096
-        || visited.has(token))) throw cloudError("provider_error", "Repeated Drive inventory token");
-      if (bounded && token) visited.add(token);
+      const nextToken = page.data.nextPageToken;
+      if (nextToken != null && (typeof nextToken !== "string"
+        || !nextToken || nextToken.length > 4096)) {
+        throw cloudError("provider_error", "Invalid Drive inventory token");
+      }
+      if (nextToken && visited.has(nextToken)) {
+        throw cloudError("provider_error", "Repeated Drive inventory token");
+      }
+      token = nextToken || undefined;
+      if (token) visited.add(token);
     } while (token);
     return objects;
   }
@@ -692,10 +747,40 @@ function createCloudStorage(options = {}) {
     }
   }
   async function download(folderId, fileName, localPath, area = "uploads", canPublish = () => true,
-    constraints = undefined) {
+    constraints = undefined, backupInventoryPin = undefined) {
     assertProvider(); if (!enabled() || fs.existsSync(localPath)) return false;
+    // An ordinary whole-account ZIP is unbounded, unlike a signed ZK GET,
+    // but its Drive inventory identified a SPECIFIC physical file ID. Never
+    // issue a second same-key list that can select a newer replacement ID:
+    // the ZIP would then certify an object it did not actually inventory.
+    let inventoriedId = null;
+    let inventoriedEtag = null;
+    let inventoriedSize = null;
+    if (backupInventoryPin !== undefined) {
+      const validObject = backupInventoryPin && typeof backupInventoryPin === "object"
+        && !Array.isArray(backupInventoryPin)
+        && Object.getPrototypeOf(backupInventoryPin) === Object.prototype
+        && constraints === undefined;
+      const driveId = validObject && Reflect.ownKeys(backupInventoryPin).length === 1
+        && Object.getOwnPropertyDescriptor(backupInventoryPin, "providerFileId");
+      const s3Etag = validObject && Reflect.ownKeys(backupInventoryPin).length === 2
+        && Object.getOwnPropertyDescriptor(backupInventoryPin, "etag");
+      const s3Size = s3Etag && Object.getOwnPropertyDescriptor(backupInventoryPin, "size");
+      if (provider === "gdrive" && driveId && Object.hasOwn(driveId, "value")
+        && isDriveFileId(driveId.value)) {
+        inventoriedId = driveId.value;
+      } else if (provider === "s3" && s3Etag && s3Size
+        && Object.hasOwn(s3Etag, "value") && Object.hasOwn(s3Size, "value")
+        && validS3BackupEtag(s3Etag.value)
+        && Number.isSafeInteger(s3Size.value) && s3Size.value >= 0) {
+        inventoriedEtag = s3Etag.value;
+        inventoriedSize = s3Size.value;
+      } else {
+        throw cloudError("invalid_path", "Invalid pinned backup inventory identity");
+      }
+    }
     const pinId = constraints && Object.hasOwn(constraints, "providerFileId")
-      ? constraints.providerFileId : null;
+      ? constraints.providerFileId : inventoriedId;
     const externalSignal = constraints && Object.hasOwn(constraints, "abortSignal")
       ? constraints.abortSignal : undefined;
     const pinnedVersion = constraints && Object.hasOwn(constraints, "providerVersionId")
@@ -779,10 +864,18 @@ function createCloudStorage(options = {}) {
         const bucketName = bucket();
         const response = await abortableProviderRead(async () => (await s3()).send(
           new (require("@aws-sdk/client-s3").GetObjectCommand)({ Bucket: bucketName,
-            Key: cloudKey, ...(pinnedVersion === null ? {} : { VersionId: pinnedVersion }) }),
+            Key: cloudKey, ...(pinnedVersion === null ? {} : { VersionId: pinnedVersion }),
+            ...(inventoriedEtag === null ? {} : { IfMatch: inventoriedEtag }) }),
           signal ? { abortSignal: signal } : undefined), signal);
         if (constraints) assertFullCiphertextGet(response, provider,
           constraints.maxBytes, boundedLengthOnly);
+        if (inventoriedEtag !== null && (response?.ETag !== inventoriedEtag
+          || response?.ContentLength !== inventoriedSize
+          || (response?.$metadata?.httpStatusCode !== undefined
+            && response.$metadata.httpStatusCode !== 200)
+          || (response?.ContentRange !== undefined && response.ContentRange !== null))) {
+          throw cloudError("provider_error", "S3 backup GET differs from inventoried object identity");
+        }
         if (pinnedVersion !== null && response?.VersionId !== pinnedVersion) {
           throw cloudError("provider_error", "S3 returned a different ciphertext version");
         }
@@ -831,7 +924,17 @@ function createCloudStorage(options = {}) {
           throw cloudError("provider_error", "Empty signed catalog object");
         }
       } else {
-        await pipeline(input, fs.createWriteStream(stagedPath));
+        if (inventoriedEtag !== null) {
+          let bytes = 0;
+          await pipeline(input, new Transform({ transform(chunk, _encoding, done) {
+            bytes += chunk.length;
+            if (bytes > inventoriedSize) done(cloudError("provider_error", "S3 backup object exceeds inventoried byte length"));
+            else done(null, chunk);
+          } }), fs.createWriteStream(stagedPath));
+          if (bytes !== inventoriedSize) {
+            throw cloudError("provider_error", "S3 backup object is shorter than inventoried byte length");
+          }
+        } else await pipeline(input, fs.createWriteStream(stagedPath));
       }
       if (signal?.aborted) throw cloudError("provider_error", "Bounded cloud readback deadline exceeded");
       if (guardParent) guardParent();

@@ -314,7 +314,7 @@ class SyncJournal {
     this.queue = Promise.resolve();
   }
 
-  async open() {
+  async open({ requireExisting = false } = {}) {
     const previousState = this.state;
     try {
       this.state = await readHeldJournal(this.filePath);
@@ -381,6 +381,13 @@ class SyncJournal {
       // rejected open or be consumed by a later retry on this same instance.
       this.state = previousState;
       if (error.code !== "ENOENT") throw error;
+      // Recovery previews are advisory READS. They must never replace lost
+      // journal evidence with an empty outbox if a file vanished after open.
+      if (requireExisting) {
+        throw Object.assign(new Error("Existing sync journal is unavailable for read-only preview"), {
+          code: "history_preview_unavailable",
+        });
+      }
       await createInitialJournalExclusive(this.filePath, this.state);
     }
     return this;
@@ -480,6 +487,31 @@ class SyncJournal {
       // but cannot confer authorization or suppress NEW signed envelopes.
     });
     return operation;
+  }
+
+  async discardUnsent(operation) {
+    // Only the caller that created an exact never-dispatched signed envelope
+    // may cancel it after a local preflight conflict. Never erase an admitted,
+    // acknowledged, or atomic-group operation.
+    const digest = signedEnvelopeDigest(operation);
+    if (!digest || !VALID_OPERATION_ID.test(operation.operationId)) {
+      throw new Error("A signed outbox operation is required for cancellation");
+    }
+    await this.commit((next) => {
+      const index = next.pending.findIndex((item) => item.operationId === operation.operationId);
+      if (index < 0 || signedEnvelopeDigest(next.pending[index]) !== digest
+        || next.seen.includes(operation.operationId)
+        || Object.hasOwn(next.admitted, operation.operationId)
+        || !Object.hasOwn(next.committedSigned, operation.operationId)
+        || next.committedSigned[operation.operationId] !== digest
+        || Object.values(next.atomicSignedGroups).some((group) =>
+          group.deleteId === operation.operationId || group.moveId === operation.operationId)) {
+        throw new Error("Cannot discard an ineligible signed outbox operation");
+      }
+      next.pending.splice(index, 1);
+      delete next.committedSigned[operation.operationId];
+      delete next.observed[operation.operationId];
+    });
   }
 
   async enqueueMany(operations) {

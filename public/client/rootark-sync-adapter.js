@@ -18,6 +18,20 @@
 
   const PROTOCOL_VERSION = 2;
   const INVENTORY_MAX_PAGE_ITEMS = 64;
+  const HISTORY_MAX_PAGE_ITEMS = 32;
+  const HISTORY_MAX_CURSOR_CHARS = 1024;
+  // Match the engine's existing 256-version restore bound. The page and total
+  // byte budgets are derived from the server's 16 MiB response cap.
+  const HISTORY_MAX_PAGES = 256;
+  const HISTORY_MAX_TOTAL_ITEMS = 256;
+  const HISTORY_MAX_PAGE_BYTES = 16 * 1024 * 1024;
+  // 256 engine-supported records × the 8 MiB ciphertext ceiling.
+  const HISTORY_MAX_TOTAL_BYTES = HISTORY_MAX_TOTAL_ITEMS * 9 * 1024 * 1024;
+  // Browsing is streamed page-by-page and can inspect paused-device retention
+  // beyond the engine's separate 256-version restore limit.
+  const HISTORY_BROWSE_MAX_PAGES = 4096;
+  const HISTORY_BROWSE_MAX_TOTAL_ITEMS = HISTORY_BROWSE_MAX_PAGES * HISTORY_MAX_PAGE_ITEMS;
+  const HISTORY_BROWSE_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024;
   const OPERATION_FIELDS = ["protocolVersion", "operationId", "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId", "deviceId", "metadata", "tombstone", "ciphertext", "nonce", "tag", "aad", "authorization"];
   const INVENTORY_FIELDS = OPERATION_FIELDS.filter((field) => !["ciphertext", "nonce", "tag", "aad", "authorization"].includes(field));
   const OPTIONAL_FIELDS = new Set(["authorization"]);
@@ -67,6 +81,29 @@
     const text = String(value || "");
     if (!text || text.length > 160 || !/^[A-Za-z0-9._:-]+$/.test(text)) fail("Invalid sync id");
     return text;
+  }
+
+  function historyCursorAfter(value) {
+    if (typeof value !== "string" || !value || value.length > HISTORY_MAX_CURSOR_CHARS
+      || !/^[A-Za-z0-9_-]+$/.test(value)) fail("Invalid sync history cursor");
+    let binary;
+    try { binary = atob(value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=")); }
+    catch { fail("Invalid sync history cursor"); }
+    let roundTrip = "";
+    for (let index = 0; index < binary.length; index += 1) roundTrip += String.fromCharCode(binary.charCodeAt(index));
+    if (btoa(roundTrip).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "") !== value) {
+      fail("Non-canonical sync history cursor");
+    }
+    let cursor;
+    try { cursor = JSON.parse(new TextDecoder().decode(Uint8Array.from(binary, (character) => character.charCodeAt(0)))); }
+    catch { fail("Invalid sync history cursor"); }
+    if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)
+      || Object.keys(cursor).sort().join(",") !== "after,index,snapshot,version" || cursor.version !== 3
+      || !Number.isSafeInteger(cursor.index) || cursor.index < 0
+      || typeof cursor.snapshot !== "string" || !/^[a-f0-9]{32}$/.test(cursor.snapshot)) {
+      fail("Invalid sync history cursor");
+    }
+    return { after: id(cursor.after), index: cursor.index, snapshot: cursor.snapshot };
   }
 
   function revision(value, optional) {
@@ -154,17 +191,142 @@
   }
 
   function createOpaqueSyncAdapter({ fetchImpl = fetch, baseUrl = "" } = {}) {
-    const request = async (url, options = {}) => {
+    const responseByteLengths = new WeakMap();
+    const cancelBodyBestEffort = (body) => {
+      try {
+        const pending = body?.cancel?.();
+        if (pending && typeof pending.catch === "function") pending.catch(() => {});
+      } catch { /* cancellation is best-effort; never hold the caller open */ }
+    };
+    const request = async (url, options = {}, maxResponseBytes = null) => {
       // A 307/308 replays the complete signed encrypted operation to the
       // redirect target. Never let an untrusted sync endpoint or proxy choose
       // a different recipient for ciphertext, AAD filenames or bearer tokens.
       const response = await fetchImpl(`${baseUrl}${url}`, { ...options,
         redirect: "error",
         headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
-      const payload = await response.json().catch(() => ({}));
+      let payload;
+      let responseBytes = null;
+      if (maxResponseBytes !== null) {
+        const declaredLength = response.headers?.get?.("content-length");
+        if (declaredLength && /^[0-9]+$/.test(declaredLength)
+          && Number(declaredLength) > maxResponseBytes) {
+          cancelBodyBestEffort(response.body);
+          fail("Sync history page exceeds response limit");
+        }
+        const reader = response.body?.getReader?.();
+        if (!reader) {
+          cancelBodyBestEffort(response.body);
+          fail("Bounded sync history requires a streaming response body");
+        }
+        const chunks = [];
+        let total = 0;
+        try {
+          while (true) {
+            const part = await reader.read();
+            if (part.done) break;
+            total += part.value.byteLength;
+            if (total > maxResponseBytes) {
+              try {
+                const pending = reader.cancel();
+                if (pending && typeof pending.catch === "function") pending.catch(() => {});
+              } catch { /* cancellation is best-effort */ }
+              fail("Sync history page exceeds response limit");
+            }
+            chunks.push(part.value);
+          }
+        } finally {
+          try { reader.releaseLock?.(); } catch { /* cancellation may already release it */ }
+        }
+        const bytes = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+        try { payload = JSON.parse(new TextDecoder().decode(bytes)); }
+        catch { payload = {}; }
+        responseBytes = total;
+      } else {
+        payload = await response.json().catch(() => ({}));
+      }
+      if (maxResponseBytes !== null && payload && typeof payload === "object") {
+        responseByteLengths.set(payload, responseBytes);
+      }
       if (response.status === 409) throw new SyncConflictError(payload);
       if (!response.ok) throw Object.assign(new Error(payload.error || "Falha de sincronizacao"), { status: response.status, payload });
       return payload;
+    };
+    const iterateHistoryPages = async function* (objectId, {
+      maxPages, maxTotalItems, maxTotalBytes, requireUniqueVersions, signal = null,
+    }) {
+      const requestedId = id(objectId);
+      const versionIds = requireUniqueVersions ? new Set() : null;
+      const cursors = new Set();
+      let pages = 0;
+      let totalItems = 0;
+      let totalBytes = 0;
+      let cursor = null;
+      let snapshot = null;
+      while (true) {
+        if (signal?.aborted) fail("Sync history request aborted");
+        if (pages >= maxPages) fail("Sync history exceeds bounded read limits");
+        const query = `?limit=${HISTORY_MAX_PAGE_ITEMS}${cursor === null
+          ? "" : `&cursor=${encodeURIComponent(cursor)}`}`;
+        const payload = await request(`/sync/v1/objects/${encodeURIComponent(requestedId)}/history${query}`,
+          signal ? { signal } : {}, HISTORY_MAX_PAGE_BYTES);
+        pages += 1;
+        const pageBytes = responseByteLengths.get(payload);
+        if (!Number.isSafeInteger(pageBytes) || pageBytes > HISTORY_MAX_PAGE_BYTES
+          || totalBytes + pageBytes > maxTotalBytes) {
+          fail("Sync history exceeds bounded read limits");
+        }
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)
+          || payload.protocolVersion !== PROTOCOL_VERSION || !Array.isArray(payload.versions)
+          || payload.versions.length > HISTORY_MAX_PAGE_ITEMS
+          || !Object.hasOwn(payload, "nextCursor")) {
+          fail("Invalid sync history response");
+        }
+        if (payload.nextCursor !== null && (typeof payload.nextCursor !== "string"
+          || !payload.nextCursor || payload.nextCursor.length > HISTORY_MAX_CURSOR_CHARS
+          || !/^[A-Za-z0-9_-]+$/.test(payload.nextCursor))) {
+          fail("Invalid sync history cursor");
+        }
+        if (payload.nextCursor !== null && cursors.has(payload.nextCursor)) {
+          fail("Sync history pagination cursor repeated");
+        }
+        if ((cursor !== null || payload.nextCursor !== null) && !payload.versions.length) {
+          fail("Sync history pagination made no progress");
+        }
+        // History is untrusted read data, never a new device grant or proof
+        // that a version was durably admitted before its signature expired.
+        const page = payload.versions.map((record) => assertOpaqueEnvelope(record, false));
+        const nextTotalItems = totalItems + page.length;
+        if (nextTotalItems > maxTotalItems) {
+          fail(maxTotalItems === HISTORY_MAX_TOTAL_ITEMS
+            ? "Sync history exceeds the 256-version restore bound"
+            : "Sync history exceeds the supported read item bound");
+        }
+        if (payload.nextCursor !== null) {
+          const decodedCursor = historyCursorAfter(payload.nextCursor);
+          if (decodedCursor.after !== page[page.length - 1].versionId
+            || decodedCursor.index !== nextTotalItems - 1) {
+            fail("Sync history cursor does not follow its page");
+          }
+          if (snapshot !== null && decodedCursor.snapshot !== snapshot) {
+            fail("Sync history snapshot changed during pagination");
+          }
+          snapshot = decodedCursor.snapshot;
+        }
+        for (const record of page) {
+          if (record.objectId !== requestedId) fail("Sync history includes a different object");
+          if (versionIds && versionIds.has(record.versionId)) fail("Sync history repeats a version");
+          versionIds?.add(record.versionId);
+        }
+        totalItems = nextTotalItems;
+        totalBytes += pageBytes;
+        yield page;
+        if (payload.nextCursor === null) return;
+        cursors.add(payload.nextCursor);
+        cursor = payload.nextCursor;
+      }
     };
     return {
       listInventory: async ({ limit = INVENTORY_MAX_PAGE_ITEMS, cursor = null } = {}) => {
@@ -189,6 +351,64 @@
         // continue to require a fresh authorization.
         if (Array.isArray(payload.objects)) return { ...payload, protocolVersion: PROTOCOL_VERSION, objects: payload.objects.map((record) => assertOpaqueEnvelope(record, false)) };
         return assertOpaqueEnvelope(payload, false);
+      },
+      history: async (objectId) => {
+        const versions = [];
+        for await (const page of iterateHistoryPages(objectId, {
+          maxPages: HISTORY_MAX_PAGES,
+          maxTotalItems: HISTORY_MAX_TOTAL_ITEMS,
+          maxTotalBytes: HISTORY_MAX_TOTAL_BYTES,
+          requireUniqueVersions: true,
+        })) versions.push(...page);
+        return { protocolVersion: PROTOCOL_VERSION, versions };
+      },
+      historyPages: async function* (objectId, {
+        signal = null,
+        maxPages = HISTORY_BROWSE_MAX_PAGES,
+        maxTotalItems = HISTORY_BROWSE_MAX_TOTAL_ITEMS,
+        maxTotalBytes = HISTORY_BROWSE_MAX_TOTAL_BYTES,
+      } = {}) {
+        if (!Number.isSafeInteger(maxPages) || maxPages < 1
+          || !Number.isSafeInteger(maxTotalItems) || maxTotalItems < 1
+          || !Number.isSafeInteger(maxTotalBytes) || maxTotalBytes < 1
+          || maxPages > HISTORY_BROWSE_MAX_PAGES
+          || maxTotalItems > HISTORY_BROWSE_MAX_TOTAL_ITEMS
+          || maxTotalBytes > HISTORY_BROWSE_MAX_TOTAL_BYTES) {
+          fail("Invalid sync history page limits");
+        }
+        yield* iterateHistoryPages(objectId, {
+          maxPages,
+          maxTotalItems,
+          maxTotalBytes,
+          requireUniqueVersions: false,
+          signal,
+        });
+      },
+      // Releasing a ransomware-shield pause is NEVER a sync-device proof or
+      // a new ciphertext admission. The server independently re-authenticates
+      // the account and (when enabled) consumes a one-use second factor.
+      resumeDevice: async (targetDeviceId, credentials) => {
+        const target = id(targetDeviceId);
+        if (!credentials || typeof credentials !== "object" || Array.isArray(credentials)
+          || typeof credentials.password !== "string" || !credentials.password
+          || credentials.password.length > 1024) fail("Resume password required");
+        const caller = id(credentials.deviceId);
+        if (target === caller) fail("Paused device cannot resume itself");
+        if (credentials.code !== undefined
+          && (typeof credentials.code !== "string" || credentials.code.length > 256)) {
+          fail("Invalid second factor");
+        }
+        const body = { password: credentials.password, deviceId: caller };
+        if (credentials.code !== undefined) body.code = credentials.code;
+        const payload = await request(`/sync/v1/devices/${encodeURIComponent(target)}/resume`, {
+          method: "POST", body: JSON.stringify(body),
+        });
+        if (payload.protocolVersion !== PROTOCOL_VERSION || payload.deviceId !== target
+          || payload.paused !== false || typeof payload.wasPaused !== "boolean") {
+          fail("Invalid sync resume response");
+        }
+        return { protocolVersion: PROTOCOL_VERSION, deviceId: target,
+          paused: false, wasPaused: payload.wasPaused };
       },
       push: (envelope) => {
         const normalized = assertOpaqueEnvelope(envelope);
