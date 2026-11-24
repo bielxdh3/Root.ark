@@ -93,11 +93,12 @@ function scan(f, options = {}) {
   return inspect({ optIn: true, databasePath: f.databasePath,
     backupDataDir: f.data, persistence: MODE, ...options });
 }
+const privateScan = (f, options) => withPrivateWindowsTestTemp(() => scan(f, options));
 test("real generated ZIP/SQLite historical joins need independent owner Ed25519 referential proof", async (t) => {
   const f = make(t);
   await build(f);
   const original = fs.readFileSync(f.backup);
-  const unauthenticated = await scan(f);
+  const unauthenticated = await privateScan(f);
   assert.equal(unauthenticated.historicalSqlite.status, "BOUNDED_JOINS_ONLY");
   assert.equal(unauthenticated.referentialAuthentication.status, "UNKNOWN");
   assert.equal(unauthenticated.referentialAuthentication.verifiedArchives, 0);
@@ -105,7 +106,7 @@ test("real generated ZIP/SQLite historical joins need independent owner Ed25519 
   const owner = crypto.generateKeyPairSync("ed25519");
   const signed = signZk1LegacyArchiveReferentialProof({
     evidence: unauthenticated.archiveEvidence[0], ownerPrivateKey: owner.privateKey });
-  const checked = await scan(f, { pinnedArchiveReferentialPublicKey: owner.publicKey,
+  const checked = await privateScan(f, { pinnedArchiveReferentialPublicKey: owner.publicKey,
     signedArchiveReferentialProofs: [signed] });
   assert.equal(checked.referentialAuthentication.status, "AUTHENTICATED_BOUNDED_JOINS");
   assert.equal(checked.referentialAuthentication.verifiedArchives, 1);
@@ -122,15 +123,15 @@ test("archive reissued with equal-size different ciphertext and updated live che
   const base = make(t);
   await build(base);
   const owner = crypto.generateKeyPairSync("ed25519");
-  const baseline = await scan(base);
+  const baseline = await privateScan(base);
   const signed = signZk1LegacyArchiveReferentialProof({
     evidence: baseline.archiveEvidence[0], ownerPrivateKey: owner.privateKey });
   const replaced = make(t);
   await build(replaced, { alteredSameSizeSource: true });
-  const independent = await scan(replaced);
+  const independent = await privateScan(replaced);
   assert.equal(independent.historicalSqlite.status, "BOUNDED_JOINS_ONLY",
     "SQLite byte-size joins alone miss equal-size ciphertext substitution");
-  const refused = await scan(replaced, { pinnedArchiveReferentialPublicKey: owner.publicKey,
+  const refused = await privateScan(replaced, { pinnedArchiveReferentialPublicKey: owner.publicKey,
     signedArchiveReferentialProofs: [signed] });
   assert.equal(refused.referentialAuthentication.status, "UNKNOWN");
   assert.equal(refused.referentialAuthentication.verifiedArchives, 0);
@@ -142,7 +143,7 @@ test("archive reissued with equal-size different ciphertext and updated live che
 test("untrusted keys, missing proof, forged evidence and unresolved historical references fail closed", async (t) => {
   const f = make(t);
   await build(f);
-  const original = await scan(f);
+  const original = await privateScan(f);
   const owner = crypto.generateKeyPairSync("ed25519");
   const attacker = crypto.generateKeyPairSync("ed25519");
   const valid = signZk1LegacyArchiveReferentialProof({
@@ -152,7 +153,7 @@ test("untrusted keys, missing proof, forged evidence and unresolved historical r
   for (const proofs of [[], [{ ...valid, signature: (valid.signature[0] === "A" ? "B" : "A") + valid.signature.slice(1) }],
     [signZk1LegacyArchiveReferentialProof({ evidence: original.archiveEvidence[0],
       ownerPrivateKey: attacker.privateKey })]]) {
-    const result = await scan(f, { ...options, signedArchiveReferentialProofs: proofs });
+    const result = await privateScan(f, { ...options, signedArchiveReferentialProofs: proofs });
     assert.equal(result.referentialAuthentication.status, "UNKNOWN");
     assert.equal(result.authorizesCutover, false);
   }
@@ -161,10 +162,10 @@ test("untrusted keys, missing proof, forged evidence and unresolved historical r
   db.prepare("UPDATE trash_items SET size_bytes=?").run(TRASH.length + 7);
   db.close();
   await build(wrongHistory);
-  const unproven = await scan(wrongHistory);
+  const unproven = await privateScan(wrongHistory);
   const signedUnknown = signZk1LegacyArchiveReferentialProof({
     evidence: unproven.archiveEvidence[0], ownerPrivateKey: owner.privateKey });
-  const denied = await scan(wrongHistory, { ...options,
+  const denied = await privateScan(wrongHistory, { ...options,
     signedArchiveReferentialProofs: [signedUnknown] });
   assert.equal(denied.referentialAuthentication.status, "UNKNOWN");
   assert.equal(denied.historicalSqlite.status, "UNKNOWN");
@@ -182,10 +183,10 @@ test("untrusted keys, missing proof, forged evidence and unresolved historical r
     ] }), ORIGINAL);
   history.close();
   await build(missingVersion);
-  const candidate = await scan(missingVersion);
+  const candidate = await privateScan(missingVersion);
   const signedIncomplete = signZk1LegacyArchiveReferentialProof({
     evidence: candidate.archiveEvidence[0], ownerPrivateKey: owner.privateKey });
-  const stillUnknown = await scan(missingVersion, { ...options,
+  const stillUnknown = await privateScan(missingVersion, { ...options,
     signedArchiveReferentialProofs: [signedIncomplete] });
   assert.equal(stillUnknown.referentialAuthentication.verifiedArchives, 1);
   assert.equal(stillUnknown.referentialAuthentication.status, "UNKNOWN");
@@ -198,7 +199,7 @@ test("backupService-generated archive joins SQLite versions, FTS, retention, tra
   const f = make(t);
   await build(f);
   const bytes = fs.readFileSync(f.backup);
-  const report = await withPrivateWindowsTestTemp(() => scan(f));
+  const report = await privateScan(f);
   const graph = report.historicalSqlite;
   assert.equal(graph.inspectedSnapshots, 1);
   assert.equal(graph.joinedVersionReferences, 1);
@@ -218,7 +219,7 @@ test("real backup with omitted referenced bytes marks UNKNOWN without a deletion
   for (const type of ["omitSource", "omitTrash", "orphanUpload", "unmapped"]) {
     const f = make(t);
     await build(f, { [type]: true });
-    const report = await scan(f);
+    const report = await privateScan(f);
     assert.equal(report.historicalSqlite.status, "UNKNOWN", type);
     assert.ok(report.historicalSqlite.unknownReferences > 0, type);
     assert.equal(report.authorizesCutover, false);
@@ -234,7 +235,7 @@ test("altered archived SQLite metadata with current live database intact stays U
     ] }), ORIGINAL);
   db.close();
   await build(f);
-  const report = await scan(f);
+  const report = await privateScan(f);
   assert.equal(report.historicalSqlite.joinedVersionReferences, 0);
   assert.ok(report.historicalSqlite.unknownReferences > 0);
   assert.equal(report.historicalSqlite.status, "UNKNOWN");
@@ -254,7 +255,7 @@ test("archived in-flight upload and unfamiliar SQL table remain UNKNOWN even whe
   const now = new DatabaseSync(f.databasePath);
   now.exec("DROP TABLE newer_encrypted_legacy_refs");
   now.close();
-  const report = await scan(f);
+  const report = await privateScan(f);
   assert.equal(report.historicalSqlite.status, "UNKNOWN");
   assert.ok(report.historicalSqlite.unknownReferences >= 2);
   assert.equal(report.canDeleteLegacy, false);
@@ -263,7 +264,7 @@ test("archived in-flight upload and unfamiliar SQL table remain UNKNOWN even whe
 
 test("no archived snapshots is UNKNOWN rather than vacuously a proven empty corpus", async (t) => {
   const f = make(t);
-  const report = await scan(f);
+  const report = await privateScan(f);
   assert.equal(report.historicalSqlite.inspectedSnapshots, 0);
   assert.equal(report.historicalSqlite.status, "UNKNOWN");
   assert.ok(report.historicalSqlite.unknownReferences > 0);
@@ -280,7 +281,7 @@ test("a missing old revision poisons logical FTS, retention and encrypted-file j
     ] }), ORIGINAL);
   db.close();
   await build(f);
-  const graph = (await scan(f)).historicalSqlite;
+  const graph = (await privateScan(f)).historicalSqlite;
   assert.equal(graph.joinedVersionReferences, 1);
   assert.equal(graph.joinedDerivedReferences, 0);
   assert.equal(graph.joinedRetentionReferences, 0);
@@ -294,7 +295,7 @@ test("trash source with incorrect archived SQL size is not a recoverable join", 
   db.prepare("UPDATE trash_items SET size_bytes=?").run(TRASH.length + 1);
   db.close();
   await build(f);
-  const graph = (await scan(f)).historicalSqlite;
+  const graph = (await privateScan(f)).historicalSqlite;
   assert.equal(graph.joinedTrashReferences, 0);
   assert.equal(graph.status, "UNKNOWN");
 });

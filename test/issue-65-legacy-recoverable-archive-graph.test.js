@@ -12,6 +12,7 @@ const { inspectZk1LiveLegacyRecoverableArchiveGraph: inspect } =
   require("../src/services/zk1LiveLegacyRecoverableArchiveGraph");
 const { withInodeGrowthAfterFstat } = require("./support/issue-65-inode-growth-race");
 const { canonicalTestTemp } = require("./support/issue-65-canonical-temp-fixture");
+const { withPrivateWindowsTestTemp } = require("./support/issue-65-private-temp-environment");
 
 const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false };
 const FILE = "SECRET-ARCHIVED-ENCRYPTED-FILE.dat";
@@ -69,6 +70,7 @@ function scan(f, extra = {}) {
   return inspect({ optIn: true, databasePath: f.databasePath,
     backupDataDir: f.dataDir, persistence: MODE, ...extra });
 }
+const privateScan = (f, extra) => withPrivateWindowsTestTemp(() => scan(f, extra));
 function rejected(f, extra) {
   return assert.rejects(scan(f, extra), /ZK_LEGACY_RECOVERABLE_GRAPH_UNVERIFIED/);
 }
@@ -77,7 +79,7 @@ test("actual checksum-pinned ZIP graph observes archived uploads, non-FTS candid
   const f = fixture(t);
   await archive(f);
   const before = fs.readFileSync(f.archive);
-  const a = await scan(f), b = await scan(f);
+  const a = await privateScan(f), b = await privateScan(f);
   assert.equal(a.observation, "bounded-readonly-legacy-recoverable-archive-members");
   assert.equal(a.inspectedArchives, 1);
   assert.equal(a.archivedUploads, 1);
@@ -183,8 +185,8 @@ test("opt-in local non-FTS temp graph accounts for derived files absent from SQL
   const derivedDir = path.join(temp, "generated");
   fs.mkdirSync(derivedDir, { recursive: true });
   fs.writeFileSync(path.join(derivedDir, "private-unindexed-derived.bin"), DATA);
-  const a = await scan(f, { localTempDir: temp });
-  const b = await scan(f);
+  const a = await privateScan(f, { localTempDir: temp });
+  const b = await privateScan(f);
   assert.equal(a.liveNonFtsDerived, 1);
   assert.equal(a.liveNonFtsDerivedInspected, true);
   assert.equal(b.liveNonFtsDerived, null);
