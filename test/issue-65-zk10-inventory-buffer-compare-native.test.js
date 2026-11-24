@@ -122,7 +122,8 @@ test("P2 inventory: inherited numeric Array setter cannot turn owner-signed entr
     else delete Array.prototype[0];
   }
   assert.ok(keyGetterReads > 0, "hostile native KeyObject property callback was reached");
-  assert.ok(decodedCopies > 0, "real signed CBOR A was decoded before the numeric trap");
+  assert.equal(decodedCopies, 0,
+    "signed CBOR decoding must use the captured native decoder, not a late module-export replacement");
   assert.equal(interceptedAssignments, 0,
     "normalization must define its own indexed slots without inherited setters");
   assert.equal(returnedForgedB, 0, "signed membership must not consult prototype entries");
@@ -197,7 +198,8 @@ test("P2 inventory: hostile late Array constructor cannot proxy a signed A row i
     global.Array = originalArray;
   }
   assert.ok(keyReads > 0, "hostile native key callback executed");
-  assert.ok(validDecodes > 0, "original Ed25519-signed snapshot was actually decoded");
+  assert.equal(validDecodes, 0,
+    "the native snapshot must not dispatch through a callback-replaced decoder export");
   assert.equal(maliciousConstructs, 0,
     "normalized rows must use an intrinsic Array literal, not the late global constructor");
   assert.equal(substitutedReads, 0, "membership cannot read a hostile Proxy array");
@@ -251,12 +253,13 @@ test("P2 inventory: native key getter cannot replace signed member A with reques
     return signer.publicKey[handle];
   } });
   try {
-    assert.equal((await inventory.verifySnapshot(input(poisoned, memberB))).outcome,
-      "ABSENT", "signed member A cannot be presented as unsigned B");
+    await assert.rejects(inventory.verifySnapshot(input(poisoned, memberB)),
+      { code: "INVENTORY_SIGNER_KEY" },
+      "inherited native handle accessors must be rejected before membership verification");
   } finally {
     Array.prototype[Symbol.iterator] = originalIterator;
   }
-  assert.ok(keyGetterReads > 0, "real native KeyObject getter executed");
+  assert.equal(keyGetterReads, 0, "invalid inherited native handle getter must not execute");
   assert.equal(substituted, 0, "membership search must not use a post-key iterator");
   assert.equal((await inventory.verifySnapshot(input(signer.publicKey, memberA))).outcome,
     "PRESENT", "genuine A remains accepted");
@@ -368,10 +371,11 @@ test("P2 inventory: signed object A must not make requested B PRESENT via post-k
     return signer.publicKey[handle];
   } });
   try {
-    assert.equal((await inventory.verifySnapshot(args(poisonedPin, requestedB))).outcome,
-      "ABSENT", "valid signature for A must not authorize unlisted object B");
+    await assert.rejects(inventory.verifySnapshot(args(poisonedPin, requestedB)),
+      { code: "INVENTORY_SIGNER_KEY" },
+      "own inherited native handle accessor must be rejected before comparison");
   } finally { Buffer.compare = originalCompare; }
-  assert.ok(getterReads > 0, "product verification must invoke hostile inherited kHandle");
+  assert.equal(getterReads, 0, "invalid inherited native handle getter must not execute");
   assert.equal(substitutions, 0, "lookup must retain early native buffer comparator");
   assert.equal((await inventory.verifySnapshot(args(signer.publicKey, requestedA))).outcome,
     "PRESENT", "valid real Ed25519 owner remains accepted after the attack");
