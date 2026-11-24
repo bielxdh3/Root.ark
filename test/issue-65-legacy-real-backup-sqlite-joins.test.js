@@ -14,6 +14,7 @@ const { signZk1LegacyArchiveReferentialProof } =
   require("../src/services/zk1LegacyArchiveReferentialProof");
 const { canonicalTestTemp } = require("./support/issue-65-canonical-temp-fixture");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
+const { withPrivateWindowsTestTemp } = require("./support/issue-65-private-temp-environment");
 const { verifyWindowsChunkUploadTree } = require("../services/chunkUploadWindowsAcl");
 
 const MODE = { dbEnabled: true, jsonReadFallback: false, jsonWriteMirror: false };
@@ -197,7 +198,7 @@ test("backupService-generated archive joins SQLite versions, FTS, retention, tra
   const f = make(t);
   await build(f);
   const bytes = fs.readFileSync(f.backup);
-  const report = await scan(f);
+  const report = await withPrivateWindowsTestTemp(() => scan(f));
   const graph = report.historicalSqlite;
   assert.equal(graph.inspectedSnapshots, 1);
   assert.equal(graph.joinedVersionReferences, 1);
