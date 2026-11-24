@@ -11,8 +11,8 @@ import java.nio.charset.StandardCharsets
 
 /**
  * One-shot, user-initiated protected text interaction. The Android login is
- * never a content grant. A separate independently authenticated source must
- * deliver a fresh trusted device/epoch snapshot and a 32-byte CEK.
+ * never a content grant. The owner-pinned enrollment provider verifies a
+ * fresh owner head and a wrapped CEK addressed to this installation key.
  *
  * Returned characters are caller-owned and MUST be cleared after rendering.
  * No plaintext is cached, exported or sent to a preview endpoint.
@@ -48,7 +48,11 @@ internal class VerifiedTextPreview(
         }
     }
 
+    /** True means a provider is configured; use [isAvailable] for a scoped grant decision. */
     val available: Boolean get() = trustedGrants != null
+
+    fun isAvailable(username: String, objectId: String): Boolean =
+        trustedGrants?.isAvailable(username, objectId) == true
 
     fun open(
         origin: ServerOrigin,

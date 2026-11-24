@@ -222,11 +222,7 @@ internal class AuthHttpTransport(
         is Short -> value.toInt()
         is Byte -> value.toInt()
         is Long -> if (value in Int.MIN_VALUE..Int.MAX_VALUE) value.toInt() else null
-        is BigInteger -> try {
-            value.intValueExact()
-        } catch (_: ArithmeticException) {
-            null
-        }
+        is BigInteger -> exactBigIntegerInt(value)
         is BigDecimal -> exactBigDecimalInt(value)
         is Double, is Float -> null
         else -> null
@@ -237,12 +233,7 @@ internal class AuthHttpTransport(
         is Long -> if (value >= 0L) value else null
         is Short -> if (value >= 0) value.toLong() else null
         is Byte -> if (value >= 0) value.toLong() else null
-        is BigInteger -> try {
-            val l = value.longValueExact()
-            if (l >= 0L) l else null
-        } catch (_: ArithmeticException) {
-            null
-        }
+        is BigInteger -> exactBigIntegerLong(value)?.takeIf { it >= 0L }
         is BigDecimal -> exactBigDecimalLong(value)?.takeIf { it >= 0L }
         is Double, is Float -> null
         else -> null
@@ -253,12 +244,7 @@ internal class AuthHttpTransport(
         is Short -> if (value > 0) value.toInt() else null
         is Byte -> if (value > 0) value.toInt() else null
         is Long -> if (value in 1..Int.MAX_VALUE) value.toInt() else null
-        is BigInteger -> try {
-            val i = value.intValueExact()
-            if (i > 0) i else null
-        } catch (_: ArithmeticException) {
-            null
-        }
+        is BigInteger -> exactBigIntegerInt(value)?.takeIf { it > 0 }
         is BigDecimal -> exactBigDecimalInt(value)?.takeIf { it > 0 }
         is Double, is Float -> null
         else -> null
@@ -278,11 +264,8 @@ internal class AuthHttpTransport(
             is Long -> value
             is Short -> value.toLong()
             is Byte -> value.toLong()
-            is BigInteger -> try {
-                value.longValueExact()
-            } catch (_: ArithmeticException) {
-                throw SyncListingValidationException("Invalid sync listing")
-            }
+            is BigInteger -> exactBigIntegerLong(value)
+                ?: throw SyncListingValidationException("Invalid sync listing")
             is BigDecimal -> exactBigDecimalLong(value)
                 ?: throw SyncListingValidationException("Invalid sync listing")
             is Double, is Float -> throw SyncListingValidationException("Invalid sync listing")
@@ -301,6 +284,14 @@ internal class AuthHttpTransport(
             null
         }
     }
+
+    // BigInteger.*ValueExact was added to Android's platform API at level 31.
+    // bitLength preserves the exact range check on the app's API 29 minimum.
+    private fun exactBigIntegerInt(value: BigInteger): Int? =
+        if (value.bitLength() <= 31) value.toInt() else null
+
+    private fun exactBigIntegerLong(value: BigInteger): Long? =
+        if (value.bitLength() <= 63) value.toLong() else null
 
     private fun exactBigDecimalInt(value: BigDecimal): Int? =
         exactBigDecimalLong(value)?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()

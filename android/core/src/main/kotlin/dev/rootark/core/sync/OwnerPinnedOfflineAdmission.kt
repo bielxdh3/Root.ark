@@ -30,7 +30,7 @@ data class IndependentOfflineOwnerPin(
 )
 
 /** Owner-signed, bounded revocation snapshot; offline copies cannot learn about later revocations. */
-data class OwnerSignedOfflineHead(
+internal data class OwnerSignedOfflineHead(
     val schema: String, val origin: String, val username: String, val readerDeviceId: String,
     val ownerRevision: Long, val ownerDigest: String, val revokedDeviceIds: List<String>,
     val issuedAtMillis: Long, val expiresAtMillis: Long, val signature: String,
@@ -44,7 +44,7 @@ data class OwnerSignedOfflineHead(
 }
 
 /** No CEK bytes or private identity are embedded in this owner-signed read grant. */
-data class OwnerSignedOfflineCekGrant(
+internal data class OwnerSignedOfflineCekGrant(
     val schema: String, val origin: String, val username: String, val readerDeviceId: String,
     val ownerRevision: Long, val ownerDigest: String,
     val objectId: String, val fileId: String, val versionId: String,
@@ -73,7 +73,8 @@ data class OwnerSignedOfflineCekGrant(
  * offline plaintext UI. The caller must keep protected offline unlock disabled
  * until the owner approves a lease and real on-device security is measured.
  */
-object OwnerPinnedOfflineAdmission {
+/** Legacy V1 raw-CEK admission retained only for core regression tests. Android production uses V2 HPKE grants. */
+internal object OwnerPinnedOfflineAdmission {
     private const val HEAD_SCHEMA = "rootark-android-owner-head/v1"
     private const val GRANT_SCHEMA = "rootark-android-cek-read/v1"
     private const val MAX_LEASE_MILLIS = 300_000L
@@ -91,12 +92,17 @@ object OwnerPinnedOfflineAdmission {
         try {
             verifiedHead(head, pin, nowMillis)
             store.advance(pin, head.ownerRevision, head.ownerDigest, nowMillis)
-        } catch (_: Exception) {
-            throw ProtectedSyncException()
+        } catch (error: RootArkApiException) {
+            throw error
+        } catch (error: ProtectedSyncException) {
+            throw error
+        } catch (error: Exception) {
+            throw ProtectedSyncException(error)
         }
     }
 
-    /** Caller-owned CEK is erased even if signature, floor, keystore, or consumer rejects. */
+    /** Legacy raw-CEK JVM primitive. Production Android must use V2 HPKE-wrapped grants. */
+    @Deprecated("Use OwnerEnrollmentAdmission.withAuthorizedGrant for installation-key HPKE")
     fun <T> withAuthorizedCek(
         grant: OwnerSignedOfflineCekGrant,
         head: OwnerSignedOfflineHead,
@@ -269,6 +275,13 @@ class OwnerOfflineFloorStore(
     // SAME descriptor that owns the OS lock. Null is a JVM-only, non-hostile
     // private-directory compatibility mode; it proves NO hostile-path safety.
     private val openDescriptorBoundLock: ((File, Boolean) -> OwnerFloorOpenedLock)? = null,
+    private val onSealedFloor: (() -> Unit)? = null,
+    // Even when advanceAndUse throws before onSealedFloor, the rename may
+    // already be durable. The Android alias owner must conservatively retain it.
+    private val onAdvanceAttempted: (() -> Unit)? = null,
+    // Fault-injection seam: a crash/failure between atomic rename and directory
+    // fsync must never be mistaken for evidence that no new floor was written.
+    private val afterFloorRename: (() -> Unit)? = null,
 ) {
     private val destination get() = File(root, "owner-floor-v1.bin")
     private val lockFile get() = File(root, "owner-floor-v1.lock")
@@ -316,6 +329,7 @@ class OwnerOfflineFloorStore(
         consume: () -> T,
     ): T {
         try {
+            onAdvanceAttempted?.invoke()
             val secret = key ?: throw ProtectedSyncException()
             check(secret.algorithm == "AES" && secret.encoded?.size != 0)
             check(nowMillis > 0 && revision >= 1)
@@ -420,6 +434,7 @@ class OwnerOfflineFloorStore(
                         }
                         Files.move(temporary, destination.toPath(),
                             StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                        afterFloorRename?.invoke()
                         // A file fsync does not persist the directory rename.
                         // Deny admission if metadata or stable lock identity
                         // cannot be confirmed before the CEK callback can run.
@@ -439,11 +454,18 @@ class OwnerOfflineFloorStore(
                     // observeHead cannot commit between floor validation and
                     // CEK use, even through a different store instance.
                     check(lock.isValid && lockIdentity() == lockedIdentity)
+                    // Report only a completed, durably committed floor; a
+                    // later consumer failure cannot undo that evidence.
+                    onSealedFloor?.invoke()
                     consume()
                 }
             }
-        } catch (_: Exception) {
-            throw ProtectedSyncException()
+        } catch (error: RootArkApiException) {
+            throw error
+        } catch (error: ProtectedSyncException) {
+            throw error
+        } catch (error: Exception) {
+            throw ProtectedSyncException(error)
         }
     }
 

@@ -3,6 +3,7 @@ package dev.rootark.android
 import dev.rootark.core.auth.ServerOrigin
 import dev.rootark.core.sync.LoginOutcome
 import dev.rootark.core.sync.RootArkApiException
+import java.math.BigInteger
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -11,6 +12,7 @@ import java.net.URL
 import java.security.Principal
 import java.security.cert.Certificate
 import javax.net.ssl.HttpsURLConnection
+import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -116,5 +118,30 @@ class AuthHttpTransportAuthenticationTest {
         assertTrue(failure.message.orEmpty().contains("deadline"))
         assertEquals(4, reads)
         assertTrue(response.disconnected)
+    }
+
+    @Test fun bigIntegerListingNumbersStayExactOnTheApi29Minimum() {
+        val transport = AuthHttpTransport()
+        assertEquals(Int.MIN_VALUE, transport.parseProtocolVersion(BigInteger.valueOf(Int.MIN_VALUE.toLong())))
+        assertEquals(Int.MAX_VALUE, transport.parseProtocolVersion(BigInteger.valueOf(Int.MAX_VALUE.toLong())))
+        assertNull(transport.parseProtocolVersion(BigInteger.valueOf(Int.MAX_VALUE.toLong()).add(BigInteger.ONE)))
+        assertEquals(Int.MAX_VALUE, transport.parsePositiveInt(BigInteger.valueOf(Int.MAX_VALUE.toLong())))
+        assertNull(transport.parsePositiveInt(BigInteger.valueOf(Int.MAX_VALUE.toLong()).add(BigInteger.ONE)))
+        assertNull(transport.parsePositiveInt(BigInteger.ZERO))
+
+        assertEquals(Long.MAX_VALUE, transport.parseNonNegativeLong(BigInteger.valueOf(Long.MAX_VALUE)))
+        assertNull(transport.parseNonNegativeLong(BigInteger.valueOf(Long.MAX_VALUE).add(BigInteger.ONE)))
+        assertNull(transport.parseNonNegativeLong(BigInteger.valueOf(-1)))
+        assertEquals(Long.MIN_VALUE, transport.optionalLong(
+            JSONObject().put("value", BigInteger.valueOf(Long.MIN_VALUE)), "value",
+        ))
+        assertEquals(Long.MAX_VALUE, transport.optionalLong(
+            JSONObject().put("value", BigInteger.valueOf(Long.MAX_VALUE)), "value",
+        ))
+        assertThrows(SyncListingValidationException::class.java) {
+            transport.optionalLong(
+                JSONObject().put("value", BigInteger.valueOf(Long.MAX_VALUE).add(BigInteger.ONE)), "value",
+            )
+        }
     }
 }

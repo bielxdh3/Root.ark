@@ -13,7 +13,8 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /** Deliberately contains no attacker-controlled values or decrypted bytes. */
-class ProtectedSyncException : SecurityException("Protected sync verification failed")
+class ProtectedSyncException(cause: Throwable? = null) :
+    SecurityException("Protected sync verification failed", cause)
 
 /**
  * Inputs must come from an independently authenticated device/epoch authority,
@@ -270,6 +271,7 @@ object ProtectedSyncContent {
         null -> "null"
         is String -> escapeJson(value)
         is Boolean, is Int, is Long -> value.toString()
+        is List<*> -> value.joinToString(",", "[", "]") { canonicalJson(it) }
         is Map<*, *> -> value.keys.map { it as String }.sorted().joinToString(",", "{", "}") { key ->
             escapeJson(key) + ":" + canonicalJson(value[key])
         }

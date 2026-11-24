@@ -37,5 +37,108 @@ test("native protected text view requires provisioned trust, authenticated fetch
   assert.match(activity, /previewText\.text\s*=\s*""/,
     "clear must remove the TextView's reference to the old backing buffer");
   assert.doesNotMatch(activity, /text\(view,\s*String\(characters\)\)/, "must not wrap characters in String");
-  assert.doesNotMatch(activity, /\.ciphertext|\.nonce|\.tag|\.aad|\.authorization|SharedPreferences|ClipboardManager|WebView/);
+  const protectedView = activity.slice(
+    activity.indexOf("private fun showProtectedObject"), activity.indexOf("private fun showDeviceEnrollment"),
+  );
+  assert.doesNotMatch(protectedView, /ClipboardManager|setPrimaryClip|WebView/,
+    "the protected-content view must not copy content or use a WebView");
+  assert.match(activity, /ClipData\.newPlainText\("Root\.ark Android device", "\$\{identity\.readerDeviceId\}\\n\$publicKeyText"\)/,
+    "clipboard access is limited to the public device identity for out-of-band owner pinning");
+  assert.doesNotMatch(activity, /\.ciphertext|\.nonce|\.tag|\.aad|\.authorization|SharedPreferences|WebView/);
+});
+
+test("owner fingerprint survives an out-of-band background check only via exact fresh reauthentication", () => {
+  const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
+  const policy = read("android/app/src/main/java/dev/rootark/android/AndroidKeySecurityPolicy.kt");
+  assert.match(activity, /private var pendingOwnerFingerprintStartedAtElapsedMs: Long/);
+  assert.match(activity, /SystemClock\.elapsedRealtime\(\)/);
+  assert.match(activity, /OwnerFingerprintResumePolicy\.canResume\(/);
+  assert.match(activity, /private fun resumeOwnerFingerprintAfterLogin\(/);
+  assert.match(activity, /AndroidInstallationKey\(this\)\.publicIdentity\(allowCreate = false\)/);
+  assert.match(activity, /MessageDigest\.isEqual\(/);
+  assert.match(activity, /if \(resumeOwnerFingerprintAfterLogin\(result, origin\)\) return/);
+  assert.match(activity, /pendingOwnerImportBytes\?\.fill\(0\)/);
+  assert.match(policy, /object OwnerFingerprintResumePolicy/);
+});
+
+test("credential action never retains the authenticated bearer token after background logout", () => {
+  const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
+  const section = activity.slice(activity.indexOf("private fun showProtectedObject"), activity.indexOf("private fun <T> runCheckedRequest"));
+  assert.doesNotMatch(section, /val session = authenticatedSession/,
+    "credential launcher must never capture an authenticated session object");
+  assert.ok(/authenticatedSession\s*\?: return/.test(section),
+    "the callback must recheck current login rather than holding a stale token");
+  assert.match(activity, /pendingDeviceCredentialAction = null/);
+});
+
+test("V2 runtime gate reflects Android Ed25519 provider support on API 33+", () => {
+  const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
+  const provider = read("android/app/src/main/java/dev/rootark/android/OwnerPinnedGrantProvider.kt");
+  assert.match(activity, /Build\.VERSION\.SDK_INT < Build\.VERSION_CODES\.TIRAMISU/);
+  assert.match(provider, /Build\.VERSION\.SDK_INT < Build\.VERSION_CODES\.TIRAMISU/);
+  assert.doesNotMatch(activity, /Enrollment protegido exige Android 12/);
+});
+
+test("owner document picker requires a fresh exact-account login before processing its returned package", () => {
+  const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
+  const documentResult = activity.slice(activity.indexOf("REQUEST_OWNER_PACKAGE -> {"),
+    activity.indexOf("REQUEST_DEVICE_CREDENTIAL -> {"));
+  assert.match(documentResult, /pendingOwnerDocumentAwaitingLogin\s*=\s*true/);
+  assert.match(activity, /resumeOwnerDocumentAfterLogin\(/);
+  assert.match(activity, /OwnerFingerprintResumePolicy\.canResume\(/);
+  assert.match(activity, /if \(resumeOwnerDocumentAfterLogin\(result, origin\)\) return/);
+  assert.doesNotMatch(documentResult, /showOwnerFingerprintConfirmation\(|importOwnerPackage\(|requestDeviceCredentialThen\(/,
+    "picker result must never authorize or persist a grant using the pre-background login");
+});
+
+test("protected viewer resumes only with a fresh matching login after Keyguard, without retaining bearer", () => {
+  const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
+  assert.match(activity, /pendingProtectedRead/);
+  assert.match(activity, /OwnerCredentialResumePolicy\.canResume\(/);
+  assert.match(activity, /if \(resumeProtectedReadAfterLogin\(result, origin\)\) return/);
+  assert.match(activity, /deferProtectedReadAfterCredential\(/);
+  assert.match(activity, /confirmedCredential/);
+  assert.doesNotMatch(activity, /pendingProtectedRead\s*=\s*.*(?:token|Authenticated)/,
+    "pending viewer intent must contain metadata only, never a server bearer");
+});
+
+test("owner hardware-floor import runs on worker, not on the login callback UI thread", () => {
+  const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
+  const resumption = activity.slice(activity.indexOf("private fun resumeOwnerCredentialAfterLogin("),
+    activity.indexOf("private fun deferProtectedReadAfterCredential("));
+  assert.match(resumption, /runCheckedRequest\(\{\s*stillActive\s*->/);
+  assert.match(resumption, /importOwnerPackage\(/);
+  assert.match(resumption, /OwnerCredentialResumePolicy\.canResume\(/);
+  assert.doesNotMatch(resumption, /\n\s*importOwnerPackage\(bytes, pin, publicKey, initial\)\s*\n/,
+    "blocking floor acquisition must not be called directly by the UI login callback");
+  const importBody = activity.slice(activity.indexOf("private fun importOwnerPackage("),
+    activity.indexOf("private fun readOwnerPackage("));
+  assert.match(importBody, /stillActive\(\)/,
+    "worker import must abort when foreground/login generation changes");
+  assert.match(importBody, /OwnerCredentialResumePolicy\.isWithinWindow\(/,
+    "worker import must recheck authenticated hardware window after waiting for the index lock");
+  assert.doesNotMatch(importBody, /showLogin\(/,
+    "worker import must not touch Activity UI after background thread execution");
+});
+
+test("owner floor enrollment commit fences reads and retires aliases only after persisted package", () => {
+  const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
+  const floor = read("android/app/src/main/java/dev/rootark/android/OwnerOfflineHardwareFloor.kt");
+  const provider = read("android/app/src/main/java/dev/rootark/android/OwnerPinnedGrantProvider.kt");
+  const store = read("android/app/src/main/java/dev/rootark/android/OwnerEnrollmentStore.kt");
+  const importer = activity.slice(activity.indexOf("private fun importOwnerPackage("),
+    activity.indexOf("private fun readOwnerPackage("));
+  assert.match(importer, /prepareEnrollment\s*=\s*\{[\s\S]*?enrollmentStore\.stage\(/);
+  assert.match(floor, /indexLock\s*=\s*acquireIndexLock\(noBackupRoot\)[\s\S]*?prepareEnrollment\(\)[\s\S]*?createdAlias = alias/,
+    "candidate must be durable under the index lock before allocating a high-water alias");
+  assert.match(importer, /enrollmentStore\.save\([\s\S]*?enrollmentSaved\s*=\s*true/);
+  assert.match(importer, /retireOlder\([\s\S]*?enrollmentSaved\s*=\s*enrollmentSaved/);
+  assert.doesNotMatch(importer.slice(importer.indexOf("observeHead("), importer.indexOf("enrollmentStore.save(")),
+    /stillActive\(\)|isWithinWindow\(/, "after a durable seal, Activity cancellation cannot skip signed-package persistence");
+  assert.match(floor, /PRESERVE_PRIOR_FOR_RECOVERY\s*->\s*return/);
+  assert.match(floor, /clearPreparedOnCommit\?\.invoke\(\)/);
+  assert.match(provider, /enrollmentStore\.hasPending\(\)/);
+  assert.match(store, /fun stage\(/);
+  assert.doesNotMatch(store.slice(store.indexOf("fun load("), store.indexOf("fun save(")),
+    /pending\b/, "untrusted staged state must never become active enrollment during load()");
 });

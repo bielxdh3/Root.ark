@@ -34,9 +34,23 @@ internal data class ProtectedContentGrant(
     val fileKey: ByteArray,
 )
 
-/** Deliberately has no implementation: the current Android login is not a ZK grant. */
+/** Production implementations must prove a fresh owner grant for this exact reader and object. */
 internal fun interface TrustedContentGrantProvider {
     fun obtain(username: String, objectId: String): ProtectedContentGrant?
+
+    /** A UI availability check must be read-only and must never unwrap the CEK. */
+    fun isAvailable(username: String, objectId: String): Boolean = false
+
+    /** Real providers override this to keep the owner-floor lock held through content use. */
+    fun <T> withGrant(
+        username: String,
+        objectId: String,
+        consume: (PinnedSyncReadContext, ByteArray) -> T,
+    ): T {
+        val grant = obtain(username, objectId) ?: throw ProtectedSyncException()
+        try { return consume(grant.context, grant.fileKey) }
+        finally { grant.fileKey.fill(0) }
+    }
 }
 
 /** Authenticated HTTP bytes, structurally parsed but NOT independently signature-verified. */
@@ -47,9 +61,9 @@ internal data class FetchedCiphertextPacket(val bytes: ByteArray, val record: Sy
  *
  * fetchCiphertext() returns an UNTRUSTED remote record: it is never plaintext
  * and callers must not treat metadata or server-supplied device pins as truth.
- * withVerifiedContent() accepts externally provisioned trust + CEK, verifies
+ * withVerifiedContent() accepts owner-pinned trust + a wrapped CEK, verifies
  * the signed v2 envelope/AES-GCM, and wipes key/plaintext after the callback.
- * This component is not wired to any UI or automatic download.
+ * The Activity invokes it only after a local credential prompt and fresh grant check.
  */
 internal class ProtectedSyncFetch(
     private val clockNanos: () -> Long = System::nanoTime,
@@ -158,30 +172,27 @@ internal class ProtectedSyncFetch(
     ) {
         origin.syncObjectUrl(objectId)
         if (!ReadOnlyFileListPolicy.canList(session.permissions)) throw ProtectedSyncException()
-        var grant: ProtectedContentGrant? = null
-        try {
-            grant = grantProvider.obtain(session.username, objectId)
-            val currentGrant = grant ?: throw ProtectedSyncException()
-            val context = currentGrant.context
-            if (currentGrant.fileKey.size != 32 ||
-                context.username != session.username || context.objectId != objectId ||
-                context.trustedDevicePublicKeys.isEmpty()) {
-                throw ProtectedSyncException()
-            }
+        grantProvider.withGrant(session.username, objectId) { context, fileKey ->
+            try {
+                if (fileKey.size != 32 || context.username != session.username ||
+                    context.objectId != objectId || context.trustedDevicePublicKeys.isEmpty()) {
+                    throw ProtectedSyncException()
+                }
             if (!stillActive()) throw ProtectedSyncException()
             val record = fetchCiphertext(origin, session, objectId)
             // The window may have stopped while the HTTPS response arrived.
             // Never decrypt a response after foreground authorization ended.
             if (!stillActive()) throw ProtectedSyncException()
-            val plaintext = ProtectedSyncContent.verifyAndDecrypt(record, currentGrant.fileKey, context)
+            val plaintext = ProtectedSyncContent.verifyAndDecrypt(record, fileKey, context)
             try {
                 if (!stillActive()) throw ProtectedSyncException()
                 consume(plaintext)
             } finally {
                 plaintext.fill(0)
             }
-        } finally {
-            grant?.fileKey?.fill(0)
+            } finally {
+                fileKey.fill(0)
+            }
         }
     }
 }
