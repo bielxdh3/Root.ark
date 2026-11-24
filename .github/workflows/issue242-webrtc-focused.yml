@@ -1,0 +1,43 @@
+name: Issue 242 disposable WebRTC
+
+on:
+  pull_request:
+    paths:
+      - 'experiments/issue242-webrtc/**'
+      - '.github/workflows/issue242-webrtc-focused.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  wire-and-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts
+        working-directory: experiments/issue242-webrtc
+      - run: npm test
+        working-directory: experiments/issue242-webrtc
+
+  edge-datachannel:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Require Microsoft Edge
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe')) {
+            throw 'Microsoft Edge unavailable; browser coverage must not silently skip'
+          }
+      - run: npm ci --ignore-scripts
+        working-directory: experiments/issue242-webrtc
+      - run: npm run test:browser
+        working-directory: experiments/issue242-webrtc
