@@ -86,6 +86,16 @@ test('real Root.ark session verification gates room creation and WebSocket upgra
   assert.equal((await f.createRoom(f.cookie('alice'))).status, 200);
 });
 
+test('P2 merge: per-principal signaling socket budget preserves another authenticated user capacity', async t => {
+  const f = await fixture(t);
+  const firstSession = f.cookie('alice');
+  const secondSession = f.cookie('alice', { expiresIn: '4m' });
+  for (let index = 0; index < 8; index++) await f.connect(index % 2 ? firstSession : secondSession);
+  await assert.rejects(f.connect(secondSession), /upgrade 429/,
+    'ninth socket of the same username must not monopolize the global socket budget');
+  await f.connect(f.cookie('bob')); // Positive control: unrelated principal still admitted.
+});
+
 test('recipient-bound single-use invite and host session prevent impersonation and unauthorized signaling', async t => {
   const f = await fixture(t);
   const room = (await f.createRoom(f.cookie('alice'))).data;
@@ -120,7 +130,7 @@ test('recipient-bound single-use invite and host session prevent impersonation a
   assert.equal((await replay.next('error')).code, 'INVALID_INVITE');
 });
 
-test('1:N guest membership remains private from other recipients before consent', async t => {
+test('1:N guest roster and membership events remain private between recipients', async t => {
   const f = await fixture(t);
   const room = (await f.createRoom(f.cookie('alice'))).data;
   const host = await f.connect(f.cookie('alice'));
@@ -132,44 +142,56 @@ test('1:N guest membership remains private from other recipients before consent'
   const bob = await f.connect(f.cookie('bob'));
   bob.send({ type: 'join', roomId: room.roomId, invitation: bobInvite.invitation });
   const bobJoined = await bob.next('joined');
-  assert.deepEqual(bobJoined.members.map(m => m.username), ['alice']);
-  await host.next('peer-joined');
+  assert.deepEqual(bobJoined.members, [
+    { peerId: hostJoined.peerId, role: 'host', username: 'alice' },
+  ]);
+  assert.equal((await host.next('peer-joined')).username, 'bob');
+
+  // Host-to-recipient consent remains functional without exposing a guest
+  // to any other guest's membership or signaling channel.
   host.send({ type: 'request-peer', to: bobJoined.peerId });
   const request = await bob.next('peer-request');
   assert.equal(request.peerId, hostJoined.peerId);
   bob.send({ type: 'consent', requestId: request.requestId, accept: true });
   assert.equal((await host.next('peer-accepted')).peerId, bobJoined.peerId);
-  host.send({ type: 'signal', to: bobJoined.peerId, signal: { kind: 'ice', candidate: { candidate: 'consented' } } });
+  host.send({ type: 'signal', to: bobJoined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'consented' } } });
   assert.equal((await bob.next('signal')).peerId, hostJoined.peerId);
 
+  const bobSawGuestEvents = [];
+  bob.ws.on('message', bytes => {
+    const message = JSON.parse(bytes.toString());
+    if (message.type === 'peer-joined' || message.type === 'peer-left') {
+      bobSawGuestEvents.push(message);
+    }
+  });
   host.send({ type: 'invite', recipient: 'eve' });
   const eveInvite = await host.next('invited');
   const eve = await f.connect(f.cookie('eve'));
-  const bobSawGuest = [];
-  bob.ws.on('message', bytes => {
-    const message = JSON.parse(bytes.toString());
-    if (message.type === 'peer-joined' || message.type === 'peer-left') bobSawGuest.push(message);
-  });
   eve.send({ type: 'join', roomId: room.roomId, invitation: eveInvite.invitation });
   const eveJoined = await eve.next('joined');
-  assert.deepEqual(eveJoined.members.map(m => m.username), ['alice'],
-    'a recipient must not learn another invited recipient name or peer ID');
-  assert.equal((await host.next('peer-joined')).username, 'eve', 'host still sees every invited recipient');
+  assert.deepEqual(eveJoined.members, [
+    { peerId: hostJoined.peerId, role: 'host', username: 'alice' },
+  ], 'Eve must not learn Bob\'s username or peer ID');
+  assert.equal((await host.next('peer-joined')).username, 'eve',
+    'the host still sees every invited recipient');
 
-  // Consent with Alice never grants Bob signaling rights to another guest.
+  // The error reply is an ordering barrier for earlier messages on Bob's socket.
+  bob.send({ type: 'invite', recipient: 'eve' });
+  assert.equal((await bob.next('error')).code, 'FORBIDDEN');
+  assert.deepEqual(bobSawGuestEvents, [], 'Bob must not receive Eve\'s peer-joined event');
+
   bob.send({ type: 'signal', to: eveJoined.peerId,
     signal: { kind: 'ice', candidate: { candidate: 'cross-guest' } } });
-  assert.equal((await bob.next('error')).code, 'FORBIDDEN');
+  assert.equal((await bob.next('error')).code, 'FORBIDDEN',
+    'consent with the host must not authorize signaling to another guest');
 
   host.send({ type: 'kick', to: eveJoined.peerId });
   assert.equal((await eve.next('error')).code, 'REVOKED');
   assert.equal((await host.next('peer-left')).peerId, eveJoined.peerId);
-  // A round-trip error reply on Bob's socket is a protocol-order barrier:
-  // any earlier peer-left broadcast on that same socket precedes this reply.
   bob.send({ type: 'invite', recipient: 'eve' });
   assert.equal((await bob.next('error')).code, 'FORBIDDEN');
-  assert.deepEqual(bobSawGuest, []);
-  assert.equal(hostJoined.role, 'host');
+  assert.deepEqual(bobSawGuestEvents, [], 'Bob must not receive Eve\'s peer-left event');
 });
 
 test('revoked or expired Root.ark session closes its previously consented peer channel', async t => {

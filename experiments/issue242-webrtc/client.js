@@ -21,7 +21,6 @@
   const wsUrl = location.origin.replace(/^http/, 'ws') + (inRootark ? '/ws' : '/signal');
   const fileWire = window.P2PFileWire;
   const MAX_FILE = fileWire ? fileWire.MAX_FILE : (32 * 1024 * 1024);
-  const BUFFER_HIGH = 256 * 1024;
   let preparingFile = false;
   let preparingFileToken = 0;
   let ws, roomId, hostKey, selfId, role, activeBoundObject = null;
@@ -30,9 +29,14 @@
   let creatingRoom = false;
   let pendingCreateController = null;
   const peers = new Map(), invites = new Map();
+  // The broker may deliver earlier signaling after a local kick or peer-left.
+  // A departed peer ID is never eligible for a fresh RTC transport in this room.
+  const locallyRevokedPeers = new Set();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
   async function releaseUnusedRoom(reservation) {
+    // Only the real signed-session adapter can cancel an HTTP reservation.
+    // Standalone and synthetic fixture room IDs are not server capabilities.
     if (!inRootark || typeof reservation?.roomId !== 'string' ||
       !/^[a-f0-9]{16}$/.test(reservation.roomId) ||
       typeof reservation.hostKey !== 'string' ||
@@ -47,7 +51,7 @@
           'X-CSRF-Token': csrf.slice('rootark_csrf='.length) },
         body: JSON.stringify({ roomId: reservation.roomId, hostKey: reservation.hostKey }),
       });
-    } catch { /* The signed broker still expires unjoined rooms after 15 seconds. */ }
+    } catch { /* Expiry is still the fail-safe if the release request is lost. */ }
   }
   const setCreateButtonsDisabled = disabled => {
     const awaitingAdmission = Boolean(ws && ws.readyState !== WebSocket.CLOSED && !role);
@@ -59,6 +63,7 @@
   function retireRoom() {
     const oldSocket = ws;
     ws = null; // Ignore callbacks from the previous room immediately.
+    locallyRevokedPeers.clear();
     ++preparingFileToken;
     preparingFile = false;
     if (oldSocket && oldSocket.readyState < 2) oldSocket.close();
@@ -129,6 +134,12 @@
       try { m = JSON.parse(event.data); } catch { return; }
       if (m.type === 'error') {
         record(diagnostics.rejected, m.code);
+        if (m.code === 'REVOKED' || m.code === 'ROOM_CLOSED') {
+          // An authoritative room denial must close direct WebRTC now, not
+          // after the broker's asynchronous WebSocket close handshake.
+          leaveRoom();
+          return log('Erro: ' + m.code);
+        }
         // Any server error before `joined` is an admission failure. A bound
         // room can lose ACL/object eligibility between its successful POST
         // and the WebSocket recheck; never retain that pending room identity.
@@ -180,6 +191,7 @@
         invites.delete(m.inviteId);
         log('Convite revogado');
       } else if (m.type === 'peer-joined' && role === 'host') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const line = document.createElement('div');
         line.className = 'entry';
         line.dataset.peerId = m.peerId;
@@ -187,8 +199,10 @@
         const kick = document.createElement('button');
         kick.textContent = 'Revogar participante';
         kick.addEventListener('click', () => {
-          if (ws !== eventSocket) return;
+          if (ws !== eventSocket || locallyRevokedPeers.has(m.peerId)) return;
+          locallyRevokedPeers.add(m.peerId);
           wire({ type: 'kick', to: m.peerId });
+          dropPeer(m.peerId);
         });
         line.append(kick);
         $('peers').append(line);
@@ -210,6 +224,7 @@
         }
         $('peers').append(div);
       } else if (m.type === 'peer-accepted') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const p = preparePeer(m.peerId, true);
         try {
           const dc = p.pc.createDataChannel('fixture-transfer', { ordered: true });
@@ -228,8 +243,10 @@
           }
         }
       } else if (m.type === 'peer-allowed') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         preparePeer(m.peerId, false);
       } else if (m.type === 'signal') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const p = peers.get(m.peerId);
         if (!p) return;
         try {
@@ -261,12 +278,8 @@
           if (ws === eventSocket && peers.get(p.id) === p) log('Negociação falhou: ' + e.name);
         }
       } else if (m.type === 'peer-left') {
-        const p = peers.get(m.peerId);
-        peers.delete(m.peerId);
-        if (p) closePeer(p);
-        document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
-          if (el.dataset.peerId === m.peerId) el.remove();
-        });
+        locallyRevokedPeers.add(m.peerId);
+        dropPeer(m.peerId);
         log('Par desconectado');
       }
     };
@@ -355,7 +368,20 @@
       p.saved.element.remove();
       p.saved = null;
     }
+    // Closing only RTCPeerConnection does not synchronously change the
+    // DataChannel state in every browser. Stop locally queued bytes first.
+    if (p.dc && p.dc.readyState !== 'closed') {
+      try { p.dc.close(); } catch { /* Closing the parent still retires RTC. */ }
+    }
     p.pc.close();
+  }
+  function dropPeer(id) {
+    const p = peers.get(id);
+    peers.delete(id);
+    if (p) closePeer(p);
+    document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
+      if (el.dataset.peerId === id) el.remove();
+    });
   }
   function transferUi(p, title, direction, cancel) {
     const node = document.createElement('div');
@@ -400,7 +426,9 @@
     }
     p.dc = dc;
     dc.binaryType = 'arraybuffer';
-    dc.bufferedAmountLowThreshold = 64 * 1024;
+    // bufferedamountlow fires only after crossing this threshold. Match the
+    // send-window limit so a peer that drains below 256 KiB wakes immediately.
+    dc.bufferedAmountLowThreshold = (fileWire.BUFFER_HIGH || 256 * 1024) - 1;
     dc.onopen = () => {
       if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc) return;
       record(diagnostics.channels, p.id);
@@ -419,7 +447,9 @@
       log('Arquivo rejeitado: ' + code);
     }
     dc.onmessage = async event => {
-      if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc) return;
+      if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc ||
+        dc.readyState !== 'open') return;
+      const messageRoomIntent = roomIntent;
       if (event.data instanceof ArrayBuffer) {
         const rx = p.incoming;
         if (!rx) { record(diagnostics.rejected, 'UNEXPECTED_CHUNK'); return; }
@@ -448,9 +478,11 @@
       }
       if (m.type === 'text' && typeof m.text === 'string' && m.text.length <= 1000 && /^[0-9a-f]{64}$/.test(m.digest)) {
         const hash = await sha(new TextEncoder().encode(m.text));
-        // Hashing yields to room switches and revocation. The old DataChannel
-        // must not publish plaintext into a later room's UI or diagnostics.
-        if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc ||
+        // A digest may finish after a room switch, peer retirement or the
+        // beginning of a protected-room intent. Never admit old plaintext
+        // into the new room's verified-text diagnostics or status.
+        if (ws !== p.socket || messageRoomIntent !== roomIntent || peers.get(p.id) !== p ||
+          p.dc !== dc || dc.readyState !== 'open' ||
           protectedRoomRequired || activeBoundObject) return;
         if (hash === m.digest) {
           record(diagnostics.verifiedTexts, { from: p.id, text: m.text, sha256: hash });
@@ -556,26 +588,11 @@
       }
     };
   }
-  async function awaitBufferSpace(dc, signal) {
-    if (dc.bufferedAmount < BUFFER_HIGH || signal.aborted || dc.readyState !== 'open') return;
-    await new Promise(resolve => {
-      const finish = () => {
-        dc.removeEventListener('bufferedamountlow', finish);
-        dc.removeEventListener('close', finish);
-        signal.removeEventListener('abort', finish);
-        resolve();
-      };
-      dc.addEventListener('bufferedamountlow', finish);
-      dc.addEventListener('close', finish);
-      signal.addEventListener('abort', finish, { once: true });
-      if (signal.aborted || dc.readyState !== 'open' || dc.bufferedAmount < BUFFER_HIGH) finish();
-    });
-  }
   async function sendChunks(p, tx) {
     const { dc } = p;
     try {
       for (let offset = 0; offset < tx.size; offset += fileWire.CHUNK_BYTES) {
-        await awaitBufferSpace(dc, tx.abort.signal);
+        await fileWire.waitForSendWindow(dc, tx.abort.signal);
         if (p.outgoing !== tx || tx.abort.signal.aborted || dc.readyState !== 'open') return;
         const bytes = new Uint8Array(await tx.file.slice(offset, offset + fileWire.CHUNK_BYTES).arrayBuffer());
         if (p.outgoing !== tx || tx.abort.signal.aborted || dc.readyState !== 'open') return;
@@ -596,10 +613,12 @@
         cancelOutgoing(p, true);
         log('Confirmação de integridade expirou');
       }, 30_000);
-    } catch {
+    } catch (error) {
       if (p.outgoing !== tx) return;
       cancelOutgoing(p, true);
-      record(diagnostics.rejected, 'SEND_FAILED');
+      record(diagnostics.rejected, error?.message === 'P2P_SEND_BUFFER_STALLED'
+        ? 'P2P_SEND_BUFFER_STALLED' : 'SEND_FAILED');
+      log('Falha ao enviar arquivo para o par ' + p.id.slice(0, 5));
     }
   }
   function cancelOutgoing(p, notify) {
@@ -637,6 +656,7 @@
         return log('O SHA-256 não corresponde ao ciphertext da sala');
       }
       const name = file.name.slice(0, 100) || 'arquivo.bin';
+      let offered = 0;
       for (const p of receivers) {
         if (sendingIntent !== roomIntent) break;
         if (peers.get(p.id) !== p || p.dc?.readyState !== 'open' || p.outgoing) continue;
@@ -651,8 +671,11 @@
         tx.timer = setTimeout(() => {
           if (p.outgoing === tx) cancelOutgoing(p, true);
         }, 60_000);
+        offered++;
       }
-      log('Arquivo oferecido a ' + receivers.length + ' destinatário(s)');
+      log(offered
+        ? 'Arquivo oferecido a ' + offered + ' destinatário(s)'
+        : 'Nenhum destinatário permaneceu disponível');
     } catch { log('Falha ao ler ou oferecer arquivo'); }
     finally {
       if (preparationToken === preparingFileToken) preparingFile = false;
@@ -694,6 +717,9 @@
     protectedRoomRequired = Boolean(boundObject);
     if (protectedRoomRequired) {
       retireRoom();
+      // The server may now deny this entire mode before hashing. Do not
+      // leave a stale manual room identifier or host key visible as if it
+      // authorized ciphertext sharing after a failed bound admission.
       roomId = null;
       hostKey = null;
       $('room').textContent = '';

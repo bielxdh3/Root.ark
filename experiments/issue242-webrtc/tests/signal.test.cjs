@@ -176,6 +176,76 @@ test('room expires even when idle, and rejected consent cannot forward SDP', asy
   assert.equal((await guest.next('error')).code, 'ROOM_CLOSED');
 });
 
+test('P2 merge: a blocked recipient signaling socket cannot retain more than 512 KiB outbound', async t => {
+  const h = await setup(t);
+  const { roomId, hostKey } = await h.room();
+  const originalSend = WebSocket.prototype.send;
+  let serverSideHost = null;
+  WebSocket.prototype.send = function (data, ...args) {
+    // Observe the actual server-facing object without changing its send path.
+    if (this._isServer && typeof data === 'string' &&
+      JSON.parse(data).type === 'joined') serverSideHost = this;
+    return Reflect.apply(originalSend, this, [data, ...args]);
+  };
+  try {
+    const host = await h.connect();
+    host.send({ type: 'join', roomId, hostKey });
+    await host.next('joined');
+    assert.ok(serverSideHost, 'positive: actual server-side WebSocket was captured');
+    Object.defineProperty(serverSideHost, 'bufferedAmount', {
+      configurable: true, get: () => 512 * 1024,
+    });
+    const closed = new Promise(resolve => host.ws.once('close', () => resolve(true)));
+    host.send({ type: 'invite' });
+    const stopped = await Promise.race([
+      closed,
+      new Promise(resolve => setTimeout(() => resolve(false), 400)),
+    ]);
+    assert.equal(stopped, true,
+      'a full outbound queue must evict a stalled signaling socket, not append an invite ACK');
+  } finally {
+    WebSocket.prototype.send = originalSend;
+  }
+});
+
+test('idle pre-join sockets cannot retain all standalone signaling slots past admission deadline', async t => {
+  let clock = Date.now();
+  const h = await setup(t, { now: () => clock });
+  const { roomId, hostKey } = await h.room();
+  const host = await h.connect();
+  host.send({ type: 'join', roomId, hostKey });
+  assert.equal((await host.next('joined')).role, 'host');
+
+  // One admitted host and 31 idle sockets fill the existing global 32 cap.
+  const idle = await Promise.all(Array.from({ length: 31 }, () => h.connect()));
+  const closes = idle.map(({ ws }) => new Promise(resolve => ws.once('close', resolve)));
+  const extra = new WebSocket(h.origin.replace('http:', 'ws:') + '/signal', {
+    headers: { Origin: h.origin },
+  });
+  extra.on('error', () => {});
+  const denied = await new Promise(resolve => extra.once('unexpected-response', (_req, response) => {
+    response.resume();
+    resolve(response.statusCode);
+  }));
+  assert.equal(denied, 403, 'all signaling slots were exhausted before the admission deadline');
+
+  clock += 20_000;
+  let timeout;
+  const outcome = await Promise.race([
+    Promise.all(closes).then(codes => ({ codes })),
+    new Promise(resolve => { timeout = setTimeout(() => resolve({ timeout: true }), 3000); }),
+  ]);
+  clearTimeout(timeout);
+  assert.ok(outcome.codes, 'idle sockets must be evicted by the existing expiry sweep');
+  assert.ok(outcome.codes.every(code => code === 1006),
+    'idle sockets must be terminated even when a client ignores close handshakes');
+  assert.equal(host.ws.readyState, WebSocket.OPEN, 'joined host must survive idle eviction');
+  const replacement = await h.connect();
+  assert.equal(replacement.ws.readyState, WebSocket.OPEN, 'signaling capacity must recover');
+  host.send({ type: 'invite' });
+  assert.ok((await host.next('invited')).invitation, 'joined room remains usable');
+});
+
 test('P2: a stalled signaling recipient is evicted without blocking healthy peers', async t => {
   const serverSockets = [];
   const originalEmit = WebSocket.WebSocketServer.prototype.emit;

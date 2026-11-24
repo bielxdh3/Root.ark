@@ -3,7 +3,6 @@
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } = require('node:fs');
-const { createHash } = require('node:crypto');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { fixture } = require('../../../test/support/issue242-app-fixture');
@@ -382,8 +381,8 @@ async function run() {
     assert.equal(await alice.evaluate('document.getElementById("createObjectRoom").disabled'), false,
       'failed bound create did not release the create controls');
     await alice.evaluate('window.__restoreBoundFailureFetch()');
-    // Protected-object mode reads the actual locally retained *ciphertext*
-    // bytes for the expected SHA-256 and rechecks the authoritative file ACL.
+    // Even a valid, explicit legacy ACL is insufficient for immutable-version
+    // and all-party snapshot custody. Refuse bound admission before hashing.
     const ciphertext = Buffer.from(Array.from({ length: 92 }, (_, i) => i + 11));
     mkdirSync(join(f.directory, 'uploads'), { recursive: true });
     writeFileSync(join(f.directory, 'uploads', 'sealed.bin'), ciphertext);
@@ -399,122 +398,18 @@ async function run() {
     writeFileSync(join(f.directory, 'data', 'file-permissions.json'),
       JSON.stringify({ 'root/sealed.bin': { owner: 'alice', public: false,
         users: { bob: { read: true, edit: false } } } }));
-    const expectedDigest = createHash('sha256').update(ciphertext).digest('hex');
     assert.equal(await alice.evaluate('document.getElementById("boundObjectControls").hidden'), false);
-    // The room POST may succeed while the subsequent authoritative WebSocket
-    // admission recheck rejects the room. That failure must retire all pending
-    // room identity and protected-only state rather than leave a dead room UI.
-    await alice.evaluate(`(() => {
-      const originalFetch = window.fetch.bind(window);
-      window.__restoreAdmissionFetch = () => { window.fetch = originalFetch; };
-      window.fetch = (input, init = {}) => {
-        const url = new URL(typeof input === 'string' ? input : input.url, location.href);
-        if (url.pathname === '/p2p/rooms' && init.method === 'POST' && init.body) {
-          return Promise.resolve(new Response(JSON.stringify({
-            roomId: 'missing-bound-room',
-            hostKey: 'invalid-host-key',
-            boundObject: { folderId: 'root', fileName: 'sealed.bin',
-              sha256: '${expectedDigest}', size: ${ciphertext.length} },
-          }), { status: 201, headers: { 'content-type': 'application/json' } }));
-        }
-        return originalFetch(input, init);
-      };
-    })()`);
-    await alice.evaluate('window.__poc.createRoom({folderId:"root",fileName:"sealed.bin"})');
-    await until(() => alice.evaluate('document.getElementById("state").textContent===' +
-      '"Erro: INVALID_INVITE" && window.__poc.snapshot().roomId===null && ' +
-      'window.__poc.snapshot().role===null && window.__poc.snapshot().boundObject===null && ' +
-      'document.getElementById("room").textContent==="" && document.getElementById("leave").disabled && ' +
-      '!document.getElementById("create").disabled && !document.getElementById("createObjectRoom").disabled'),
-    'WebSocket admission failure retained a stale protected room');
-    assert.equal(await alice.evaluate('window.__poc.snapshot().diagnostics.rejected.includes("INVALID_INVITE")'), true,
-      'WebSocket admission rejection was not recorded');
-    await alice.evaluate('window.__restoreAdmissionFetch()');
-    await alice.evaluate('window.__poc.createRoom({folderId:"root",fileName:"sealed.bin"})');
-    const boundRoom = await until(() => alice.evaluate(
-      'window.__poc.snapshot().boundObject?.sha256 && window.__poc.snapshot().roomId'),
-    'ciphertext ACL room not opened', 12_000);
-    assert.equal(await alice.evaluate('window.__poc.snapshot().boundObject.sha256'), expectedDigest);
-    await alice.evaluate('window.__testSockets[0].onmessage({data:JSON.stringify({type:"joined",role:"guest",peerId:"old-room"})})');
-    assert.equal(await alice.evaluate('window.__poc.snapshot().boundObject?.sha256'), expectedDigest,
-      'stale unbound join stripped the current signed ciphertext room policy');
-    assert.equal(await alice.evaluate('window.__poc.snapshot().role'), 'host');
-    await alice.evaluate('window.__poc.invite("carol")');
-    await until(() => alice.evaluate(
-      'window.__poc.snapshot().diagnostics.rejected.includes("OBJECT_ACCESS_DENIED")'),
-    'unlisted account received an object grant');
-    const invitationsBefore = await alice.evaluate('window.__poc.invitations().length');
-    await alice.evaluate('window.__poc.invite("bob")');
-    const boundInvitation = await until(() => alice.evaluate(
-      'window.__poc.invitations().length>' + invitationsBefore +
-      ' && window.__poc.invitations().at(-1)?.recipient==="bob" && window.__poc.invitations().at(-1)?.invitation'),
-    'authorized object recipient did not get an invitation');
-    const refreshedBob = await pageFor('bob');
-    await refreshedBob.evaluate('window.__poc.joinRoom(' + JSON.stringify(boundRoom) + ',' +
-      JSON.stringify(boundInvitation) + ')');
-    await until(() => refreshedBob.evaluate('window.__poc.snapshot().boundObject?.sha256===' +
-      JSON.stringify(expectedDigest)), 'guest did not receive trusted ciphertext SHA-256');
-    await until(() => refreshedBob.evaluate('Boolean(document.querySelector("[data-testid=accept-peer]"))'),
-      'object peer consent missing');
-    // A signaling socket can be retired by the broker while a second room
-    // creation is still waiting for its HTTP response. Socket close must abort
-    // that request and invalidate its intent, not allow a late room reconnect.
-    await refreshedBob.evaluate(`(() => {
-      const originalFetch = window.fetch.bind(window);
-      window.__createAbortObserved = false;
-      window.__createSocketCountBeforeClose = window.__testSockets.length;
-      window.__restoreCloseCreateFetch = () => { window.fetch = originalFetch; };
-      window.__releaseCloseCreateFetch = null;
-      window.fetch = (input, init = {}) => {
-        const url = new URL(typeof input === 'string' ? input : input.url, location.href);
-        if (url.pathname === '/p2p/rooms' && init.method === 'POST') {
-          return new Promise((resolve, reject) => {
-            const signal = init.signal;
-            const abort = () => {
-              window.__createAbortObserved = true;
-            };
-            if (!signal) return reject(new Error('missing create abort signal'));
-            if (signal.aborted) return abort();
-            signal.addEventListener('abort', abort, { once: true });
-            // Deliberately ignore AbortSignal and deliver a late success. The
-            // room-intent fence, not fetch cooperation, must prevent reconnect.
-            window.__releaseCloseCreateFetch = () => resolve({ ok: true,
-              json: async () => ({ roomId: 'late-room-after-close', hostKey: 'late-host-after-close' }) });
-          });
-        }
-        return originalFetch(input, init);
-      };
-      document.getElementById('create').click();
-    })()`);
-    await until(() => refreshedBob.evaluate('document.getElementById("create").disabled'),
-      'room create was not pending before broker socket close');
-    await refreshedBob.evaluate('document.querySelector("[data-testid=accept-peer]").click()');
-    // No shared mutation-serialized ACL authority exists in this legacy app.
-    // The broker must close the bound room rather than relay the WebRTC offer.
-    // peers.length===0 can be TRUE before any signaling is processed. Require
-    // BOTH affirmative server ROOM_CLOSED and the socket-close side effect,
-    // which clears the pinned object on the real browser client.
-    await until(() => refreshedBob.evaluate(
-      'window.__poc.snapshot().diagnostics.rejected.includes("ROOM_CLOSED")' +
-      ' && window.__poc.snapshot().boundObject===null' +
-      ' && window.__poc.snapshot().peers.length===0' +
-      ' && window.__createAbortObserved'),
-    'broker did not affirmatively close bound signaling without all-party authority', 20_000);
-    await refreshedBob.evaluate('window.__releaseCloseCreateFetch()');
-    await until(() => refreshedBob.evaluate(
-      '!document.getElementById("create").disabled && !document.getElementById("createObjectRoom").disabled'),
-    'late room response did not settle after the aborted intent');
-    assert.equal(await refreshedBob.evaluate('window.__poc.snapshot().roomId'), null,
-      'a late room-creation response restored the room after signaling closed');
-    assert.equal(await refreshedBob.evaluate('window.__poc.snapshot().role'), null,
-      'a late room-creation response reconnected the closed room');
-    assert.equal(await refreshedBob.evaluate('window.__testSockets.length'),
-      await refreshedBob.evaluate('window.__createSocketCountBeforeClose'),
-      'a late room-creation response created a new signaling socket');
-    await refreshedBob.evaluate('window.__restoreCloseCreateFetch()');
-    assert.equal(await refreshedBob.evaluate('window.__poc.snapshot().diagnostics.verifiedFiles.length'), 0,
-      'no bound ciphertext transfer can be received without snapshot authority');
-    console.log('PASS real Root.ark Edge: signed-cookie manual 1:N transfer, bound owner ACL/digest admission, and bound signaling fail-closed without atomic authority');
+    const outcome = await alice.evaluate(
+      'window.__poc.createRoom({folderId:"root",fileName:"sealed.bin"}).then(()=> "allowed",()=> "denied")');
+    assert.equal(outcome, 'denied', 'valid legacy ACL cannot create a bound room without both authorities');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().boundObject'), null);
+    assert.equal(await alice.evaluate('window.__poc.snapshot().roomId'), null,
+      'failed bound admission must not inherit the old unbound room identifier');
+    assert.equal(await alice.evaluate('window.__poc.snapshot().role'), null);
+    await alice.evaluate('window.__poc.createRoom()');
+    await until(() => alice.evaluate('window.__poc.snapshot().role==="host" && window.__poc.snapshot().roomId'),
+      'manual sharing did not recover after denied bound creation', 12_000);
+    console.log('PASS real Root.ark Edge: signed-cookie manual 1:N transfer, bound pretrust refusal, and manual recovery');
   } finally {
     for (const page of pages) page.close();
     child.kill();

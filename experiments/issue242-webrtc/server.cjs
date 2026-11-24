@@ -11,17 +11,57 @@ const MAX_MEMBERS = 4;
 const ROOM_TTL_MS = 5 * 60_000;
 const UNJOINED_ROOM_TTL_MS = 15_000;
 const MAX_ACTIVE_ROOMS_PER_OWNER = 2;
+const MAX_SOCKETS_PER_ACCOUNT = 8;
 const INVITE_TTL_MS = 60_000;
 const MAX_SIGNAL_BYTES = 16_384;
 const MAX_OUTBOUND_BUFFER_BYTES = 512 * 1024;
+const MAX_UNJOINED_SOCKET_AGE_MS = 15_000;
+// The wire rate cap does not bound a Promise chain held behind a stalled
+// trusted ACL/storage callback. Limit queued closures per room independently.
+const MAX_PENDING_ROOM_ACTIONS = 64;
 const token = () => randomBytes(32).toString('hex');
 const shortId = () => randomBytes(8).toString('hex');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const roomMessageTypes = new Set(['join', 'invite', 'revoke', 'kick', 'request-peer', 'consent', 'signal']);
 
+function ownDataSnapshot(value, fields) {
+  if (!object(value) || Object.getPrototypeOf(value) !== Object.prototype) return null;
+  // Read the properties exactly once through own data descriptors, never
+  // through value.field (which can be a changing Proxy get trap).
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Reflect.ownKeys(descriptors).length !== fields.length) return null;
+  const snapshot = {};
+  for (const field of fields) {
+    const descriptor = descriptors[field];
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) return null;
+    snapshot[field] = descriptor.value;
+  }
+  return snapshot;
+}
+
+function immutableVersionSnapshot(value, expected) {
+  const snapshot = ownDataSnapshot(value,
+    ['owner', 'boundObject', 'pin', 'sha256', 'bytes', 'versionId']);
+  if (!snapshot) return null;
+  const boundObject = ownDataSnapshot(snapshot.boundObject, ['folderId', 'fileName']);
+  if (!boundObject || snapshot.owner !== expected.owner ||
+    boundObject.folderId !== expected.boundObject.folderId ||
+    boundObject.fileName !== expected.boundObject.fileName ||
+    snapshot.pin !== expected.pin || snapshot.sha256 !== expected.sha256 ||
+    snapshot.bytes !== expected.bytes ||
+    typeof snapshot.versionId !== 'string' ||
+    !/^[a-zA-Z0-9_-]{16,128}$/.test(snapshot.versionId) ||
+    /^\d+$/.test(snapshot.versionId) ||
+    snapshot.versionId === expected.pin || snapshot.versionId === expected.sha256) return null;
+  // All fields crossing awaits and entering the room are now detached
+  // ordinary primitives; no callback-returned Proxy is retained or reread.
+  return Object.freeze({ ...snapshot, boundObject: Object.freeze(boundObject) });
+}
+
 function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = ROOM_TTL_MS,
   authenticateSession = null, sharedWss = null, authorizeRecipient = null,
-  authorizeObject = null, authorizeSignalSnapshot = null } = {}) {
+  authorizeObject = null, authorizeSignalSnapshot = null,
+  authorizeImmutableVersion = null } = {}) {
   const rooms = new Map();
   const pendingRoomCreatesByOwner = new Map();
   let pendingRoomCreates = 0;
@@ -54,7 +94,8 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
   function send(ws, data) {
     if (ws.readyState !== WebSocket.OPEN || !sessionCurrent(ws)) return;
     const payload = JSON.stringify(data);
-    // One non-reading recipient must not exhaust signaling transport memory.
+    // A compliant peer may stop reading while a host continues relaying
+    // signaling. Never retain an unbounded per-socket outbound backlog.
     if (ws.bufferedAmount + Buffer.byteLength(payload) > MAX_OUTBOUND_BUFFER_BYTES) {
       ws.terminate();
       removePeer(ws);
@@ -146,8 +187,8 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     room.members.delete(peer.id);
     room.pending.forEach((p, id) => { if (p.from === peer.id || p.to === peer.id) room.pending.delete(id); });
     for (const key of room.allowed) if (key.split(':').includes(peer.id)) room.allowed.delete(key);
-    // A 1:N guest has not consented to reveal their participation to peers.
-    // Preserve host-to-guest state without broadcasting guest-to-guest roster.
+    // Guests have not consented to reveal their participation to other guests.
+    // Keep membership changes visible to the host without a guest-to-guest roster.
     for (const other of room.members.values()) {
       if (peer.role === 'host' || other.role === 'host') {
         send(other.ws, { type: 'peer-left', peerId: peer.id });
@@ -333,7 +374,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       if (role === 'host') room.hostJoined = true;
       send(ws, { type: 'joined', peerId: id, role, username: peer.username,
         ...(room.boundObject ? { boundObject: { ...room.boundObject, sha256: room.objectDigest,
-          size: room.objectSize } } : {}),
+          size: room.objectSize, versionId: room.immutableVersionId } } : {}),
         members: [...room.members.values()]
           .filter(p => p.id !== id && (role === 'host' || p.role === 'host'))
           .map(p => ({ peerId: p.id, role: p.role, username: p.username })) });
@@ -437,6 +478,10 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     }
   }
   function onConnection(ws, req) {
+    // A peer that never joins must not occupy one of the standalone broker's
+    // scarce 32 upgrade slots indefinitely. Shared Root.ark /ws connections
+    // may carry unrelated application events and are exempt from this timer.
+    if (!sharedWss) ws.p2pConnectedAt = now();
     if (sharedWss) {
       ws.upgradeRequest = req;
       ws.identity = identify(req);
@@ -446,6 +491,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     // ws emits an error before closing an oversized frame; keep the broker alive.
     ws.on('error', () => {});
     ws.on('message', (raw, binary) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
       let message;
       if (sharedWss) {
         // Reuse Root.ark's established /ws socket. Ignore the application's
@@ -466,9 +512,19 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       const roomId = participants.get(ws)?.roomId || message?.roomId;
       const room = rooms.get(roomId);
       if (!room) { void onMessage(ws, raw).catch(() => error(ws, 'FORBIDDEN')); return; }
+      if ((room.pendingActions || 0) >= MAX_PENDING_ROOM_ACTIONS) {
+        // Do not keep retaining attacker-supplied frames while the queue's
+        // head awaits a noncooperative callback. Immediately revoke this
+        // peer's participation; existing room expiry handles stale work.
+        ws.close(1008, 'action backlog exceeded');
+        removePeer(ws);
+        return;
+      }
+      room.pendingActions = (room.pendingActions || 0) + 1;
       room.actionQueue = (room.actionQueue || Promise.resolve())
         .then(() => onMessage(ws, raw))
-        .catch(() => { if (rooms.get(room.id) === room) expireRoom(room); });
+        .catch(() => { if (rooms.get(room.id) === room) expireRoom(room); })
+        .finally(() => { room.pendingActions--; });
     });
     ws.on('close', () => removePeer(ws));
   }
@@ -480,6 +536,7 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     let objectPin = null;
     let objectDigest = null;
     let objectSize = null;
+    let immutableVersionId = null;
     const body = req.body;
     if (body !== undefined && body !== null && (!object(body) ||
       (Object.keys(body).length > 0 && (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'boundObject'))))) {
@@ -487,7 +544,16 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
     }
     if (body && Object.hasOwn(body, 'boundObject')) {
       const input = body.boundObject;
+      // This admission gate is intentionally stricter than the legacy hash
+      // preflight. The Root.ark adapter presently has neither an immutable,
+      // owner-authorized version authority nor a single mutation-serialized
+      // all-party ACL snapshot. Do not read 32 MiB or allocate a P2P room
+      // merely to discover later that protected signaling must fail closed.
+      // Only startup-injected trusted callbacks can enable this path; request
+      // JSON, hash results and self-asserted flags are never capabilities.
       if (!authenticated || typeof authorizeObject !== 'function' ||
+        typeof authorizeImmutableVersion !== 'function' ||
+        typeof authorizeSignalSnapshot !== 'function' ||
         !object(input) || Object.keys(input).length !== 2 ||
         typeof input.folderId !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(input.folderId) ||
         typeof input.fileName !== 'string' || input.fileName.length > 100 ||
@@ -536,6 +602,30 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
           objectPin = grant.fingerprint;
           objectDigest = grant.sha256;
           objectSize = grant.bytes;
+          // A callback's mere presence or a hash of mutable legacy ciphertext
+          // cannot authorize a version. Only a trusted startup-injected
+          // authority may attest the exact owner/path/pin/digest/size tuple;
+          // the adapter MUST independently verify owner-signed immutable
+          // storage and custody before returning this record.
+          const context = Object.freeze({
+            owner, boundObject: Object.freeze({ ...boundObject }),
+            pin: objectPin, sha256: objectDigest, bytes: objectSize,
+          });
+          const version = await authorizeImmutableVersion(context);
+          const versionSnapshot = immutableVersionSnapshot(version, context);
+          if (!versionSnapshot) return { status: 403 };
+          immutableVersionId = versionSnapshot.versionId;
+          // The async authority may overlap a revocation or ciphertext
+          // replacement. Recheck the owner's live ACL and exact bytes after it
+          // resolves; these preflights still cannot replace an atomic custody
+          // and ACL mutation fence.
+          const current = await authorizeObject({
+            owner, recipient: null, boundObject, pin: objectPin,
+          });
+          if (!object(current) || current.fingerprint !== objectPin ||
+            current.sha256 !== objectDigest || current.bytes !== objectSize) {
+            return { status: 403 };
+          }
         } catch { return { status: 403 }; }
       }
       // Hashing may complete after the HTTP request was canceled or the session
@@ -551,12 +641,13 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
         hostJoinDeadline: timestamp + (authenticated ? Math.min(roomTtlMs, UNJOINED_ROOM_TTL_MS) : roomTtlMs),
         hostJoined: false,
         owner: user?.username, ownerSessionVersion: user?.sessionVersion,
-        boundObject, objectPin, objectDigest, objectSize,
+        boundObject, objectPin, objectDigest, objectSize, immutableVersionId,
         members: new Map(), invites: new Map(), pending: new Map(), allowed: new Set() };
       rooms.set(room.id, room);
       createdRoom = room;
       return { status: 200, roomId: room.id, hostKey: room.hostKey, expires: room.expires,
-        ...(boundObject ? { boundObject: { ...boundObject, sha256: objectDigest, size: objectSize } } : {}) };
+        ...(boundObject ? { boundObject: { ...boundObject, sha256: objectDigest,
+          size: objectSize, versionId: immutableVersionId } } : {}) };
     } finally {
       // Retain close/finish listeners for an allocated room until HTTP delivery
       // completes. A disconnect before delivery then reclaims its orphan room.
@@ -612,6 +703,16 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
       socket.destroy();
       return;
     }
+    // This standalone broker admits its own sockets. Do not impose this
+    // quota on sharedWss: those sockets also serve unrelated Root.ark routes.
+    if (authenticated && [...wss.clients].filter(ws =>
+      ws.identity?.username === identity.username &&
+      ws.readyState !== WebSocket.CLOSING &&
+      ws.readyState !== WebSocket.CLOSED).length >= MAX_SOCKETS_PER_ACCOUNT) {
+      socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     wss.handleUpgrade(req, socket, head, ws => {
       ws.identity = identity;
       ws.upgradeRequest = req;
@@ -625,6 +726,15 @@ function makeBroker({ now = Date.now, inviteTtlMs = INVITE_TTL_MS, roomTtlMs = R
         .then(async () => { if (validRoom(room)) await recheckBoundRoom(room); })
         .catch(() => { if (rooms.get(room.id) === room) expireRoom(room); })
         .finally(() => { room.sweepPending = false; });
+    }
+    if (!sharedWss) for (const ws of wss.clients) {
+      if (!participants.has(ws) &&
+        (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CLOSING) &&
+        now() - ws.p2pConnectedAt >= MAX_UNJOINED_SOCKET_AGE_MS) {
+        // A noncooperative peer may ignore a graceful WebSocket close frame.
+        // Terminate its socket so the global admission slot is reclaimed now.
+        ws.terminate();
+      }
     }
     if (authenticated) for (const ws of participants.keys()) sessionCurrent(ws);
   }, 1000);
