@@ -1,9 +1,9 @@
 package dev.rootark.android
 
 import android.app.Activity
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
-import android.os.Build
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
@@ -27,6 +27,15 @@ internal fun inventoryPageFailureMessage(failure: Exception?): String = when (fa
     is SyncListingValidationException ->
         "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
     else -> inventoryPageRequestFailureMessage(failure)
+}
+
+/** Presentation for the legacy, non-paginated inventory list. */
+internal fun inventoryListFailureMessage(failure: Exception?): String = when (failure) {
+    is SyncListingLimitException ->
+        "Não foi possível carregar a lista. A resposta excede o limite do protótipo (1 MiB / 128 registros)."
+    is SyncListingValidationException ->
+        "Não foi possível carregar a lista. Os dados de sincronização retornados pelo servidor são inválidos."
+    else -> inventoryListRequestFailureMessage(failure)
 }
 
 class MainActivity : Activity() {
