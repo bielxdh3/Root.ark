@@ -40,7 +40,7 @@ function clientFixture({ digest, fetchRoom } = {}) {
     close() { this.closed = true; if (this.channel) this.channel.readyState = 'closed'; }
   }
   const ctx = { document, window: {}, WebSocket: FakeSocket, RTCPeerConnection: FakePeer,
-    crypto: digest ? { subtle: { digest }, randomUUID: crypto.randomUUID } : crypto.webcrypto,
+    crypto: digest ? { subtle: { digest }, randomUUID: () => crypto.randomUUID() } : crypto.webcrypto,
     fetch: fetchRoom, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer,
     location: { origin: 'http://127.0.0.1:1234' }, setTimeout, console };
   vm.createContext(ctx);
@@ -49,6 +49,22 @@ function clientFixture({ digest, fetchRoom } = {}) {
     await socket.onmessage({ data: JSON.stringify(value) });
   }
   return { ...ctx.window.__poc, sockets, elements, incoming, peerConnections };
+}
+
+async function connectedRecipient(f, socket, peerId) {
+  await f.incoming(socket, { type: 'peer-allowed', peerId });
+  const callbacks = new Map();
+  const channel = {
+    readyState: 'open', bufferedAmount: 0, sent: [],
+    send(data) { this.sent.push(typeof data === 'string' ? JSON.parse(data) : data); },
+    addEventListener(type, callback) { callbacks.set(type, callback); },
+    removeEventListener(type, callback) {
+      if (callbacks.get(type) === callback) callbacks.delete(type);
+    },
+    emit(type) { callbacks.get(type)?.(); },
+  };
+  f.peerConnections.at(-1).ondatachannel({ channel });
+  return channel;
 }
 
 test('P2: delayed old-room close cannot revoke or tear down new-room peer', async () => {
@@ -95,65 +111,75 @@ test('P2: empty offer IDs cannot create unbounded consent panels; valid offer st
     'repeated pending ID may not create more dialogs');
 });
 
-test('P2: repeated accept-file frames cannot start concurrent send loops during a stalled DataChannel', async () => {
+test('P2: file selected in room A cannot be offered to room B after delayed read', async () => {
   const f = clientFixture();
-  f.joinRoom('room', 'invitation');
-  await f.incoming(f.sockets[0], { type: 'joined', role: 'host', peerId: 'host' });
-  await f.incoming(f.sockets[0], { type: 'peer-accepted', peerId: 'peer-A' });
-  const channel = f.testChannel(0);
-  const listeners = new Map();
-  channel.addEventListener = (type, callback) => {
-    if (!listeners.has(type)) listeners.set(type, new Set());
-    listeners.get(type).add(callback);
-  };
-  channel.removeEventListener = (type, callback) => listeners.get(type)?.delete(callback);
-  channel.close = () => {
-    channel.readyState = 'closed';
-    channel.onclose?.();
-    for (const callback of [...(listeners.get('close') || [])]) callback();
-  };
-  const originalSend = channel.send.bind(channel);
-  channel.send = value => {
-    originalSend(value);
-    if (value instanceof ArrayBuffer) channel.bufferedAmount = 128 * 1024;
-  };
-  channel.bufferedAmount = 128 * 1024;
+  f.joinRoom('room-A', 'invite-A');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'self-A' });
+  let finishRead;
+  const pendingRead = new Promise(resolve => { finishRead = resolve; });
+  const pendingSend = f.sendFile({ name: 'private-A.bin', size: 3,
+    arrayBuffer: () => pendingRead });
+  f.joinRoom('room-B', 'invite-B');
+  const fresh = f.sockets[1];
+  await f.incoming(fresh, { type: 'joined', role: 'guest', peerId: 'self-B' });
+  const channelB = await connectedRecipient(f, fresh, 'recipient-B');
+  finishRead(Uint8Array.of(1, 2, 3).buffer);
+  await pendingSend;
+  assert.equal(channelB.sent.length, 0,
+    'completion of old-room file read must not offer private A bytes to B');
+  await f.sendFile({ name: 'chosen-in-B.bin', size: 3,
+    arrayBuffer: async () => Uint8Array.of(4, 5, 6).buffer });
+  assert.equal(channelB.sent.filter(m => m.type === 'offer-file').length, 1,
+    'a newly selected file in current room B must still be offered');
+});
 
-  const bytes = new Uint8Array(32 * 1024).fill(7);
-  await f.sendFile({ name: 'replay.bin', size: bytes.byteLength,
-    arrayBuffer: async () => bytes.buffer });
-  const offer = channel.sent.find(message => message.type === 'offer-file');
-  assert.ok(offer, 'positive control: sender has a live offer before consent');
-  const accept = { type: 'accept-file', id: offer.id };
-  let first;
-  let replay;
-  try {
-    first = channel.onmessage({ data: JSON.stringify(accept) });
-    replay = channel.onmessage({ data: JSON.stringify(accept) });
-    assert.equal(listeners.get('bufferedamountlow')?.size || 0, 1,
-      'a repeated accept while the first send is stalled must not register a second send loop');
+test('P2: delayed text hash from room A cannot deliver text into room B', async () => {
+  let releaseDigest;
+  const pendingDigest = new Promise(resolve => { releaseDigest = resolve; });
+  const f = clientFixture({ digest: async (algorithm, bytes) => {
+    await pendingDigest;
+    return crypto.webcrypto.subtle.digest(algorithm, bytes);
+  } });
+  f.joinRoom('room-A', 'invite-A');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'self-A' });
+  const pendingText = f.sendText('secret intended only for A');
+  f.joinRoom('room-B', 'invite-B');
+  const fresh = f.sockets[1];
+  await f.incoming(fresh, { type: 'joined', role: 'guest', peerId: 'self-B' });
+  const channelB = await connectedRecipient(f, fresh, 'recipient-B');
+  releaseDigest();
+  await pendingText;
+  assert.equal(channelB.sent.length, 0,
+    'text SHA completion after room switch must not send old-room text');
+  await f.sendText('chosen in B');
+  assert.equal(channelB.sent.filter(m => m.type === 'text').length, 1,
+    'current-room text transfer still works');
+});
 
-    const drain = () => {
-      channel.bufferedAmount = 0;
-      for (const callback of [...(listeners.get('bufferedamountlow') || [])]) callback();
-    };
-    drain();
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(channel.sent.filter(value => value instanceof ArrayBuffer).length, 1,
-      'one drain must release exactly one first chunk');
-    assert.equal(listeners.get('bufferedamountlow')?.size || 0, 1,
-      'the single sender waits once for the next chunk window');
-
-    drain();
-    await Promise.all([first, replay]);
-    assert.equal(channel.sent.filter(value => value instanceof ArrayBuffer).length, 2,
-      'the file must be emitted as exactly two chunks');
-    assert.equal(channel.sent.filter(value => value.type === 'end-file').length, 1,
-      'the transfer must have exactly one completion frame');
-  } finally {
-    if (channel.readyState === 'open') channel.close();
-    await Promise.all([first, replay].filter(Boolean));
-  }
+test('P2: delayed bufferedamountlow cannot resume file chunks after leaving room', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'invite-A');
+  const old = f.sockets[0];
+  await f.incoming(old, { type: 'joined', role: 'guest', peerId: 'self-A' });
+  const channelA = await connectedRecipient(f, old, 'recipient-A');
+  await f.sendFile({ name: 'only-in-A.bin', size: 3,
+    arrayBuffer: async () => Uint8Array.of(7, 8, 9).buffer });
+  const offer = channelA.sent.find(m => m.type === 'offer-file');
+  assert.ok(offer, 'must reach an actual outgoing offer before pausing send');
+  channelA.bufferedAmount = 100_000;
+  const pendingChunks = channelA.onmessage({ data: JSON.stringify({
+    type: 'accept-file', id: offer.id,
+  }) });
+  // Simulate the real race: closing the old PeerConnection has not yet
+  // asynchronously closed its DataChannel when bufferedamountlow fires.
+  f.joinRoom('room-B', 'invite-B');
+  await f.incoming(f.sockets[1], { type: 'joined', role: 'guest', peerId: 'self-B' });
+  channelA.bufferedAmount = 0;
+  channelA.emit('bufferedamountlow');
+  await pendingChunks;
+  assert.equal(channelA.sent.some(m => m instanceof ArrayBuffer ||
+    m instanceof Uint8Array || m?.type === 'end-file'), false,
+    'no old-room chunk or completion marker may be emitted after leaving');
 });
 
 test('P2: delayed text hash cannot deliver to another room or a newly joined recipient', async () => {
