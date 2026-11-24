@@ -3,7 +3,8 @@
 // DEV-OFF recipient-side bridge. Requires separately provisioned owner/V2
 // custody and a real owner-approved, recipient-specific HPKE file CEK.
 const crypto = require("node:crypto");
-const { types: { isProxy, isSharedArrayBuffer, isUint8Array } } = require("node:util");
+const { isProxy: isNativeProxy, isSharedArrayBuffer: nativeIsSharedArrayBuffer,
+  isUint8Array: nativeIsUint8Array } = require("node:util").types;
 const z = require("./rootark-zk-1");
 const { redeemProtectedCiphertextShare } =
   require("../../public/client/rootark-zk1-recipient-share");
@@ -11,29 +12,28 @@ const { openOwnerAuthorizedFileCek, sealOwnerAuthorizedFileCek } =
   require("./rootark-zk1-owner-authorized-file-cek-transfer");
 const fileContent = require("../../public/client/rootark-zk1-file-content");
 const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
-// Snapshot the native wall-clock entry point before any caller-supplied
-// authority callback runs. A callback may overwrite global Date.now, but it
-// must not be able to roll back the final post-AEAD release deadline.
+// Capture the real clock before an independent roster reader gets to execute
+// arbitrary JavaScript. An authority callback cannot extend a signed lease by
+// replacing the global Date.now function.
 const nativeReleaseNow = Date.now;
-// The last authority callback is untrusted JavaScript. Even a captured native
-// Array#filter invokes the caller's constructor[Symbol.species], allowing a
-// forged result that replaces genuinely revoked issuer/recipient records.
-// Read only own DATA descriptors, without filters, iterators, or getters.
-const nativeIsArray = Array.isArray.bind(Array);
-const nativeGetPrototype = Object.getPrototypeOf.bind(Object);
+const nativeReleaseFloor = Math.floor;
+const nativeMathCeil = Math.ceil.bind(Math);
+const nativeReflectApply = Reflect.apply.bind(Reflect);
 const nativeOwnDescriptor = Object.getOwnPropertyDescriptor.bind(Object);
-const nativeHasOwn = Object.hasOwn.bind(Object);
+const nativeAllDescriptors = Object.getOwnPropertyDescriptors.bind(Object);
+const nativeGetPrototype = Object.getPrototypeOf.bind(Object);
 const nativeOwnKeys = Reflect.ownKeys.bind(Reflect);
-const nativeApply = Reflect.apply.bind(Reflect);
-const NativeUint8Array = Uint8Array;
-const nativePlainObjectPrototype = Object.prototype;
+const nativeHasOwn = Object.hasOwn.bind(Object);
+const nativeIsArray = Array.isArray.bind(Array);
 const nativeIsSafeInteger = Number.isSafeInteger.bind(Number);
-const typedArrayPrototype = nativeGetPrototype(Uint8Array.prototype);
-const typedArrayLength = nativeOwnDescriptor(typedArrayPrototype, "length").get;
-const typedArrayByteLength = nativeOwnDescriptor(typedArrayPrototype, "byteLength").get;
-const typedArrayByteOffset = nativeOwnDescriptor(typedArrayPrototype, "byteOffset").get;
-const typedArrayBuffer = nativeOwnDescriptor(typedArrayPrototype, "buffer").get;
-const nativeUint8Set = Uint8Array.prototype.set;
+const nativeUint8Array = Uint8Array;
+const nativeTypedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const nativeTypedLength = nativeOwnDescriptor(nativeTypedArrayPrototype, "length").get;
+const nativeTypedByteLength = nativeOwnDescriptor(nativeTypedArrayPrototype, "byteLength").get;
+const nativeTypedByteOffset = nativeOwnDescriptor(nativeTypedArrayPrototype, "byteOffset").get;
+const nativeTypedBuffer = nativeOwnDescriptor(nativeTypedArrayPrototype, "buffer").get;
+const nativeTypedSet = Uint8Array.prototype.set;
+const nativeTypedFill = Uint8Array.prototype.fill;
 const nativeBufferFrom = Buffer.from.bind(Buffer);
 const nativeBufferToString = Buffer.prototype.toString;
 const nativeBufferConcat = Buffer.concat.bind(Buffer);
@@ -41,13 +41,16 @@ const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
 const nativeCreatePublicKey = crypto.createPublicKey.bind(crypto);
 const nativeVerify = crypto.verify.bind(crypto);
 const nativeFreeze = Object.freeze.bind(Object);
-const nativeUint8Fill = Uint8Array.prototype.fill;
+const nativeCreateObject = Object.create.bind(Object);
+const nativeObjectPrototype = Object.prototype;
 
 const SHARE_DOMAIN = Buffer.from("Root.ark/zk-1/protected-ciphertext-share/v1\0");
 const ED25519_SPKI = Buffer.from("302a300506032b6570032100", "hex");
 const SCOPE = ["account_id", "compartment_id", "keyring_id"];
 const METADATA = [...SCOPE, "object_id", "version_id", "parent_version_id", "epoch", "kind"];
 const ENVELOPE = ["schema", "core", "enc", "ciphertext", "owner_signature",
+  "authorizesProductionRestore", "externalCustodyProven"];
+const ENVELOPE_OTHER = ["schema", "enc", "ciphertext", "owner_signature",
   "authorizesProductionRestore", "externalCustodyProven"];
 const SHARE = ["type", "grant_id", "account_id", "compartment_id", "keyring_id",
   "object_id", "object_revision", "ciphertext_digest", "epoch", "manifest_revision",
@@ -61,117 +64,149 @@ const OFFER = ["schema", "grant", "recipientUsername", "recipientDeviceId",
   "metadata", "envelope", "authorizesProductionIo", "externalCustodyProven"];
 function deny() { throw Error("ZK_SHARE_FILE_OPEN_DENIED"); }
 function denyOffer() { throw Error("ZK_SHARE_OFFER_DENIED"); }
+// Independent roster readers may mutate typed-array prototype methods, own
+// `length` fields or Buffer.from between awaited signature checks. Verify the
+// actual view's native slots and copy its bytes without using its iterator.
 function copyNativeBytes(value, minLength, maxLength) {
-  // A real Uint8Array/Buffer can own hostile `length`, `valueOf` or iterator.
-  // Native typed-array accessors read the internal view slots without
-  // dispatching those properties; native Set copies actual indexed bytes.
-  if (isProxy(value) || !isUint8Array(value)) deny();
-  const length = nativeApply(typedArrayLength, value, []);
-  const byteLength = nativeApply(typedArrayByteLength, value, []);
-  const offset = nativeApply(typedArrayByteOffset, value, []);
-  const backing = nativeApply(typedArrayBuffer, value, []);
+  if (isNativeProxy(value) || !nativeIsUint8Array(value)) deny();
+  const length = nativeReflectApply(nativeTypedLength, value, []);
+  const byteLength = nativeReflectApply(nativeTypedByteLength, value, []);
+  const byteOffset = nativeReflectApply(nativeTypedByteOffset, value, []);
+  const backing = nativeReflectApply(nativeTypedBuffer, value, []);
   if (!nativeIsSafeInteger(length) || length < minLength || length > maxLength
-    || byteLength !== length || !nativeIsSafeInteger(offset)
-    || offset < 0 || isSharedArrayBuffer(backing)) deny();
-  const privateCopy = new NativeUint8Array(length);
-  nativeApply(nativeUint8Set, privateCopy, [value]);
-  // Buffer.from(ArrayBuffer, offset, length) shares only this new private
-  // allocation, never the caller's possibly poisoned original typed array.
-  return nativeBufferFrom(nativeApply(typedArrayBuffer, privateCopy, []), 0, length);
+    || byteLength !== length || !nativeIsSafeInteger(byteOffset)
+    || byteOffset < 0 || nativeIsSharedArrayBuffer(backing)) deny();
+  const bytes = new nativeUint8Array(length);
+  nativeReflectApply(nativeTypedSet, bytes, [value]);
+  return nativeBufferFrom(nativeReflectApply(nativeTypedBuffer, bytes, []), 0, length);
 }
 const copyNativeBytes32 = (value) => copyNativeBytes(value, 32, 32);
-// Signed CBOR scope/id bytes may be 16, 32 or bounded compartment bytes.
-// Buffer#toString itself can consult a callback-poisoned Buffer.prototype
-// length or encoding method AFTER the final authority read. Encode bounded
-// freshly copied native bytes directly, without any JS prototype dispatch.
 const BASE64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 function b64(value) {
   const bytes = copyNativeBytes(value, 1, 128);
-  const size = nativeApply(typedArrayLength, bytes, []);
+  const length = nativeReflectApply(nativeTypedLength, bytes, []);
   let encoded = "";
-  for (let index = 0; index < size; index += 3) {
+  for (let index = 0; index < length; index += 3) {
     const a = bytes[index];
-    const b = index + 1 < size ? bytes[index + 1] : 0;
-    const c = index + 2 < size ? bytes[index + 2] : 0;
+    const b = index + 1 < length ? bytes[index + 1] : 0;
+    const c = index + 2 < length ? bytes[index + 2] : 0;
     encoded += BASE64URL[a >>> 2];
     encoded += BASE64URL[((a & 3) << 4) | (b >>> 4)];
-    if (index + 1 < size) encoded += BASE64URL[((b & 15) << 2) | (c >>> 6)];
-    if (index + 2 < size) encoded += BASE64URL[c & 63];
+    if (index + 1 < length) encoded += BASE64URL[((b & 15) << 2) | (c >>> 6)];
+    if (index + 2 < length) encoded += BASE64URL[c & 63];
   }
   return encoded;
 }
+function wipeNativeBytes(value) {
+  if (value != null && !isNativeProxy(value) && nativeIsUint8Array(value)) {
+    nativeReflectApply(nativeTypedFill, value, [0]);
+  }
+}
 function from64(value, length) {
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)
-    || value.length > Math.ceil(length * 4 / 3) + 4) denyOffer();
+    || value.length > nativeMathCeil(length * 4 / 3) + 4) denyOffer();
   const bytes = nativeBufferFrom(value, "base64url");
+  // A signed CBOR statement is up to 4096 bytes, unlike 16/32-byte scope
+  // fields. Re-encode through the captured native Buffer method, not the
+  // deliberately 128-byte-bounded scope encoder.
   if (bytes.length !== length
-    || nativeApply(nativeBufferToString, bytes, ["base64url"]) !== value) denyOffer();
+    || nativeReflectApply(nativeBufferToString, bytes, ["base64url"]) !== value) denyOffer();
   return bytes;
 }
 function same(a, b) {
   return a.length === b.length && nativeTimingSafeEqual(a, b);
 }
-function wipeNativeBytes(value) {
-  // Even a genuine Uint8Array or Buffer may have an own fill() or a rebound
-  // Buffer.prototype.fill after the final independent authority callback.
-  if (value != null && !isProxy(value) && isUint8Array(value)) {
-    nativeApply(nativeUint8Fill, value, [0]);
+function allOwnData(descriptors, names) {
+  // External callbacks can replace Array#some, Array#every, Object.values,
+  // and their prototype iterators between signed checks. No user callback
+  // participates in checking the captured descriptors.
+  for (let index = 0; index < names.length; index++) {
+    const field = descriptors[names[index]];
+    if (!field || !nativeHasOwn(field, "value")) return false;
   }
+  return true;
 }
 function strict(value, names) {
-  if (!value || typeof value !== "object" || nativeIsArray(value) || isProxy(value)
-    || (nativeGetPrototype(value) !== nativePlainObjectPrototype
+  if (!value || typeof value !== "object" || nativeIsArray(value)
+    || isNativeProxy(value)
+    || (nativeGetPrototype(value) !== nativeObjectPrototype
       && nativeGetPrototype(value) !== null)
     || nativeOwnKeys(value).length !== names.length) deny();
-  for (let i = 0; i < names.length; i += 1) {
-    const descriptor = nativeOwnDescriptor(value, names[i]);
+  for (let index = 0; index < names.length; index++) {
+    const descriptor = nativeOwnDescriptor(value, names[index]);
     if (!descriptor || !nativeHasOwn(descriptor, "value")) deny();
   }
 }
 function snapshot(value, names) {
   strict(value, names);
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const copy = Object.create(null);
-  for (const name of names) {
+  const descriptors = nativeAllDescriptors(value);
+  const copy = nativeCreateObject(null);
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
     const descriptor = descriptors[name];
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) deny();
+    if (!descriptor || !nativeHasOwn(descriptor, "value")) deny();
     const part = descriptor.value;
     if (part !== null && !["string", "number", "boolean"].includes(typeof part)) deny();
     copy[name] = part;
   }
-  return Object.freeze(copy);
+  return nativeFreeze(copy);
 }
 // Recipient contact pins come from the owner's separately authenticated
 // contact/device enrollment. Neither the server response nor its grant may
 // populate them. Reject accessors before any crypto or network await.
 function snapshotAuthority(value) {
+  // A Proxy over a real Array passes Array.isArray and may forge index
+  // descriptors, even when no own map/filter method is invoked. Reject it
+  // using the Node intrinsic before any user-controlled reflective access.
+  if (isNativeProxy(value)) denyOffer();
   strict(value, ["scope", "head", "devices"]);
-  const fields = Object.getOwnPropertyDescriptors(value);
-  if (["scope", "head", "devices"].some((key) =>
-    !Object.hasOwn(fields[key], "value"))) denyOffer();
+  const fields = nativeAllDescriptors(value);
+  if (!allOwnData(fields, ["scope", "head", "devices"])) denyOffer();
+  if (isNativeProxy(fields.scope.value)
+    || isNativeProxy(fields.head.value)
+    || isNativeProxy(fields.devices.value)) denyOffer();
   const scope = snapshot(fields.scope.value, SCOPE);
   const headValue = fields.head.value;
   strict(headValue, ["revision", "epoch", "digest"]);
-  const h = Object.getOwnPropertyDescriptors(headValue);
-  if (["revision", "epoch", "digest"].some((key) =>
-    !Object.hasOwn(h[key], "value"))
-    || !(h.digest.value instanceof Uint8Array)
-    || h.digest.value.length !== 32) denyOffer();
+  const h = nativeAllDescriptors(headValue);
+  if (!h.revision || !nativeHasOwn(h.revision, "value")
+    || !h.epoch || !nativeHasOwn(h.epoch, "value")
+    || !h.digest || !nativeHasOwn(h.digest, "value")
+    || !nativeIsSafeInteger(h.revision.value) || h.revision.value < 0
+    || !nativeIsSafeInteger(h.epoch.value) || h.epoch.value < 0
+    || isNativeProxy(h.digest.value)
+    || !nativeIsUint8Array(h.digest.value)) denyOffer();
   const head = { revision: h.revision.value, epoch: h.epoch.value,
-    digest: Buffer.from(h.digest.value) };
+    digest: copyNativeBytes32(h.digest.value) };
   const sourceDevices = fields.devices.value;
-  if (!Array.isArray(sourceDevices) || sourceDevices.length > 128) denyOffer();
-  const devices = sourceDevices.map((device) => {
+  if (!nativeIsArray(sourceDevices)) denyOffer();
+  // Do not invoke an untrusted array's own map/iterator: it can substitute a
+  // healthy roster while the actual authority entries are revoked.
+  const entries = nativeAllDescriptors(sourceDevices);
+  const length = entries.length?.value;
+  if (!nativeIsSafeInteger(length) || length > 128
+    || nativeOwnKeys(entries).length !== length + 1) denyOffer();
+  const devices = [];
+  for (let index = 0; index < length; ++index) {
+    const entry = entries[index];
+    if (!entry || !nativeHasOwn(entry, "value")) denyOffer();
+    const device = entry.value;
+    if (isNativeProxy(device)) denyOffer();
     strict(device, ["deviceId", "authorizationPublicKey",
       "enrolledEpoch", "revokedAtEpoch"]);
-    const d = Object.getOwnPropertyDescriptors(device);
-    if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))
-      || !(d.authorizationPublicKey.value instanceof Uint8Array)
-      || d.authorizationPublicKey.value.length !== 32) denyOffer();
-    return { deviceId: d.deviceId.value,
-      authorizationPublicKey: Buffer.from(d.authorizationPublicKey.value),
+    const d = nativeAllDescriptors(device);
+    if (!allOwnData(d, ["deviceId", "authorizationPublicKey",
+      "enrolledEpoch", "revokedAtEpoch"])
+      || isNativeProxy(d.authorizationPublicKey.value)
+      || !nativeIsUint8Array(d.authorizationPublicKey.value)
+      || !nativeIsSafeInteger(d.enrolledEpoch.value) || d.enrolledEpoch.value < 0
+      || !(d.revokedAtEpoch.value === null
+        || (nativeIsSafeInteger(d.revokedAtEpoch.value)
+          && d.revokedAtEpoch.value >= d.enrolledEpoch.value))) denyOffer();
+    devices[index] = { deviceId: d.deviceId.value,
+      authorizationPublicKey: copyNativeBytes32(d.authorizationPublicKey.value),
       enrolledEpoch: d.enrolledEpoch.value, revokedAtEpoch: d.revokedAtEpoch.value };
-  });
+  }
   return { scope, head, devices };
 }
 async function verifyOfferAuthority(authority, statement, bytes, signature, pin,
@@ -180,17 +215,27 @@ async function verifyOfferAuthority(authority, statement, bytes, signature, pin,
   currentAuthority(current, statement, signature, bytes);
   // Independent roster membership does NOT grant issuer/owner authority:
   // a recipient may have a legitimate active Ed25519 signing device.
-  const issuer = current.devices.filter((device) =>
-    device.deviceId === issuerPin.deviceId);
-  if (issuer.length !== 1
-    || !same(issuer[0].authorizationPublicKey,
+  const issuer = findUniqueDevice(current.devices, issuerPin.deviceId);
+  if (!issuer
+    || !same(issuer.authorizationPublicKey,
       from64(issuerPin.authorizationPublicKey, 32))) denyOffer();
-  const recipient = current.devices.filter((device) =>
-    device.deviceId === pin.deviceId);
-  if (recipient.length !== 1
-    || !same(recipient[0].authorizationPublicKey,
+  const recipient = findUniqueDevice(current.devices, pin.deviceId);
+  if (!recipient
+    || !same(recipient.authorizationPublicKey,
       from64(pin.authorizationPublicKey, 32))) denyOffer();
   return current;
+}
+function findUniqueDevice(devices, deviceId) {
+  // snapshotAuthority creates a dense private array from checked own data
+  // descriptors. Do not run Array#filter or species constructors after the
+  // independent authority read: callbacks can poison those mutable methods.
+  let found = null;
+  for (let index = 0; index < devices.length; index++) {
+    if (devices[index].deviceId !== deviceId) continue;
+    if (found) deny();
+    found = devices[index];
+  }
+  return found;
 }
 // Owner-side DEV-OFF portable offer. The owner MUST independently pin the
 // authorized issuer's device ID and Ed25519 key; a candidate server ACK has no
@@ -202,8 +247,10 @@ async function createProtectedRecipientShareOffer(input) {
     strict(input, ["grant", "recipientPin", "issuerPin", "readIndependentAuthority",
       "ownerPrivateKey", "ownerHeldCek", "metadata", "objectRevision",
       "ciphertext", "ciphertextRoot", "authority", "nowSeconds"]);
-    const d = Object.getOwnPropertyDescriptors(input);
-    if (Object.values(d).some((entry) => !Object.hasOwn(entry, "value"))) denyOffer();
+    const d = nativeAllDescriptors(input);
+    if (!allOwnData(d, ["grant", "recipientPin", "issuerPin", "readIndependentAuthority",
+      "ownerPrivateKey", "ownerHeldCek", "metadata", "objectRevision",
+      "ciphertext", "ciphertextRoot", "authority", "nowSeconds"])) denyOffer();
     const grant = snapshot(d.grant.value, GRANT);
     const pin = snapshot(d.recipientPin.value, RECIPIENT_PIN);
     const issuerPin = snapshot(d.issuerPin.value, ISSUER_PIN);
@@ -242,7 +289,7 @@ async function createProtectedRecipientShareOffer(input) {
     if (typeof grant.shareStatementBase64 !== "string"
       || grant.shareStatementBase64.length > 5470) denyOffer();
     const statementBytes = from64(grant.shareStatementBase64,
-      Buffer.from(grant.shareStatementBase64, "base64url").length);
+      nativeBufferFrom(grant.shareStatementBase64, "base64url").length);
     if (statementBytes.length < 1 || statementBytes.length > 4096) denyOffer();
     const statement = await z.decodeDeterministic(statementBytes);
     strict(statement, SHARE);
@@ -251,6 +298,7 @@ async function createProtectedRecipientShareOffer(input) {
       || !same(Buffer.from(statement.grant_id || []), from64(grant.grantId, 32))
       || statement.expires_at !== grant.expiresAt
       || !Number.isSafeInteger(statement.issued_at) || statement.issued_at < 1
+      || statement.issued_at > d.nowSeconds.value + 30
       || !Number.isSafeInteger(statement.expires_at)
       || statement.expires_at <= Math.max(d.nowSeconds.value, statement.issued_at)
       || statement.expires_at - statement.issued_at > 86400
@@ -262,11 +310,12 @@ async function createProtectedRecipientShareOffer(input) {
       || statement.epoch !== metadata.epoch
       || !same(Buffer.from(statement.ciphertext_digest || []),
         crypto.createHash("sha256").update(ciphertext).digest())) denyOffer();
-    for (const field of SCOPE) {
+    for (let index = 0; index < SCOPE.length; index++) {
+      const field = SCOPE[index];
       if (metadata[field] !== b64(statement[field])) denyOffer();
     }
     const signature = from64(grant.shareSignatureBase64, 64);
-    await verifyOfferAuthority(d.readIndependentAuthority.value,
+    const preAuthority = await verifyOfferAuthority(d.readIndependentAuthority.value,
       statement, statementBytes, signature, pin, issuerPin);
     // Existing owner ceremony verifies an independent owner pin, an authentic
     // V2 approval + PoP, witness receipt, matching signed X25519 roster key,
@@ -285,12 +334,14 @@ async function createProtectedRecipientShareOffer(input) {
       || envelope.core.owner_digest !== b64(statement.manifest_digest)
       || envelope.core.owner_epoch !== statement.epoch
       || envelope.core.epoch !== statement.epoch) denyOffer();
-    await verifyOfferAuthority(d.readIndependentAuthority.value,
+    const postAuthority = await verifyOfferAuthority(d.readIndependentAuthority.value,
       statement, statementBytes, signature, pin, issuerPin);
+    if (postAuthority.head.revision < preAuthority.head.revision
+      || postAuthority.head.epoch < preAuthority.head.epoch) denyOffer();
     // The independently verified second authority read can outlast the
     // owner-approved HPKE envelope even while the share grant remains valid.
     // Neither lease may expire before releasing the portable CEK offer.
-    const releaseSeconds = Math.floor(Date.now() / 1000);
+    const releaseSeconds = nativeReleaseFloor(nativeReleaseNow() / 1000);
     if (!Number.isSafeInteger(envelope.core.expires_at)
       || releaseSeconds >= envelope.core.expires_at
       || releaseSeconds >= statement.expires_at) denyOffer();
@@ -306,16 +357,19 @@ async function createProtectedRecipientShareOffer(input) {
 }
 function safeEnvelope(value) {
   strict(value, ENVELOPE);
-  const d = Object.getOwnPropertyDescriptors(value);
-  if (ENVELOPE.some((name) => !Object.hasOwn(d[name], "value"))) deny();
-  const keys = Reflect.ownKeys(d.core.value);
-  if (keys.length > 40 || keys.some((key) => typeof key !== "string")) deny();
+  const d = nativeAllDescriptors(value);
+  if (!allOwnData(d, ENVELOPE) || isNativeProxy(d.core.value)) deny();
+  const keys = nativeOwnKeys(d.core.value);
+  if (keys.length > 40) deny();
+  for (let index = 0; index < keys.length; index++) {
+    if (typeof keys[index] !== "string") deny();
+  }
   const core = snapshot(d.core.value, keys);
   const other = snapshot({ schema: d.schema.value, enc: d.enc.value,
     ciphertext: d.ciphertext.value, owner_signature: d.owner_signature.value,
     authorizesProductionRestore: d.authorizesProductionRestore.value,
     externalCustodyProven: d.externalCustodyProven.value },
-  ENVELOPE.filter((field) => field !== "core"));
+  ENVELOPE_OTHER);
   return Object.freeze({ ...other, core });
 }
 function currentAuthority(snapshotValue, statement, shareSignature, statementBytes) {
@@ -324,37 +378,20 @@ function currentAuthority(snapshotValue, statement, shareSignature, statementByt
   strict(snapshotValue.head, ["revision", "epoch", "digest"]);
   if (snapshotValue.head.revision !== statement.manifest_revision
     || snapshotValue.head.epoch !== statement.epoch
-    || !nativeTimingSafeEqual(copyNativeBytes32(snapshotValue.head.digest),
-      statement.manifest_digest)
-    || !nativeIsArray(snapshotValue.devices) || isProxy(snapshotValue.devices)
-    || snapshotValue.devices.length > 128) deny();
-  for (let index = 0; index < SCOPE.length; index += 1) {
+    || !same(copyNativeBytes32(snapshotValue.head.digest),
+      copyNativeBytes32(statement.manifest_digest))
+    || !nativeIsArray(snapshotValue.devices) || snapshotValue.devices.length > 128) deny();
+  for (let index = 0; index < SCOPE.length; index++) {
     const field = SCOPE[index];
     if (snapshotValue.scope[field] !== b64(statement[field])) deny();
   }
   const active = (deviceId) => {
-    let found = null;
-    for (let i = 0; i < snapshotValue.devices.length; i += 1) {
-      const slot = nativeOwnDescriptor(snapshotValue.devices, `${i}`);
-      if (!slot || !nativeHasOwn(slot, "value")) deny();
-      const device = slot.value;
-      strict(device, ["deviceId", "authorizationPublicKey", "enrolledEpoch", "revokedAtEpoch"]);
-      const id = nativeOwnDescriptor(device, "deviceId");
-      if (!id || !nativeHasOwn(id, "value")) deny();
-      if (id.value !== deviceId) continue;
-      if (found) deny();
-      const revoked = nativeOwnDescriptor(device, "revokedAtEpoch");
-      const enrolled = nativeOwnDescriptor(device, "enrolledEpoch");
-      const publicKey = nativeOwnDescriptor(device, "authorizationPublicKey");
-      if (!revoked || !nativeHasOwn(revoked, "value") || revoked.value !== null
-        || !enrolled || !nativeHasOwn(enrolled, "value")
-        || !nativeIsSafeInteger(enrolled.value) || enrolled.value < 1
-        || enrolled.value > statement.epoch
-        || !publicKey || !nativeHasOwn(publicKey, "value")) deny();
-      found = copyNativeBytes32(publicKey.value);
-    }
-    if (!found) deny();
-    return found;
+    const device = findUniqueDevice(snapshotValue.devices, deviceId);
+    if (!device) deny();
+    if (device.revokedAtEpoch !== null || !nativeIsSafeInteger(device.enrolledEpoch)
+      || device.enrolledEpoch < 1 || device.enrolledEpoch > statement.epoch
+      || !nativeIsUint8Array(device.authorizationPublicKey)) deny();
+    return copyNativeBytes32(device.authorizationPublicKey);
   };
   active(statement.recipient_device_id);
   const issuer = active(statement.issuer_device_id);
@@ -368,21 +405,28 @@ async function openProtectedRecipientShareFile(input) {
   try {
     strict(input, ["redeemInput", "envelope", "authority", "operatorMinimumSequence",
       "metadata", "deviceHpkePrivateKey", "nowSeconds"]);
-    const metadata = snapshot(input.metadata, METADATA);
-    const envelope = safeEnvelope(input.envelope);
-    const { redeemInput, authority, operatorMinimumSequence,
-      deviceHpkePrivateKey, nowSeconds } = input;
-    // A valid independent reader must stay the SAME reader across the initial
-    // signed redemption, owner HPKE, file AEAD and final release fence.
-    // An awaited caller callback may otherwise replace this property with a
-    // stale always-active authority implementation before the final check.
-    const readerDescriptor = redeemInput && !isProxy(redeemInput)
-      ? nativeOwnDescriptor(redeemInput, "readIndependentAuthority") : null;
-    if (!readerDescriptor || !nativeHasOwn(readerDescriptor, "value")
+    const entry = nativeAllDescriptors(input);
+    if (!allOwnData(entry, ["redeemInput", "envelope", "authority", "operatorMinimumSequence",
+      "metadata", "deviceHpkePrivateKey", "nowSeconds"])) deny();
+    const metadata = snapshot(entry.metadata.value, METADATA);
+    const envelope = safeEnvelope(entry.envelope.value);
+    const redeemInput = entry.redeemInput.value;
+    const authority = entry.authority.value;
+    const operatorMinimumSequence = entry.operatorMinimumSequence.value;
+    const deviceHpkePrivateKey = entry.deviceHpkePrivateKey.value;
+    const nowSeconds = entry.nowSeconds.value;
+    // Pin the same independently enrolled authority reader across signed GET,
+    // owner HPKE, file AEAD and final plaintext-release validation. A caller
+    // must not replace its function after the initial asynchronous GET with a
+    // stale but otherwise plausible roster reader.
+    const readerDescriptor = redeemInput && !isNativeProxy(redeemInput)
+      ? Object.getOwnPropertyDescriptor(redeemInput, "readIndependentAuthority") : null;
+    if (!readerDescriptor || !Object.hasOwn(readerDescriptor, "value")
       || typeof readerDescriptor.value !== "function"
-      || !nativeIsSafeInteger(nowSeconds) || nowSeconds < 1) deny();
+      || isNativeProxy(readerDescriptor.value)
+      || !Number.isSafeInteger(nowSeconds) || nowSeconds < 1) deny();
     const readIndependentAuthority = () =>
-      nativeApply(readerDescriptor.value, redeemInput, []);
+      nativeReflectApply(readerDescriptor.value, redeemInput, []);
     const receipt = await redeemProtectedCiphertextShare({
       ...redeemInput, readIndependentAuthority,
     });
@@ -410,7 +454,8 @@ async function openProtectedRecipientShareFile(input) {
       || core.owner_revision !== statement.manifest_revision
       || core.owner_digest !== b64(statement.manifest_digest)
       || core.owner_epoch !== statement.epoch) deny();
-    for (const field of SCOPE) {
+    for (let index = 0; index < SCOPE.length; index++) {
+      const field = SCOPE[index];
       if (core[field] !== b64(statement[field])
         || metadata[field] !== core[field]) deny();
     }
@@ -428,21 +473,16 @@ async function openProtectedRecipientShareFile(input) {
     });
     // HPKE and file AEAD await. Check the independent head and both live devices
     // again immediately before releasing the decrypted file to this process.
-    currentAuthority(await readIndependentAuthority(),
+    currentAuthority(snapshotAuthority(await readIndependentAuthority()),
       statement, shareSignature, statementBytes);
     // Only the owner CEK opener can attest which owner approval and witness
     // it ACTUALLY verified after the preceding asynchronous share redemption.
     const verifiedReleaseExpiresAt = opened.verifiedReleaseExpiresAt;
-    if (!nativeIsSafeInteger(verifiedReleaseExpiresAt)
+    if (!Number.isSafeInteger(verifiedReleaseExpiresAt)
       || verifiedReleaseExpiresAt < 1) deny();
-    const releaseSeconds = nativeReleaseNow() / 1000;
-    // The independent authority callback just ran. Never dispatch a mutable
-    // Array.prototype.some for the final plaintext-release expiry decision.
-    if (releaseSeconds >= statement.expires_at
-      || releaseSeconds >= verifiedReleaseExpiresAt
-      || nowSeconds >= statement.expires_at
-      || nowSeconds >= verifiedReleaseExpiresAt) deny();
-    // Never delegate DEV-OFF proof flags to a callback-rebound Object.freeze.
+    const releaseSeconds = nativeReleaseFloor(nativeReleaseNow() / 1000);
+    if (releaseSeconds >= statement.expires_at || nowSeconds >= statement.expires_at
+      || releaseSeconds >= verifiedReleaseExpiresAt || nowSeconds >= verifiedReleaseExpiresAt) deny();
     const result = nativeFreeze({
       schema: "rootark-zk1-recipient-share-file-dev/v1",
       grantId: receipt.grantId, objectId: receipt.objectId,
@@ -462,22 +502,32 @@ async function openPortableProtectedRecipientShareFile(input) {
   try {
     strict(input, ["offer", "redeemInput", "authority", "operatorMinimumSequence",
       "deviceHpkePrivateKey", "nowSeconds"]);
-    const inputDescriptors = Object.getOwnPropertyDescriptors(input);
-    if (Object.values(inputDescriptors).some((entry) =>
-      !Object.hasOwn(entry, "value"))) deny();
+    const inputDescriptors = nativeAllDescriptors(input);
+    if (!allOwnData(inputDescriptors, ["offer", "redeemInput", "authority",
+      "operatorMinimumSequence", "deviceHpkePrivateKey", "nowSeconds"])) deny();
     const offer = inputDescriptors.offer.value;
     strict(offer, OFFER);
-    const offerDescriptors = Object.getOwnPropertyDescriptors(offer);
-    if (Object.values(offerDescriptors).some((entry) =>
-      !Object.hasOwn(entry, "value"))) deny();
+    const offerDescriptors = nativeAllDescriptors(offer);
+    if (!allOwnData(offerDescriptors, OFFER)) deny();
     if (offer.schema !== "rootark-zk1-recipient-share-offer-dev/v1"
       || offer.authorizesProductionIo !== false
       || offer.externalCustodyProven !== false) deny();
     const grant = snapshot(offer.grant, GRANT);
-    const expectedGrant = snapshot(input.redeemInput?.grant, GRANT);
-    if (GRANT.some((key) => grant[key] !== expectedGrant[key])
-      || offer.recipientUsername !== input.redeemInput.recipientUsername
-      || offer.recipientDeviceId !== input.redeemInput.recipientDeviceId) deny();
+    const redeemInput = inputDescriptors.redeemInput.value;
+    if (!redeemInput || typeof redeemInput !== "object") deny();
+    const redeemDescriptors = nativeAllDescriptors(redeemInput);
+    if (!allOwnData(redeemDescriptors, ["grant", "recipientUsername", "recipientDeviceId"])) deny();
+    const expectedGrant = snapshot(redeemDescriptors.grant.value, GRANT);
+    const recipientUsername = redeemDescriptors.recipientUsername.value;
+    const recipientDeviceId = redeemDescriptors.recipientDeviceId.value;
+    if (typeof recipientUsername !== "string" || typeof recipientDeviceId !== "string") deny();
+    let grantMatches = true;
+    for (let index = 0; index < GRANT.length; index++) {
+      const field = GRANT[index];
+      if (grant[field] !== expectedGrant[field]) grantMatches = false;
+    }
+    if (!grantMatches || offer.recipientUsername !== recipientUsername
+      || offer.recipientDeviceId !== recipientDeviceId) deny();
     return await openProtectedRecipientShareFile({
       redeemInput: input.redeemInput, envelope: offer.envelope,
       authority: input.authority,
