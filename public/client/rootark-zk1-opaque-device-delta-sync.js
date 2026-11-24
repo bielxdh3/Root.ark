@@ -213,8 +213,12 @@
       const sessionCsrf = trust.csrfToken();
       if (typeof sessionCsrf !== "string" || !sessionCsrf || sessionCsrf.length > 512
         || /[\u0000-\u001f\u007f]/.test(sessionCsrf)) deny();
+      // A signed catalog reader can await while caller-owned input methods
+      // change. Pin the original generation guard at client construction:
+      // never permit a replacement property to authorize decrypted names.
+      const originalAssertLive = input.assertLive.bind(input);
       const assertLive = () => {
-        const result = input.assertLive();
+        const result = originalAssertLive();
         if (result === false || (result && typeof result.then === "function")
           || trust.isSessionCurrent() !== true
           || trust.csrfToken() !== sessionCsrf) deny();
@@ -276,19 +280,13 @@
             plaintextMetadataExposed: false, productionDurabilityProven: false });
         } catch (_) { deny(); }
       }
-      async function readPrivateListing(previous, metadataKey) {
+      async function freshPrivateListing(previous) {
         try {
           const state = tracked.get(previous);
           if (!state || state.owner !== writer || previous !== latest
             || previous.head.sequence !== state.head.sequence
             || previous.head.digest !== state.head.digest
-            || previous.entries.length !== state.snapshot.rows.length
-            || typeof catalog.openMetadata !== "function"
-            || metadataKey?.type !== "secret"
-            || metadataKey?.algorithm?.name !== "AES-GCM"
-            || metadataKey.algorithm.length !== 256
-            || metadataKey.extractable !== false
-            || !metadataKey.usages?.includes("decrypt")) deny();
+            || previous.entries.length !== state.snapshot.rows.length) deny();
           assertLive();
           // Never decrypt the caller-supplied or cached rows: re-read the
           // complete owner/witness/CAS signed page set at the exact pinned
@@ -299,7 +297,35 @@
             || !equal(bytes(current.head.digest, 32),
               from64(state.head.digest, 32))
             || current.rows.length !== state.snapshot.rows.length) deny();
-          const entries = [];
+          for (let index = 0; index < current.rows.length; index++) {
+            const signed = rowWire(current.rows[index]);
+            const baseline = previous.entries[index];
+            if (Object.keys(signed).some((key) => signed[key] !== baseline[key])) deny();
+          }
+          return { current, head: Object.freeze({ ...state.head }),
+            scope: Object.freeze(scopeFor(trust.signedDeviceGrant)) };
+        } catch (_) { deny(); }
+      }
+      async function verifyPrivateListingHead(previous) {
+        const { head, scope } = await freshPrivateListing(previous);
+        assertLive();
+        return Object.freeze({ head, scope });
+      }
+      async function readPrivateListing(previous, metadataKey, term = "") {
+        try {
+          if (typeof term !== "string" || term.length > 120) deny();
+          const query = term.trim().normalize("NFC").toLowerCase();
+          if (typeof catalog.openMetadata !== "function"
+            || metadataKey?.type !== "secret"
+            || metadataKey?.algorithm?.name !== "AES-GCM"
+            || metadataKey.algorithm.length !== 256
+            || metadataKey.extractable !== false
+            || !metadataKey.usages?.includes("decrypt")) deny();
+          const { current, head, scope } = await freshPrivateListing(previous);
+          // The catalog is append-only history. Decrypt and validate EVERY
+          // signed row first, but search/display only the highest revision
+          // per object: an old name must not resurrect a trashed/renamed file.
+          const latestByObject = new Map();
           for (const row of current.rows) {
             assertLive();
             const name = await catalog.openMetadata({
@@ -308,17 +334,78 @@
               ciphertext: bytes(row.metadata_ciphertext, 284),
             });
             assertLive();
-            entries.push(Object.freeze({ objectId: row.object_id,
-              revision: row.revision, epoch: row.epoch,
-              name: name === TRASH_NAME ? null : name,
-              logicalTrashCandidate: name === TRASH_NAME }));
+            // Preserve the max signed revision regardless of global row order.
+            // Never skip historical decryption/verification for convenience.
+            const previous = latestByObject.get(row.object_id);
+            if (!previous || row.revision > previous.revision) {
+              latestByObject.delete(row.object_id);
+              latestByObject.set(row.object_id, Object.freeze({
+                objectId: row.object_id, revision: row.revision, epoch: row.epoch,
+                name: name === TRASH_NAME ? null : name,
+                logicalTrashCandidate: name === TRASH_NAME,
+              }));
+            }
           }
           assertLive();
+          const entries = [];
+          let totalMatches = 0;
+          for (const entry of latestByObject.values()) {
+            if (!query || (!entry.logicalTrashCandidate
+              && entry.name.normalize("NFC").toLowerCase().includes(query))) {
+              totalMatches++;
+              // Cap private query hits, not the full workspace listing. The
+              // signed head can contain >100 current objects, all of which
+              // must remain visible when no local filename filter is active.
+              if (!query || entries.length < 100) entries.push(entry);
+            }
+          }
+          // Every metadata AEAD open awaited above. An owner revocation or
+          // independent CAS successor during those awaits invalidates the
+          // earlier read; recheck the signed current head before local release.
+          const final = await writer.readAll();
+          assertLive();
+          if (final.head.sequence !== current.head.sequence
+            || !equal(bytes(final.head.digest, 32), bytes(current.head.digest, 32))
+            || final.rows.length !== current.rows.length) deny();
+          // A server cannot replay a same-head but different row set while
+          // the filename AEAD callbacks are pending. Compare the signed
+          // immutable listing against the original verified baseline too.
+          for (let index = 0; index < final.rows.length; index++) {
+            const signed = rowWire(final.rows[index]);
+            const baseline = previous.entries[index];
+            if (Object.keys(signed).some((key) => signed[key] !== baseline[key])) deny();
+          }
           // One bad entry/key invalidates the ENTIRE list; no partial results.
-          return Object.freeze({ head: Object.freeze({ ...state.head }),
-            entries: Object.freeze(entries),
+          return Object.freeze({ head, scope,
+            entries: Object.freeze(entries), totalMatches,
             plaintextSentToServer: false, independentlySignedCatalog: true,
             authorizesMutation: false });
+        } catch (_) { deny(); }
+      }
+      async function readSelectedCiphertext(previous, objectId, revision) {
+        try {
+          if (typeof objectId !== "string" || !/^[A-Za-z0-9_-]{22}$/.test(objectId)
+            || !Number.isSafeInteger(revision) || revision < 1) deny();
+          from64(objectId, 16);
+          const { current, head } = await freshPrivateListing(previous);
+          const rows = current.rows.filter((row) =>
+            row.object_id === objectId && row.revision === revision);
+          if (rows.length !== 1) deny();
+          const selected = rowWire(rows[0]);
+          const fetched = await writer.readVerifiedCiphertext(current, objectId, revision);
+          assertLive();
+          if (fetched.objectId !== selected.objectId
+            || fetched.revision !== selected.revision
+            || fetched.epoch !== selected.epoch
+            || fetched.ciphertextDigestBase64 !== selected.ciphertextDigestBase64) deny();
+          const sealed = from64(fetched.ciphertextBase64, 16, MAX);
+          const actual = new Uint8Array(await crypto.subtle.digest("SHA-256", sealed));
+          if (!equal(actual, bytes(rows[0].ciphertext_digest, 32))) deny();
+          const after = await freshPrivateListing(previous);
+          assertLive();
+          if (after.head.sequence !== head.sequence || after.head.digest !== head.digest) deny();
+          return Object.freeze({ ...fetched, verifiedCiphertext: true,
+            plaintextAvailable: false, authorizesMutation: false });
         } catch (_) { deny(); }
       }
       async function commitVersion(inputVersion, internalTrash = false,
@@ -821,6 +908,7 @@
         }
       }
       return Object.freeze({ readCurrent, pullDelta, readPrivateListing,
+        verifyPrivateListingHead, readSelectedCiphertext,
         commitVersion: (value) => commitVersion(value, false), trashVersion, readTrash, restoreVersion });
     }
     return Object.freeze({ createClient });
