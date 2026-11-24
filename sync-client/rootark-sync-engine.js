@@ -5383,16 +5383,11 @@ class SyncEngine {
     if (!staged) fail("Tracked local source disappeared during staging", "local_changes_pending");
     try {
       await containedAbsolute(this.rootDir, staged, false);
-      const stagedStats = await fsp.lstat(staged, { bigint: true });
-      if (!stagedStats.isFile() || stagedStats.isSymbolicLink() || stagedStats.nlink !== 1n
-        || !sameFileIdentity(before, stagedStats)) {
-        fail("Tracked local source changed during staging", "local_changes_pending");
-      }
       const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
       const handle = await fsp.open(staged, flags);
       try {
         const opened = await handle.stat({ bigint: true });
-        if (!sameFileVersion(stagedStats, opened)) {
+        if (!opened.isFile() || opened.nlink !== 1n || !sameFileIdentity(before, opened)) {
           fail("Tracked local source changed during staging", "local_changes_pending");
         }
         const stagedBytes = await handle.readFile();
@@ -5400,6 +5395,7 @@ class SyncEngine {
         const stagedAfterRead = await fsp.lstat(staged, { bigint: true });
         if (!sameFileVersion(opened, openedAfterRead)
           || !sameFileVersion(openedAfterRead, stagedAfterRead)
+          || stagedAfterRead.isSymbolicLink()
           || crypto.createHash("sha256").update(stagedBytes).digest("hex") !== tracked.hash) {
           fail("Tracked local source changed during staging", "local_changes_pending");
         }
