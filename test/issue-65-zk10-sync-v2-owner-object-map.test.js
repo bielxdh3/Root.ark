@@ -61,8 +61,7 @@ test("P2 mapping: callback iterator must not hide genuine owner Ed25519 A when C
   const actualIterator = Array.prototype[Symbol.iterator];
   const nativeEquals = crypto.KeyObject.prototype.equals;
   let reads = 0, skipped = 0;
-  Object.defineProperty(poisoned, handle, { get() {
-    reads++;
+  const poison = () => {
     Array.prototype[Symbol.iterator] = function*() {
       if (this.length === 1 && this[0] instanceof crypto.KeyObject
         && Reflect.apply(nativeEquals, this[0], [keys.owner.publicKey])) {
@@ -71,6 +70,10 @@ test("P2 mapping: callback iterator must not hide genuine owner Ed25519 A when C
       }
       yield* Reflect.apply(actualIterator, this, []);
     };
+  };
+  Object.defineProperty(poisoned, handle, { get() {
+    reads++;
+    poison();
     return keys.owner.publicKey[handle];
   } });
   try {
@@ -78,8 +81,14 @@ test("P2 mapping: callback iterator must not hide genuine owner Ed25519 A when C
       sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
       mappingAuthority: { ...sameSignerAuthority, pinnedPublicKey: poisoned },
     }), deny, "inherited KeyObject getter cannot omit owner from separation check");
+    assert.equal(reads, 0, "inherited native handle getter must fail closed early");
+    assert.equal(Array.prototype[Symbol.iterator], actualIterator);
+    poison();
+    assert.throws(() => createOwnerObjectMapVerifier({
+      sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+      mappingAuthority: sameSignerAuthority,
+    }), deny, "owner Ed25519 A cannot issue purported independent CURRENT Ed25519 A under poisoned iterator");
   } finally { Array.prototype[Symbol.iterator] = actualIterator; }
-  assert.ok(reads > 0, "native owner key callback executed");
   assert.equal(skipped, 0, "native iteration or indexed role checks must ignore forged iterator");
   const good = await fixture();
   const valid = createOwnerObjectMapVerifier({
@@ -1168,18 +1177,24 @@ test("P2 review: native authority KeyObject getter cannot rewind independently r
     floor.digest = hex(77);
     return keys.authority.publicKey[handle];
   } });
-  const verifier = createOwnerObjectMapVerifier({
+  assert.throws(() => createOwnerObjectMapVerifier({
     sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
     mappingAuthority: { ...f.authority, independentlyRetainedFloor: floor,
       pinnedPublicKey: keyWithGetter },
+  }), deny, "inherited native handle must fail closed before mutating floor");
+  assert.equal(callbacks, 0, "inherited native handle getter must not execute");
+  const verifier = createOwnerObjectMapVerifier({
+    sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
+    mappingAuthority: { ...f.authority, independentlyRetainedFloor: floor },
   });
-  assert.ok(callbacks > 0, "attacker-controlled native getter ran");
+  floor.sequence = 4;
+  floor.digest = hex(77);
   assert.deepEqual(initialFloor, { sequence: 6, digest: hex(99) },
     "the original trusted minimum must be strictly higher than mapping sequence 5");
   await assert.rejects(verifier(f.input), deny,
     "a valid sequence-5 Ed25519 mapping cannot rewind original floor sequence 6");
   assert.deepEqual(floor, { sequence: 4, digest: hex(77) },
-    "the callback really altered the caller-owned floor; only the detached snapshot denied rollback");
+    "caller-owned floor mutation cannot affect the detached snapshot");
   const valid = await createOwnerObjectMapVerifier({
     sourceAuthority: f.sourceAuthority, zkAuthority: f.zkAuthority,
     mappingAuthority: f.authority,
@@ -1231,8 +1246,7 @@ test("P2 device Ed25519 ciphertext A must not authorize independently owner-sign
   const originalIterator = Array.prototype[Symbol.iterator];
   let getterReads = 0;
   let skippedChecks = 0;
-  Object.defineProperty(hostileAuthorityKey, nativeHandle, { get() {
-    getterReads += 1;
+  const poison = () => {
     Array.prototype[Symbol.iterator] = function*() {
       if (this.length === 16 && this[0] === "protocolVersion"
         && this[13] === "ciphertextDigest") {
@@ -1241,15 +1255,25 @@ test("P2 device Ed25519 ciphertext A must not authorize independently owner-sign
       }
       yield* Reflect.apply(originalIterator, this, []);
     };
+  };
+  Object.defineProperty(hostileAuthorityKey, nativeHandle, { get() {
+    getterReads += 1;
+    poison();
     return keys.authority.publicKey[nativeHandle];
   } });
   try {
-    await assert.rejects(create({ ...authorityB, pinnedPublicKey: hostileAuthorityKey })(candidate),
-      deny, "native owner-map key callback cannot suppress ciphertext A/B device binding");
+    assert.throws(() => create({ ...authorityB, pinnedPublicKey: hostileAuthorityKey }),
+      deny, "inherited native handle must fail closed early");
+    assert.equal(getterReads, 0, "inherited native handle getter must not execute");
+    assert.equal(Array.prototype[Symbol.iterator], originalIterator);
+    poison();
+    await assert.rejects(create(authorityB)(candidate),
+      deny, "poisoned Array iterator cannot suppress ciphertext A/B device binding");
+    assert.equal((await create(f.authority)(f.input)).authorizesIo, false,
+      "genuine owner and device Ed25519 authorization still passes under poisoned iterator");
   } finally {
     Array.prototype[Symbol.iterator] = originalIterator;
   }
-  assert.ok(getterReads > 0, "genuine KeyObject callback was exercised");
   assert.equal(skippedChecks, 0, "authorization comparison must not use poisoned Array iterator");
   assert.equal((await create(f.authority)(f.input)).authorizesIo, false,
     "genuine owner and device Ed25519 authorization still passes");
@@ -1508,9 +1532,13 @@ test("P2: global String(index) cannot erase a legitimate owner root from CURRENT
     return keys.owner.publicKey[kHandle];
   } });
   try {
-    // Critical nonvacuous control: the same poisoned root MUST still accept
-    // genuine rotated B with an actually independent C-signed CURRENT head.
-    const underPoison = await verifyWith(hostileRoot, {
+    assert.throws(() => verifyWith(hostileRoot, {
+      ...f.authority, readCurrentHead: makeHead(keys.authority.privateKey),
+    }), deny, "inherited native handle must fail closed before getter");
+    assert.equal(nativeGetterReads, 0, "inherited native handle getter must not execute");
+    assert.equal(global.String, originalString);
+    global.String = poisonedString;
+    const underPoison = await verifyWith(keys.owner.publicKey, {
       ...f.authority, readCurrentHead: makeHead(keys.authority.privateKey),
     })(signedInput);
     assert.equal(underPoison.ownerMappingVerified, true);
@@ -1518,10 +1546,9 @@ test("P2: global String(index) cannot erase a legitimate owner root from CURRENT
     assert.equal(underPoison.authorizesIo, false);
     // Legacy: rotation appends B to accepted[0] instead of accepted[1],
     // deleting A from the key set. Real CURRENT A then masquerades as independent.
-    assert.throws(() => verifyWith(hostileRoot, rootAsAuthority), deny,
+    assert.throws(() => verifyWith(keys.owner.publicKey, rootAsAuthority), deny,
       "the exact owner root signer must be rejected during synchronous role separation");
-    assert.ok(nativeGetterReads > 0, "the native key getter actually ran");
-    assert.equal(global.String, poisonedString, "the actual native getter poisoned the ambient realm");
+    assert.equal(global.String, poisonedString, "the ambient realm String was poisoned");
   } finally {
     global.String = originalString;
   }
@@ -1603,7 +1630,7 @@ test("P2: inherited KeyObject kHandle cannot splice owner A's signature onto cla
   assert.throws(() => verifyOwnerRotationKeys([signRotation(claimedBHash)],
     rogueRoot, immutableId), /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/,
   "signed rotation from real owner A must never authenticate claimed SPKI B");
-  assert.ok(seen.length >= 2, `native kHandle splicing was exercised: ${seen.join(",")}`);
+  assert.equal(seen.length, 0, "inherited native handle must fail closed before kHandle getter");
   const genuine = verifyOwnerRotationKeys(
     [signRotation(ownerAHash)], ownerA.publicKey, immutableId);
   assert.equal(genuine.length, 2, "legitimate distinct signed rotation remains valid");
@@ -1921,7 +1948,7 @@ test("P2: physical owner kHandle cannot redirect signed mapping A digest onto in
   let armed = false;
   let intercepted = 0;
   let readbacks = 0;
-  Object.defineProperty(root, handle, { get() {
+  const poison = () => {
     if (!armed) {
       armed = true;
       Object.defineProperty(hashPrototype, "digest", { ...original, value(encoding) {
@@ -1933,12 +1960,26 @@ test("P2: physical owner kHandle cannot redirect signed mapping A digest onto in
         return digest;
       } });
     }
+  };
+  Object.defineProperty(root, handle, { get() {
+    poison();
     return keys.owner.publicKey[handle];
   } });
   try {
-    const verifier = createOwnerObjectMapVerifier({
+    assert.throws(() => createOwnerObjectMapVerifier({
       sourceAuthority: f.sourceAuthority,
       zkAuthority: { ...f.zkAuthority, ownerRootPublicKey: root },
+      mappingAuthority: {
+        ...f.authority,
+        independentlyRetainedFloor: { sequence: 5, digest: otherDigest },
+        readCurrentHead: async () => { throw new Error("unexpected head read"); },
+      },
+    }), deny, "inherited native handle must fail closed before getter");
+    assert.equal(armed, false, "inherited native handle getter must not execute");
+    poison();
+    const verifier = createOwnerObjectMapVerifier({
+      sourceAuthority: f.sourceAuthority,
+      zkAuthority: { ...f.zkAuthority, ownerRootPublicKey: keys.owner.publicKey },
       mappingAuthority: {
         ...f.authority,
         independentlyRetainedFloor: { sequence: 5, digest: otherDigest },
@@ -1954,7 +1995,7 @@ test("P2: physical owner kHandle cannot redirect signed mapping A digest onto in
     });
     await assert.rejects(verifier(f.input), deny,
       "signed mapping A must not match retained digest B even if an attacker poisons Hash.digest");
-    assert.equal(armed, true, "owner KeyObject getter must have installed the poison");
+    assert.equal(armed, true, "Hash.digest poison was installed");
     assert.equal(intercepted, 0, "mapping hashing must bypass a poisoned Hash prototype");
     assert.equal(readbacks, 0, "mismatched retained digest must fail before an external head read");
   } finally {

@@ -71,14 +71,21 @@ test("P2 inventory: native getter must not retarget genuine A signature to forge
     f.signer.publicKey)), { code: "INVENTORY_SIGNATURE" });
   const originalVerify = crypto.verify;
   let retargetCalls = 0;
-  const evil = nativeGetter(f.signer.publicKey, () => {
+  const poison = () => {
     crypto.verify = () => { retargetCalls++; return true; };
-  });
+  };
+  const evil = nativeGetter(f.signer.publicKey, poison);
   try {
     await assert.rejects(inventory.verifyCommittedEntryProof(input(proof.forged,
-      evil.forged)), { code: "INVENTORY_SIGNATURE" });
+      evil.forged)), { code: "INVENTORY_SIGNER_KEY" });
+    assert.equal(evil.reads, 0, "inherited native handle getter must not execute");
+    assert.equal(crypto.verify, originalVerify, "early rejection must not alter crypto.verify");
+    poison();
+    await assert.rejects(inventory.verifyCommittedEntryProof(input(proof.forged,
+      f.signer.publicKey)), { code: "INVENTORY_SIGNATURE" });
+    assert.equal((await inventory.verifyCommittedEntryProof(input(proof.good,
+      f.signer.publicKey))).authorizesIo, false);
   } finally { crypto.verify = originalVerify; }
-  assert.ok(evil.reads > 0, "native getter executes after snapshot");
   assert.equal(retargetCalls, 0, "must use early captured crypto.verify");
   assert.equal((await inventory.verifyCommittedEntryProof(input(proof.good,
     f.signer.publicKey))).authorizesIo, false);
@@ -105,14 +112,21 @@ test("P2 composite: inherited Ed25519 inventory pin cannot make A signature auth
     f.signer.publicKey)), /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/);
   const originalVerify = crypto.verify;
   let mutableCalls = 0;
-  const poisonedKey = nativeGetter(f.signer.publicKey, () => {
+  const poison = () => {
     crypto.verify = () => { mutableCalls++; return true; };
-  });
+  };
+  const poisonedKey = nativeGetter(f.signer.publicKey, poison);
   try {
     await assert.rejects(verifyAttestedInventoryCommit(input(receipts.forged,
       poisonedKey.forged)), /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/);
+    assert.equal(poisonedKey.reads, 0, "inherited native handle getter must fail closed early");
+    assert.equal(crypto.verify, originalVerify, "early rejection must not alter crypto.verify");
+    poison();
+    await assert.rejects(verifyAttestedInventoryCommit(input(receipts.forged,
+      f.signer.publicKey)), /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/);
+    assert.equal((await verifyAttestedInventoryCommit(input(receipts.good,
+      f.signer.publicKey))).authorizesIo, false);
   } finally { crypto.verify = originalVerify; }
-  assert.ok(poisonedKey.reads > 0, "real inherited native getter before composite");
   assert.equal(mutableCalls, 0, "the pinned native inventory verifier must be used");
   assert.equal((await verifyAttestedInventoryCommit(input(receipts.good,
     f.signer.publicKey))).authorizesIo, false);
@@ -150,28 +164,42 @@ test("P2 PG: native getter cannot substitute signature verification or byte comp
     options(f.signer.publicKey)), /ZK_PHYSICAL_ATTESTATION_DENIED/);
   const originalVerify = crypto.verify;
   let verifyCalls = 0;
-  const evil = nativeGetter(f.signer.publicKey, () => {
+  const poisonVerify = () => {
     crypto.verify = () => { verifyCalls++; return true; };
-  });
+  };
+  const evil = nativeGetter(f.signer.publicKey, poisonVerify);
   try {
     await assert.rejects(pg.verifyCommittedPhysicalReadback(forged,
       options(evil.forged)), /ZK_PHYSICAL_ATTESTATION_DENIED/);
+    assert.equal(evil.reads, 0, "inherited native handle getter must fail closed early");
+    assert.equal(crypto.verify, originalVerify);
+    poisonVerify();
+    await assert.rejects(pg.verifyCommittedPhysicalReadback(forged,
+      options(f.signer.publicKey)), /ZK_PHYSICAL_ATTESTATION_DENIED/);
+    assert.equal((await pg.verifyCommittedPhysicalReadback(signed,
+      options(f.signer.publicKey))).verified, true);
   } finally { crypto.verify = originalVerify; }
-  assert.ok(evil.reads > 0);
   assert.equal(verifyCalls, 0, "PG must verify Ed25519 through original native method");
 
   const originalCompare = crypto.timingSafeEqual;
   let comparisons = 0;
-  const comparisonEvil = nativeGetter(f.signer.publicKey, () => {
+  const poisonCompare = () => {
     crypto.timingSafeEqual = () => { comparisons++; return true; };
-  });
+  };
+  const comparisonEvil = nativeGetter(f.signer.publicKey, poisonCompare);
   try {
     await assert.rejects(pg.verifyCommittedPhysicalReadback(signed,
       options(comparisonEvil.forged, {
         digest: Buffer.alloc(32, 88), root: Buffer.alloc(32, 32), chunks: 1,
       })), /ZK_PHYSICAL_ATTESTATION_DENIED/);
+    assert.equal(comparisonEvil.reads, 0, "inherited native handle getter must fail closed early");
+    assert.equal(crypto.timingSafeEqual, originalCompare);
+    poisonCompare();
+    await assert.rejects(pg.verifyCommittedPhysicalReadback(signed,
+      options(f.signer.publicKey, {
+        digest: Buffer.alloc(32, 88), root: Buffer.alloc(32, 32), chunks: 1,
+      })), /ZK_PHYSICAL_ATTESTATION_DENIED/);
   } finally { crypto.timingSafeEqual = originalCompare; }
-  assert.ok(comparisonEvil.reads > 0);
   assert.equal(comparisons, 0, "PG must retain original constant-time comparator");
   assert.equal((await pg.verifyCommittedPhysicalReadback(signed,
     options(f.signer.publicKey, { digest, root: Buffer.alloc(32, 32), chunks: 1 })))
@@ -236,7 +264,7 @@ test("P2 inventory signed A must not verify tampered B after hostile Buffer.conc
     await z.encodeDeterministic(unsignedA),
   ]);
   let replacements = 0;
-  const evil = nativeGetter(f.signer.publicKey, () => {
+  const poison = () => {
     Buffer.concat = (segments, ...args) => {
       if (Array.isArray(segments) && segments[0]?.equals?.(
         Buffer.from("Root.ark/zk-1/content-inventory-entry/v1\0"))) {
@@ -245,12 +273,8 @@ test("P2 inventory signed A must not verify tampered B after hostile Buffer.conc
       }
       return originalConcat(segments, ...args);
     };
-  });
-  Object.defineProperty(evil.forged, "type", { get() {
-    const handle = Object.getOwnPropertySymbols(f.signer.publicKey).find((k) => k.description === "kHandle");
-    assert.ok(evil.forged[handle], "real native handle getter reached");
-    return "public";
-  } });
+  };
+  const evil = nativeGetter(f.signer.publicKey, poison);
   const opts = (serialized, key) => ({ serialized, pinnedPublicKey: key,
     pinnedSignerKeyId: f.signerKeyId, expectedScope: f.scope, operation: f.operation });
   assert.equal((await inventory.verifyCommittedEntryProof(opts(good, f.signer.publicKey))).authorizesIo, false);
@@ -258,9 +282,14 @@ test("P2 inventory signed A must not verify tampered B after hostile Buffer.conc
     { code: "INVENTORY_SIGNATURE" });
   try {
     await assert.rejects(inventory.verifyCommittedEntryProof(opts(forged, evil.forged)),
+      { code: "INVENTORY_SIGNER_KEY" }, "inherited native handle must fail closed early");
+    assert.equal(evil.reads, 0, "inherited native handle getter must not execute");
+    assert.equal(Buffer.concat, originalConcat);
+    poison();
+    await assert.rejects(inventory.verifyCommittedEntryProof(opts(forged, f.signer.publicKey)),
       { code: "INVENTORY_SIGNATURE" }, "signed A must never authenticate the forged B root");
+    assert.equal((await inventory.verifyCommittedEntryProof(opts(good, f.signer.publicKey))).authorizesIo, false);
   } finally { Buffer.concat = originalConcat; }
-  assert.ok(evil.reads > 0, "hostile native getter must run");
   assert.equal(replacements, 0, "signed bytes must not reach poisoned Buffer.concat");
 });
 
@@ -282,7 +311,7 @@ test("P2 PG signed A must not verify generation B after hostile Buffer.concat re
   await assert.rejects(pg.verifyCommittedPhysicalReadback(forged,
     options(f.signer.publicKey)), /ZK_PHYSICAL_ATTESTATION_DENIED/);
   let replacements = 0;
-  const evil = nativeGetter(f.signer.publicKey, () => {
+  const poison = () => {
     Buffer.concat = (segments, ...args) => {
       if (Array.isArray(segments) && segments[0]?.equals?.(
         Buffer.from("Root.ark/zk-1/physical-pg-readback-attestation/v1\0"))) {
@@ -291,17 +320,19 @@ test("P2 PG signed A must not verify generation B after hostile Buffer.concat re
       }
       return originalConcat(segments, ...args);
     };
-  });
-  Object.defineProperty(evil.forged, "type", { get() {
-    const handle = Object.getOwnPropertySymbols(f.signer.publicKey).find((k) => k.description === "kHandle");
-    assert.ok(evil.forged[handle], "real native handle getter reached");
-    return "public";
-  } });
+  };
+  const evil = nativeGetter(f.signer.publicKey, poison);
   try {
     await assert.rejects(pg.verifyCommittedPhysicalReadback(forged, options(evil.forged)),
+      /ZK_PHYSICAL_ATTESTATION_DENIED/, "inherited native handle must fail closed early");
+    assert.equal(evil.reads, 0, "inherited native handle getter must not execute");
+    assert.equal(Buffer.concat, originalConcat);
+    poison();
+    await assert.rejects(pg.verifyCommittedPhysicalReadback(forged, options(f.signer.publicKey)),
       /ZK_PHYSICAL_ATTESTATION_DENIED/, "signed A must never authenticate generation B");
+    assert.equal((await pg.verifyCommittedPhysicalReadback(signed,
+      options(f.signer.publicKey))).generation, 1);
   } finally { Buffer.concat = originalConcat; }
-  assert.ok(evil.reads > 0, "hostile native getter must run");
   assert.equal(replacements, 0, "signed bytes must not reach poisoned Buffer.concat");
 });
 test("P2 PG signed scope A cannot authorize foreign scope B via hostile Array.every", async () => {
@@ -316,24 +347,26 @@ test("P2 PG signed scope A cannot authorize foreign scope B via hostile Array.ev
     opts(f.signer.publicKey, scopeB)), /ZK_PHYSICAL_ATTESTATION_DENIED/);
   const originalEvery = Array.prototype.every;
   let attackCalls = 0;
-  const evil = nativeGetter(f.signer.publicKey, () => {
+  const poison = () => {
     Array.prototype.every = function(callback, ...args) {
       if (this[0] === "account_id" || this[0] === "operation_id"
         || this[0] === "type") { attackCalls++; return true; }
       return originalEvery.call(this, callback, ...args);
     };
-  });
-  Object.defineProperty(evil.forged, "type", { get() {
-    const handle = Object.getOwnPropertySymbols(f.signer.publicKey)
-      .find((k) => k.description === "kHandle");
-    assert.ok(evil.forged[handle], "real inherited native getter invoked");
-    return "public";
-  } });
+  };
+  const evil = nativeGetter(f.signer.publicKey, poison);
   try {
     await assert.rejects(pg.verifyCommittedPhysicalReadback(signed,
       opts(evil.forged, scopeB)), /ZK_PHYSICAL_ATTESTATION_DENIED/,
+    "inherited native handle must fail closed early");
+    assert.equal(evil.reads, 0, "inherited native handle getter must not execute");
+    assert.equal(Array.prototype.every, originalEvery);
+    poison();
+    await assert.rejects(pg.verifyCommittedPhysicalReadback(signed,
+      opts(f.signer.publicKey, scopeB)), /ZK_PHYSICAL_ATTESTATION_DENIED/,
     "valid signed A must not authorize a different account B");
+    assert.equal((await pg.verifyCommittedPhysicalReadback(signed,
+      opts(f.signer.publicKey, f.scope))).verified, true);
   } finally { Array.prototype.every = originalEvery; }
-  assert.ok(evil.reads > 0, "native getter must run");
   assert.equal(attackCalls, 0, "same-realm Array.every must never decide signed scope");
 });

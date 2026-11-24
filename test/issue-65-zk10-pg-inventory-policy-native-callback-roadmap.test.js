@@ -523,7 +523,7 @@ test("P2 PG: hostile CBOR Object.keys cannot transiently sign A while returning 
   await assert.rejects(verify(f.signer.publicKey), /ZK_PHYSICAL_ATTESTATION_DENIED/);
 
   const originalKeys = Object.keys;
-  let getterReads = 0, substitutions = 0, restored = 0;
+  let getterReads = 0, substitutions = 0, restored = 0, frozenSeen = 0;
   const maliciousPin = crypto.createPublicKey({
     key: f.signer.publicKey.export({ type: "spki", format: "der" }),
     type: "spki", format: "der",
@@ -533,9 +533,13 @@ test("P2 PG: hostile CBOR Object.keys cannot transiently sign A while returning 
     Object.keys = function (value) {
       if (value && value.type === pg.TYPE && value.generation === 2
         && !Object.hasOwn(value, "signature")) {
-        substitutions++;
-        value.generation = 1;
-        queueMicrotask(() => { value.generation = 2; restored++; });
+        if (Object.isFrozen(value)) {
+          frozenSeen++;
+        } else {
+          substitutions++;
+          value.generation = 1;
+          queueMicrotask(() => { value.generation = 2; restored++; });
+        }
       }
       return originalKeys(value);
     };
@@ -549,12 +553,17 @@ test("P2 PG: hostile CBOR Object.keys cannot transiently sign A while returning 
     assert.equal(positiveUnderPoison.generation, 1,
       "a genuine Ed25519 attestation A must still verify while the hostile callback is installed");
     assert.equal(positiveUnderPoison.authorizesIo, false);
+    const probe = { type: pg.TYPE, generation: 2 };
+    assert.deepEqual(Object.keys(probe), ["type", "generation"]);
+    await Promise.resolve();
+    assert.equal(probe.generation, 2, "the probe's queued restoration ran");
   } finally {
     Object.keys = originalKeys;
     delete maliciousPin.type;
   }
   assert.ok(getterReads > 0, "the real Ed25519 KeyObject callback ran");
-  assert.ok(substitutions > 0, "the CBOR unsigned-map poison was actually invoked");
+  assert.ok(frozenSeen > 0, "the codec froze the isolated CBOR snapshot before Object.keys");
+  assert.equal(substitutions, 1, "the hostile Object.keys hook is live on a mutable probe");
   assert.equal(restored, substitutions, "every transient mutation was restored");
   assert.equal(accepted, undefined,
     "genuine signed A cannot authenticate the unsigned generation B");
