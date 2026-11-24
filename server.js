@@ -4359,7 +4359,13 @@ async function sendOptimizedFile(req, res, filePath, downloadName, dispositionTy
       if (snapshotAbortController.signal.aborted || req.aborted || res.destroyed) return;
       const unavailable = new Set(["ENOENT", "ENOTDIR", "ELOOP", "FILE_NOT_REGULAR", "FILE_HANDLE_CHANGED"]);
       if (unavailable.has(error.code)) return res.status(404).send("Arquivo nao encontrado");
-      console.error("Erro ao preparar snapshot para transmissao:", error.message);
+      const SAFE_SNAPSHOT_ERROR_CODES = new Set([
+        "EACCES", "EPERM", "ENAMETOOLONG", "ENOSPC", "EMFILE", "ENFILE", "EIO",
+        "EROFS", "EBUSY", "EEXIST", "PRIVATE_SNAPSHOT_DIRECTORY_INVALID",
+        "PRIVATE_SNAPSHOT_BUDGET_EXCEEDED", "FILE_HANDLE_ABORTED",
+      ]);
+      const safeCode = SAFE_SNAPSHOT_ERROR_CODES.has(error?.code) ? error.code : "UNKNOWN_SNAPSHOT_ERROR";
+      console.error("Erro ao preparar snapshot para transmissao:", safeCode);
       return res.status(500).send("Nao foi possivel preparar o arquivo");
     }
     if (snapshotAbortController.signal.aborted || req.aborted || res.destroyed) {
@@ -12822,12 +12828,30 @@ const createPublicShare = async (req, res) => {
   if (getEncryptedFileMetadata(finalFolder.id, name)) {
     return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
   }
-  const resourceBinding = isCapability ? (() => {
+  const capabilityInfo = isCapability ? (() => {
     const info = getShareFileInfo({ folderId: finalFolder.id, fileName: name });
-    const identity = info && shareFileIdentity(info.filePath);
-    return identity ? { version: 2, folderId: finalFolder.id, fileName: name, identity } : null;
+    if (!info) return null;
+    let handle;
+    try {
+      handle = openReadHandle(info.filePath);
+      const identity = shareFileIdentity(info.filePath, handle.stats);
+      return identity ? {
+        size: handle.stats.size,
+        resourceBinding: { version: 2, folderId: finalFolder.id, fileName: name, identity },
+      } : null;
+    } catch {
+      return null;
+    } finally {
+      cleanupReadHandle(handle);
+    }
   })() : null;
-  if (isCapability && !resourceBinding) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (isCapability && !capabilityInfo) return res.status(404).json({ error: "Arquivo nao encontrado" });
+  if (isCapability && capabilityInfo.size > PRIVATE_SHARE_SNAPSHOT_MAX_BYTES) {
+    return res.status(413).json({
+      error: `Arquivo excede o limite de snapshot para capacidade (${PRIVATE_SHARE_SNAPSHOT_MAX_BYTES} bytes)`,
+    });
+  }
+  const resourceBinding = capabilityInfo ? capabilityInfo.resourceBinding : null;
   const links = isCapability && shouldUseDatabase() ? null : cleanupExpiredPublicLinks();
   const shareToken = isCapability
     ? `C${crypto.randomBytes(24).toString("hex").slice(1)}`
