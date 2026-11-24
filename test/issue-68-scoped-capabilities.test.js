@@ -83,7 +83,7 @@ for (const mode of ["json", "sqlite"]) {
     });
 }
 
-async function startFixture(t, mode, extraEnv = {}) {
+async function startFixture(t, mode, extraEnv = {}, options = {}) {
   const sandbox = createPrivateAuthorityFixture(`rootark-share-permissions-${mode}-`);
   const dataDir = path.join(sandbox, "data");
   fs.mkdirSync(dataDir, { recursive: true });
@@ -94,7 +94,9 @@ async function startFixture(t, mode, extraEnv = {}) {
 
   const password = crypto.randomBytes(24).toString("base64url");
   fs.writeFileSync(path.join(dataDir, "users.local.json"), JSON.stringify([
-    { username: "tester", password: bcrypt.hashSync(password, 4), role: "admin", permissions: { listFiles: true }, sessionVersion: 0 },
+    { username: "tester", password: bcrypt.hashSync(password, 4),
+      role: options.caseDistinctAccounts ? "user" : "admin",
+      permissions: { listFiles: true }, sessionVersion: 0 },
     { username: "other", password: bcrypt.hashSync(password, 4), role: "admin", permissions: { listFiles: true }, sessionVersion: 0 },
   ]));
   fs.writeFileSync(path.join(dataDir, "folders.json"), JSON.stringify([
@@ -252,6 +254,153 @@ async function startFixture(t, mode, extraEnv = {}) {
 
 function viewerCookieFrom(response) {
   return (response.headers["set-cookie"] || []).map((value) => value.split(";", 1)[0]).join("; ");
+}
+
+test("P2 SQLite: distinct non-admin tester and TESTER cannot cross-read or edit a private file", { timeout: 60_000 }, async (t) => {
+  const { port, origin, authed, password, dataDir } = await startFixture(t, "sqlite", {},
+    { caseDistinctAccounts: true });
+  // The JSON-to-SQLite bootstrap may already import tester; either way the
+  // actual account must authenticate as a non-admin and the case-distinct
+  // TESTER must be a separately created, non-admin SQLite principal.
+  const ownerCreate = await authed("/users", {
+    username: "tester", password, role: "user", permissions: { listFiles: true },
+  });
+  assert.ok([201, 409].includes(ownerCreate.status), ownerCreate.body);
+  const otherCreate = await authed("/users", {
+    username: "TESTER", password, role: "user", permissions: { listFiles: true },
+  });
+  assert.equal(otherCreate.status, 201, otherCreate.body);
+
+  const loginAs = async (username) => {
+    const body = JSON.stringify({ username, password });
+    const login = await request(port, "/auth/login", { method: "POST",
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
+    assert.equal(login.status, 200, login.body);
+    assert.equal(JSON.parse(login.body).username, username,
+      "login must bind the exact case-sensitive SQLite account");
+    assert.equal(JSON.parse(login.body).role, "user", "neither principal may be administrator");
+    const cookies = login.headers["set-cookie"].map((value) => value.split(";", 1)[0]);
+    const cookie = cookies.join("; ");
+    const csrf = cookies.find((value) => value.startsWith("rootark_csrf=")).split("=", 2)[1];
+    const get = (url) => request(port, url, { headers: { origin, cookie } });
+    const put = (url, payload) => {
+      const body = JSON.stringify(payload);
+      return request(port, url, { method: "PUT", headers: {
+        origin, cookie, "x-csrf-token": csrf,
+        "content-type": "application/json", "content-length": Buffer.byteLength(body),
+      }, body });
+    };
+    return { cookie, get, put };
+  };
+  const owner = await loginAs("tester");
+  const impostor = await loginAs("TESTER");
+  assert.notEqual(owner.cookie, impostor.cookie, "two independent authenticated sessions are required");
+
+  // Change ACL through the actual authenticated mutation endpoint and verify
+  // SQLite persistence: no mocked `public:false` response or synthetic guard.
+  const acl = { name: FILE_NAME, folderId: "root", public: false, users: {} };
+  const restrict = await authed("/file-access", acl, "PUT");
+  assert.equal(restrict.status, 200, restrict.body);
+  assert.equal(JSON.parse(restrict.body).owner, "tester");
+  assert.equal(JSON.parse(restrict.body).public, false);
+  const Database = require("better-sqlite3");
+  const database = new Database(path.join(dataDir, "rootark.sqlite"), { readonly: true });
+  try {
+    const accounts = database.prepare("SELECT username, role FROM users WHERE username IN (?, ?) AND deleted_at IS NULL")
+      .all("tester", "TESTER");
+    assert.deepEqual(accounts.map(({ username, role }) => [username, role]).sort(),
+      [["TESTER", "user"], ["tester", "user"]].sort(),
+      "SQLite must store distinct non-admin accounts differing only by case");
+    const saved = database.prepare("SELECT allowed_users_json FROM file_permissions WHERE folder_id = ? AND file_name = ?")
+      .get("root", FILE_NAME);
+    assert.ok(saved, "a private ACL must be persisted in SQLite");
+    const persisted = JSON.parse(saved.allowed_users_json);
+    assert.equal(persisted.owner, "tester");
+    assert.equal(persisted.public, false);
+    assert.deepEqual(persisted.users, {});
+  } finally { database.close(); }
+
+  const fileUrl = `/files/${encodeURIComponent(FILE_NAME)}?folderId=root`;
+  const aclUrl = `/file-access?name=${encodeURIComponent(FILE_NAME)}&folderId=root`;
+  const legitimateRead = await owner.get(fileUrl);
+  assert.equal(legitimateRead.status, 200, legitimateRead.body);
+  assert.equal(legitimateRead.body, FILE_CONTENT, "exact private owner retains file access");
+  assert.equal((await owner.get(aclUrl)).status, 200,
+    "exact private owner retains permission management");
+
+  const illegalRead = await impostor.get(fileUrl);
+  const illegalAclRead = await impostor.get(aclUrl);
+  const illegalEdit = await impostor.put("/file-access", { ...acl, public: true });
+  // On the original HEAD these are 200, 200 and 200 respectively: the second
+  // account is falsely identified as the owner and can expose private bytes
+  // and promote the private ACL to public. The fixed policy must reject all.
+  assert.equal(illegalRead.status, 403, "case-colliding non-admin cannot GET private owner bytes");
+  assert.equal(illegalRead.body.includes(FILE_CONTENT), false, "denied read contains no private bytes");
+  assert.equal(illegalAclRead.status, 403, "case-colliding account cannot read owner ACL");
+  assert.equal(illegalEdit.status, 403, "case-colliding account cannot publish/modify owner ACL");
+
+  const unchanged = await owner.get(aclUrl);
+  assert.equal(unchanged.status, 200);
+  assert.equal(JSON.parse(unchanged.body).owner, "tester");
+  assert.equal(JSON.parse(unchanged.body).public, false,
+    "rejected edit cannot change the persisted private ACL");
+  assert.equal((await owner.put("/file-access", acl)).status, 200,
+    "exact owner may still edit their own file permissions");
+});
+
+for (const mode of ["json", "sqlite"]) {
+  test(`P2: case-distinct account cannot create or revoke another account's capability (${mode})`,
+    { timeout: 60_000 }, async (t) => {
+      const { authed, port, origin, password, publicPost } = await startFixture(t, mode);
+      const issuer = mode === "json" ? "tester" : "admin";
+      const wrongAccount = issuer.toUpperCase();
+      // Both names are legitimate, separately authenticated users: the
+      // account store and login perform exact-case lookup, unlike the old
+      // share-owner comparison. No forged cookie or storage mutation needed.
+      const createdAccount = await authed("/users", {
+        username: wrongAccount, password, role: "user", permissions: { listFiles: true },
+      });
+      assert.equal(createdAccount.status, 201, createdAccount.body);
+      const loginBody = JSON.stringify({ username: wrongAccount, password });
+      const login = await request(port, "/auth/login", {
+        method: "POST", headers: { "content-type": "application/json",
+          "content-length": Buffer.byteLength(loginBody) }, body: loginBody,
+      });
+      assert.equal(login.status, 200, login.body);
+      assert.equal(JSON.parse(login.body).username, wrongAccount,
+        "login really authenticated a separate case-sensitive account");
+      const cookies = login.headers["set-cookie"].map((cookie) => cookie.split(";", 1)[0]);
+      const impostorCookie = cookies.join("; ");
+      const csrf = cookies.find((cookie) => cookie.startsWith("rootark_csrf=")).split("=", 2)[1];
+      const asImpostor = (url, data, method = "POST") => {
+        const body = JSON.stringify(data);
+        return request(port, url, { method,
+          headers: { cookie: impostorCookie, origin, "x-csrf-token": csrf,
+            "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
+      };
+
+      const policy = { name: FILE_NAME, folderId: "root", expiresInMinutes: 60,
+        permissions: ["download"], maxDownloads: 2 };
+      if (mode === "json") {
+        const spoofedOwner = await asImpostor("/share/capabilities", policy);
+        assert.equal(spoofedOwner.status, 403,
+          "a case-colliding user with listFiles cannot issue a capability for the original file owner");
+      }
+      const created = await authed("/share/capabilities", policy);
+      assert.equal(created.status, 201, created.body);
+      const { token } = JSON.parse(created.body);
+      const deniedRevoke = await asImpostor("/share/capabilities/revoke", { token }, "DELETE");
+      assert.equal(deniedRevoke.status, 403,
+        "a different account cannot revoke an issuer's capability just by matching username casing");
+      const stillLive = await publicPost(token, "view");
+      assert.equal(stillLive.status, 200,
+        "denied cross-account revocation must leave the legitimate issuer's grant live");
+      const legitimateRevoke = await authed("/share/capabilities/revoke", { token }, "DELETE");
+      assert.equal(legitimateRevoke.status, 204,
+        "exact issuer must retain the ability to revoke their own capability");
+      const afterRevoke = await publicPost(token, "view");
+      assert.equal(afterRevoke.status, 404);
+    });
 }
 
 for (const mode of ["json", "sqlite"]) {

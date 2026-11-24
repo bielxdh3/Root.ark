@@ -7,6 +7,8 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 const express = require("express");
+const jwt = require("jsonwebtoken");
+const { createAuthenticate } = require("../src/middlewares/auth");
 const z = require("../src/crypto/rootark-zk-1");
 const manifestV2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const historyV2 = require("../src/crypto/rootark-zk-recovery-history-v2");
@@ -94,9 +96,16 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     manifestProvider: () => z.encodeDeterministic(manifest), nowSeconds: () => now,
   });
   let server;
+  const sessionJwtSecret = crypto.randomBytes(32).toString("base64url");
+  const authenticateCookie = createAuthenticate({ jwt, jwtSecret: sessionJwtSecret,
+    loadUser: (username) => username === "recipient"
+      ? { username, sessionVersion: 1, role: "viewer", totpEnabled: true } : null,
+    normalizeUserPermissions: () => ({ listFiles: true }),
+  });
   const mount = async () => {
     const app = express();
     const authenticate = (req, res, next) => {
+      if (req.get("cookie")) return authenticateCookie(req, res, next);
       const username = req.get("x-fixture-account");
       if (!["owner", "recipient", "attacker"].includes(username)) return res.sendStatus(401);
       req.user = { username, sessionVersion: 1 }; next();
@@ -276,6 +285,75 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal(redeemed.durableCopyProven, false);
   assert.equal(redeemed.authorizesPlaintextRelease, false);
   assert.equal(redeemed.serverRevocationProofVerified, false);
+  {
+  // Real Root.ark cookie sessions reject POST without the double-submit CSRF
+  // header. Earlier x-fixture-account HTTP tests bypass that middleware and
+  // would not catch a broken browser recipient redemption.
+  const csrf = b64(crypto.randomBytes(32));
+  const session = jwt.sign({ username: "recipient", sessionVersion: 1 },
+    sessionJwtSecret, { algorithm: "HS256", expiresIn: "8h" });
+  const sessionCookie = `rootark_session=${session}; rootark_csrf=${csrf}`;
+  const sessionFetch = (url, options) => fetch(url, { ...options,
+    headers: { ...options.headers, cookie: sessionCookie },
+  });
+  const hadDocument = Object.hasOwn(global, "document");
+  const previousDocument = global.document;
+  try {
+    global.document = { cookie: `rootark_csrf=${csrf}` };
+    const missingHeader = (url, options) => fetch(url, { ...options,
+      headers: { ...options.headers, cookie: sessionCookie, "x-csrf-token": "" },
+    });
+    await assert.rejects(redeem({ fetchImpl: missingHeader }),
+      /ZK_SHARE_REDEMPTION_DENIED/,
+      "real cookie authentication must deny the same signed request without CSRF");
+    assert.deepEqual(await redeem({ fetchImpl: sessionFetch }), redeemed,
+      "real cookie-authenticated recipient redemption must supply the current CSRF header");
+    // P2 TOCTOU: a mutable caller can swap its own authority provider while
+    // the REAL signed cookie-authenticated HTTP fetch is awaiting a response.
+    // The original provider revokes the issuer on its second read; substituting
+    // a stale-but-active provider must NOT bypass that final independent check.
+    let originalAuthorityReads = 0;
+    let substitutedAuthorityReads = 0;
+    let fetchedSignedCiphertext = false;
+    const mutableInput = {
+      origin: base, grant: issued.body, recipientUsername: "recipient",
+      recipientDeviceId: recipient.device_id, signerKey,
+      nowSeconds: () => now,
+      readIndependentAuthority: async () => {
+        originalAuthorityReads++;
+        const snapshot = await independentAuthority();
+        return originalAuthorityReads === 1 ? snapshot : {
+          ...snapshot,
+          devices: snapshot.devices.map((entry) => entry.deviceId === owner.device_id
+            ? { ...entry, revokedAtEpoch: manifest.current_epoch } : entry),
+        };
+      },
+      fetchImpl: async (url, options) => {
+        const response = await sessionFetch(url, options);
+        assert.equal(response.status, 200,
+          "adversarial callback swap requires actual successful signed recipient HTTP");
+        fetchedSignedCiphertext = true;
+        mutableInput.readIndependentAuthority = async () => {
+          substitutedAuthorityReads++;
+          return independentAuthority(); // stale: falsely keeps issuer active
+        };
+        return response;
+      },
+    };
+    await assert.rejects(redeemProtectedCiphertextShare(mutableInput),
+      /ZK_SHARE_REDEMPTION_DENIED/,
+      "the original captured authority reader must revoke issuer after awaited HTTP");
+    assert.equal(fetchedSignedCiphertext, true,
+      "final denial must occur after an actual authorized HTTP response");
+    assert.equal(originalAuthorityReads, 2,
+      "both initial and final independent checks must use the SAME original reader");
+    assert.equal(substitutedAuthorityReads, 0,
+      "a newly substituted stale authority callback must never run");
+  } finally {
+    if (hadDocument) global.document = previousDocument;
+    else delete global.document;
+  }
+  }
   // P2 review: a hostile ciphertext transport can replay an authentic owner
   // grant and bytes while ignoring the recipient's unrelated GET signature.
   // The client itself must bind its nonexportable Ed25519 signer to the
@@ -304,6 +382,7 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   const genuineAgainstUntrustedServer = await redeem({ fetchImpl: forgedServer });
   assert.deepEqual(genuineAgainstUntrustedServer, redeemed,
     "positive control: the same authenticated bytes with the pinned device signer remain valid");
+  {
   // Exercise the same client under a browser cookie session: a genuine owner
   // grant must include the double-submit CSRF header without trusting the
   // server response to furnish the recipient's authorization history.
@@ -329,6 +408,7 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   } finally {
     if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument);
     else delete globalThis.document;
+  }
   }
   await assert.rejects(redeem({ fetchImpl: fetch }), /ZK_SHARE_REDEMPTION_DENIED/,
     "grant possession without recipient account session must not download ciphertext");
