@@ -8,10 +8,10 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.text.InputType
-import android.os.Build
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
@@ -79,6 +79,15 @@ internal data class InventoryPagingTracker(
 }
 
 /** Authenticated metadata browsing with an explicit, provisioned-only protected text viewer. */
+/** Presentation for the legacy, non-paginated inventory list. */
+internal fun inventoryListFailureMessage(failure: Exception?): String = when (failure) {
+    is SyncListingLimitException ->
+        "Não foi possível carregar a lista. A resposta excede o limite do protótipo (1 MiB / 128 registros)."
+    is SyncListingValidationException ->
+        "Não foi possível carregar a lista. Os dados de sincronização retornados pelo servidor são inválidos."
+    else -> inventoryListRequestFailureMessage(failure)
+}
+
 class MainActivity : Activity() {
     companion object {
         private const val REQUEST_OWNER_PACKAGE = 64
@@ -175,6 +184,12 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        // Also invalidate callbacks and wipe retained preview arrays when the
+        // activity is destroyed without a normal foreground/background cycle.
+        // clearSensitiveState is idempotent after onStop.
+        isForeground = false
+        generation++
+        clearSensitiveState()
         pendingDeviceCredentialAction = null
         pendingDeviceCredentialCancel = null
         pendingProtectedRead = null

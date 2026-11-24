@@ -13,6 +13,8 @@ import java.io.InputStream
 import java.net.URL
 import java.security.Principal
 import java.security.cert.Certificate
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.net.ssl.HttpsURLConnection
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -40,10 +42,11 @@ class PagedProtectedInventoryTest {
         private val encoding: String? = null,
         private val declaredSize: Long = -1L,
         private val stream: InputStream? = null,
+        private val source: InputStream? = null,
     ) : HttpsURLConnection(url) {
         var disconnected = false
         override fun getResponseCode() = status
-        override fun getInputStream() = stream ?: ByteArrayInputStream(payload)
+        override fun getInputStream() = source ?: stream ?: ByteArrayInputStream(payload)
         override fun getContentType(): String? = mime
         override fun getContentEncoding(): String? = encoding
         override fun getContentLengthLong() = declaredSize
@@ -55,6 +58,55 @@ class PagedProtectedInventoryTest {
         override fun getServerCertificates(): Array<Certificate> = emptyArray()
         override fun getPeerPrincipal(): Principal = Principal { "CN=fixture" }
         override fun getLocalPrincipal(): Principal? = null
+    }
+
+    @Test fun signedInPagedInventoryRejectsSlowDripBeforeCompleteBody() {
+        val body = """{"protocolVersion":2,"view":"metadata","objects":[],"nextCursor":null}"""
+            .toByteArray(Charsets.UTF_8)
+        val ordinary = AuthHttpTransport {
+            SecureResponse(origin.syncInventoryUrl(), payload = body)
+        }.listInventoryPage(origin, "test-token")
+        assertTrue("The complete body must be a valid empty metadata page", ordinary.rows.isEmpty())
+
+        val elapsed = AtomicLong(0L)
+        val reads = AtomicInteger(0)
+        var offset = 0
+        var closed = false
+        // Each read returns one byte in 4s, below the per-read 10s timeout.
+        // The full, valid JSON takes far more than a cumulative 10s budget.
+        val drip = object : InputStream() {
+            override fun read(): Int {
+                if (offset == body.size) return -1
+                reads.incrementAndGet()
+                elapsed.addAndGet(4_000_000_000L)
+                return body[offset++].toInt() and 0xff
+            }
+            override fun read(buffer: ByteArray, start: Int, length: Int): Int {
+                if (length == 0) return 0
+                val next = read()
+                if (next < 0) return -1
+                buffer[start] = next.toByte()
+                return 1
+            }
+            override fun close() { closed = true }
+        }
+        val response = SecureResponse(origin.syncInventoryUrl(), source = drip)
+        val transport = AuthHttpTransport(
+            openInventoryConnection = { requested ->
+                assertEquals(origin.syncInventoryUrl().toString(), requested.toString())
+                response
+            },
+            monotonicNanos = elapsed::get,
+        )
+        val denied = assertThrows(SyncListingLimitException::class.java) {
+            transport.listInventoryPage(origin, "test-token")
+        }
+        assertTrue(denied.message?.contains("deadline") == true)
+        assertEquals("Third short body read exhausts the cumulative 10s limit", 3, reads.get())
+        assertTrue("The valid metadata page remains incomplete at rejection", offset < body.size)
+        assertEquals("Bearer test-token", response.getRequestProperty("Authorization"))
+        assertTrue("The response stream is closed after denial", closed)
+        assertTrue("The HTTPS connection is disconnected after denial", response.disconnected)
     }
 
     @Test fun realSignedStorePagesKeep130DistinctOpaqueIdsAndLockedViewer() {

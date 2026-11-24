@@ -37,6 +37,8 @@ class InventoryAccessibilityLabelTest {
     fun ordinaryUnicodeEmojiAndCombiningMarksArePreserved() {
         val path = "cafe\u0301/relatório 👨‍👩‍👧‍👦.pdf"
         assertEquals("Conteúdo protegido: $path", protectedContentAccessibilityLabel(row("id-unicode", "relatório 📄.pdf", path)))
+        val flagPath = "cafe\u0301/relatório 📄 🇧🇷.pdf"
+        assertEquals("Conteúdo protegido: $flagPath", protectedContentAccessibilityLabel(row("id-flag", "relatório 📄.pdf", flagPath)))
         val persianPath = "پیش\u200Cنویس.pdf"
         assertEquals("Conteúdo protegido: $persianPath", protectedContentAccessibilityLabel(row("id-persian", "نویس.pdf", persianPath)))
     }
