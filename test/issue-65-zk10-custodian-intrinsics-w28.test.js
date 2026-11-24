@@ -65,9 +65,9 @@ test("P2: owner A GENESIS signature cannot initialize real SQLite at unsigned B 
   const x = fixture(t, "genesis-tojson");
   const forged = { ...x.genesis, head_digest: hex(47) };
   assert.notEqual(forged.head_digest, x.genesis.head_digest);
-  assert.equal(crypto.verify(null, signatureBytes(GENESIS_DOMAIN, {
-    ...forged, signature: undefined,
-  }), x.owner.publicKey, Buffer.from(forged.signature, "base64url")), false);
+  const { signature: forgedSignature, ...unsignedForgedGenesis } = forged;
+  assert.equal(crypto.verify(null, signatureBytes(GENESIS_DOMAIN, unsignedForgedGenesis),
+    x.owner.publicKey, Buffer.from(forgedSignature, "base64url")), false);
   const previous = Object.getOwnPropertyDescriptor(Object.prototype, "toJSON");
   let hijackCalls = 0;
   Object.defineProperty(Object.prototype, "toJSON", { configurable: true, value() {
