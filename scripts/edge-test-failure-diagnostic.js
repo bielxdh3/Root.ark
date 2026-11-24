@@ -41,6 +41,11 @@ const CASES = Object.freeze({
 const SAFE_CODES = new Set(["ASSERTION", "RUNTIME", "PERMISSION", "DEPENDENCY"]);
 const LINE = /^# ROOTARK_EDGE_V1 case=([A-Z0-9_]{1,32}) stage=([A-Z_]{1,40}) code=([A-Z_]{1,32})$/;
 const hash = (value) => createHash("sha256").update(value).digest("hex").slice(0, 24);
+// The offline browser fixture predates ROOTARK_EDGE_V1 and reports a phase
+// only. Preserve that bounded hint without guessing an exception category.
+const OFFLINE_STAGE = /^# EDGE_OFFLINE_STAGE_V1 (fixture|lab-setup|server-listen|edge-launch|cdp-port|cdp-target|cdp-websocket|cdp-navigate|ui-outcome|cleanup)$/;
+const OFFLINE_TITLE_HASH = hash("real Edge opt-in UI refuses missing external pins and recovers signed local chunks without HTTP GET");
+const OFFLINE_FILE_HASH = hash("test/issue-65-browser-offline-persisted-restore.test.js");
 
 function classify(error) {
   if (error?.code === "ERR_ASSERTION") return "ASSERTION";
@@ -61,6 +66,11 @@ function reportEdgeFailure(t, caseId, stage, error) {
 
 function parseEdgeFailureDiagnostic(line, pending) {
   if (!pending || typeof line !== "string" || line.length > 150) return null;
+  const offline = OFFLINE_STAGE.exec(line);
+  if (offline) {
+    if (pending.nameHash !== OFFLINE_TITLE_HASH || pending.pathHash !== OFFLINE_FILE_HASH) return null;
+    return { stage: offline[1].replaceAll("-", "_").toUpperCase(), code: "UNKNOWN" };
+  }
   const match = LINE.exec(line);
   if (!match) return null;
   const [, caseId, stage, code] = match;
