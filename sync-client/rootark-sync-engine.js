@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const { AsyncLocalStorage } = require("node:async_hooks");
+const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
@@ -431,6 +432,157 @@ function activeFileIdentityPath(files, operation, exceptPath) {
   return Object.entries(files).find(([relativePath, prior]) => relativePath !== exceptPath
     && !prior.deleted && !prior.directory
     && prior.objectId === operation.objectId && prior.fileId === operation.fileId)?.[0] || null;
+}
+
+async function windowsScopeHasNoReparsePoints(observed) {
+  // Node's fs.Stats.isSymbolicLink() does not cover all Win32 reparse tags
+  // (e.g. cloud/projection filter points). Query the native FILE_ATTRIBUTE
+  // REPARSE_POINT for every existing ancestor/leaf, without evaluating any
+  // user-controlled pathname as PowerShell source. Absent/unavailable probe
+  // means UNKNOWN, not permission to continue after a signed 409.
+  const encodedPaths = [...new Set(observed.map(({ target }) => target))]
+    .map((target) => Buffer.from(target, "utf8").toString("base64"));
+  if (!encodedPaths.length) return false;
+  const powershell = [
+    "$ErrorActionPreference = 'Stop'",
+    "try {",
+    `  foreach ($encoded in @('${encodedPaths.join("','")}')) {`,
+    "    $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))",
+    "    if (([IO.File]::GetAttributes($target) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { exit 4 }",
+    "  }",
+    "  exit 0",
+    "} catch { exit 5 }",
+  ].join("\n");
+  const script = Buffer.from(powershell, "utf16le").toString("base64");
+  const executable = path.join(process.env.SystemRoot || "C:\\Windows",
+    "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  try {
+    await new Promise((resolve, reject) => {
+      childProcess.execFile(executable, ["-NoProfile", "-NonInteractive",
+        "-EncodedCommand", script], { windowsHide: true, timeout: 10000,
+        maxBuffer: 4096 }, (error) => error ? reject(error) : resolve());
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function hasDisjointSyncScope(left, right, files, rootDir) {
+  // Only continue an independent operation after a strict 409. The server's
+  // signed CURRENT is NOT admission evidence for the disputed object. Treat
+  // both path ancestors and case-folded aliases as shared local scope; a
+  // directory relocation may source its old path from the tracked snapshot.
+  if (!left || !right || typeof left.objectId !== "string"
+    || typeof right.objectId !== "string" || left.objectId === right.objectId) return false;
+  const affected = (operation) => {
+    const metadata = operation.metadata;
+    if (!metadata || typeof metadata.path !== "string" || !metadata.path
+      || (metadata.sourcePath !== undefined && typeof metadata.sourcePath !== "string")) return null;
+    const paths = [metadata.path, metadata.sourcePath].filter(Boolean);
+    for (const [relative, prior] of Object.entries(files)) {
+      // A signed update/restore can rotate fileId while retaining objectId.
+      // The old active pathname still belongs to the disputed object's
+      // physical scope even when the pending envelope names a new fileId.
+      if (prior && !prior.deleted && prior.objectId === operation.objectId) paths.push(relative);
+    }
+    return paths;
+  };
+  const leftPaths = affected(left);
+  const rightPaths = affected(right);
+  if (!leftPaths || !rightPaths || !leftPaths.every((leftPath) =>
+    rightPaths.every((rightPath) => {
+      const leftFolded = leftPath.toLowerCase();
+      const rightFolded = rightPath.toLowerCase();
+      return leftFolded !== rightFolded
+        && !leftFolded.startsWith(`${rightFolded}/`)
+        && !rightFolded.startsWith(`${leftFolded}/`);
+    }))) return false;
+  // POSIX hardlinks and Windows 8.3 names can alias the same physical inode
+  // despite distinct textual paths. Resolve existing components by volume
+  // and file ID on BOTH platforms; append textual components only after a
+  // genuinely missing parent/leaf. Any error, alias, reparse point or
+  // unstable/zero file ID is UNKNOWN: do not advance after a signed 409.
+  const root = path.resolve(rootDir);
+  const scope = async (relative) => {
+    const safe = protocol.safeRelativePath(relative, "path");
+    const rootStat = await fsp.lstat(root, { bigint: true });
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || rootStat.ino === 0n) return null;
+    const canonicalRoot = await fsp.realpath(root);
+    const segments = safe.split("/");
+    const tokens = [];
+    const observed = [{ target: root, stats: rootStat }];
+    let current = root;
+    let lastExisting = root;
+    let firstMissing = segments.length;
+    let leaf = null;
+    for (let index = 0; index < segments.length; index += 1) {
+      current = path.join(current, segments[index]);
+      let stats;
+      try { stats = await fsp.lstat(current, { bigint: true }); }
+      catch (error) {
+        if (error?.code !== "ENOENT") return null;
+        firstMissing = index;
+        break;
+      }
+      if (stats.isSymbolicLink() || stats.ino === 0n
+        || (index < segments.length - 1 && !stats.isDirectory())) return null;
+      tokens.push(`i:${stats.dev}:${stats.ino}`);
+      observed.push({ target: current, stats });
+      lastExisting = current;
+      if (index === segments.length - 1) leaf = stats;
+    }
+    // JS lowercasing is not a complete oracle for Windows' filesystem
+    // Unicode name equivalence. When an unresolved suffix is non-ASCII,
+    // there is no physical identity to consult: defer instead of guessing.
+    if (process.platform === "win32"
+      && segments.slice(firstMissing).some((segment) => /[^\x20-\x7e]/.test(segment))) return null;
+    for (let index = firstMissing; index < segments.length; index += 1) {
+      tokens.push(`n:${segments[index].toLowerCase()}`);
+    }
+    const physicalBase = await fsp.realpath(lastExisting);
+    if (!isWithinPath(canonicalRoot, physicalBase)) return null;
+    const physical = path.join(physicalBase, ...segments.slice(firstMissing)).toLowerCase();
+    return { tokens, physical, observed,
+      leafId: leaf ? `${leaf.dev}:${leaf.ino}` : null };
+  };
+  try {
+    const scopes = await Promise.all([...leftPaths, ...rightPaths].map(scope));
+    if (scopes.some((entry) => !entry)) return false;
+    if (process.platform === "win32") {
+      const observed = scopes.flatMap((entry) => entry.observed);
+      if (!(await windowsScopeHasNoReparsePoints(observed))) return false;
+    }
+    // On POSIX, realpath(lastExisting) also awaits and permits a concurrent
+    // replacement AFTER the first lstat but BEFORE this decision. Revalidate
+    // every observed physical component on both platforms, not just Windows.
+    // This is a final check-time fence, not a held-handle guarantee against
+    // an external writer changing paths after the comparison.
+    for (const { target, stats } of scopes.flatMap((entry) => entry.observed)) {
+      const after = await fsp.lstat(target, { bigint: true });
+      if (!sameFileVersion(stats, after) || after.nlink !== stats.nlink
+        || after.isSymbolicLink()) return false;
+    }
+    const leftScopes = scopes.slice(0, leftPaths.length);
+    const rightScopes = scopes.slice(leftPaths.length);
+    const prefix = (first, second) => first.length <= second.length
+      && first.every((token, index) => token === second[index]);
+    return leftScopes.every((one) => rightScopes.every((two) =>
+      one.physical !== two.physical
+      && !(one.leafId && two.leafId && one.leafId === two.leafId)
+      && !prefix(one.tokens, two.tokens) && !prefix(two.tokens, one.tokens)));
+  } catch {
+    return false;
+  }
+}
+
+async function overlapsIndeterminate(indeterminate, candidates, files, rootDir) {
+  for (const blocked of indeterminate || []) {
+    for (const candidate of candidates) {
+      if (!(await hasDisjointSyncScope(blocked, candidate, files, rootDir))) return true;
+    }
+  }
+  return false;
 }
 
 class SyncEngine {
@@ -952,6 +1104,34 @@ class SyncEngine {
     const directoryRecord = directoryMove || (tombstone && Boolean(prior?.directory));
     if (!prior || prior.deleted || Boolean(prior.directory) !== directoryRecord
       || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return null;
+    // Reconciliation can stage/rename the origin and then discard its tracked
+    // snapshot entry. A signed MOVE/DELETE outside selectedPaths must never
+    // sidestep the local pin policy merely because _apply() is not called.
+    // Fold case on every OS so a POSIX path remains safe after Windows replay.
+    const originKey = sourcePath.toLowerCase();
+    if (Object.values(this.snapshot.pinnedFiles || {}).some((pin) => {
+      const pinnedPath = pin.path.toLowerCase();
+      return pinnedPath === originKey || pinnedPath.startsWith(`${originKey}/`);
+    })) {
+      fail("Pinned local origin cannot be reconciled outside selected paths", "file_pinned");
+    }
+
+    return { sourcePath, prior, tombstone, directoryRecord };
+  }
+
+  async reconcileOutOfScopeMove(operation, summary, options = {}) {
+    // The same side-effect-free check runs BEFORE signature pre-observation.
+    // Keep it here too for direct callers and changes during verification.
+    const source = this.preflightOutOfScopeMove(operation);
+    // No pull/reconciliation entry point may separately advance a member of
+    // a locally durable signed DELETE+MOVE remote transaction. A partial LIST
+    // or out-of-scope sweep is not a two-envelope atomic admission receipt.
+    if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
+      fail("Cannot reconcile remote changes while an atomic WebDAV batch is pending",
+        "sync_atomic_batch_indeterminate");
+    }
+    if (!source) return false;
+    const { sourcePath, prior, tombstone, directoryRecord } = source;
 
     // This path bypasses _apply and can move an offline pinned source into
     // trash. Refuse before signed pre-observation or snapshot/journal changes.
@@ -1691,7 +1871,7 @@ class SyncEngine {
     summary.pushed += 2;
   }
 
-  async _pushPending(summary) {
+  async _pushPending(summary, indeterminate = null) {
     const recovered = await this.journal.recover();
     // The journal's durable group manifest—not adjacency—is the local
     // evidence that the DELETE and MOVE entered the outbox together.
@@ -1740,13 +1920,20 @@ class SyncEngine {
         if (pushedGroups.has(group.deleteId)) continue;
         const deleteOp = pendingById.get(group.deleteId);
         const moveOp = pendingById.get(group.moveId);
+        const pair = [deleteOp, moveOp];
+        if (await overlapsIndeterminate(indeterminate, pair, this.snapshot.files, this.rootDir)) {
+          // Never dispatch just one side of an overlapping atomic group.
+          pushedGroups.add(group.deleteId);
+          continue;
+        }
         await this.assertOutgoingPinnedPolicy(deleteOp);
         await this.assertOutgoingPinnedPolicy(moveOp);
-        await this.pushAtomicSignedOverwritePair([deleteOp, moveOp], summary);
+        await this.pushAtomicSignedOverwritePair(pair, summary);
         pushedGroups.add(group.deleteId);
         if (summary.offline) break;
         continue;
       }
+      if (await overlapsIndeterminate(indeterminate, [original], this.snapshot.files, this.rootDir)) continue;
       await this.assertOutgoingPinnedPolicy(original);
       const next = recovered[index + 1];
       const event = signedWebDavEventId(original);
@@ -1888,6 +2075,24 @@ class SyncEngine {
         if (error instanceof SyncConflictError || error?.status === 409 || error?.code === "sync_conflict") {
           const current = error.current
             ? envelopeCopy(protocol.validateStoredOperation(error.current)) : null;
+          // A bare HTTP 409 is not a signed remote admission receipt. Without
+          // an authenticated, specific winner, remote-wins would discard our
+          // pending signed operation even if the server never committed it.
+          if (!current) {
+            fail("Unsigned conflict response has no verifiable remote winner",
+              "remote_authorization_rejected");
+          }
+          // A valid device signature authenticates *an operation*, not the
+          // server's claim that it won THIS object's HTTP 409. A compromised
+          // transport may replay a genuine, unrelated signed object and make
+          // remote-wins discard our still-pending local outbox. Require the
+          // same object and compartment before any local recovery files,
+          // summary updates or durable journal ACKs (fileId may rotate).
+          if (current.objectId !== operation.objectId
+            || current.compartmentId !== operation.compartmentId) {
+            fail("Unrelated remote winner cannot acknowledge pending operation",
+              "remote_authorization_rejected");
+          }
           if (current?.operationId === operation?.operationId
             && signedEnvelopeDigest(current) !== signedEnvelopeDigest(operation)) {
             fail("Conflicting local sync admission evidence", "remote_authorization_rejected");
@@ -1910,8 +2115,33 @@ class SyncEngine {
               }
             }
           }
-          if (current && !this.operationDestinationIsSelected(current)) {
+          // ALL 409 `current` envelopes are attacker-controlled until Ed25519
+          // device/roster verification, including destinations inside selected
+          // paths. In particular, recoverConflict writes decrypted pending
+          // plaintext under .rootark-conflicts and must never run for B.
+          // No durable admission is created until after pin preflight.
+          await this.verifyIncomingOperation(current, { preObserve: false });
+          if (!this.operationDestinationIsSelected(current)) {
             this.preflightOutOfScopeMove(current);
+          }
+          // A device signature alone cannot certify that the remote server
+          // actually committed CURRENT. A malicious 409 may echo our OWN
+          // freshly signed pending operation or replay an old same-object
+          // signature. Neither is an independent admission receipt. Until a
+          // separately trusted current-state/CAS witness is available, strict
+          // sync must preserve its pending outbox for explicit reconciliation
+          // instead of writing recovery plaintext or silently marking it seen.
+          if (this.requireAuthorization) {
+            if (indeterminate) {
+              // Only syncOnce opts in: direct pushPending keeps its explicit
+              // rejection contract. Keep the signed outbox entirely unchanged
+              // and allow only disjoint later items to proceed in this cycle.
+              indeterminate.push(operation);
+              summary.indeterminate = (summary.indeterminate || 0) + 1;
+              continue;
+            }
+            fail("Signed 409 winner lacks independent durable admission evidence",
+              "remote_admission_unproven");
           }
           summary.conflicts.push({ operationId: operation?.operationId || pending.operationId, policy: "remote-wins", currentRevision: error.currentRevision || error.payload?.currentRevision || null });
           await this.recoverConflict(operation, summary);
@@ -1920,7 +2150,15 @@ class SyncEngine {
             if (this.operationDestinationIsSelected(current)) {
               verifiedFreshDigest = await this._apply(current, summary);
             } else {
-              verifiedFreshDigest = await this.verifyIncomingOperation(current);
+              // Recheck current revocation/identity after asynchronous local
+              // conflict recovery. Only now may a successfully preflighted
+              // exact signed envelope reserve a durable journal observation.
+              verifiedFreshDigest = await this.verifyIncomingOperation(current,
+                { preObserve: false });
+              this.preflightOutOfScopeMove(current);
+              if (verifiedFreshDigest) {
+                await this.journal.observeAdmission(current.operationId, verifiedFreshDigest);
+              }
               const reconciled = await this.reconcileOutOfScopeMove(current, summary, {
                 preservedOperationIds: [operation.operationId], conflictAlreadyRecorded: true,
               });
@@ -2081,20 +2319,18 @@ class SyncEngine {
     }
     const pinnedDescendant = protectedPaths.some((pin) => affectedPaths.some((candidate) =>
       pin.path.toLowerCase().startsWith(`${candidate.toLowerCase()}/`)));
-    // A signed CREATE can record the identity of an existing directory
-    // without touching that directory or its pinned descendants. This is
-    // common after hydration of a child while the parent CREATE was unseen.
+    // A signed CREATE can register an existing directory after child hydration
+    // without replacing it. Never allow a case-distinct alias, conflicting
+    // tracked identity or non-directory target to bypass pin protection.
     let existingAncestorCreate = false;
     if (pinnedDescendant && operation.operation === "create"
+      && !operation.tombstone && !metadata.sourcePath
       && metadata.contentType === "inode/directory") {
       const ancestorPrefix = `${metadata.path}/`;
-      // A second case-distinct POSIX directory can be replayed as an alias on
-      // Windows. It is not the pinned child's actual ancestor, even if both
-      // physical directories happen to exist on the originating device.
       const sameSpelling = protectedPaths.every((pin) =>
         !pin.path.toLowerCase().startsWith(ancestorPrefix.toLowerCase())
         || pin.path.startsWith(ancestorPrefix));
-      const existing = Object.entries(this.snapshot.files).find(([relative, entry]) =>
+      const existing = Object.entries(this.snapshot.files).find(([relative]) =>
         relative.toLowerCase() === metadata.path.toLowerCase());
       if (sameSpelling && (!existing || (!existing[1].deleted && existing[1].directory
         && existing[1].objectId === operation.objectId && existing[1].fileId === operation.fileId))) {
@@ -2982,6 +3218,20 @@ class SyncEngine {
     return this.withMutationLock(() => this._materializeRemote(relativePath));
   }
 
+  async assertPendingMaterializationDisjoint(operation) {
+    // syncOnce's indeterminate list is only in-memory and expires at the
+    // end of that cycle. An explicit hydrate (including after restart) must
+    // NOT use signed LIST/inventory B to advance inside a pending signed A's
+    // directory, previous tracked path, or physical alias after a 409.
+    // Re-read durable pending envelopes at each pre-write boundary and use
+    // the same conservative physical/ancestor comparison as push and pull.
+    if (await overlapsIndeterminate(await this.journal.recover(), [operation],
+      this.snapshot.files, this.rootDir)) {
+      fail("Pending signed sync overlaps the requested materialization",
+        "sync_operation_pending");
+    }
+  }
+
   async _materializeRemote(relativePath) {
     if (!this.opened) await this._open();
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
@@ -3000,6 +3250,7 @@ class SyncEngine {
       fail("Remote object is outside the selected scope", "path_not_selected");
     }
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
+    await this.assertPendingMaterializationDisjoint(operation);
     if (operation.tombstone) {
       if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
       this.rememberRemoteOnly(operation, entry.reason);
@@ -3080,6 +3331,7 @@ class SyncEngine {
     if (operation.metadata.contentType === "inode/directory") {
       fail("Files On-Demand materializes regular files only", "cache_entry_unavailable");
     }
+    await this.assertPendingMaterializationDisjoint(operation);
     const moveKey = operation.operation === "move" ? await this.keyFor(operation) : null;
     const movePayload = moveKey
       ? protocol.decodeMovePayload(protocol.decryptPayload(operation, moveKey), moveKey) : null;
@@ -3108,6 +3360,7 @@ class SyncEngine {
     const checkBeforeWrite = async () => {
       assertNoSignedInventoryRollback();
       await checkLocalCache();
+      await this.assertPendingMaterializationDisjoint(operation);
       const assertNoPendingRelocatedSource = async (sourcePath) => {
         const pendingSource = await this.journal.recover();
         if (pendingSource.some((item) => item.objectId === operation.objectId
@@ -3174,6 +3427,7 @@ class SyncEngine {
     if (matches.length !== 1) fail("Ambiguous tracked object identity", "remote_object_ambiguous");
     const [sourcePath, currentPrior] = matches[0];
     const prior = { ...currentPrior };
+    let operation = null;
     const checkBeforeWrite = async () => {
       const current = this.snapshot.files[sourcePath];
       if (!current || current.deleted || current.directory
@@ -3182,6 +3436,7 @@ class SyncEngine {
         || !/^[a-f0-9]{64}$/.test(current.hash || "")) {
         fail("Tracked local cache changed", "local_changes_pending");
       }
+      if (operation) await this.assertPendingMaterializationDisjoint(operation);
       const pending = await this.journal.recover();
       if (pending.some((item) => item.objectId === inventory.objectId
         || item.metadata?.path === sourcePath || item.metadata?.sourcePath === sourcePath)) {
@@ -3198,7 +3453,7 @@ class SyncEngine {
     const result = await this.adapter.list(inventory.objectId);
     const records = Array.isArray(result) ? result : Array.isArray(result?.objects) ? result.objects : result ? [result] : [];
     if (records.length !== 1) fail("Remote tombstone is unavailable", "remote_object_unavailable");
-    const operation = envelopeCopy(protocol.validateStoredOperation(records[0]));
+    operation = envelopeCopy(protocol.validateStoredOperation(records[0]));
     assertInventoryMatchesEnvelope(operation, inventory);
     if (!operation.tombstone && operation.operation !== "delete") {
       fail("Remote tombstone is not a delete operation", "inventory_changed");
@@ -3217,7 +3472,7 @@ class SyncEngine {
     return this.withMutationLock(() => this._pullRemote(summary));
   }
 
-  async _pullRemote(summary) {
+  async _pullRemote(summary, indeterminate = []) {
     // A remotely visible single side of a just-committed/lost-ACK pair must
     // NOT consume that local pending ID via _apply, markSeen or the excluded-
     // path reconciliation path. Recover the atomic pair through its outbound
@@ -3281,9 +3536,23 @@ class SyncEngine {
       observedRemoteOnly.length = 0;
     };
     for (const operation of inspected) {
+      if (await overlapsIndeterminate(indeterminate, [operation], this.snapshot.files, this.rootDir)) {
+        // An untrusted LIST is not an independent CURRENT/CAS witness. Neither
+        // observe nor apply the disputed object, aliases or its ancestors.
+        continue;
+      }
       if (!this.operationDestinationIsSelected(operation)) {
+        // Authenticity must precede even a side-effect-free local pin oracle:
+        // an untrusted LIST entry cannot force file_pinned before its Ed25519
+        // device/roster proof is checked. Defer durable observation until the
+        // pin preflight accepts this exact verified envelope, so a genuine
+        // refused MOVE cannot exhaust the finite observed[] window either.
+        const verifiedFreshDigest = await this.verifyIncomingOperation(operation,
+          { preObserve: false });
         this.preflightOutOfScopeMove(operation);
-        const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
+        if (verifiedFreshDigest) {
+          await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+        }
         await this.reconcileOutOfScopeMove(operation, summary);
         this.rememberRemoteOnly(operation, "excluded");
         observedRemoteOnly.push({ operation, verifiedFreshDigest });
@@ -3396,26 +3665,31 @@ class SyncEngine {
     const excluded = await this._applyExcludedPaths();
     if (excluded) summary.excluded = excluded;
     await this._reconcileLocal();
-    await this._pushPending(summary);
+    const indeterminate = [];
+    await this._pushPending(summary, indeterminate);
     if (!summary.offline) {
       if (this.filesOnDemand) {
-        try {
-          const inventory = await this.scanOnDemandInventory();
-          summary.available = inventory.available;
-          for (const tombstone of inventory.tombstones) {
-            try {
-              await this._reconcileOnDemandTombstone(tombstone, summary);
-            } catch (error) {
-              // One dirty or locally pending cache must be preserved, not
-              // abort reconciliation of other independently clean tombstones.
-              if (error.code !== "local_changes_pending" && error.code !== "sync_operation_pending") throw error;
+        // Metadata-only inventory has no independent signed per-object
+        // materialization fence. Defer it when any 409 is unresolved.
+        if (!indeterminate.length) {
+          try {
+            const inventory = await this.scanOnDemandInventory();
+            summary.available = inventory.available;
+            for (const tombstone of inventory.tombstones) {
+              try {
+                await this._reconcileOnDemandTombstone(tombstone, summary);
+              } catch (error) {
+                // One dirty or locally pending cache must be preserved, not
+                // abort reconciliation of other independently clean tombstones.
+                if (error.code !== "local_changes_pending" && error.code !== "sync_operation_pending") throw error;
+              }
             }
+          } catch (error) {
+            if (transient(error)) summary.offline = true;
+            else throw error;
           }
-        } catch (error) {
-          if (transient(error)) summary.offline = true;
-          else throw error;
         }
-      } else await this._pullRemote(summary);
+      } else await this._pullRemote(summary, indeterminate);
     }
     return summary;
   }
