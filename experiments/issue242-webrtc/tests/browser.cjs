@@ -3,7 +3,7 @@
 // browser with three tabs against one loopback broker. No Playwright required.
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
-const { existsSync, mkdtempSync, mkdirSync, readFileSync, unlinkSync, rmSync } = require('node:fs');
+const { existsSync, mkdtempSync, mkdirSync, readFileSync, statSync, unlinkSync, rmSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const net = require('node:net');
@@ -104,6 +104,7 @@ async function run() {
     const host = await newPage();
     const guest1 = await newPage();
     const guest2 = await newPage();
+    assert.equal(await host.evaluate('document.getElementById("rootarkReturn").hidden'), true);
     await host.evaluate('window.__poc.createRoom()');
     const room = await until(() => host.evaluate('window.__poc.snapshot().role === "host" && window.__poc.snapshot().roomId'), 'host did not join');
     async function addGuest(guest, priorCount) {
@@ -307,7 +308,10 @@ async function run() {
       assert.equal(download.name, 'large-3m.bin');
       assert.equal(download.href, true, 'verified file must use browser-local Blob URL');
       const target = join(downloadDir, download.name);
-      await until(() => existsSync(target), 'Edge did not save verified Blob download', 18000);
+      // Edge creates the destination file before it finishes writing bytes.
+      // Waiting for mere existence can read a transient zero-byte file.
+      await until(() => existsSync(target) && statSync(target).size === 3 * 1024 * 1024,
+        'Edge did not finish verified Blob download', 18000);
       const bytes = readFileSync(target);
       assert.equal(bytes.byteLength, 3 * 1024 * 1024);
       assert.deepEqual([...bytes.subarray(0, 256)], Array.from({ length: 256 }, (_, i) => i % 239));
@@ -384,4 +388,5 @@ async function run() {
     catch { /* Disposable OS temp profile can be removed after Edge exits. */ }
   }
 }
-run().catch(e => { console.error('FAIL: ' + e.message); process.exitCode = 1; });
+if (require.main === module) run().catch(e => { console.error('FAIL: ' + e.message); process.exitCode = 1; });
+module.exports = { Cdp, until, port };

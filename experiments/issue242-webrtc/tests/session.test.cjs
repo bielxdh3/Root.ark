@@ -7,7 +7,7 @@ const WebSocket = require('ws');
 const { createRealtimeAuthenticator, parseCookies } = require('../../../src/middlewares/auth');
 const { makeBroker } = require('../server.cjs');
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const secret = randomBytes(48).toString('hex');
   const users = new Map(['alice', 'bob', 'eve'].map(username => [
     username, { username, role: 'user', sessionVersion: 1, disabled: false, totpEnabled: true, permissions: {} }
@@ -17,7 +17,7 @@ async function fixture(t) {
     normalizeUserPermissions: user => user.permissions
   });
   const auth = req => verify(parseCookies(req.headers.cookie).get('rootark_session'));
-  const broker = makeBroker({ authenticateSession: auth });
+  const broker = makeBroker({ authenticateSession: auth, ...options });
   const origin = await broker.listen();
   const sockets = [];
   t.after(async () => {
@@ -120,6 +120,58 @@ test('recipient-bound single-use invite and host session prevent impersonation a
   assert.equal((await replay.next('error')).code, 'INVALID_INVITE');
 });
 
+test('1:N guest membership remains private from other recipients before consent', async t => {
+  const f = await fixture(t);
+  const room = (await f.createRoom(f.cookie('alice'))).data;
+  const host = await f.connect(f.cookie('alice'));
+  host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+  const hostJoined = await host.next('joined');
+
+  host.send({ type: 'invite', recipient: 'bob' });
+  const bobInvite = await host.next('invited');
+  const bob = await f.connect(f.cookie('bob'));
+  bob.send({ type: 'join', roomId: room.roomId, invitation: bobInvite.invitation });
+  const bobJoined = await bob.next('joined');
+  assert.deepEqual(bobJoined.members.map(m => m.username), ['alice']);
+  await host.next('peer-joined');
+  host.send({ type: 'request-peer', to: bobJoined.peerId });
+  const request = await bob.next('peer-request');
+  assert.equal(request.peerId, hostJoined.peerId);
+  bob.send({ type: 'consent', requestId: request.requestId, accept: true });
+  assert.equal((await host.next('peer-accepted')).peerId, bobJoined.peerId);
+  host.send({ type: 'signal', to: bobJoined.peerId, signal: { kind: 'ice', candidate: { candidate: 'consented' } } });
+  assert.equal((await bob.next('signal')).peerId, hostJoined.peerId);
+
+  host.send({ type: 'invite', recipient: 'eve' });
+  const eveInvite = await host.next('invited');
+  const eve = await f.connect(f.cookie('eve'));
+  const bobSawGuest = [];
+  bob.ws.on('message', bytes => {
+    const message = JSON.parse(bytes.toString());
+    if (message.type === 'peer-joined' || message.type === 'peer-left') bobSawGuest.push(message);
+  });
+  eve.send({ type: 'join', roomId: room.roomId, invitation: eveInvite.invitation });
+  const eveJoined = await eve.next('joined');
+  assert.deepEqual(eveJoined.members.map(m => m.username), ['alice'],
+    'a recipient must not learn another invited recipient name or peer ID');
+  assert.equal((await host.next('peer-joined')).username, 'eve', 'host still sees every invited recipient');
+
+  // Consent with Alice never grants Bob signaling rights to another guest.
+  bob.send({ type: 'signal', to: eveJoined.peerId,
+    signal: { kind: 'ice', candidate: { candidate: 'cross-guest' } } });
+  assert.equal((await bob.next('error')).code, 'FORBIDDEN');
+
+  host.send({ type: 'kick', to: eveJoined.peerId });
+  assert.equal((await eve.next('error')).code, 'REVOKED');
+  assert.equal((await host.next('peer-left')).peerId, eveJoined.peerId);
+  // A round-trip error reply on Bob's socket is a protocol-order barrier:
+  // any earlier peer-left broadcast on that same socket precedes this reply.
+  bob.send({ type: 'invite', recipient: 'eve' });
+  assert.equal((await bob.next('error')).code, 'FORBIDDEN');
+  assert.deepEqual(bobSawGuest, []);
+  assert.equal(hostJoined.role, 'host');
+});
+
 test('revoked or expired Root.ark session closes its previously consented peer channel', async t => {
   const f = await fixture(t);
   const room = (await f.createRoom(f.cookie('alice'))).data;
@@ -178,4 +230,37 @@ test('signal is never delivered to a recipient whose session was just revoked', 
   assert.equal(await closed, 1008);
   assert.deepEqual(deliveries, [], 'live revocation must be checked before forwarding signaling');
   assert.equal(hp.username, 'alice');
+});
+
+test('unjoined same-owner rooms are reclaimed at 15 seconds without ending joined sessions', async t => {
+  let time = Date.now();
+  const f = await fixture(t, { now: () => time });
+  const alice = f.cookie('alice');
+  const bob = f.cookie('bob');
+  const first = (await f.createRoom(alice)).data;
+  const second = (await f.createRoom(alice)).data;
+  assert.equal((await f.createRoom(alice)).status, 429);
+  assert.equal((await f.createRoom(bob)).status, 200);
+
+  const host = await f.connect(alice);
+  host.send({ type: 'join', roomId: first.roomId, hostKey: first.hostKey });
+  assert.equal((await host.next('joined')).role, 'host');
+  time += 15_001;
+  // "second" was never hosted; it must expire. The joined first room must
+  // retain its original 5-minute lifetime and remain usable for invites.
+  const replacement = await f.createRoom(alice);
+  assert.equal(replacement.status, 200);
+  const unused = await f.connect(alice);
+  unused.send({ type: 'join', roomId: second.roomId, hostKey: second.hostKey });
+  assert.equal((await unused.next('error')).code, 'INVALID_INVITE');
+  host.send({ type: 'invite', recipient: 'bob' });
+  assert.equal((await host.next('invited')).recipient, 'bob');
+  assert.equal((await f.createRoom(alice)).status, 429);
+
+  time += 15_001;
+  assert.equal((await f.createRoom(alice)).status, 200,
+    'second idle room must also release owner capacity');
+  host.send({ type: 'invite', recipient: 'bob' });
+  assert.equal((await host.next('invited')).recipient, 'bob');
+  assert.notEqual(first.roomId, second.roomId);
 });

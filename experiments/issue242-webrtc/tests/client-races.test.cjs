@@ -75,7 +75,7 @@ function clientFixture({ cryptoApi = {
     Uint8Array,
     ArrayBuffer,
     AbortController,
-    location: { origin: 'http://127.0.0.1:1234' },
+    location: { origin: 'http://127.0.0.1:1234', pathname: '/' },
     setTimeout,
     clearTimeout,
     console
