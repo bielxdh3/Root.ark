@@ -28,10 +28,15 @@ class SyncListingValidationException(message: String, cause: Throwable? = null) 
 /** HTTP adapter for canonical login/TOTP and the bounded, read-only sync listing. */
 internal class AuthHttpTransport(
     private val clockNanos: () -> Long = System::nanoTime,
+    private val monotonicNanos: () -> Long = System::nanoTime,
     private val openInventoryConnection: (URL) -> URLConnection = { it.openConnection() },
 ) {
-    companion object { const val INVENTORY_READ_DEADLINE_NANOS = 30_000_000_000L }
-
+    companion object {
+        const val INVENTORY_READ_DEADLINE_NANOS = 30_000_000_000L
+        // readTimeout applies to each socket read. Bound cumulative inventory
+        // BODY reads independently; connection and headers have separate timeouts.
+        private const val MAX_INVENTORY_BODY_NANOS = 10_000_000_000L
+    }
     fun login(origin: ServerOrigin, username: String, password: String): LoginOutcome {
         val (status, json) = post(origin.loginUrl(), JSONObject().put("username", username).put("password", password))
         if (status == 403) {
@@ -86,6 +91,12 @@ internal class AuthHttpTransport(
                 throw SyncListingValidationException("Invalid inventory response encoding or size")
             }
             val json = connection.inputStream.use { stream ->
+                val startedNanos = monotonicNanos()
+                fun checkBodyDeadline() {
+                    if (monotonicNanos() - startedNanos >= MAX_INVENTORY_BODY_NANOS) {
+                        throw SyncListingLimitException("Inventory body read deadline exceeded")
+                    }
+                }
                 val out = ByteArrayOutputStream()
                 val buffer = ByteArray(4096)
                 var total = 0
@@ -93,10 +104,12 @@ internal class AuthHttpTransport(
                     if (clockNanos() - requestStartedAt >= INVENTORY_READ_DEADLINE_NANOS) {
                         throw SyncListingException("Inventory response exceeded read deadline")
                     }
+                    checkBodyDeadline()
                     val count = stream.read(buffer)
                     if (clockNanos() - requestStartedAt >= INVENTORY_READ_DEADLINE_NANOS) {
                         throw SyncListingException("Inventory response exceeded read deadline")
                     }
+                    checkBodyDeadline()
                     if (count < 0) break
                     total += count
                     if (total > PagedInventoryPolicy.MAX_RESPONSE_BYTES) {
