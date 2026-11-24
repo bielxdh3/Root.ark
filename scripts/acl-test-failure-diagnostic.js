@@ -34,6 +34,12 @@ const CASES = Object.freeze({
     title: "Windows native ACL worker initialization leaves the Node event loop responsive",
     stages: ["INSUFFICIENT_TICKS", "EVENT_LOOP_STALL"],
   },
+  LOCAL_FIXTURE_CRASH: {
+    file: "test/issue-65-local-fixture-migration-journal.test.js",
+    title: "repeated crashes before and after initial journal link ignore unrelated pre-link orphan",
+    stages: ["START", "FIXTURE_READY", "PRELINK_CHILD_EXIT", "PRELINK_JOURNAL",
+      "POSTLINK_CHILD_EXIT", "POSTLINK_JOURNAL", "RECOVERY", "FINAL_BYTES"],
+  },
 });
 const TRUST = new Set(["UNKNOWN", "INHERITED", "PROTECTED", "UNTRUSTED_ADDED", "REJECTED", "ACCEPTED", "QUARANTINED"]);
 const ERRORS = new Set(["UNKNOWN", "ASSERTION", "ATOMIC_UNSAFE", "PERMISSION", "RUNTIME"]);

@@ -7,7 +7,7 @@
 // It does not defend against an untrusted script running BEFORE initial load
 // or supply independent custody, a protected process, or production I/O.
 const crypto = require("node:crypto");
-const { types: { isProxy, isKeyObject } } = require("node:util");
+const { types: { isProxy, isPromise, isKeyObject } } = require("node:util");
 // Capture these before the first caller-owned KeyObject getter too. Even an
 // immutable JSON encoder can be retargeted via Array.join or Buffer.from.
 // Calling a captured function through .call is insufficient: the dispatch
@@ -38,6 +38,96 @@ const OBJECT_CREATE = Object.create.bind(Object);
 const SET_PROTOTYPE = Object.setPrototypeOf.bind(Object);
 const DEFINE_PROPERTY = Object.defineProperty.bind(Object);
 const OBJECT_FREEZE = Object.freeze.bind(Object);
+// A caller-owned Ed25519 KeyObject getter may replace Set and its prototype
+// before a noncooperative CURRENT authority read settles. Keep the constructor,
+// methods and internal-slot size getter pinned alongside the other intrinsics.
+const SET_CONSTRUCTOR = Set;
+const SET_ADD = SET_CONSTRUCTOR.prototype.add;
+const SET_DELETE = SET_CONSTRUCTOR.prototype.delete;
+const SET_SIZE = OWN_DESCRIPTOR(SET_CONSTRUCTOR.prototype, "size").get;
+function newNativeSet() { return new SET_CONSTRUCTOR(); }
+// Native Promise reactions MUST NOT look up .then, constructor[Symbol.species]
+// or Promise.race after a hostile KeyObject getter. Await on a truly native
+// Promise uses its internal state only when constructor is the realm's pinned
+// intrinsic; pin that own DATA property before crossing any async boundary.
+const PROMISE_CONSTRUCTOR = Promise;
+function pinNativePromise(promise) {
+  if (isProxy(promise) || !isPromise(promise)) throw new TypeError("not a native Promise");
+  DEFINE_PROPERTY(promise, "constructor", { value: PROMISE_CONSTRUCTOR,
+    enumerable: false, configurable: false, writable: false });
+  return promise;
+}
+function newNativePromise(executor) {
+  return pinNativePromise(new PROMISE_CONSTRUCTOR(executor));
+}
+function nativePromiseThen(onFulfilled, onRejected) {
+  const source = this;
+  return pinNativePromise((async () => {
+    let value;
+    try {
+      value = await source;
+    } catch (error) {
+      if (typeof onRejected === "function") return onRejected(error);
+      throw error;
+    }
+    // Reactions handle the source outcome, not errors thrown by one another.
+    // A failing fulfillment reaction rejects the returned promise.
+    return typeof onFulfilled === "function" ? onFulfilled(value) : value;
+  })());
+}
+function nativePromiseRace(first, second, third) {
+  return newNativePromise((resolve, reject) => {
+    const observe = (candidate) => {
+      void (async () => {
+        try { resolve(await candidate); } catch (error) { reject(error); }
+      })();
+    };
+    observe(first);
+    observe(second);
+    observe(third);
+  });
+}
+function nativeSettledRead(value) {
+  // A hostile CURRENT adapter can poison Object.prototype.then before
+  // promise settlement. A null-prototype box cannot be assimilated as a
+  // forged inherited thenable by the native resolver or await.
+  const result = OBJECT_CREATE(null);
+  DEFINE_PROPERTY(result, "settled", { value: true, enumerable: true });
+  DEFINE_PROPERTY(result, "value", { value, enumerable: true });
+  return result;
+}
+function invokeNativeRead(callback) {
+  return newNativePromise((resolve, reject) => {
+    // Wait one genuine microtask before entering the external adapter; caller
+    // must reserve its slot synchronously before the adapter gets control.
+    void (async () => {
+      await newNativePromise((ready) => ready());
+      let outcome;
+      try {
+        outcome = callback();
+      } catch (_) {
+        // A caller may start external work and then throw. There is no proof
+        // the read stopped; retain the occupied slot fail-closed.
+        return;
+      }
+      if (outcome !== null && (typeof outcome === "object" || typeof outcome === "function")) {
+        if (isPromise(outcome) && !isProxy(outcome)) {
+          try { pinNativePromise(outcome); } catch (_) { return; }
+          try { resolve(nativeSettledRead(await outcome)); }
+          catch (error) { reject(error); }
+          return;
+        }
+        // Never adopt a foreign/custom thenable: it can settle its callback
+        // while real I/O still runs. Nor may rejection release this read slot.
+        // An unsupported asynchronous return keeps the quota until restart.
+        let then;
+        try { then = outcome.then; } catch (_) { return; }
+        if (typeof then === "function") return;
+      }
+      resolve(nativeSettledRead(outcome));
+    })();
+  });
+}
 
 const createPublicKey = crypto.createPublicKey.bind(crypto);
 const createHash = crypto.createHash.bind(crypto);
@@ -130,7 +220,9 @@ function canonicalStringify(value, depth = 0, sortKeys = false) {
     // getter could replace signed field 5 while leaving the statement at B.
     const fields = SET_PROTOTYPE([], null);
     for (let index = 0; index < value.length; index += 1) {
-      const descriptor = OWN_DESCRIPTOR(value, String(index));
+      // A prior native KeyObject getter can replace ambient String(). Keep
+      // canonical signed array access on intrinsic numeric property keys.
+      const descriptor = OWN_DESCRIPTOR(value, index);
       if (!descriptor || !HAS_OWN(descriptor, "value")) {
         throw new TypeError("noncanonical signed array element");
       }
@@ -205,6 +297,14 @@ module.exports = Object.freeze({
   hasOwn: HAS_OWN,
   objectCreate: OBJECT_CREATE,
   defineProperty: DEFINE_PROPERTY,
+  newNativeSet,
+  setAdd: withSafeCall(SET_ADD),
+  setDelete: withSafeCall(SET_DELETE),
+  setSize: withSafeCall(SET_SIZE),
+  newNativePromise,
+  nativePromiseThen: withSafeCall(nativePromiseThen),
+  nativePromiseRace,
+  invokeNativeRead,
   hashUpdate: withSafeCall(OWN_DESCRIPTOR(prototype, "update").value),
   hashDigest: withSafeCall(OWN_DESCRIPTOR(prototype, "digest").value),
   publicExport: withSafeCall(OWN_DESCRIPTOR(publicPrototype, "export").value),

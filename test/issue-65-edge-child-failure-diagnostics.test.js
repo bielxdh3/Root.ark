@@ -72,6 +72,34 @@ test("failing real Edge v2 archive reports only an allowlisted numeric test call
   assert.doesNotMatch(safe, /JWT|very-private|Root\.ark|C:|Error|stack|private\.key|runner/i);
 });
 
+test("hosted V2 archive stage diagnostic is strict, pinned to the exact test and never exposes browser errors", () => {
+  const { reportEdgeFailure, parseEdgeFailureDiagnostic } =
+    require("../scripts/edge-test-failure-diagnostic");
+  const parent = { nameHash: sha(EXPECTED_EDGE_CASES[4]), pathHash: sha(EDGE_FILES[3]) };
+  const diagnostic = "# ROOTARK_EDGE_V1 case=V2_ARCHIVE stage=ARCHIVE_IMPORT code=RUNTIME";
+  assert.deepEqual(parseEdgeFailureDiagnostic(diagnostic, parent),
+    { stage: "ARCHIVE_IMPORT", code: "RUNTIME" });
+  for (const malicious of [
+    diagnostic + " " + hostile,
+    diagnostic.replace("ARCHIVE_IMPORT", hostile),
+    diagnostic.replace("V2_ARCHIVE", "V2_WITNESSED"),
+    diagnostic.replace("RUNTIME", "ACCEPTED"),
+  ]) assert.equal(parseEdgeFailureDiagnostic(malicious, parent), null);
+  assert.equal(parseEdgeFailureDiagnostic(diagnostic, { ...parent,
+    pathHash: sha(EDGE_FILES[2]) }), null);
+  assert.equal(parseEdgeFailureDiagnostic(diagnostic, { ...parent,
+    nameHash: sha("attacker renamed the test") }), null);
+  const emitted = [];
+  reportEdgeFailure({ diagnostic: (line) => emitted.push(line) },
+    "V2_ARCHIVE", "archive-import", new Error(hostile));
+  if (process.platform === "win32") {
+    assert.deepEqual(emitted, ["ROOTARK_EDGE_V1 case=V2_ARCHIVE stage=ARCHIVE_IMPORT code=RUNTIME"]);
+  } else assert.deepEqual(emitted, []);
+  assert.doesNotMatch(emitted.join(" "), /JWT|Users|secret|private\.key|very-private/i);
+  assert.throws(() => reportEdgeFailure({ diagnostic() {} }, "V2_ARCHIVE", hostile,
+    new Error(hostile)), /INVALID_EDGE_DIAGNOSTIC_STAGE/);
+});
+
 test("real Node22 TAP failure schema feeds the same safe parser", () => {
   const { summarizeFailedEdgeChild } = require("../scripts/edge-child-failure-diagnostics");
   // A fixture beneath this checkout matches the hosted Node --test entrypoint.

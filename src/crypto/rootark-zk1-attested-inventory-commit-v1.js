@@ -184,6 +184,7 @@ async function verifyAttestedInventoryCommitInternal(input) {
     // KeyObject getter. Such a getter can rewrite even already-validated
     // buffers in this same realm, then restore B after an async signature.
     const nowSeconds = input.nowSeconds;
+    if (!Number.isSafeInteger(nowSeconds) || nowSeconds < 1) deny();
     const receipt = rawBytes(input.receipt, 1, inventory.MAX_COMMITTED_PROOF_BYTES);
     const physicalBytes = rawBytes(input.physicalAttestation, 1, 2048);
     const nonce = rawBytes(input.nonce, 32, 32);

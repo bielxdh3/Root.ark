@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="pt-BR">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transferência experimental · Root.ark</title>
+<style>
+  body{font:16px system-ui,Arial;max-width:750px;margin:2rem auto;padding:0 1rem;color:#171717;background:#fafafa}
+  button,input{font:inherit;padding:.5rem;margin:.2rem;max-width:95%}
+  #leave{min-height:44px}
+  fieldset{border:1px solid #aaa;border-radius:8px;margin:1rem 0;padding:1rem}
+  .entry{padding:.5rem;background:#eee;border-radius:5px;margin:.5rem 0;overflow-wrap:anywhere}
+  #events{white-space:pre-wrap;overflow-wrap:anywhere;min-height:80px}
+  small{color:#555}
+</style>
+<h1>Transferência direta experimental</h1>
+<p id="rootarkReturn" hidden><a href="/index.html">Voltar aos arquivos Root.ark</a></p>
+<p>Sem STUN/TURN: conexão fora do mesmo host não é garantida. Selecione apenas arquivos que deseja compartilhar; nenhum arquivo armazenado no Root.ark é carregado automaticamente. Credenciais nunca entram no link.</p>
+<fieldset>
+  <legend>Sala temporária</legend>
+  <button id="create">Criar sala (host)</button>
+  <button id="leave" type="button" aria-describedby="leaveHint" disabled>Sair da sala</button>
+  <small id="leaveHint">O host encerra a sala para todos; convidados podem sair individualmente.</small>
+  <div>ID da sala: <strong id="room"></strong></div>
+  <label for="recipientInput">Destinatário (usuário Root.ark no modo de sessão assinada)</label>
+  <input id="recipientInput" autocomplete="off" maxlength="128" placeholder="Nome de usuário">
+  <button id="invite" disabled>Gerar convite único (60 s)</button>
+  <div id="invites"></div>
+</fieldset>
+<fieldset id="boundObjectControls" hidden>
+  <legend>Sala com permissão de arquivo criptografado Root.ark</legend>
+  <p>Informe o caminho lógico de um arquivo criptografado do qual você é proprietário e cujo destinatário possui acesso explícito. Esta verificação usa a ACL do servidor; ela não comprova assinatura ZK nem valida os bytes do arquivo local selecionado.</p>
+  <label for="objectFolderInput">ID da pasta</label>
+  <input id="objectFolderInput" autocomplete="off" value="root" maxlength="80">
+  <label for="objectFileInput">Nome exato do arquivo criptografado</label>
+  <input id="objectFileInput" autocomplete="off" maxlength="100" placeholder="arquivo.enc">
+  <button id="createObjectRoom">Criar sala vinculada à ACL</button>
+</fieldset>
+<fieldset>
+  <legend>Entrar em sala existente</legend>
+  <label for="roomInput">ID da sala</label>
+  <input id="roomInput" placeholder="ID da sala" autocomplete="off">
+  <label for="inviteInput">Convite de uso único</label>
+  <input id="inviteInput" type="password" placeholder="Convite (uso único)" autocomplete="off">
+  <button id="join">Entrar</button>
+</fieldset>
+<fieldset>
+  <legend>Pares e consentimento</legend>
+  <div id="peers"></div>
+</fieldset>
+<fieldset>
+  <legend>Enviar aos pares autorizados</legend>
+  <label for="textInput">Texto de teste</label>
+  <input id="textInput" maxlength="1000" placeholder="Texto de teste" aria-label="Texto de teste">
+  <button id="sendText">Enviar texto</button>
+  <label for="fileInput">Arquivo a enviar</label>
+  <input type="file" id="fileInput">
+  <button id="sendFile">Enviar arquivo (até 32 MiB)</button>
+  <div id="incoming"></div>
+  <div id="transfers" aria-live="polite"></div>
+  <div id="downloads"></div>
+</fieldset>
+<p id="state" role="status" aria-atomic="true">Sem conexão</p>
+<pre id="events" aria-live="polite"></pre>
+<small>O destinatário deve aceitar o arquivo. Baixe somente após SHA-256 OK. O limite é 32 MiB por arquivo, em memória; não testa TURN, NAT externo, retomada nem armazenamento permanente. Autenticação Root.ark somente no modo de sessão assinado.</small>
+<script src="transfer-protocol.js"></script>
+<script src="client.js"></script>
+</html>

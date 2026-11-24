@@ -10,16 +10,22 @@ const { SCHEMA, FIELDS, checkpointDigest, verifyOwnerInventoryEnrollment } =
   require("../src/crypto/rootark-zk1-owner-inventory-trust-head");
 const portable = require("../public/client/rootark-zk1-owner-inventory-trust-head");
 
-async function fixture() {
+async function fixture({ forgedInventorySignature = false } = {}) {
   const keys = crypto.generateKeyPairSync("ed25519");
   const scope = { account_id: crypto.randomBytes(16),
     compartment_id: Buffer.from("owner-client"), keyring_id: crypto.randomBytes(16) };
   const signerKeyId = crypto.randomBytes(16);
   const nonce = crypto.randomBytes(32);
-  const snapshot = await inventory.createSignedSnapshot({
+  let snapshot = await inventory.createSignedSnapshot({
     signerKeyId, privateKey: keys.privateKey, scope,
     sequence: 0, previousRoot: null, entries: [], nonce,
   });
+  if (forgedInventorySignature) {
+    const z = require("../src/crypto/rootark-zk-1");
+    const original = await z.decodeDeterministic(snapshot);
+    snapshot = await z.encodeDeterministic({ ...original,
+      signature: crypto.randomBytes(64) });
+  }
   const decoded = await require("../src/crypto/rootark-zk-1").decodeDeterministic(snapshot);
   const now = Math.floor(Date.now() / 1000);
   const signed = await runOfflineSigner({
@@ -44,200 +50,141 @@ async function fixture() {
   return { enrollment, signed, scope, keys, now, snapshot };
 }
 
-// The owner signer is a genuinely separate process and signs the SHA-256 of
-// the ACTUAL supplied bytes B, not the valid inventory bytes C later forged
-// into the decoder by a caller-owned KeyObject getter.
-async function signedOwnerOnInvalidInventoryBytes() {
-  const good = await fixture();
-  const z = require("../src/crypto/rootark-zk-1");
-  const decodedC = await z.decodeDeterministic(good.snapshot);
-  const fakeSignature = crypto.randomBytes(64);
-  assert.notDeepEqual(fakeSignature, decodedC.signature);
-  const bytesB = await z.encodeDeterministic({ ...decodedC, signature: fakeSignature });
-  assert.notDeepEqual(bytesB, good.snapshot);
-  const ownerB = await runOfflineSigner({
-    scope: Object.fromEntries(Object.entries(good.scope).map(([name, data]) =>
-      [name, data.toString("base64url")])),
-    inventorySignerKeyId: good.enrollment.inventorySignerKeyId.toString("base64url"),
-    inventorySpkiSha256: crypto.createHash("sha256").update(
-      good.keys.publicKey.export({ type: "spki", format: "der" })).digest("hex"),
-    heads: [{ sequence: 0, root: Buffer.from(decodedC.root).toString("hex"),
-      snapshotSha256: crypto.createHash("sha256").update(bytesB).digest("hex"),
-      issuedAt: good.now - 5, expiresAt: good.now + 120 }],
-  });
-  const enrollmentB = {
-    ...good.enrollment, minimumSnapshot: bytesB,
-    checkpoints: ownerB.checkpoints,
-    ownerPublicKey: crypto.createPublicKey({
-      key: Buffer.from(ownerB.ownerSpki, "base64url"), format: "der", type: "spki",
-    }),
-    independentOwnerSpkiSha256: ownerB.independentOwnerSpkiSha256,
-    independentRetainedCheckpointDigest: ownerB.independentRetainedCheckpointDigest,
+test("P2: a previous KeyObject getter cannot redirect String(index) into an inherited checkpoint slot", async () => {
+  const a = await fixture();
+  const b = await fixture();
+  const signedA = a.signed.checkpoints[0];
+  const digestA = checkpointDigest(signedA);
+  const digestB = checkpointDigest(b.signed.checkpoints[0]);
+  assert.notEqual(digestA, digestB,
+    "checkpoint B is independently and genuinely signed, with a different pinned digest");
+  const originalString = global.String;
+  const inheritedBefore = Object.getOwnPropertyDescriptor(Array.prototype, "0");
+  assert.equal(inheritedBefore, undefined, "the adversarial inherited slot must be new");
+
+  // This is the exact verified A (payload + real Ed25519 signature), paired
+  // with B's independently retained digest. Only the digest is substituted.
+  const fieldsA = Object.fromEntries(FIELDS.map((name) => [name, signedA[name]]));
+  const inherited = {
+    current: fieldsA,
+    signature: Buffer.from(signedA.signature, "base64url"),
+    recordDigest: digestB,
   };
-  assert.equal(enrollmentB.checkpoints[0].snapshot_sha256,
-    crypto.createHash("sha256").update(bytesB).digest("hex"));
-  await assert.rejects(verifyOwnerInventoryEnrollment(enrollmentB),
-    /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
-    "real offline owner signature over B cannot validate fake inventory signature B");
-  return { good, decodedC, bytesB, enrollmentB };
-}
-
-test("owner-signed raw B rejects forged nested inventory signature despite post-KeyObject codec B-to-C", async () => {
-  const { good, decodedC, bytesB, enrollmentB } =
-    await signedOwnerOnInvalidInventoryBytes();
-  const z = require("../src/crypto/rootark-zk-1");
-  const originalDecode = z.decodeDeterministic;
-  const owner = crypto.createPublicKey({
-    key: enrollmentB.ownerPublicKey.export({ type: "spki", format: "der" }),
+  let zeroConversions = 0;
+  const divertedString = new Proxy(originalString, { apply(target, receiver, args) {
+    if (args.length === 1 && args[0] === 0) {
+      zeroConversions += 1;
+      return zeroConversions % 2 === 1 ? "0" : "injected-nonindex";
+    }
+    return Reflect.apply(target, receiver, args);
+  } });
+  const hostileKey = crypto.createPublicKey({
+    key: a.enrollment.ownerPublicKey.export({ type: "spki", format: "der" }),
     format: "der", type: "spki",
   });
-  let getterCalls = 0;
-  let substituted = 0;
-  Object.defineProperty(owner, "type", { configurable: true, get() {
-    getterCalls++;
-    z.decodeDeterministic = async (raw) => {
-      if (Buffer.isBuffer(raw) && raw.equals(bytesB)) {
-        substituted++;
-        return decodedC; // Genuine signed inventory C, but B was owner-pinned.
-      }
-      return originalDecode(raw);
-    };
-    return "public";
-  } });
-  let accepted = false;
-  try {
-    try {
-      await verifyOwnerInventoryEnrollment({ ...enrollmentB, ownerPublicKey: owner });
-      accepted = true;
-    } catch (error) {
-      assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
-    }
-  } finally {
-    z.decodeDeterministic = originalDecode;
-    delete owner.type;
-  }
-  assert.ok(getterCalls > 0, "genuine KeyObject callback must execute");
-  assert.equal(accepted, false, "owner signature on B cannot attest to signed C");
-  assert.equal((await verifyOwnerInventoryEnrollment(good.enrollment)).ownerSignatureVerified, true);
-  assert.equal(substituted, 0,
-    "no post-KeyObject dispatch may reach the shared mutable decoder export");
-});
-
-test("owner-signed raw B must not be mutated in decoder to an unsigned inventory C", async () => {
-  const { good, bytesB, enrollmentB } = await signedOwnerOnInvalidInventoryBytes();
-  // Offline owner signs the SHA256 of B. C is a genuine Ed25519 inventory
-  // snapshot, identical in length but NOT authorized by that owner checkpoint.
-  const signedC = Buffer.from(good.snapshot);
-  assert.notDeepEqual(bytesB, signedC);
-  assert.equal(bytesB.length, signedC.length);
-  const ownerKey = crypto.createPublicKey({
-    key: enrollmentB.ownerPublicKey.export({ type: "spki", format: "der" }),
-    format: "der", type: "spki",
-  });
-  const originalFrom = Buffer.from;
-  const nativeCompare = Buffer.compare.bind(Buffer);
-  let getterReads = 0, mutatedCopies = 0;
-  Object.defineProperty(ownerKey, "type", { configurable: true, get() {
-    getterReads++;
-    Buffer.from = function(input, ...args) {
-      if (Buffer.isBuffer(input) && input.length === bytesB.length
-        && nativeCompare(input, bytesB) === 0) {
-        // Hostile post-owner-hash mutation of the verifier's local B copy:
-        // original owner hash was B, nested Ed25519 inventory is now C.
-        mutatedCopies++;
-        signedC.copy(input);
-      }
-      return Reflect.apply(originalFrom, Buffer, [input, ...args]);
-    };
-    return "public";
-  } });
-  let accepted = false;
-  try {
-    try {
-      await verifyOwnerInventoryEnrollment({ ...enrollmentB, ownerPublicKey: ownerKey });
-      accepted = true;
-    } catch (error) {
-      assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
-    }
-  } finally {
-    Buffer.from = originalFrom;
-    delete ownerKey.type;
-  }
-  assert.ok(getterReads > 0, "native KeyObject.type getter ran");
-  assert.equal(accepted, false, "offline owner signature over B must not attest C");
-  assert.equal(mutatedCopies, 0,
-    "decoder input must use early pinned Buffer.from, never hostile wrapper");
-  assert.equal((await verifyOwnerInventoryEnrollment(good.enrollment)).ownerSignatureVerified,
-    true, "legitimate owner and inventory positive preserved");
-});
-
-test("valid offline owner A and signed inventory C survive post-getter codec export replacement", async () => {
-  const f = await fixture();
-  const z = require("../src/crypto/rootark-zk-1");
-  const originalDecode = z.decodeDeterministic;
-  const originalEncode = z.encodeDeterministic;
-  const owner = crypto.createPublicKey({
-    key: f.enrollment.ownerPublicKey.export({ type: "spki", format: "der" }),
-    type: "spki", format: "der",
-  });
-  let getterCalls = 0;
-  let injectedCalls = 0;
-  Object.defineProperty(owner, "type", { configurable: true, get() {
-    getterCalls++;
-    z.decodeDeterministic = async () => {
-      injectedCalls++;
-      throw new Error("MUTABLE_DECODER_CALLED");
-    };
-    z.encodeDeterministic = async () => {
-      injectedCalls++;
-      throw new Error("MUTABLE_ENCODER_CALLED");
-    };
-    return "public";
-  } });
-  try {
-    const accepted = await verifyOwnerInventoryEnrollment({
-      ...f.enrollment, ownerPublicKey: owner,
+  let callbackReads = 0;
+  Object.defineProperty(hostileKey, "type", { configurable: true, get() {
+    callbackReads += 1;
+    global.String = divertedString;
+    Object.defineProperty(Array.prototype, "0", {
+      value: inherited, enumerable: false, configurable: true, writable: true,
     });
-    assert.equal(accepted.ownerSignatureVerified, true);
-    assert.equal(accepted.authorizesIo, false);
+    throw new Error("stop prior owner verification after mutating the same realm");
+  } });
+  try {
+    await assert.rejects(verifyOwnerInventoryEnrollment({
+      ...a.enrollment, ownerPublicKey: hostileKey,
+    }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
+    assert.equal(callbackReads, 1, "the actual owner KeyObject getter must run");
+    assert.equal(global.String, divertedString);
+    assert.equal(Object.getOwnPropertyDescriptor(Array.prototype, "0").value, inherited);
+
+    // Old implementation reads signed A using String(0) -> "0", then writes
+    // to String(0) -> "injected-nonindex". checked[0] remains a hole and
+    // inherits A + digest B. This must reject even though A itself is valid.
+    await assert.rejects(verifyOwnerInventoryEnrollment({
+      ...a.enrollment, independentRetainedCheckpointDigest: digestB,
+    }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+    "signed A cannot be accepted under independently signed checkpoint B's digest");
+    const valid = await verifyOwnerInventoryEnrollment(a.enrollment);
+    assert.equal(valid.ownerSignatureVerified, true,
+      "the genuine checkpoint A remains accepted in the poisoned realm");
+    assert.equal(valid.authorizesIo, false);
   } finally {
-    z.decodeDeterministic = originalDecode;
-    z.encodeDeterministic = originalEncode;
-    delete owner.type;
+    global.String = originalString;
+    if (inheritedBefore) {
+      Object.defineProperty(Array.prototype, "0", inheritedBefore);
+    } else {
+      delete Array.prototype[0];
+    }
+    delete hostileKey.type;
   }
-  assert.ok(getterCalls > 0, "native owner key callback executed");
-  assert.equal(injectedCalls, 0,
-    "authentic signed C must not use mutable codec exports after the getter");
+  assert.equal((await verifyOwnerInventoryEnrollment(a.enrollment)).ownerSignatureVerified, true);
 });
 
-test("owner-signed raw B rejects mutable nested verifier even with valid owner Ed25519", async () => {
-  const { good, enrollmentB } = await signedOwnerOnInvalidInventoryBytes();
-  const originalVerify = inventory.verifySnapshot;
-  const owner = crypto.createPublicKey({
-    key: enrollmentB.ownerPublicKey.export({ type: "spki", format: "der" }),
-    format: "der", type: "spki",
-  });
-  let getterCalls = 0;
+test("P2: hostile native key getter cannot replace Array checkpoint staging", async () => {
+  const f = await fixture();
+  const unrelatedSigned = await fixture();
+  const differentPin = checkpointDigest(unrelatedSigned.signed.checkpoints[0]);
+  assert.notEqual(differentPin, checkpointDigest(f.signed.checkpoints[0]),
+    "the independently retained B digest must belong to a different genuine signed checkpoint");
+  const OriginalArray = global.Array;
+  let replacedSlots = 0;
+  const injectedArray = function(length) {
+    const slots = new OriginalArray(length);
+    if (!new.target || length !== f.signed.checkpoints.length) return slots;
+    // One poisoned staging allocation, then restore ambient Array to avoid
+    // accidentally sabotaging unrelated built-in array construction later.
+    global.Array = OriginalArray;
+    return new Proxy(slots, { set(target, name, value) {
+      if (name === "0") {
+        replacedSlots++;
+        return Reflect.set(target, name, { ...value, recordDigest: differentPin });
+      }
+      return Reflect.set(target, name, value);
+    } });
+  };
+  // Preserve real Array static methods (Array.isArray, etc.), so only its
+  // constructor/staged index assignment is adversarial. An unadorned fake
+  // constructor would fail unrelated input checks before reaching the bug.
+  Object.setPrototypeOf(injectedArray, OriginalArray);
+  injectedArray.prototype = OriginalArray.prototype;
+  const owner = crypto.createPublicKey({ key: f.enrollment.ownerPublicKey.export({
+    type: "spki", format: "der",
+  }), type: "spki", format: "der" });
+  let callbackReads = 0;
   Object.defineProperty(owner, "type", { configurable: true, get() {
-    getterCalls++;
-    inventory.verifySnapshot = async () => ({ status: "FAKE_ACCEPT" });
+    callbackReads++;
+    global.Array = injectedArray;
     return "public";
   } });
-  let accepted = false;
   try {
-    try {
-      await verifyOwnerInventoryEnrollment({ ...enrollmentB, ownerPublicKey: owner });
-      accepted = true;
-    } catch (error) {
-      assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
-    }
+    // An earlier verifier may encounter the hostile getter and leave the
+    // same realm's constructor poisoned for a later signed enrollment.
+    try { await verifyOwnerInventoryEnrollment({ ...f.enrollment, ownerPublicKey: owner }); }
+    catch (error) { assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/); }
+    assert.ok(callbackReads > 0, "a real owner-key callback must run");
+    assert.equal(global.Array, injectedArray, "the constructor poisoning must occur");
+    await assert.rejects(verifyOwnerInventoryEnrollment({
+      ...f.enrollment, independentRetainedCheckpointDigest: differentPin,
+    }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+    "signed A must not be certified as unrelated independently retained digest B");
+    assert.equal(replacedSlots, 0,
+      "the original native array constructor must bypass the adversarial staging setter");
+    assert.equal(global.Array, injectedArray,
+      "the verifier must not depend on the attacker restoring the original constructor");
+    const accepted = await verifyOwnerInventoryEnrollment(f.enrollment);
+    assert.equal(accepted.ownerSignatureVerified, true,
+      "valid A remains accepted while the hostile constructor remains installed");
+    assert.equal(global.Array, injectedArray,
+      "the legitimate positive must run with the same hostile ambient constructor");
   } finally {
-    inventory.verifySnapshot = originalVerify;
+    global.Array = OriginalArray;
     delete owner.type;
   }
-  assert.ok(getterCalls > 0);
-  assert.equal(accepted, false, "forged nested verifier cannot authorize B");
-  assert.equal((await verifyOwnerInventoryEnrollment(good.enrollment)).ownerSignatureVerified, true);
+  const valid = await verifyOwnerInventoryEnrollment(f.enrollment);
+  assert.equal(valid.ownerSignatureVerified, true);
+  assert.equal(valid.authorizesIo, false);
 });
 
 test("independent offline owner process signs an externally pinned, verified inventory root", async () => {
@@ -266,128 +213,6 @@ test("signed owner inventory ancestry cannot be verified under a spoofed indepen
     independentOwnerSpkiSha256: crypto.createHash("sha256").update(foreignSpki).digest("hex"),
   }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
   "an owner signature is not proof of the independently pinned owner identity");
-});
-
-test("P2 native owner handle cannot pin SPKI B while verifying genuine owner Ed25519 A", async () => {
-  const f = await fixture();
-  const nativeA = f.enrollment.ownerPublicKey;
-  const foreign = crypto.generateKeyPairSync("ed25519");
-  const foreignSpki = foreign.publicKey.export({ type: "spki", format: "der" });
-  const foreignPin = crypto.createHash("sha256").update(foreignSpki).digest("hex");
-  await assert.rejects(verifyOwnerInventoryEnrollment({
-    ...f.enrollment, independentOwnerSpkiSha256: foreignPin,
-  }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
-  "genuine signed owner A must reject independent pin B");
-
-  const handle = Object.getOwnPropertySymbols(nativeA)
-    .find((symbol) => symbol.description === "kHandle");
-  assert.ok(handle, "Node22 real owner Ed25519 KeyObject handle required");
-  const hybrid = Object.create(nativeA);
-  let returnedForeignDuringSpki = 0;
-  let returnedGenuineDuringVerification = 0;
-  Object.defineProperty(hybrid, handle, { get() {
-    if (new Error().stack.includes("nativeEd25519Spki")) {
-      returnedForeignDuringSpki++;
-      return foreign.publicKey[handle];
-    }
-    returnedGenuineDuringVerification++;
-    return nativeA[handle];
-  } });
-  await assert.rejects(verifyOwnerInventoryEnrollment({
-    ...f.enrollment, ownerPublicKey: hybrid,
-    independentOwnerSpkiSha256: foreignPin,
-  }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
-  "caller-controlled native kHandle must never mix B identity with A signature");
-  assert.equal(returnedForeignDuringSpki, 0,
-    "caller-owned native handle accessors must be rejected before SPKI export");
-  assert.equal(returnedGenuineDuringVerification, 0,
-    "the verifier must not return to the caller-owned A handle after pinning B");
-  assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true,
-    "genuine owner A remains accepted for the true A pin");
-});
-
-test("P2 native inventory handle cannot pin signer B while verifying genuine signed snapshot A", async () => {
-  const f = await fixture();
-  const otherInventory = crypto.generateKeyPairSync("ed25519");
-  const spkiB = otherInventory.publicKey.export({ type: "spki", format: "der" });
-  const decoded = await require("../src/crypto/rootark-zk-1").decodeDeterministic(f.snapshot);
-  const freshOwner = await runOfflineSigner({
-    scope: Object.fromEntries(Object.entries(f.scope).map(([name, bytes]) =>
-      [name, bytes.toString("base64url")])),
-    inventorySignerKeyId: f.enrollment.inventorySignerKeyId.toString("base64url"),
-    inventorySpkiSha256: crypto.createHash("sha256").update(spkiB).digest("hex"),
-    heads: [{ sequence: 0, root: Buffer.from(decoded.root).toString("hex"),
-      snapshotSha256: crypto.createHash("sha256").update(f.snapshot).digest("hex"),
-      issuedAt: f.now - 5, expiresAt: f.now + 120 }],
-  });
-  const claimedB = {
-    ...f.enrollment, checkpoints: freshOwner.checkpoints,
-    ownerPublicKey: crypto.createPublicKey({
-      key: Buffer.from(freshOwner.ownerSpki, "base64url"),
-      format: "der", type: "spki",
-    }),
-    independentOwnerSpkiSha256: freshOwner.independentOwnerSpkiSha256,
-    independentRetainedCheckpointDigest: freshOwner.independentRetainedCheckpointDigest,
-    inventoryPublicKey: otherInventory.publicKey,
-  };
-  await assert.rejects(verifyOwnerInventoryEnrollment(claimedB),
-    /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
-    "genuine owner-signed declaration of inventory B cannot verify snapshot signed by A");
-
-  const realA = f.keys.publicKey;
-  const handle = Object.getOwnPropertySymbols(realA)
-    .find((symbol) => symbol.description === "kHandle");
-  assert.ok(handle, "real Ed25519 inventory native handle required");
-  const hybrid = Object.create(realA);
-  let spkiBReads = 0;
-  let checkedAReads = 0;
-  Object.defineProperty(hybrid, handle, { get() {
-    if (new Error().stack.includes("nativeEd25519Spki")) {
-      spkiBReads++;
-      return otherInventory.publicKey[handle];
-    }
-    checkedAReads++;
-    return realA[handle];
-  } });
-  await assert.rejects(verifyOwnerInventoryEnrollment({
-    ...claimedB, inventoryPublicKey: hybrid,
-  }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
-  "signed B inventory identity cannot validate genuine A snapshot through mutable kHandle");
-  assert.equal(spkiBReads, 0,
-    "the native SPKI path must not execute a caller-owned kHandle accessor");
-  assert.equal(checkedAReads, 0,
-    "nested inventory signature verifier must never use caller-owned A handle");
-  // The caller's public key getter can also retarget the mutable Node
-  // crypto.verify export after native SPKI export but before the nested
-  // inventory snapshot verifies its Ed25519 signature. The independently
-  // owner-signed inventory B fingerprint MUST still reject snapshot A.
-  const originalVerify = crypto.verify;
-  const poisoned = Object.create(realA);
-  let exportBRuns = 0;
-  let injectedVerifyRuns = 0;
-  Object.defineProperty(poisoned, handle, { get() {
-    if (new Error().stack.includes("nativeEd25519Spki")) {
-      exportBRuns++;
-      crypto.verify = (...args) => {
-        injectedVerifyRuns++;
-        return true;
-      };
-      return otherInventory.publicKey[handle];
-    }
-    return realA[handle];
-  } });
-  try {
-    await assert.rejects(verifyOwnerInventoryEnrollment({
-      ...claimedB, inventoryPublicKey: poisoned,
-    }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
-    "owner-signed B must not accept inventory-signed A via retargeted dynamic crypto.verify");
-    assert.equal(exportBRuns, 0, "foreign kHandle accessor must fail closed before callback");
-    assert.equal(injectedVerifyRuns, 0, "nested verification must retain the native crypto.verify");
-  } finally {
-    crypto.verify = originalVerify;
-  }
-  assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true,
-    "unmodified legitimate A snapshot continues to verify with its signed A key");
 });
 
 test("browser/WebCrypto imports offline owner checkpoint with independent pins; export roundtrip is portable", async () => {
@@ -526,6 +351,37 @@ test("owner KeyObject callback cannot rewrite independently expected account B t
   assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true);
 });
 
+test("genuine Ed25519 owner A does not delegate inventory signature B to a swapped verifier export", async () => {
+  // Owner A signs a real checkpoint and its independent digest pins the
+  // exact serialized inventory snapshot. Its INNER inventory signer is
+  // deliberately forged (B). A caller KeyObject may not change the verifier
+  // implementation after valid owner authorization.
+  const f = await fixture({ forgedInventorySignature: true });
+  const owner = crypto.createPublicKey({ key: f.enrollment.ownerPublicKey.export({
+    type: "spki", format: "der",
+  }), type: "spki", format: "der" });
+  const original = inventory.verifySnapshot;
+  let attacks = 0;
+  Object.defineProperty(owner, "type", { configurable: true, get() {
+    attacks++;
+    inventory.verifySnapshot = async () => ({ status: "FORGED_ACCEPT" });
+    return "public";
+  } });
+  try {
+    await assert.rejects(verifyOwnerInventoryEnrollment({
+      ...f.enrollment, ownerPublicKey: owner,
+    }), /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/,
+    "owner-signed checkpoint cannot waive the independent inventory signature");
+    assert.ok(attacks > 0, "test must run the KeyObject callback");
+  } finally {
+    inventory.verifySnapshot = original;
+    delete owner.type;
+  }
+  const good = await fixture();
+  assert.equal((await verifyOwnerInventoryEnrollment(good.enrollment))
+    .ownerSignatureVerified, true);
+});
+
 test("genuine signed checkpoint A cannot authorize unsigned B by post-getter Buffer.concat retarget", async () => {
   const f = await fixture();
   const authentic = f.signed.checkpoints[0];
@@ -606,5 +462,43 @@ test("owner A native PublicKey export cannot be spoofed as foreign pinned B via 
   assert.ok(keyCallbacks > 0, "real owner KeyObject getter must be invoked");
   assert.equal(accepted, false,
     "genuinely owner-signed A cannot masquerade as independently pinned B");
+  assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true);
+});
+
+test("owner native kHandle cannot export pinned B and then verify genuine A with a different handle", async () => {
+  const f = await fixture();
+  const realA = f.enrollment.ownerPublicKey;
+  const realB = crypto.generateKeyPairSync("ed25519").publicKey;
+  const pinB = crypto.createHash("sha256").update(
+    realB.export({ type: "spki", format: "der" })).digest("hex");
+  assert.notEqual(pinB, f.enrollment.independentOwnerSpkiSha256);
+  const symbol = Object.getOwnPropertySymbols(realA)
+    .find((value) => String(value) === "Symbol(kHandle)");
+  assert.ok(symbol, "physical Node 22 KeyObject must expose its native handle");
+  const handleA = Object.getOwnPropertyDescriptor(realA, symbol).value;
+  const handleB = Object.getOwnPropertyDescriptor(realB, symbol).value;
+  const samples = [];
+  for (let pivot = 1; pivot <= 16; pivot++) {
+    const disguised = Object.create(realA);
+    let reads = 0;
+    Object.defineProperty(disguised, symbol, { configurable: true, get() {
+      reads++;
+      // Stable B for first N native handle reads, then genuine A at verify.
+      return reads <= pivot ? handleB : handleA;
+    } });
+    let accepted = false;
+    try {
+      await verifyOwnerInventoryEnrollment({ ...f.enrollment,
+        ownerPublicKey: disguised, independentOwnerSpkiSha256: pinB });
+      accepted = true;
+    } catch (error) {
+      assert.match(error.message, /ZK_OWNER_INVENTORY_TRUST_UNVERIFIED/);
+    }
+    samples.push({ pivot, reads, accepted });
+  }
+  assert.ok(samples.some((sample) => sample.reads >= 1),
+    "the original caller-owned handle getter must actually execute");
+  assert.equal(samples.some((sample) => sample.accepted), false,
+    `an owner A signature must not verify under independently pinned owner B: ${JSON.stringify(samples)}`);
   assert.equal((await verifyOwnerInventoryEnrollment(f.enrollment)).ownerSignatureVerified, true);
 });

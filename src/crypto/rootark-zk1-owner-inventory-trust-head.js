@@ -18,9 +18,11 @@ const {
   ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
   getPrototype: NATIVE_GET_PROTOTYPE, hasOwn: NATIVE_HAS_OWN,
   objectCreate: NATIVE_OBJECT_CREATE, arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+  defineProperty: NATIVE_DEFINE_PROPERTY,
 } = require("./rootark-zk10-native-intrinsics-v1");
 const { types: { isProxy } } = require("node:util");
 const NATIVE_IS_BUFFER = Buffer.isBuffer.bind(Buffer);
+const NATIVE_ARRAY_CTOR = Array;
 // This detached facade is created before any caller-owned KeyObject getter.
 // A live export lookup after the callback can substitute the valid decoded C
 // for raw B while the genuine offline owner checkpoint still hashes B.
@@ -81,7 +83,19 @@ function b64(value, min, max = min) {
 function key(value, kind) {
   if (!(value instanceof crypto.KeyObject) || value.type !== kind
     || value.asymmetricKeyType !== "ed25519") fail();
-  return value;
+  if (kind === "private") return value; // Never export private material.
+  try {
+    // A caller-controlled Symbol(kHandle) getter can return genuine key B
+    // during SPKI export and genuine key A during Ed25519 verification.
+    // Export ONCE with the original native method, reimport the exact 44
+    // bytes, and retain only that fresh stable KeyObject for BOTH operations.
+    const originalSpki = nativeEd25519Spki(value);
+    const pinned = NATIVE_CREATE_PUBLIC_KEY({
+      key: originalSpki, format: "der", type: "spki",
+    });
+    if (NATIVE_BUFFER_COMPARE(nativeEd25519Spki(pinned), originalSpki) !== 0) fail();
+    return pinned;
+  } catch { fail(); }
 }
 function digest(data) {
   const hash = NATIVE_CREATE_HASH("sha256");
@@ -166,9 +180,12 @@ async function verifyOwnerInventoryEnrollment(input) {
     if (!NATIVE_ARRAY_IS_ARRAY(r.checkpoints) || isProxy(r.checkpoints) ||
         r.checkpoints.length < 1 || r.checkpoints.length > 64 ||
         NATIVE_OWN_KEYS(r.checkpoints).length !== r.checkpoints.length + 1) fail();
-    const checked = new Array(r.checkpoints.length);
+    const checked = new NATIVE_ARRAY_CTOR(r.checkpoints.length);
     for (let index = 0; index < checked.length; index += 1) {
-      const descriptor = NATIVE_DESCRIPTOR(r.checkpoints, String(index));
+      // Numeric keys are converted by the native descriptor operation. The
+      // ambient String constructor may have been replaced by an earlier
+      // caller-owned KeyObject getter in this same realm.
+      const descriptor = NATIVE_DESCRIPTOR(r.checkpoints, index);
       if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail();
       const record = exact(descriptor.value, SIGNED_FIELDS);
       const unsigned = NATIVE_OBJECT_CREATE(null);
@@ -178,25 +195,22 @@ async function verifyOwnerInventoryEnrollment(input) {
       }
       const current = statement(unsigned);
       const signature = b64(record.signature, 64);
-      checked[index] = { current, signature, recordDigest: checkpointDigest(record) };
+      // Native numeric keys plus own DATA slots bypass poisoned String,
+      // Array constructors and inherited numeric setters.
+      NATIVE_DEFINE_PROPERTY(checked, index, {
+        value: { current, signature, recordDigest: checkpointDigest(record) },
+        enumerable: true, writable: true, configurable: true,
+      });
     }
-    // A caller-owned KeyObject can swap its native kHandle after exporting
-    // SPKI B and before Ed25519 verification. Reimport the exact detached
-    // DER bytes and use only those new native keys for signatures and nested
-    // inventory verification; the fingerprint and verifier must be identical.
-    const ownerSpki = nativeEd25519Spki(key(r.ownerPublicKey, "public"));
-    const inventorySpki = nativeEd25519Spki(key(r.inventoryPublicKey, "public"));
-    const ownerKey = NATIVE_CREATE_PUBLIC_KEY({
-      key: ownerSpki, format: "der", type: "spki",
-    });
-    const inventoryKey = NATIVE_CREATE_PUBLIC_KEY({
-      key: inventorySpki, format: "der", type: "spki",
-    });
-    if (digest(ownerSpki) !== pinnedOwnerSpki) fail();
-    const signerFingerprint = digest(inventorySpki);
+    const ownerKey = key(r.ownerPublicKey, "public");
+    const inventoryKey = key(r.inventoryPublicKey, "public");
+    if (spkiHash(ownerKey) !== pinnedOwnerSpki) fail();
+    const signerFingerprint = spkiHash(inventoryKey);
     let previous = null;
     for (let index = 0; index < checked.length; index += 1) {
-      const { current, signature, recordDigest } = checked[index];
+      const slot = NATIVE_DESCRIPTOR(checked, index);
+      if (!slot || !NATIVE_HAS_OWN(slot, "value")) fail();
+      const { current, signature, recordDigest } = slot.value;
       if (!NATIVE_VERIFY(null, bytes(current), ownerKey, signature)) fail();
       compareScope(current, expectedScope);
       if (current.inventory_spki_sha256 !== signerFingerprint

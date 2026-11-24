@@ -2489,6 +2489,7 @@ function getShareAuditActor(req) {
 
 function logShareAudit(req, eventType, token, link, action, result, details = {}) {
   const auditTokenId = crypto.createHash("sha256").update(token, "utf8").digest("hex");
+  const capability = link?.shareKind === "capability-v1" || token.startsWith("C");
   auditLog(
     eventType,
     redactShareTokenFromAuditValue(getShareAuditActor(req), token),
@@ -2496,8 +2497,8 @@ function logShareAudit(req, eventType, token, link, action, result, details = {}
     action,
     result,
     redactShareTokenFromAuditValue({
-      fileName: link?.fileName || null,
-      folderId: link?.folderId || ROOT_FOLDER_ID,
+      fileName: capability ? null : link?.fileName || null,
+      folderId: capability ? null : link?.folderId || ROOT_FOLDER_ID,
       ...details,
     }, token)
   );
@@ -2510,6 +2511,42 @@ function getShareFileInfo(link) {
 
   const filePath = path.join(getFolderStoragePath("./uploads", folderId), fileName);
   return { folderId, fileName, filePath };
+}
+
+// A capability pins the opened file generation, not the mutable filename. Use
+// the same verified file-handle path as byte serving and bind to its inode and
+// change timestamps. Cloud cache hydration has no durable inode, so issuing
+// these local-file capabilities is disabled for cloud providers.
+function shareFileIdentity(filePath, openedStats = null) {
+  let handle;
+  try {
+    const stats = openedStats || (handle = openReadHandle(filePath)).stats;
+    const values = [stats.dev, stats.ino, stats.size, stats.birthtimeMs, stats.mtimeMs];
+    if (values.some((value) => !Number.isFinite(value))) return null;
+    return crypto.createHash("sha256").update(JSON.stringify(values)).digest("hex");
+  } catch {
+    return null;
+  } finally {
+    if (handle) fs.closeSync(handle.fd);
+  }
+}
+
+function shareCapabilityMatches(link, fileInfo, token, openedStats = null) {
+  // Legacy tokens are lowercase; the reserved uppercase C prefix survives
+  // loss of metadata_json, so corrupt capability records cannot downgrade.
+  if (!token.startsWith("C") && link.shareKind === undefined) return true;
+  const binding = link.resourceBinding;
+  if (link.shareKind !== "capability-v1" || binding?.version !== 1
+    || binding.folderId !== fileInfo.folderId || binding.fileName !== fileInfo.fileName
+    || typeof binding.identity !== "string" || !/^[a-f0-9]{64}$/.test(binding.identity)) return false;
+  const currentIdentity = shareFileIdentity(fileInfo.filePath, openedStats);
+  return currentIdentity !== null && currentIdentity === binding.identity;
+}
+
+function shareCapabilityPageAvailable(link, token) {
+  if (!token.startsWith("C")) return true;
+  const fileInfo = getShareFileInfo(link);
+  return Boolean(fileInfo && shareCapabilityMatches(link, fileInfo, token));
 }
 
 async function ensureShareFileAvailable(link) {
@@ -2661,7 +2698,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
   }
 
   const fileInfo = await ensureShareFileAvailable(link);
-  if (!fileInfo) return { status: 404, error: "Link indisponivel." };
+  if (!fileInfo || !shareCapabilityMatches(link, fileInfo, token)) return { status: 404, error: "Link indisponivel." };
 
   // Provider hydration yields the event loop. Reload and revalidate the link so
   // concurrent requests cannot consume the same final view/download allowance
@@ -2672,6 +2709,7 @@ async function resolveShareAccess(req, res, token, options = {}) {
   if (!currentLink || currentLink.fileName !== link.fileName || (currentLink.folderId || ROOT_FOLDER_ID) !== (link.folderId || ROOT_FOLDER_ID)) {
     return { status: 404, error: "Link indisponivel." };
   }
+  if (!shareCapabilityMatches(currentLink, fileInfo, token)) return { status: 404, error: "Link indisponivel." };
   const currentExpiresAt = new Date(currentLink.expiresAt).getTime();
   if (!Number.isFinite(currentExpiresAt) || currentExpiresAt <= Date.now()) {
     logShareAudit(req, "share.expired", token, currentLink, "expired", "failure");
@@ -2781,11 +2819,14 @@ async function resolveShareAccess(req, res, token, options = {}) {
 
   // Run synchronously as close as possible to streaming the bytes. The link
   // may change while the file lookup and authorization requests are awaited.
-  const revalidateStreamAccess = () => {
+  const revalidateStreamAccess = (readHandle = null) => {
     const latestLinks = loadPublicLinks();
     const latestLink = latestLinks[token];
     if (!latestLink || latestLink.fileName !== currentLink.fileName
       || (latestLink.folderId || ROOT_FOLDER_ID) !== (currentLink.folderId || ROOT_FOLDER_ID)) {
+      return { status: 404, error: "Link indisponivel." };
+    }
+    if (!shareCapabilityMatches(latestLink, fileInfo, token, readHandle?.stats)) {
       return { status: 404, error: "Link indisponivel." };
     }
     const latestExpiresAt = new Date(latestLink.expiresAt).getTime();
@@ -2822,11 +2863,11 @@ async function resolveShareAccess(req, res, token, options = {}) {
     return null;
   };
 
-  const reserveDownloadQuota = () => {
+  const reserveDownloadQuota = (readHandle = null) => {
     if (!options.countDownload) return null;
     // A repeat preview can already have paid its quota. Recheck its
     // capability and token even then, in both SQLite and JSON storage.
-    const failure = revalidateStreamAccess();
+    const failure = revalidateStreamAccess(readHandle);
     if (failure) return failure;
     if (downloadAlreadyCounted) return null;
     if (shouldUseDatabase()) {
@@ -4047,7 +4088,7 @@ function sendOptimizedFile(req, res, filePath, downloadName, dispositionType = "
   if (typeof options.beforeSend === "function") {
     let rejection;
     try {
-      rejection = options.beforeSend();
+      rejection = options.beforeSend(readHandle);
     } catch {
       try { fs.closeSync(fd); } catch {}
       return res.status(500).send("Erro ao autorizar transmissao");
@@ -6183,6 +6224,249 @@ app.use((req, res, next) => {
   if (req.path === "/sync/v1" || req.path.startsWith("/sync/v1/")) return syncJsonParser(req, res, next);
   return express.json()(req, res, next);
 });
+
+// Deliberately opt-in, development/test only. The shared /ws socket already
+// authenticates and limits the session; the room broker rechecks the current
+// authoritative user/permission record for every room action and delivery.
+const ROOTARK_P2P_EXPERIMENTAL = ["development", "test"].includes(NODE_ENV)
+  && process.env.ROOTARK_P2P_EXPERIMENTAL === "true";
+// Mirror the broker's explicit room protocol. Only these dev/test frames may
+// use its separate 120/10s limit; ordinary /ws events stay on the 30-frame
+// realtime budget, including malformed or oversized attempted P2P frames.
+const P2P_ROOM_MESSAGE_TYPES = new Set([
+  "join", "invite", "revoke", "kick", "request-peer", "consent", "signal",
+]);
+function registerExperimentalP2p() {
+  if (!ROOTARK_P2P_EXPERIMENTAL) return;
+  const { makeBroker } = require("./experiments/issue242-webrtc/server.cjs");
+  const p2pUser = (username) => loadUsers({ failOnDatabaseError: true, allowJsonFallback: false })
+    .find((user) => user.username === username);
+  const p2pAuthenticator = createRealtimeAuthenticator({
+    jwt, jwtSecret: JWT_SECRET, loadUser: p2pUser, normalizeUserPermissions,
+  });
+  const MAX_P2P_CIPHERTEXT = 32 * 1024 * 1024;
+  async function currentP2pCiphertext(folderId, fileName, expectedSize) {
+    // This remains local-only and dev/test-only: no reads from cloud caches,
+    // no symlinks, no hardlinked aliases and never decrypt any stored bytes.
+    let handle;
+    try {
+      if (!Number.isSafeInteger(expectedSize) || expectedSize < 1
+        || expectedSize > MAX_P2P_CIPHERTEXT) return null;
+      const directory = getFolderStoragePath("./uploads", folderId);
+      const source = path.resolve(directory, fileName);
+      if (!isSafeChildPath("./uploads", directory) ||
+        !isSafeFolderChildPath(directory, source)) return null;
+      const expectedDirectory = path.normalize(directory);
+      const directoryStillTrusted = async () => {
+        const real = path.normalize(await fs.promises.realpath(directory));
+        return process.platform === "win32"
+          ? real.toLowerCase() === expectedDirectory.toLowerCase()
+          : real === expectedDirectory;
+      };
+      if (!await directoryStillTrusted()) return null;
+      const expectedBytes = BigInt(expectedSize);
+      const validFile = (stats) => stats.isFile() && !stats.isSymbolicLink()
+        && stats.ino !== 0n && stats.nlink === 1n && stats.size === expectedBytes;
+      const sameVersion = (a, b) => a.dev === b.dev && a.ino === b.ino
+        && a.size === b.size && a.nlink === b.nlink
+        && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs
+        && a.birthtimeNs === b.birthtimeNs && a.mode === b.mode;
+      // Windows Node has no O_NOFOLLOW: deny a preexisting reparse point
+      // BEFORE open. This precheck alone is NOT an atomic native no-reparse
+      // guarantee against a privileged concurrent filesystem attacker.
+      let windowsPrecheck = null;
+      if (process.platform === "win32") {
+        windowsPrecheck = await fs.promises.lstat(source, { bigint: true });
+        if (!validFile(windowsPrecheck)) return null;
+      }
+      // POSIX opens the pinned FD FIRST (O_NOFOLLOW also rejects a symlink
+      // atomically). O_NONBLOCK prevents blocking on a hostile FIFO before
+      // fstat can reject its type.
+      handle = await fs.promises.open(source, fs.constants.O_RDONLY
+        | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+      const opened = await handle.stat({ bigint: true });
+      if (!validFile(opened)) return null;
+      const pathname = await fs.promises.lstat(source, { bigint: true });
+      if (!validFile(pathname) || !sameVersion(opened, pathname)
+        || (windowsPrecheck && !sameVersion(windowsPrecheck, pathname))
+        || !await directoryStillTrusted()) return null;
+      const bytes = Buffer.allocUnsafe(512 * 1024);
+      const digestHandle = async () => {
+        const hash = crypto.createHash("sha256");
+        for (let offset = 0; offset < expectedSize;) {
+          const { bytesRead } = await handle.read(bytes, 0,
+            Math.min(bytes.length, expectedSize - offset), offset);
+          if (bytesRead <= 0) return null;
+          hash.update(bytes.subarray(0, bytesRead));
+          offset += bytesRead;
+        }
+        return hash.digest("hex");
+      };
+      let first;
+      let second;
+      try {
+        first = await digestHandle();
+        if (!first) return null;
+        // Re-hash the pinned FD so same-tick overwrites without stat deltas fail closed.
+        second = await digestHandle();
+      } finally {
+        bytes.fill(0);
+      }
+      if (!second || first !== second) return null;
+      const after = await handle.stat({ bigint: true });
+      const current = await fs.promises.lstat(source, { bigint: true });
+      if (!validFile(after) || !validFile(current)
+        || !sameVersion(opened, after) || !sameVersion(after, current)
+        || !await directoryStillTrusted()) return null;
+      return { bytes: expectedSize, sha256: first };
+    } catch { return null; }
+    finally { if (handle) await handle.close(); }
+  }
+  // This gate deliberately uses the existing, explicit per-file encrypted ACL.
+  // It is NOT a ZK owner-signed capability: no grant from another branch or
+  // decryption key is accepted. Exact folder+filename and object metadata are
+  // pinned to each room so replacing an object cannot inherit an old invite.
+  const authorizeP2pObject = async ({ owner, recipient, boundObject, pin }) => {
+    const { folderId, fileName } = boundObject || {};
+    if (typeof folderId !== "string" || typeof fileName !== "string"
+      || !/^[a-zA-Z0-9_-]{1,80}$/.test(folderId)
+      || fileName.length < 1 || fileName.length > 100
+      || path.basename(fileName) !== fileName
+      || /[/\\\x00-\x1f\x7f]/.test(fileName) || isCloudStorageEnabled()) return null;
+    // Cheap, synchronous deny BEFORE touching up to 32 MiB of ciphertext.
+    // A non-owner or unlisted recipient must never induce a disk hash; the
+    // complete fresh ACL/metadata check below still runs AFTER the awaited
+    // ciphertext read, so revocation during hashing remains fail closed.
+    const prior = loadEncryptedFiles()[getEncryptedFileKey(folderId, fileName)];
+    const earlyOwner = p2pUser(owner);
+    const earlyRecipient = recipient === null ? null : p2pUser(recipient);
+    const earlyFolder = getFolderById(folderId);
+    const earlyAcl = prior?.accessControl;
+    const earlyFileEntry = getFilePermissionEntry(folderId, fileName, loadFilePermissions());
+    const earlyFileAcl = earlyFileEntry && normalizeFilePermissionEntry(earlyFileEntry);
+    if (!earlyOwner || earlyOwner.disabled || normalizeUserPermissions(earlyOwner).listFiles !== true
+      || (recipient !== null && (!earlyRecipient || earlyRecipient.disabled
+        || normalizeUserPermissions(earlyRecipient).listFiles !== true))
+      || !earlyFolder || !isFolderAvailable(folderId)
+      || isFileExpired(folderId, fileName) || isFileInTrash(folderId, fileName)
+      || isStoredVersionFile(folderId, fileName)
+      || restoreProviderOrphans.isSuppressed(folderId, fileName, "uploads")
+      || !prior || prior.folderId !== folderId || prior.fileName !== fileName
+      || !["user-key", "dual"].includes(prior.encryptionLevel)
+      || prior.algorithm !== "aes-256-gcm"
+      || !Number.isSafeInteger(prior.encryptedSize) || prior.encryptedSize < 1
+      || !earlyAcl || earlyAcl.owner !== owner || !Array.isArray(earlyAcl.authorizedUsers)
+      || !earlyAcl.authorizedUsers.includes(owner)
+      || (recipient !== null && !earlyAcl.authorizedUsers.includes(recipient))
+      || (earlyAcl.expiresAt !== null && earlyAcl.expiresAt !== undefined
+        && (!Number.isFinite(Date.parse(earlyAcl.expiresAt)) || Date.parse(earlyAcl.expiresAt) <= Date.now()))
+      || !earlyFileEntry || earlyFileEntry.public !== false || earlyFileAcl?.owner !== owner
+      || (recipient !== null && !earlyFileAcl.users?.[recipient]?.read)
+      || !hasFolderAccess({ user: earlyOwner }, earlyFolder)
+      || !hasFileAccess({ user: earlyOwner }, earlyFolder, fileName)
+      || (recipient !== null && (!hasFolderAccess({ user: earlyRecipient }, earlyFolder)
+        || !hasFileAccess({ user: earlyRecipient }, earlyFolder, fileName)))) return null;
+    // No path/mtime cache can substitute for the current ciphertext SHA-256.
+    const ciphertext = await currentP2pCiphertext(folderId, fileName, prior?.encryptedSize);
+    if (!ciphertext) return null;
+    const ownerUser = p2pUser(owner);
+    const recipientUser = recipient === null ? null : p2pUser(recipient);
+    if (!ownerUser || ownerUser.disabled || normalizeUserPermissions(ownerUser).listFiles !== true
+      || (recipient !== null && (!recipientUser || recipientUser.disabled
+        || normalizeUserPermissions(recipientUser).listFiles !== true))) return null;
+    const folder = getFolderById(folderId);
+    if (!folder || !isFolderAvailable(folderId) || isFileExpired(folderId, fileName)
+      || isFileInTrash(folderId, fileName) || isStoredVersionFile(folderId, fileName)
+      || restoreProviderOrphans.isSuppressed(folderId, fileName, "uploads")) return null;
+    const metadata = loadEncryptedFiles()[getEncryptedFileKey(folderId, fileName)];
+    const acl = metadata?.accessControl;
+    // Legacy hasFileAccess defaults an absent file-permissions record to
+    // public. A protected room may not treat missing/failed ACL storage as an
+    // affirmative recipient grant: require the private explicit owner ACL.
+    const fileAclEntry = getFilePermissionEntry(folderId, fileName, loadFilePermissions());
+    const fileAcl = fileAclEntry && normalizeFilePermissionEntry(fileAclEntry);
+    if (!metadata || metadata.folderId !== folderId || metadata.fileName !== fileName
+      || !["user-key", "dual"].includes(metadata.encryptionLevel)
+      || metadata.algorithm !== "aes-256-gcm"
+      || !Number.isSafeInteger(metadata.encryptedSize) || metadata.encryptedSize < 1
+      || !Number.isSafeInteger(metadata.size) || metadata.size < 1
+      || !Array.isArray(metadata.layers) || metadata.layers.length < 1
+      || typeof metadata.uploadedAt !== "string" || !Number.isFinite(Date.parse(metadata.uploadedAt))
+      || !acl || acl.owner !== owner || !Array.isArray(acl.authorizedUsers)
+      || !acl.authorizedUsers.includes(owner)
+      || !fileAclEntry || fileAclEntry.public !== false || fileAcl?.owner !== owner
+      || (recipient !== null && !fileAcl.users[recipient]?.read)
+      || (acl.expiresAt !== null && acl.expiresAt !== undefined &&
+        (!Number.isFinite(Date.parse(acl.expiresAt)) || Date.parse(acl.expiresAt) <= Date.now()))) return null;
+    const permitted = (user) => hasFolderAccess({ user }, folder) &&
+      hasFileAccess({ user }, folder, fileName);
+    if (!permitted(ownerUser) || (recipient !== null &&
+      (!acl.authorizedUsers.includes(recipient) || !permitted(recipientUser)))) return null;
+    if (metadata.encryptedSize !== ciphertext.bytes) return null;
+    // Ignore only mutable ACL membership and its timestamp. Every other
+    // security-relevant metadata field must remain byte-for-byte stable.
+    const { accessControl: _acl, updatedAt: _updatedAt, ...pinnedMetadata } = metadata;
+    const fingerprint = crypto.createHash("sha256")
+      .update(JSON.stringify(pinnedMetadata)).update(ciphertext.sha256).digest("hex");
+    if (pin !== null && fingerprint !== pin) return null;
+    return { fingerprint, ...ciphertext };
+  };
+  const p2pBroker = makeBroker({
+    sharedWss: wss,
+    authenticateSession: (req) => {
+      const user = p2pAuthenticator(parseCookies(req.headers.cookie).get("rootark_session"));
+      return user?.permissions.listFiles === true ? user : null;
+    },
+    authorizeRecipient: (_host, username) => {
+      const recipient = p2pUser(username);
+      return recipient && !recipient.disabled && normalizeUserPermissions(recipient).listFiles === true
+        ? { username: recipient.username, sessionVersion: recipient.sessionVersion || 0 } : null;
+    },
+    authorizeObject: authorizeP2pObject,
+  });
+  const p2pDir = path.join(__dirname, "experiments", "issue242-webrtc");
+  const p2pCsp = [
+    "default-src 'none'", "script-src 'self'", "style-src 'self' 'unsafe-inline'",
+    "connect-src 'self' ws: wss:", "img-src 'self'", "object-src 'none'",
+    "base-uri 'none'", "form-action 'none'", "frame-ancestors 'self'",
+  ].join("; ");
+  const p2pHeaders = (res) => res.set({
+    "Cache-Control": "no-store", "Content-Security-Policy": p2pCsp,
+    "Cross-Origin-Resource-Policy": "same-origin",
+  });
+  app.get("/p2p", authenticate, requirePermission("listFiles"), (req, res, next) =>
+    req.path === "/p2p" ? res.redirect(302, "/p2p/") : next());
+  app.get("/p2p/", authenticate, requirePermission("listFiles"), (_req, res) =>
+    p2pHeaders(res).type("text/html").send(fs.readFileSync(path.join(p2pDir, "index.html"))));
+  for (const asset of ["client.js", "transfer-protocol.js"]) {
+    app.get("/p2p/" + asset, authenticate, requirePermission("listFiles"), (_req, res) =>
+      p2pHeaders(res).type("application/javascript").send(fs.readFileSync(path.join(p2pDir, asset))));
+  }
+  app.post("/p2p/rooms", authenticate, requirePermission("listFiles"), async (req, res) => {
+    if (req.get("origin") !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+      return res.status(403).json({ error: "Origin denied" });
+    }
+    let result;
+    try { result = await p2pBroker.createRoom(req, res); }
+    catch {
+      if (res.destroyed) return;
+      return res.status(403).json({ error: "Sala indisponivel" });
+    }
+    if (res.destroyed) return;
+    if (result.status !== 200) return res.status(result.status).json({ error: "Sala indisponivel" });
+    const { roomId, hostKey, expires, boundObject } = result;
+    return p2pHeaders(res).json({ roomId, hostKey, expires, ...(boundObject ? { boundObject } : {}) });
+  });
+  app.post("/p2p/rooms/release", authenticate, requirePermission("listFiles"), (req, res) => {
+    if (req.get("origin") !== getExpectedOrigin(req, app.get("trust proxy fn"))) {
+      return res.status(403).json({ error: "Origin denied" });
+    }
+    const result = p2pBroker.releaseReservedRoom(req, req.body);
+    return res.sendStatus(result.status);
+  });
+  server.once("close", () => { void p2pBroker.close(); });
+}
+
 // DEV-OFF deny-only guard for authenticated legacy HTTP reads. JWT proves a
 // session, NOT an independently signed immutable owner/account cutover state.
 // There is no off-host monotonic floor or external authority in this process.
@@ -6312,24 +6596,32 @@ wss.on("connection", (socket, req) => {
     if (restoreService.isWholeRestoreBlocked()) return socket.close(1012, "Restore recovery required");
     if (!refreshRealtimeUser(socket)) return;
     if (isBinary) return socket.close(1003, "Quadro binario nao suportado");
-    const now = Date.now();
-    if (now - socket.realtimeRate.startedAt >= REALTIME_RATE_WINDOW_MS) socket.realtimeRate = { startedAt: now, count: 0 };
-    socket.realtimeRate.count += 1;
-    if (socket.realtimeRate.count > REALTIME_MAX_MESSAGES_PER_WINDOW) return socket.close(1008, "Limite de mensagens excedido");
     let message = {};
     try {
       message = JSON.parse(rawMessage.toString());
     } catch {
-      return;
+      message = null;
+    }
+    const p2pRoomFrame = ROOTARK_P2P_EXPERIMENTAL && rawMessage.length <= 16_384
+      && message && typeof message === "object" && !Array.isArray(message)
+      && !Object.hasOwn(message, "event") && P2P_ROOM_MESSAGE_TYPES.has(message.type);
+    if (!p2pRoomFrame) {
+      // The experimental room broker independently enforces 120/10s on P2P
+      // frames. Do not spend this separate budget on valid room signalling.
+      const now = Date.now();
+      if (now - socket.realtimeRate.startedAt >= REALTIME_RATE_WINDOW_MS) socket.realtimeRate = { startedAt: now, count: 0 };
+      socket.realtimeRate.count += 1;
+      if (socket.realtimeRate.count > REALTIME_MAX_MESSAGES_PER_WINDOW) return socket.close(1008, "Limite de mensagens excedido");
     }
 
-    if (message.event === "ping") {
+    if (message?.event === "ping") {
       sendRealtime(socket, "pong", {});
     }
   });
 });
 
 const requirePermission = createRequirePermission();
+registerExperimentalP2p();
 
 // Opt-in authenticated ZK-1 ciphertext I/O with pinned remote CAS + witness.
 // This is an experimental single-scope integration, not a replacement for
@@ -12014,7 +12306,17 @@ registerTrashRoutes(app, {
   trashService,
 });
 
-app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"), async (req, res) => {
+const createPublicShare = async (req, res) => {
+  const isCapability = req.route.path === "/share/capabilities";
+  // A capability must never silently ignore a requested broader operation,
+  // recipient restriction, or client-provided decryption material.
+  if (isCapability && (!req.body || typeof req.body !== "object" || Array.isArray(req.body)
+    || !Object.hasOwn(req.body, "permissions")
+    || Object.keys(req.body).some((key) => ![
+      "name", "folderId", "expiresInMinutes", "maxViews", "maxDownloads", "password", "permissions",
+    ].includes(key)))) {
+    return res.status(400).json({ error: "Escopo de capacidade invalido" });
+  }
   const rawName = typeof req.body.name === "string" ? req.body.name.trim() : "";
   const name = path.basename(rawName);
   const expiresInMinutes = getShareExpirationMinutes(req.body.expiresInMinutes);
@@ -12059,6 +12361,10 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     return res.status(400).json({ error: "Permissoes do link invalidas. Use uma lista sem repeticao de: view, preview, download." });
   }
 
+  if (isCapability && isCloudStorageEnabled()) {
+    return res.status(409).json({ error: "Capacidades de arquivo local indisponiveis para cache remoto" });
+  }
+
   if (!hasPublicShareAccess(req, folder, name)) {
     return res.status(403).json({ error: "Acesso negado a este arquivo" });
   }
@@ -12097,8 +12403,16 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
   if (getEncryptedFileMetadata(finalFolder.id, name)) {
     return res.status(403).json({ error: "Links publicos nao estao disponiveis para arquivos criptografados" });
   }
+  const resourceBinding = isCapability ? (() => {
+    const info = getShareFileInfo({ folderId: finalFolder.id, fileName: name });
+    const identity = info && shareFileIdentity(info.filePath);
+    return identity ? { version: 1, folderId: finalFolder.id, fileName: name, identity } : null;
+  })() : null;
+  if (isCapability && !resourceBinding) return res.status(404).json({ error: "Arquivo nao encontrado" });
   const links = cleanupExpiredPublicLinks();
-  const shareToken = crypto.randomBytes(24).toString("hex");
+  const shareToken = isCapability
+    ? `C${crypto.randomBytes(24).toString("hex").slice(1)}`
+    : crypto.randomBytes(24).toString("hex");
   const expiresAt = new Date(Date.now() + expiresInMinutes * 60 * 1000).toISOString();
   links[shareToken] = {
     fileName: name,
@@ -12112,21 +12426,23 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     maxDownloads,
     passwordHash,
     permissions: sharePermissions,
+    ...(isCapability ? { shareKind: "capability-v1", resourceBinding } : {}),
     activeViewers: {},
   };
   savePublicLinks(links);
-  addActionHistory("share_created", name, req.user.username, {
+  addActionHistory(isCapability ? "share_capability_created" : "share_created",
+    isCapability ? "" : name, req.user.username, {
     expiresAt,
-    folderId: currentFolder.id,
-    folderName: currentFolder.name,
+    ...(!isCapability ? { folderId: currentFolder.id, folderName: currentFolder.name } : {}),
     maxViews,
     maxDownloads,
     passwordProtected: Boolean(passwordHash),
     permissions: sharePermissions,
   });
-  auditLog("share.created", getAuditActor(req), { type: "file", id: name }, "created", "success", {
-    folderId: currentFolder.id,
-    token: shareToken,
+  auditLog(isCapability ? "share.capability_created" : "share.created", getAuditActor(req),
+    isCapability ? { type: "public_link", id: crypto.createHash("sha256").update(shareToken).digest("hex") }
+      : { type: "file", id: name }, "created", "success", {
+    ...(!isCapability ? { folderId: currentFolder.id, token: shareToken } : {}),
     expiresAt,
     maxViews,
     maxDownloads,
@@ -12144,10 +12460,33 @@ app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"),
     maxDownloads,
     passwordProtected: Boolean(passwordHash),
     permissions: sharePermissions,
+    ...(isCapability ? { capability: true, scope: { type: "file", folderId: finalFolder.id, fileName: name } } : {}),
     remainingViews: maxViews > 0 ? maxViews : null,
     remainingDownloads: maxDownloads > 0 ? maxDownloads : null,
   });
   }, res);
+};
+
+app.post("/share", shareRateLimit, authenticate, requirePermission("listFiles"), createPublicShare);
+app.post("/share/capabilities", shareRateLimit, authenticate, requirePermission("listFiles"), createPublicShare);
+
+app.delete("/share/capabilities/:token", shareRateLimit, authenticate, requirePermission("listFiles"), (req, res) => {
+  const token = validateShareToken(req.params.token);
+  if (!token) return res.status(404).json({ error: "Capacidade indisponivel" });
+  const links = loadPublicLinks();
+  const link = links[token];
+  if (!link || link.shareKind !== "capability-v1") {
+    return res.status(404).json({ error: "Capacidade indisponivel" });
+  }
+  if (!sameUsername(link.createdBy, req.user.username)) {
+    return res.status(403).json({ error: "Acesso negado" });
+  }
+  delete links[token];
+  savePublicLinks(links);
+  auditLog("share.capability_revoked", getAuditActor(req),
+    { type: "public_link", id: crypto.createHash("sha256").update(token).digest("hex") },
+    "revoked", "success", { scope: "file" });
+  return res.status(204).end();
 });
 
 app.get("/share/:token", shareRateLimit, (req, res) => {
@@ -12158,7 +12497,7 @@ app.get("/share/:token", shareRateLimit, (req, res) => {
 
   const links = loadPublicLinks();
   const link = links[shareToken];
-  if (!link) {
+  if (!link || !shareCapabilityPageAvailable(link, shareToken)) {
     return res.status(404).type("html").send(getShareFailurePage("Este link nao esta disponivel."));
   }
 
@@ -12199,7 +12538,7 @@ app.post("/share/:token/status", shareRateLimit, requireSameOriginPublicShareMut
   if (!shareToken) return res.status(404).json({ error: "Link indisponivel." });
 
   const link = loadPublicLinks()[shareToken];
-  if (!link) return res.status(404).json({ error: "Link indisponivel." });
+  if (!link || !shareCapabilityPageAvailable(link, shareToken)) return res.status(404).json({ error: "Link indisponivel." });
 
   const expiresAt = new Date(link.expiresAt).getTime();
   if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
@@ -12253,8 +12592,8 @@ app.post("/share/:token/download", shareRateLimit, requireSameOriginPublicShareM
 
   sendOptimizedFile(req, res, access.fileInfo.filePath, access.fileInfo.fileName, "attachment", {
     cacheControl: "private, max-age=600",
-    beforeSend: () => {
-      const rejection = access.reserveDownload();
+    beforeSend: (readHandle) => {
+      const rejection = access.reserveDownload(readHandle);
       if (!rejection) setShareDownloadReceiptCookie(req, res, shareToken);
       return rejection;
     },

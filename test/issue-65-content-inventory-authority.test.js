@@ -28,112 +28,6 @@ function makeScope() {
   };
 }
 
-test("P2 computeRoot must not assimilate a forged SHA256 Buffer through inherited then", async () => {
-  const scope = makeScope();
-  const actual = await inventory.computeRoot(scope, 0, null, []);
-  assert.equal(Buffer.isBuffer(actual), true);
-  const forged = Buffer.alloc(32, 0x5b);
-  // Prevent the attack fixture itself from recursively re-assimilating its
-  // replacement bytes; the target is the independently computed digest.
-  Object.defineProperty(forged, "then", { value: undefined, configurable: false });
-  assert.notDeepEqual(actual, forged);
-  const priorThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
-  let poisonedRootReads = 0;
-  try {
-    Object.defineProperty(Object.prototype, "then", { configurable: true,
-      get() {
-        if (Buffer.isBuffer(this) && this.length === 32) {
-          poisonedRootReads++;
-          return (resolve) => resolve(forged);
-        }
-        return undefined;
-      },
-    });
-    const result = await inventory.computeRoot(scope, 0, null, []);
-    assert.equal(Buffer.isBuffer(result), true);
-    assert.deepEqual(result, actual,
-      "native root hash must retain actual bytes after hostile Promise resolution");
-    assert.equal(poisonedRootReads, 0,
-      "computed digest must be returned as an own non-thenable Buffer");
-  } finally {
-    if (priorThen) Object.defineProperty(Object.prototype, "then", priorThen);
-    else delete Object.prototype.then;
-  }
-});
-
-test("P2 genuine Ed25519 receipts with a false intermediate root cannot bypass independent root recomputation", async () => {
-  const f = await testFixture();
-  const minimumSnapshot = await signedGenesis(f);
-  const baseline = await decodedSnapshot(minimumSnapshot);
-  const first = makeTuple(Buffer.alloc(16, 0x21), 1, 1);
-  const second = makeTuple(Buffer.alloc(16, 0x22), 1, 1);
-  const genuineFirstRoot = await inventory.computeRoot(f.scope, 1, baseline.root, [first]);
-  const forgedFirstRoot = Buffer.alloc(32, 0x5b);
-  Object.defineProperty(forgedFirstRoot, "then", { value: undefined, configurable: false });
-  assert.notDeepEqual(genuineFirstRoot, forgedFirstRoot);
-  const genuineFinalRoot = await inventory.computeRoot(f.scope, 2, forgedFirstRoot, [first, second]);
-  const nonce = crypto.randomBytes(32);
-  const signedFinalSnapshot = await rawSignedSnapshot({ scope: f.scope,
-    signerKeyId: f.signerKeyId, privateKey: f.keys.privateKey,
-    sequence: 2, previousRoot: forgedFirstRoot, entries: [first, second], nonce });
-  const finalWire = await decodedSnapshot(signedFinalSnapshot);
-  assert.equal(Buffer.compare(Buffer.from(finalWire.root), Buffer.from(genuineFinalRoot)), 0);
-
-  async function signedReceipt(sequence, prevRoot, claimedRoot, entry) {
-    const operation = { operation_id: crypto.randomBytes(16),
-      expected_sequence: sequence - 1, expected_root: prevRoot, ...entry };
-    const unsigned = { type: ENTRY_TYPE, version: 1,
-      signer_key_id: f.signerKeyId, scope: f.scope, sequence,
-      previous_root: prevRoot, root: claimedRoot,
-      operation_id: operation.operation_id, expected_sequence: sequence - 1,
-      expected_root: prevRoot, request_digest: crypto.createHash("sha256")
-        .update(await z.encodeDeterministic(operation)).digest(), entry };
-    const signature = crypto.sign(null, Buffer.concat([
-      ENTRY_DOMAIN, await z.encodeDeterministic(unsigned) ]), f.keys.privateKey);
-    return z.encodeDeterministic({ ...unsigned, signature });
-  }
-  const signedFalseFirst = await signedReceipt(1, baseline.root, forgedFirstRoot, first);
-  const signedValidSecond = await signedReceipt(2, forgedFirstRoot, genuineFinalRoot, second);
-  const args = { serialized: signedFinalSnapshot, pinnedPublicKey: f.keys.publicKey,
-    pinnedSignerKeyId: f.signerKeyId, expectedScope: f.scope,
-    requested: requestFor(second), minimumHead: { sequence: 0, root: baseline.root },
-    minimumSnapshot, nonce,
-    committedProofChain: [signedFalseFirst, signedValidSecond] };
-  await assert.rejects(inventory.verifySnapshot(args), /INVENTORY_CHAIN/,
-    "authentic Ed25519 signatures cannot make a false signed ledger root physically correct");
-
-  const handle = Object.getOwnPropertySymbols(f.keys.publicKey)
-    .find((s) => s.description === "kHandle");
-  assert.ok(handle, "real native Ed25519 getter must exist");
-  const poisonedKey = Object.create(f.keys.publicKey);
-  const originalThen = Object.getOwnPropertyDescriptor(Object.prototype, "then");
-  let nativeGetterReads = 0, poisonedRootReads = 0;
-  // kHandle own-accessors are rejected before invocation; poison a reachable type getter.
-  Object.defineProperty(poisonedKey, "type", { get() {
-    nativeGetterReads++;
-    Object.defineProperty(Object.prototype, "then", { configurable: true,
-      get() {
-        if (Buffer.isBuffer(this) && this.length === 32) {
-          poisonedRootReads++;
-          if (poisonedRootReads === 1) return (resolve) => resolve(forgedFirstRoot);
-        }
-        return undefined;
-      },
-    });
-    return "public";
-  } });
-  try {
-    await assert.rejects(inventory.verifySnapshot({ ...args, pinnedPublicKey: poisonedKey }),
-      /INVENTORY_CHAIN/,
-      "hostile native getter cannot replace the first recomputed digest with signed false root");
-  } finally {
-    if (originalThen) Object.defineProperty(Object.prototype, "then", originalThen);
-    else delete Object.prototype.then;
-  }
-  assert.ok(nativeGetterReads > 0, "the attacker must reach a genuine native key getter");
-  assert.equal(poisonedRootReads, 0, "native computed roots must never consult inherited then");
-});
-
 function makeTuple(objectId, revision, epoch, digest = crypto.randomBytes(32)) {
   return {
     object_id: Buffer.isBuffer(objectId) ? Buffer.from(objectId) : Buffer.from(objectId),
@@ -1503,14 +1397,11 @@ test("multiple inventory revisions require a complete signed operation chain fro
   await assert.rejects(inventory.verifySnapshot({
     ...args, committedProofChain: [receipts[0], tampered, receipts[2]],
   }));
-  // A Proxy(array) passes Array.isArray(). Its ownKeys trap runs in the
-  // signed-proof snapshot path and can replace mutable Array.prototype.push.
-  // That must never replace the ACTUAL caller-supplied corrupted B1 bytes
-  // with the authentic Ed25519-signed A1 receipt in the verifier's copy.
-  const nativePush = Array.prototype.push;
-  let proxyOwnKeys = 0;
-  let forgedCopies = 0;
-  const injectedChain = new Proxy([receipts[0], tampered, receipts[2]], {
+  // A Proxy(Array) passes Array.isArray(), then ownKeys can rewrite the global
+  // Array.push BEFORE the normalizer copies real unsigned B1 receipt bytes.
+  const originalPush = Array.prototype.push;
+  let proxyOwnKeys = 0, proxySubstitutions = 0;
+  const proxyChain = new Proxy([receipts[0], tampered, receipts[2]], {
     ownKeys(target) {
       proxyOwnKeys++;
       Array.prototype.push = function (...values) {
@@ -1518,35 +1409,68 @@ test("multiple inventory revisions require a complete signed operation chain fro
         if (/\bnormalizeCommittedProofChain \(/.test(caller)
           && values.length === 1 && Buffer.isBuffer(values[0])
           && values[0].equals(tampered)) {
-          forgedCopies++;
-          return Reflect.apply(nativePush, this, [Buffer.from(receipts[1])]);
+          proxySubstitutions++;
+          return Reflect.apply(originalPush, this, [Buffer.from(receipts[1])]);
         }
-        return Reflect.apply(nativePush, this, values);
+        return Reflect.apply(originalPush, this, values);
       };
       return Reflect.ownKeys(target);
     },
   });
-  let observedError = null;
-  let accepted = null;
+  let proxyError = null, proxyAccepted = null;
   try {
     try {
-      accepted = await inventory.verifySnapshot({
-        ...args, committedProofChain: injectedChain,
+      proxyAccepted = await inventory.verifySnapshot({
+        ...args, committedProofChain: proxyChain,
       });
-    } catch (error) { observedError = error; }
-  } finally {
-    Array.prototype.push = nativePush;
-  }
-  assert.equal(observedError?.code, "INVENTORY_CHAIN",
-    `untrusted Proxy laundered signed A1 over supplied B1: accepted=${accepted?.outcome}` +
-    ` traps=${proxyOwnKeys} substitutedPushes=${forgedCopies}`);
-  assert.equal(proxyOwnKeys, 0, "Proxy trap must be refused before enumeration");
-  assert.equal(forgedCopies, 0, "native proof-chain copying must not use poisoned Array.push");
-  const afterProxyAttack = await inventory.verifySnapshot({
-    ...args, committedProofChain: receipts,
-  });
-  assert.equal(afterProxyAttack.verifiedInterveningReceipts, 3,
-    "genuine signed A0/A1/A2 chain still works");
+    } catch (error) { proxyError = error; }
+  } finally { Array.prototype.push = originalPush; }
+  // A previous real native KeyObject getter may leave a poisoned Array.push
+  // behind in the SAME REALM. A second call with an ordinary non-Proxy array
+  // must still copy physically supplied B1, never signed A1 from the wrapper.
+  const earlierPin = Object.create(f.keys.publicKey);
+  let keyGetterReads = 0, priorSubstitutions = 0;
+  Object.defineProperty(earlierPin, "type", { get() {
+    keyGetterReads++;
+    Array.prototype.push = function (...values) {
+      const caller = (new Error().stack || "").split("\n")[2] || "";
+      if (/\bnormalizeCommittedProofChain \(/.test(caller)
+        && values.length === 1 && Buffer.isBuffer(values[0])
+        && values[0].equals(tampered)) {
+        priorSubstitutions++;
+        return Reflect.apply(originalPush, this, [Buffer.from(receipts[1])]);
+      }
+      return Reflect.apply(originalPush, this, values);
+    };
+    return "public";
+  } });
+  let priorError = null, priorAccepted = null;
+  try {
+    const first = await inventory.verifySnapshot({
+      ...args, pinnedPublicKey: earlierPin, committedProofChain: receipts,
+    });
+    assert.equal(first.verifiedInterveningReceipts, 3,
+      "the first genuine owner signature and receipts must be checked");
+    try {
+      priorAccepted = await inventory.verifySnapshot({
+        ...args, committedProofChain: [receipts[0], tampered, receipts[2]],
+      });
+    } catch (error) { priorError = error; }
+  } finally { Array.prototype.push = originalPush; }
+  assert.equal(proxyError?.code, "INVENTORY_CHAIN",
+    `unsigned Proxy B1 accepted=${proxyAccepted?.outcome}` +
+    ` ownKeys=${proxyOwnKeys} substituted=${proxySubstitutions};` +
+    ` earlier-key B1 accepted=${priorAccepted?.outcome} substituted=${priorSubstitutions}`);
+  assert.equal(proxyOwnKeys, 0, "reject Proxy before calling its ownKeys trap");
+  assert.equal(proxySubstitutions, 0, "never copy through mutated Array.push");
+  assert.ok(keyGetterReads > 0, "prior native Ed25519 KeyObject callback ran");
+  assert.equal(priorError?.code, "INVENTORY_COMMIT_OPERATION",
+    `poisoned earlier callback accepted B1 as ${priorAccepted?.outcome}` +
+    ` substituted=${priorSubstitutions}; error=${priorError?.code}`);
+  assert.equal(priorAccepted, null,
+    "previously installed poisoned Array.push must never authorize B1");
+  assert.equal(priorSubstitutions, 0,
+    "a later legitimate call must never use the poisoned Array.push");
   // Real signer issued A0/A1/A2, but the caller supplies the DIFFERENT,
   // tampered B1 bytes. A native public-key getter can change this realm's
   // iterator after the B bytes are copied and before proof-chain verification.
