@@ -8,6 +8,7 @@ on:
       - 'src/routes/auth.js'
       - 'public/client/rootark-ui.js'
       - 'test/issue-242-app-session.test.js'
+      - 'test/issue-242-bound-object.test.js'
       - 'test/support/issue242-app-fixture.js'
       - '.github/workflows/issue242-webrtc-focused.yml'
 
@@ -56,7 +57,7 @@ jobs:
         with:
           node-version: '22'
       - run: npm ci --ignore-scripts
-      - run: node --test test/issue-242-app-session.test.js
+      - run: node --test test/issue-242-app-session.test.js test/issue-242-bound-object.test.js
 
   rootark-app-edge:
     runs-on: windows-latest
@@ -73,5 +74,5 @@ jobs:
             throw 'Microsoft Edge required for real app P2P validation'
           }
       - run: npm ci --ignore-scripts
-      - run: node --test test/issue-242-app-session.test.js
+      - run: node --test test/issue-242-app-session.test.js test/issue-242-bound-object.test.js
       - run: node experiments/issue242-webrtc/tests/app-browser.cjs

@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { writeFileSync } = require('node:fs');
 const { fixture } = require('./support/issue242-app-fixture');
+const WebSocket = require('ws');
 
 test('real Root.ark session, CSRF, recipient ACL and revocation protect the app P2P path', { timeout: 110_000 }, async t => {
   const f = await fixture();
@@ -81,6 +82,65 @@ test('feature flag off leaves the real Root.ark app and navigation unchanged', {
   assert.equal((await f.request('/p2p/rooms', { method: 'POST', session: alice })).status, 404);
 });
 
+test('P2P shared socket admits 35 consented ICE frames without weakening ordinary 30-frame burst denial',
+  { timeout: 110_000 }, async t => {
+    const f = await fixture();
+    t.after(f.close);
+    const alice = await f.login('alice');
+    const bob = await f.login('bob');
+    const carol = await f.login('carol');
+    const roomResponse = await f.request('/p2p/rooms', { method: 'POST', session: alice });
+    assert.equal(roomResponse.status, 200);
+    const room = JSON.parse(roomResponse.text);
+    const host = await f.connect(alice);
+    const guest = await f.connect(bob);
+    const ordinary = await f.connect(carol);
+    const spoofed = await f.connect(carol);
+    const brokerBounded = await f.connect(carol);
+    t.after(() => [host, guest, ordinary, spoofed, brokerBounded]
+      .forEach(peer => peer.socket.terminate()));
+    host.send({ type: 'join', roomId: room.roomId, hostKey: room.hostKey });
+    const joinedHost = await host.next('joined');
+    host.send({ type: 'invite', recipient: 'bob' });
+    const invitation = (await host.next('invited')).invitation;
+    guest.send({ type: 'join', roomId: room.roomId, invitation });
+    const joinedGuest = await guest.next('joined');
+    await host.next('peer-joined');
+    host.send({ type: 'request-peer', to: joinedGuest.peerId });
+    const request = await guest.next('peer-request');
+    guest.send({ type: 'consent', requestId: request.requestId, accept: true });
+    await host.next('peer-accepted');
+    await guest.next('peer-allowed');
+
+    for (let i = 0; i < 35; i++) {
+      host.send({ type: 'signal', to: joinedGuest.peerId,
+        signal: { kind: 'ice', candidate: { candidate: `candidate-${i}` } } });
+    }
+    for (let i = 0; i < 35; i++) {
+      const forwarded = await guest.next('signal');
+      assert.equal(forwarded.signal.candidate.candidate, `candidate-${i}`);
+      assert.equal(forwarded.peerId, joinedHost.peerId);
+    }
+    assert.equal(host.socket.readyState, WebSocket.OPEN,
+      'authorized ICE burst must not be closed by the unrelated generic realtime budget');
+
+    const genericClose = new Promise(resolve => ordinary.socket.once('close', resolve));
+    for (let i = 0; i < 31; i++) ordinary.send({ event: 'ping' });
+    assert.equal(await genericClose, 1008,
+      'ordinary realtime messages must retain their independent 30/10s limit');
+
+    const spoofedClose = new Promise(resolve => spoofed.socket.once('close', resolve));
+    for (let i = 0; i < 31; i++) spoofed.send({ type: 'signal', event: 'ping' });
+    assert.equal(await spoofedClose, 1008,
+      'a room-like message carrying a generic event cannot evade the generic limit');
+
+    const brokerClose = new Promise(resolve => brokerBounded.socket.once('close', resolve));
+    for (let i = 0; i < 121; i++) brokerBounded.send({ type: 'signal',
+      roomId: 'unknown-room', to: 'unknown-peer', signal: { kind: 'ice' } });
+    assert.equal(await brokerClose, 1008,
+      'the experimental broker still enforces its independent 120-frame budget');
+  });
+
 test('P2: 16 hostile room creates by one real user cannot globally starve another user', { timeout: 110_000 }, async t => {
   const f = await fixture();
   t.after(f.close);
@@ -105,4 +165,43 @@ test('P2: 16 hostile room creates by one real user cannot globally starve anothe
     assert.equal((await clients[i].next('joined')).role, 'host',
       'normal multi-client host join must remain functional');
   }
+});
+
+test('P2: signed room release frees abandoned capacity but cannot free a different principal or key', { timeout: 110_000 }, async t => {
+  const f = await fixture();
+  t.after(f.close);
+  const alice = await f.login('alice');
+  const bob = await f.login('bob');
+  const first = await f.request('/p2p/rooms', { method: 'POST', session: alice });
+  const second = await f.request('/p2p/rooms', { method: 'POST', session: alice });
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal((await f.request('/p2p/rooms', { method: 'POST', session: alice })).status, 429);
+  const { roomId, hostKey } = JSON.parse(first.text);
+  const proof = { roomId, hostKey };
+  const release = (session, body, csrf = true) => f.request('/p2p/rooms/release', {
+    method: 'POST', session, body: JSON.stringify(body), csrf,
+  });
+
+  assert.equal((await release(bob, proof)).status, 204);
+  assert.equal((await release(alice, { ...proof, hostKey: '0'.repeat(64) })).status, 204);
+  assert.equal((await release(alice, proof, false)).status, 403,
+    'browser release requires the same session CSRF proof as creating a room');
+  const joinedRoom = JSON.parse(second.text);
+  const host = await f.connect(alice);
+  t.after(() => host.socket.terminate());
+  host.send({ type: 'join', roomId: joinedRoom.roomId, hostKey: joinedRoom.hostKey });
+  assert.equal((await host.next('joined')).role, 'host');
+  assert.equal((await release(alice,
+    { roomId: joinedRoom.roomId, hostKey: joinedRoom.hostKey })).status, 204,
+  'even the exact host key cannot release a room after admission');
+  assert.equal((await f.request('/p2p/rooms', { method: 'POST', session: alice })).status, 429,
+    'unauthorized release attempts and active-room release must preserve owner capacity');
+  assert.equal((await release(alice, proof)).status, 204);
+  assert.equal((await release(alice, proof)).status, 204);
+  assert.equal((await f.request('/p2p/rooms', { method: 'POST', session: alice })).status, 200,
+    'canceling the delivered-but-unjoined room must immediately restore one owner slot');
+  host.send({ type: 'invite', recipient: 'bob' });
+  assert.equal((await host.next('invited')).recipient, 'bob',
+    'joined room must remain authorized and usable after a bogus release attempt');
 });
