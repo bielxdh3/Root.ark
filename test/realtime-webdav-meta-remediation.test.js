@@ -138,7 +138,7 @@ test("realtime and WebDAV meta-remediation matrix", async (t) => {
     ["12 realtime authentication uses cookie", () => assert.match(SERVER, /parseCookies\(req\.headers\.cookie\)/)],
     ["14 stale realtime identity is refreshed", () => assert.match(SERVER, /refreshRealtimeUser\(socket\)/)],
     ["16 malformed realtime JSON is contained", () => assert.match(SERVER, /JSON\.parse\(rawMessage\.toString\(\)\)/)],
-    ["17 pong event is accepted", () => assert.match(SERVER, /message\.event === "ping"/)],
+    ["17 pong event is accepted", () => assert.match(SERVER, /message\?\.event === "ping"/)],
     ["18 realtime sends structured events", () => assert.match(SERVER, /JSON\.stringify\(\{ event, payload/)],
     ["19 realtime server path is explicit", () => assert.match(SERVER, /path: "\/ws"/)],
     ["20 realtime server closes on shutdown", () => assert.match(SERVER, /server\.once\("close"/)],

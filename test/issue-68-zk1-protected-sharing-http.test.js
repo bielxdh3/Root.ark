@@ -2,11 +2,15 @@
 
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 const express = require("express");
+const jwt = require("jsonwebtoken");
+const { createAuthenticate } = require("../src/middlewares/auth");
+const { createRequirePermission } = require("../src/middlewares/permissions");
 const z = require("../src/crypto/rootark-zk-1");
 const manifestV2 = require("../src/crypto/rootark-zk-recovery-manifest-v2");
 const historyV2 = require("../src/crypto/rootark-zk-recovery-history-v2");
@@ -14,6 +18,7 @@ const fixtures = require("./support/issue-65-recovery-v2-fixtures");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 const { Zk1ProtectedObjectStore, contentAuthorizationMessageV1 } =
   require("../src/services/zk1ProtectedObjectStore");
+const Database = require("better-sqlite3");
 const { registerZk1ProtectedObjectRoutes } = require("../src/routes/zk1ProtectedObjectRoutes");
 const { shareGrantMessageV1 } = require("../src/services/zk1ProtectedCiphertextSharing");
 const { redeemProtectedCiphertextShare } = require("../public/client/rootark-zk1-recipient-share");
@@ -47,7 +52,12 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   });
   let now = 1400;
   let allowed = true;
+  let finishedIoAdmissions = 0;
   let pausedReadAdmission = null;
+  let observeNextDisconnectedRead = null;
+  let pausedShareResponse = null;
+  let partialShareResponse = null;
+  let revokeReplies = 0;
   const pauseNextReadAdmission = () => {
     let entered;
     let release;
@@ -55,6 +65,28 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     const wait = new Promise((resolve) => { release = resolve; });
     pausedReadAdmission = { entered, wait };
     return { started, release };
+  };
+  const observeDisconnectedRead = () => {
+    let onClose;
+    const closed = new Promise((resolve) => { onClose = resolve; });
+    const observation = { closed, onClose, responseClosed: false,
+      ciphertextResponseAttempts: 0 };
+    observeNextDisconnectedRead = observation;
+    return observation;
+  };
+  const pauseNextShareResponse = () => {
+    let arrived;
+    const started = new Promise((resolve) => { arrived = resolve; });
+    const gate = { arrived, flush: null };
+    pausedShareResponse = gate;
+    return { started, release() { gate.flush?.(); } };
+  };
+  const breakNextShareResponseAfterWrite = () => {
+    let entered;
+    const started = new Promise((resolve) => { entered = resolve; });
+    const gate = { entered, started, wrote: false, finished: false, closed: false };
+    partialShareResponse = gate;
+    return gate;
   };
   const witness = crypto.generateKeyPairSync("ed25519");
   const witnessKeyId = crypto.randomBytes(16);
@@ -80,7 +112,10 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
       }
       return { admissionId: crypto.randomBytes(16), proceed: true };
     },
-    async finishIoAdmission() { return { status: "completed" }; },
+    async finishIoAdmission() {
+      finishedIoAdmissions++;
+      return { status: "completed" };
+    },
   };
   const filename = path.join(dir, "protected.sqlite");
   let store = new Zk1ProtectedObjectStore(filename, {
@@ -94,20 +129,129 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     manifestProvider: () => z.encodeDeterministic(manifest), nowSeconds: () => now,
   });
   let server;
+  const sessionJwtSecret = crypto.randomBytes(32).toString("base64url");
+  // These principals are local test fixtures with HS256 tokens minted by this
+  // test. No HTTP header may directly assign req.user or bypass verification.
+  const fixtureUsers = Object.freeze({
+    owner: Object.freeze({ username: "owner", sessionVersion: 1,
+      role: "owner", totpEnabled: true }),
+    recipient: Object.freeze({ username: "recipient", sessionVersion: 1,
+      role: "viewer", totpEnabled: true }),
+    attacker: Object.freeze({ username: "attacker", sessionVersion: 1,
+      role: "viewer", totpEnabled: true }),
+  });
+  const fixtureTokens = Object.freeze(Object.fromEntries(
+    Object.keys(fixtureUsers).map((username) => [username,
+      jwt.sign({ username, sessionVersion: 1 }, sessionJwtSecret,
+        { algorithm: "HS256", expiresIn: "8h" })])));
+  // Match the production route requirements: owner can upload/commit and
+  // list; recipient and attacker can list but must never gain upload.
+  const fixturePermissions = (user) => ({
+    listFiles: true, upload: user.username === "owner",
+  });
+  const authenticateBearer = createAuthenticate({
+    jwt, jwtSecret: sessionJwtSecret,
+    loadUser: (username) => Object.hasOwn(fixtureUsers, username)
+      ? fixtureUsers[username] : null,
+    normalizeUserPermissions: fixturePermissions,
+  });
+  const authenticateCookie = createAuthenticate({ jwt, jwtSecret: sessionJwtSecret,
+    loadUser: (username) => username === "recipient" ? fixtureUsers.recipient : null,
+    normalizeUserPermissions: fixturePermissions,
+  });
+  const registerRoutes = (app, authenticate) => registerZk1ProtectedObjectRoutes({
+    app, store, authenticate, requirePermission: createRequirePermission(),
+    resolveTrustedScope: (user) => user.username === "owner" ? scope : null,
+  });
   const mount = async () => {
     const app = express();
-    const authenticate = (req, res, next) => {
-      const username = req.get("x-fixture-account");
-      if (!["owner", "recipient", "attacker"].includes(username)) return res.sendStatus(401);
-      req.user = { username, sessionVersion: 1 }; next();
-    };
-    registerZk1ProtectedObjectRoutes({ app, store, authenticate,
-      requirePermission: () => (_req, _res, next) => next(),
-      resolveTrustedScope: (user) => user.username === "owner" ? scope : null });
+    // Hold the real Express res.end() after a signed GET has passed admission
+    // and prepared ciphertext, before the HTTP response reaches 'finish'.
+    app.use((req, res, next) => {
+      if (req.path === "/zk-1/v1/share/read" && observeNextDisconnectedRead) {
+        const observation = observeNextDisconnectedRead;
+        observeNextDisconnectedRead = null;
+        res.once("close", () => {
+          observation.responseClosed = true;
+          observation.onClose();
+        });
+        const originalJson = res.json;
+        res.json = function (payload) {
+          if (payload?.ciphertextBase64 !== undefined) {
+            observation.ciphertextResponseAttempts++;
+          }
+          return originalJson.call(this, payload);
+        };
+      }
+      if (req.path === "/zk-1/v1/share/read" && partialShareResponse) {
+        const gate = partialShareResponse;
+        partialShareResponse = null;
+        const originalEnd = res.end;
+        res.once("finish", () => { gate.finished = true; });
+        res.once("close", () => {
+          gate.closed = true;
+          if (gate.timer) clearTimeout(gate.timer);
+        });
+        res.end = function (chunk, encoding) {
+          res.end = originalEnd;
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk,
+            typeof encoding === "string" ? encoding : "utf8");
+          // Real TCP/HTTP: first bytes go onto the response while the rest
+          // remain buffered. Then Express' synchronous sender throws.
+          res.write(bytes.subarray(0, Math.ceil(bytes.length / 2)));
+          gate.wrote = true;
+          gate.entered();
+          gate.timer = setTimeout(() => {
+            if (!res.destroyed) {
+              try { originalEnd.call(res, bytes.subarray(Math.ceil(bytes.length / 2))); }
+              catch (_) { /* failure intentionally remains unacknowledged */ }
+            }
+          }, 1500);
+          throw new Error("fixture: partial response after first TCP write");
+        };
+      }
+      if (req.path === "/zk-1/v1/share/read" && pausedShareResponse) {
+        const gate = pausedShareResponse;
+        pausedShareResponse = null;
+        const originalEnd = res.end;
+        res.end = function (...args) {
+          res.end = originalEnd;
+          gate.flush = () => {
+            if (!gate.flush) return;
+            gate.flush = null;
+            originalEnd.apply(res, args);
+          };
+          gate.arrived();
+          return res;
+        };
+      }
+      if (req.path === "/zk-1/v1/share/revoke") {
+        const originalJson = res.json;
+        res.json = function (payload) {
+          revokeReplies++;
+          return originalJson.call(res, payload);
+        };
+      }
+      next();
+    });
+    // Every request uses the real JWT verifier and real permission middleware.
+    registerRoutes(app, authenticateBearer);
     server = await new Promise((resolve) => {
       const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
     });
     return `http://127.0.0.1:${server.address().port}`;
+  };
+  const mountCookieOnly = async () => {
+    // Separate listener with production cookie/CSRF authentication only.
+    // Header-controlled downgrades cannot switch it to bearer/test identity.
+    const app = express();
+    registerRoutes(app, authenticateCookie);
+    const listener = await new Promise((resolve) => {
+      const instance = app.listen(0, "127.0.0.1", () => resolve(instance));
+    });
+    return { origin: `http://127.0.0.1:${listener.address().port}`,
+      close: () => new Promise((resolve, reject) => listener.close((error) =>
+        error ? reject(error) : resolve())) };
   };
   t.after(async () => {
     if (server) await new Promise((resolve) => server.close(resolve));
@@ -115,10 +259,27 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
   let base = await mount();
+  const restart = async () => {
+    await new Promise((resolve) => server.close(resolve)); server = null;
+    store.close();
+    store = new Zk1ProtectedObjectStore(filename, { witnessProvider,
+      witnessPinned: { keyId: witnessKeyId, publicKey: witness.publicKey },
+      trustedScope: scope, bootstrapNew: false, admissionRequired: true,
+      signedHistoryRequired: true,
+      signedHistoryGenesisDigest: await manifestV2.recoveryManifestDigestV2(state.baseManifest),
+      verifiedHistoryProvider: async () => verifiedHistory,
+      minimumHead: { revision: 1, witnessSequence: 1,
+        digest: await manifestV2.recoveryManifestDigestV2(state.baseManifest) },
+      manifestProvider: () => z.encodeDeterministic(manifest), nowSeconds: () => now });
+    base = await mount();
+  };
   const post = async (endpoint, username, body) => {
+    if (username !== null && !Object.hasOwn(fixtureTokens, username)) {
+      throw new Error("UNKNOWN_TEST_IDENTITY");
+    }
     const response = await fetch(base + endpoint, { method: "POST",
       headers: { "content-type": "application/json", ...(username
-        ? { "x-fixture-account": username } : {}) },
+        ? { authorization: `Bearer ${fixtureTokens[username]}` } : {}) },
       body: JSON.stringify(body) });
     const responseText = await response.text();
     let parsed;
@@ -142,10 +303,13 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   const ciphertext = crypto.randomBytes(256);
   const digest = crypto.createHash("sha256").update(ciphertext).digest();
   const put = await sign(owner, "put", id, null, digest);
-  const putResponse = await post("/zk-1/v1/content/put", "owner", {
+  const putBody = {
     authorization: wire(put.authorization), signatureBase64: b64(put.signature),
     ciphertextBase64: b64(ciphertext),
-  });
+  };
+  assert.equal((await post("/zk-1/v1/content/put", "recipient", putBody)).status, 403,
+    "a recipient session cannot upload even with the genuine owner's signed PUT");
+  const putResponse = await post("/zk-1/v1/content/put", "owner", putBody);
   assert.equal(putResponse.status, 201, JSON.stringify(putResponse.body));
 
   const getOwner = await sign(owner, "get", id, 1, digest);
@@ -157,6 +321,14 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   const grantBody = { ...grantInput, authorization: wire(getOwner.authorization),
     signatureBase64: b64(getOwner.signature), shareSignatureBase64: b64(shareSignature) };
   assert.equal((await post("/zk-1/v1/share/grant", null, grantBody)).status, 401);
+  const forgedBearer = await fetch(base + "/zk-1/v1/share/grant", {
+    method: "POST", headers: { "content-type": "application/json",
+      authorization: `Bearer ${fixtureTokens.attacker}`,
+      "x-fixture-account": "owner" }, body: JSON.stringify(grantBody),
+  });
+  assert.equal(forgedBearer.status, 403,
+    "a correctly signed attacker session cannot become owner via a forged fixture header");
+  await forgedBearer.arrayBuffer();
   assert.equal((await post("/zk-1/v1/share/grant", "attacker", grantBody)).status, 403);
   assert.equal((await post("/zk-1/v1/share/grant", "owner",
     { ...grantBody, recipientUsername: "attacker" })).status, 403,
@@ -258,7 +430,8 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     recipientKey.export({ format: "der", type: "pkcs8" }),
     "Ed25519", false, ["sign"]);
   const clientFetch = (url, options) => fetch(url, {
-    ...options, headers: { ...options.headers, "x-fixture-account": "recipient" },
+    ...options, headers: { ...options.headers,
+      authorization: `Bearer ${fixtureTokens.recipient}` },
   });
   const redeem = (overrides = {}) => redeemProtectedCiphertextShare({
     origin: base, grant: issued.body, recipientUsername: "recipient",
@@ -276,30 +449,104 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal(redeemed.durableCopyProven, false);
   assert.equal(redeemed.authorizesPlaintextRelease, false);
   assert.equal(redeemed.serverRevocationProofVerified, false);
-  // The HTTP server might return an authentic owner-signed reply without
-  // enforcing the local device signature. The client must check that the
-  // private signer belongs to its independently pinned recipient roster.
-  const foreignSigner = (await crypto.webcrypto.subtle.generateKey(
-    "Ed25519", false, ["sign", "verify"])).privateKey;
-  let foreignFetches = 0;
-  await assert.rejects(redeem({ signerKey: foreignSigner,
-    fetchImpl: async (...args) => { foreignFetches++; return clientFetch(...args); },
-  }), /ZK_SHARE_REDEMPTION_DENIED/,
-  "foreign signing key cannot redeem even when the server would serve valid ciphertext");
-  assert.equal(foreignFetches, 0, "foreign signer is rejected before network activity");
-  let rotatedRecipientReads = 0;
-  await assert.rejects(redeem({ readIndependentAuthority: async () => {
-    const authority = await independentAuthority();
-    if (++rotatedRecipientReads === 2) {
-      authority.devices = authority.devices.map((device) =>
-        device.deviceId === recipient.device_id ? {
-          ...device, authorizationPublicKey: new Uint8Array(crypto.randomBytes(32)),
-        } : device);
+  // Real Root.ark cookie sessions reject POST without the double-submit CSRF
+  // header. Bearer tests above run through production JWT/permission checks,
+  // while this distinct listener exercises the browser cookie/CSRF boundary.
+  const csrf = b64(crypto.randomBytes(32));
+  const session = jwt.sign({ username: "recipient", sessionVersion: 1 },
+    sessionJwtSecret, { algorithm: "HS256", expiresIn: "8h" });
+  const sessionCookie = `rootark_session=${session}; rootark_csrf=${csrf}`;
+  const cookieMount = await mountCookieOnly();
+  const cookieHttpStatuses = [];
+  const sessionFetch = async (url, options) => {
+    const response = await fetch(url, { ...options,
+      headers: { ...options.headers, cookie: sessionCookie },
+    });
+    cookieHttpStatuses.push(response.status);
+    return response;
+  };
+  const hadDocument = Object.hasOwn(global, "document");
+  const previousDocument = global.document;
+  try {
+    // A former test fixture identity header must not authenticate either
+    // listener, with no JWT and no cookie. No forged req.user may be assigned.
+    for (const origin of [base, cookieMount.origin]) {
+      const forged = await fetch(origin + "/zk-1/v1/share/read", {
+        method: "POST", headers: { "content-type": "application/json",
+          "x-fixture-account": "recipient" }, body: "{}",
+      });
+      assert.equal(forged.status, 401,
+        "unverified fixture identity header cannot reach protected HTTP");
+      await forged.arrayBuffer();
     }
-    return authority;
-  } }), /ZK_SHARE_REDEMPTION_DENIED/,
-  "recipient roster-key substitution during HTTP awaits must deny the receipt");
-  assert.equal(rotatedRecipientReads, 2);
+    global.document = { cookie: `rootark_csrf=${csrf}` };
+    const missingCsrfStatuses = [];
+    const missingHeader = async (url, options) => {
+      const response = await fetch(url, { ...options,
+        headers: { ...options.headers, cookie: sessionCookie,
+          "x-fixture-account": "recipient", "x-csrf-token": "" },
+      });
+      missingCsrfStatuses.push(response.status);
+      await response.arrayBuffer(); // Drain real 403 before closing the cookie-only listener.
+      return response;
+    };
+    await assert.rejects(redeem({ origin: cookieMount.origin, fetchImpl: missingHeader }),
+      /ZK_SHARE_REDEMPTION_DENIED/,
+      "real cookie authentication must deny the same signed request without CSRF");
+    assert.deepEqual(missingCsrfStatuses, [403],
+      "cookie middleware must deny missing CSRF despite a forged identity header");
+    assert.deepEqual(await redeem({ origin: cookieMount.origin, fetchImpl: sessionFetch }), redeemed,
+      "real cookie-authenticated recipient redemption must supply the current CSRF header");
+    assert.deepEqual(cookieHttpStatuses, [200],
+      "valid cookie and signed recipient request reached the real HTTP route");
+    // P2 TOCTOU: a mutable caller can swap its own authority provider while
+    // the REAL signed cookie-authenticated HTTP fetch is awaiting a response.
+    // The original provider revokes the issuer on its second read; substituting
+    // a stale-but-active provider must NOT bypass that final independent check.
+    let originalAuthorityReads = 0;
+    let substitutedAuthorityReads = 0;
+    let fetchedSignedCiphertext = false;
+    const mutableInput = {
+      origin: cookieMount.origin, grant: issued.body, recipientUsername: "recipient",
+      recipientDeviceId: recipient.device_id, signerKey,
+      nowSeconds: () => now,
+      readIndependentAuthority: async () => {
+        originalAuthorityReads++;
+        const snapshot = await independentAuthority();
+        return originalAuthorityReads === 1 ? snapshot : {
+          ...snapshot,
+          devices: snapshot.devices.map((entry) => entry.deviceId === owner.device_id
+            ? { ...entry, revokedAtEpoch: manifest.current_epoch } : entry),
+        };
+      },
+      fetchImpl: async (url, options) => {
+        const response = await sessionFetch(url, options);
+        assert.equal(response.status, 200,
+          "adversarial callback swap requires actual successful signed recipient HTTP");
+        fetchedSignedCiphertext = true;
+        mutableInput.readIndependentAuthority = async () => {
+          substitutedAuthorityReads++;
+          return independentAuthority(); // stale: falsely keeps issuer active
+        };
+        return response;
+      },
+    };
+    await assert.rejects(redeemProtectedCiphertextShare(mutableInput),
+      /ZK_SHARE_REDEMPTION_DENIED/,
+      "the original captured authority reader must revoke issuer after awaited HTTP");
+    assert.equal(fetchedSignedCiphertext, true,
+      "final denial must occur after an actual authorized HTTP response");
+    assert.equal(originalAuthorityReads, 2,
+      "both initial and final independent checks must use the SAME original reader");
+    assert.equal(substitutedAuthorityReads, 0,
+      "a newly substituted stale authority callback must never run");
+    assert.deepEqual(cookieHttpStatuses, [200, 200],
+      "swapped authority test also received authenticated signed HTTP ciphertext");
+  } finally {
+    if (hadDocument) global.document = previousDocument;
+    else delete global.document;
+    await cookieMount.close();
+  }
   // P2 review: a hostile ciphertext transport can replay an authentic owner
   // grant and bytes while ignoring the recipient's unrelated GET signature.
   // The client itself must bind its nonexportable Ed25519 signer to the
@@ -328,32 +575,24 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   const genuineAgainstUntrustedServer = await redeem({ fetchImpl: forgedServer });
   assert.deepEqual(genuineAgainstUntrustedServer, redeemed,
     "positive control: the same authenticated bytes with the pinned device signer remain valid");
-  // Exercise the same client under a browser cookie session: a genuine owner
-  // grant must include the double-submit CSRF header without trusting the
-  // server response to furnish the recipient's authorization history.
-  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
-  try {
-    globalThis.document = { cookie: "session=opaque; rootark_csrf=browser%2Dfixture%2Dtoken" };
-    let observedHeader = false;
-    const browserReceipt = await redeem({ fetchImpl: async (_url, options) => {
-      assert.equal(options.headers["x-csrf-token"], "browser-fixture-token");
-      observedHeader = true;
-      return forgedServer();
-    } });
-    assert.equal(observedHeader, true, "browser redemption must reach the CSRF-bound request");
-    assert.deepEqual(browserReceipt, redeemed);
-    globalThis.document.cookie = "rootark_csrf=first; rootark_csrf=second";
-    let attemptedFetch = false;
-    await assert.rejects(redeem({ fetchImpl: async () => {
-      attemptedFetch = true;
-      return forgedServer();
-    } }), /ZK_SHARE_REDEMPTION_DENIED/,
-    "an ambiguous duplicate CSRF cookie must be rejected before request dispatch");
-    assert.equal(attemptedFetch, false);
-  } finally {
-    if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument);
-    else delete globalThis.document;
-  }
+  const neverAnswers = () => new Promise(() => {});
+  const beforeHungAuthority = untrustedHttpCalls;
+  await assert.rejects(redeem({ readIndependentAuthority: neverAnswers,
+    fetchImpl: forgedServer }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "an unresponsive independent authority must fail closed before contacting the server");
+  assert.equal(untrustedHttpCalls, beforeHungAuthority,
+    "no ciphertext may be requested without the initial independent authority");
+  let authorityReads = 0;
+  const beforeHungFinal = untrustedHttpCalls;
+  await assert.rejects(redeem({
+    readIndependentAuthority: async () => ++authorityReads === 1
+      ? independentAuthority() : neverAnswers(),
+    fetchImpl: forgedServer,
+  }), /ZK_SHARE_REDEMPTION_DENIED/,
+  "a stalled final current-roster check cannot release otherwise valid ciphertext");
+  assert.equal(authorityReads, 2);
+  assert.equal(untrustedHttpCalls, beforeHungFinal + 1,
+    "the final authority timeout is exercised after authenticated-content-shaped egress");
   await assert.rejects(redeem({ fetchImpl: fetch }), /ZK_SHARE_REDEMPTION_DENIED/,
     "grant possession without recipient account session must not download ciphertext");
   await assert.rejects(redeem({ readIndependentAuthority: null }),
@@ -415,10 +654,171 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
     },
   }), /ZK_SHARE_REDEMPTION_DENIED/,
   "signed expiry reached after HTTP await cannot return a usable receipt");
-  // A separate valid grant can be permanently revoked while the issuer,
-  // recipient, epoch and object revision all remain active.
+  // An unrelated SQLite connection can hold the WAL writer lock while an
+  // authentic owner revokes its already signed grant. Failure to commit the
+  // tombstone is an availability failure, never an owner permission denial.
+  const busyOriginal = store.db.pragma("busy_timeout", { simple: true });
+  const sqliteLocker = new Database(filename);
+  store.db.pragma("busy_timeout = 40");
+  sqliteLocker.exec("BEGIN IMMEDIATE");
+  try {
+    const ownerBusy = await post("/zk-1/v1/share/revoke", "owner",
+      { grantId: secondIssued.body.grantId });
+    assert.equal(ownerBusy.status, 503,
+      "a real SQLITE_BUSY must map to retryable unavailable, not permission 403");
+    assert.equal(ownerBusy.body.error, "ZK_SHARE_UNAVAILABLE");
+    assert.equal(sqliteLocker.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
+      .get(secondIssued.body.grantId).revoked, 0,
+    "SQLITE_BUSY cannot claim a durable owner tombstone");
+    assert.equal((await post("/zk-1/v1/share/revoke", "attacker",
+      { grantId: secondIssued.body.grantId })).status, 403,
+    "non-owner cannot obtain 503 merely because SQLite is busy");
+  } finally {
+    sqliteLocker.exec("ROLLBACK");
+    sqliteLocker.close();
+    store.db.pragma(`busy_timeout = ${busyOriginal}`);
+  }
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: secondIssued.body.grantId })).status, 200,
+  "failed owner revocation cannot silently block a legitimately signed read");
+
+  // Client disconnects while signed physical admission awaits its witness.
+  // The server already observed response 'close' before share/read reaches
+  // the egress fence; no durable lease or ciphertext send is permitted.
+  const abortGrantId = b64(crypto.randomBytes(32));
+  const abortOwnerProof = await sign(owner, "get", id, 1, digest);
+  const abortFields = { grantId: abortGrantId,
+    recipientUsername: "recipient", recipientDeviceId: recipient.device_id,
+    expiresAt: now + 120 };
+  const abortSignature = crypto.sign(null, await shareGrantMessageV1({
+    authorization: abortOwnerProof.authorization, ...abortFields,
+  }), abortOwnerProof.key);
+  assert.equal((await post("/zk-1/v1/share/grant", "owner", {
+    ...abortFields, authorization: wire(abortOwnerProof.authorization),
+    signatureBase64: b64(abortOwnerProof.signature),
+    shareSignatureBase64: b64(abortSignature),
+  })).status, 201);
+  const interruptedAdmission = pauseNextReadAdmission();
+  const beforeAbortedFinish = finishedIoAdmissions;
+  const disconnected = observeDisconnectedRead();
+  const disconnectedProof = await sign(recipient, "get", id, 1, digest);
+  const disconnectedBody = JSON.stringify({
+    grantId: abortGrantId,
+    authorization: wire(disconnectedProof.authorization),
+    signatureBase64: b64(disconnectedProof.signature),
+  });
+  const request = http.request(base + "/zk-1/v1/share/read", {
+    method: "POST",
+    headers: { "content-type": "application/json",
+      authorization: `Bearer ${fixtureTokens.recipient}` },
+  });
+  request.on("error", () => {});
+  request.on("response", (response) => { response.resume(); });
+  const clientClosed = new Promise((resolve) => request.once("close", resolve));
+  request.end(disconnectedBody);
+  try {
+    await interruptedAdmission.started;
+    request.destroy();
+    await clientClosed;
+    await disconnected.closed;
+    assert.equal(disconnected.responseClosed, true,
+      "real HTTP response closes while witness admission remains pending");
+  } finally { interruptedAdmission.release(); }
+  const leaseCount = store.db.prepare(
+    "SELECT count(*) AS pending FROM zk_content_share_egress WHERE grant_id=?");
+  const leaseDeadline = Date.now() + 3000;
+  while (Date.now() < leaseDeadline
+    && finishedIoAdmissions <= beforeAbortedFinish) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(finishedIoAdmissions > beforeAbortedFinish,
+    "aborted read must finish its physical witness admission without hanging");
+  assert.equal(disconnected.ciphertextResponseAttempts, 0,
+    "no ciphertext can be emitted after the client has disconnected");
+  assert.equal(leaseCount.get(abortGrantId).pending, 0,
+    "preclosed response must not create an orphaned SQLite egress lease");
   assert.equal((await post("/zk-1/v1/share/revoke", "owner",
-    { grantId: secondIssued.body.grantId })).status, 200);
+    { grantId: abortGrantId })).status, 200,
+  "owner revoke must ACK after the closed read rather than wait on a phantom lease");
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: abortGrantId })).status, 403);
+
+  // Reproduce the second P2 on real Express HTTP, not only a mocked emit:
+  // the sender writes part of the ciphertext then throws before finish/close.
+  const partialGrantId = b64(crypto.randomBytes(32));
+  const partialOwnerProof = await sign(owner, "get", id, 1, digest);
+  const partialFields = { grantId: partialGrantId,
+    recipientUsername: "recipient", recipientDeviceId: recipient.device_id,
+    expiresAt: now + 120 };
+  const partialSignature = crypto.sign(null, await shareGrantMessageV1({
+    authorization: partialOwnerProof.authorization, ...partialFields,
+  }), partialOwnerProof.key);
+  assert.equal((await post("/zk-1/v1/share/grant", "owner", {
+    ...partialFields, authorization: wire(partialOwnerProof.authorization),
+    signatureBase64: b64(partialOwnerProof.signature),
+    shareSignatureBase64: b64(partialSignature),
+  })).status, 201);
+  const tornResponse = breakNextShareResponseAfterWrite();
+  const incompleteRead = readAs("recipient", recipient,
+    { grantId: partialGrantId }).then(
+    () => "completed", () => "aborted");
+  await tornResponse.started;
+  assert.equal(tornResponse.wrote, true, "server actually wrote partial ciphertext HTTP");
+  const partialRevoke = await post("/zk-1/v1/share/revoke", "owner",
+    { grantId: partialGrantId });
+  assert.equal(partialRevoke.status, 200);
+  assert.equal(tornResponse.finished || tornResponse.closed, true,
+    "owner revoke ACK cannot precede HTTP finish/close after a partial-write throw");
+  assert.equal(await incompleteRead, "aborted",
+    "a broken partial ciphertext response must abort, not continue after revoke ACK");
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: partialGrantId })).status, 403);
+
+  // A recipient or unrelated account cannot cancel an owner grant while its
+  // legitimate ciphertext read is already waiting for physical admission.
+  for (const guest of ["recipient", "attacker"]) {
+    const guestAdmission = pauseNextReadAdmission();
+    const pendingAuthorizedRead = readAs("recipient", recipient,
+      { grantId: secondIssued.body.grantId });
+    try {
+      await guestAdmission.started;
+      const deniedGuestRevoke = await post("/zk-1/v1/share/revoke", guest,
+        { grantId: secondIssued.body.grantId });
+      assert.equal(deniedGuestRevoke.status, 403,
+        `${guest} cannot revoke an active owner's grant during admission`);
+      assert.equal(deniedGuestRevoke.body?.ciphertextBase64, undefined);
+    } finally { guestAdmission.release(); }
+    const uninterrupted = await pendingAuthorizedRead;
+    assert.equal(uninterrupted.status, 200,
+      `unauthorized ${guest} revoke cannot interrupt a live authorized read`);
+    assert.deepEqual(Buffer.from(uninterrupted.body.ciphertextBase64, "base64url"),
+      ciphertext, "concurrent guest revoke must not alter authorized ciphertext");
+    assert.equal((await readAs("recipient", recipient,
+      { grantId: secondIssued.body.grantId })).status, 200,
+    "unauthorized revoke must not persist an owner grant tombstone");
+  }
+  // A valid grant may be revoked while the recipient waits on physical I/O
+  // admission. Neither the in-flight nor later response may expose ciphertext.
+  const revocationAdmission = pauseNextReadAdmission();
+  const inFlightRevokedRead = readAs("recipient", recipient,
+    { grantId: secondIssued.body.grantId });
+  try {
+    await revocationAdmission.started;
+    assert.equal((await post("/zk-1/v1/share/revoke", "owner",
+      { grantId: secondIssued.body.grantId })).status, 200);
+  } finally { revocationAdmission.release(); }
+  const revokedInFlight = await inFlightRevokedRead;
+  assert.equal(revokedInFlight.status, 403,
+    "revoke while awaiting I/O admission denies in-flight ciphertext");
+  assert.equal(revokedInFlight.body?.ciphertextBase64, undefined,
+    "denied in-flight read must not emit ciphertext");
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: secondIssued.body.grantId })).status, 403,
+    "subsequent read must reject revoked grant");
+  await restart();
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: secondIssued.body.grantId })).status, 403,
+    "revocation survives SQLite restart while owner is still active");
   await assert.rejects(redeem({ grant: secondIssued.body }),
     /ZK_SHARE_REDEMPTION_DENIED/,
     "durable grant tombstone rejects recipient redemption over real authenticated HTTP");
@@ -502,6 +902,79 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal((await readAs("recipient")).status, 200,
     "expiring one grant cannot affect another grant for the same ciphertext");
 
+  // A valid owner revocation is committed while an earlier authorized read is
+  // stuck inside HTTP egress. The owner must not receive a 200 until that
+  // response has finished or been aborted; queued network bytes are not recalled.
+  const heldResponse = pauseNextShareResponse();
+  const pendingEgress = readAs("recipient");
+  let revokeDuringEgress;
+  try {
+    await heldResponse.started;
+    assert.equal((await post("/zk-1/v1/share/revoke", "attacker",
+      { grantId })).status, 403,
+    "unrelated guest cannot revoke a grant while owner ciphertext egress is held");
+    assert.equal(store.db.prepare("SELECT revoked FROM zk_content_share WHERE grant_id=?")
+      .get(grantId)?.revoked, 0,
+    "guest attempt must not mutate the grant tombstone");
+    const repliesBefore = revokeReplies;
+    revokeDuringEgress = post("/zk-1/v1/share/revoke", "owner", { grantId });
+    const revokedRow = store.db.prepare(
+      "SELECT revoked FROM zk_content_share WHERE grant_id=?");
+    const deadline = Date.now() + 5000;
+    while (revokedRow.get(grantId)?.revoked !== 1 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(revokedRow.get(grantId)?.revoked, 1,
+      "concurrent owner revocation must be committed during in-flight egress");
+    assert.equal(revokeReplies, repliesBefore,
+      "owner revoke 200 must wait for previous ciphertext HTTP egress to settle");
+    assert.equal((await readAs("recipient")).status, 403,
+      "durable revoke immediately rejects new reads while old egress is draining");
+  } finally { heldResponse.release(); }
+  const [originalEgress, revokeEgressAck] = await Promise.all([
+    pendingEgress, revokeDuringEgress,
+  ]);
+  assert.equal(originalEgress.status, 200,
+    "ciphertext already admitted before revocation may finish first");
+  assert.deepEqual(Buffer.from(originalEgress.body.ciphertextBase64, "base64url"),
+    ciphertext);
+  assert.equal(revokeEgressAck.status, 200,
+    "revocation ACK occurs only after prior physical HTTP egress is finished");
+  assert.equal((await readAs("recipient")).status, 403);
+  await restart();
+  assert.equal((await readAs("recipient")).status, 403,
+    "egress-fenced revocation tombstone persists across real SQLite reopen");
+
+  // A client that never consumes its already authorized response cannot make
+  // the owner's revoke request wait forever. At the bounded drain deadline,
+  // abort the socket, observe its close, and only then acknowledge revocation.
+  const timeoutGrantId = b64(crypto.randomBytes(32));
+  const timeoutOwnerProof = await sign(owner, "get", id, 1, digest);
+  const timeoutInput = { grantId: timeoutGrantId, recipientUsername: "recipient",
+    recipientDeviceId: recipient.device_id, expiresAt: now + 120 };
+  const timeoutSignature = crypto.sign(null, await shareGrantMessageV1({
+    authorization: timeoutOwnerProof.authorization, ...timeoutInput,
+  }), timeoutOwnerProof.key);
+  assert.equal((await post("/zk-1/v1/share/grant", "owner", {
+    ...timeoutInput, authorization: wire(timeoutOwnerProof.authorization),
+    signatureBase64: b64(timeoutOwnerProof.signature),
+    shareSignatureBase64: b64(timeoutSignature),
+  })).status, 201);
+  const stuckSocket = pauseNextShareResponse();
+  // Attach the expected socket-failure handler before the 10s owner wait:
+  // otherwise Node reports a late-handled rejection as an unhandled test fail.
+  const abandonedRead = assert.rejects(readAs("recipient", recipient,
+    { grantId: timeoutGrantId }),
+  "stalled recipient socket is closed instead of outliving owner ACK");
+  await stuckSocket.started;
+  const timeoutRevoke = await post("/zk-1/v1/share/revoke", "owner",
+    { grantId: timeoutGrantId });
+  assert.equal(timeoutRevoke.status, 200,
+    "deadline must close stalled ciphertext socket before owner revoke ACK");
+  await abandonedRead;
+  assert.equal((await readAs("recipient", recipient,
+    { grantId: timeoutGrantId })).status, 403);
+
   await fixtures.appendDeviceRevocation(state, owner.device_id);
   manifest = state.headManifest;
   verifiedHistory = await historyV2.verifyRecoveryHistoryPublicV2({
@@ -522,17 +995,6 @@ test("#68: signed owner grant constrains authenticated ZK ciphertext delivery", 
   assert.equal((await post("/zk-1/v1/share/revoke", "owner", { grantId })).status, 200);
 
   // A durable share survives process restart, but revocation tombstones stay closed.
-  await new Promise((resolve) => server.close(resolve)); server = null;
-  store.close();
-  store = new Zk1ProtectedObjectStore(filename, { witnessProvider,
-    witnessPinned: { keyId: witnessKeyId, publicKey: witness.publicKey },
-    trustedScope: scope, bootstrapNew: false, admissionRequired: true,
-    signedHistoryRequired: true,
-    signedHistoryGenesisDigest: await manifestV2.recoveryManifestDigestV2(state.baseManifest),
-    verifiedHistoryProvider: async () => verifiedHistory,
-    minimumHead: { revision: 1, witnessSequence: 1,
-      digest: await manifestV2.recoveryManifestDigestV2(state.baseManifest) },
-    manifestProvider: () => z.encodeDeterministic(manifest), nowSeconds: () => now });
-  base = await mount();
+  await restart();
   assert.equal((await readAs("recipient")).status, 403);
 });

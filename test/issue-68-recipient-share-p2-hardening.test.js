@@ -442,3 +442,114 @@ test("issue 68: poisoned scope iterator and Array.some cannot suppress an indepe
   assert.equal(poisonedScopeChecks, 0,
     "the authority-scope guard must not dispatch a replaceable Array.some");
 });
+test("issue 68: revoked owner roster does not consult poisoned Array.filter after authority await", async () => {
+  const f = await createMinimalOfferFixture();
+  const revoked = {
+    ...f.baseAuthority,
+    devices: f.baseAuthority.devices.map((device, index) =>
+      index === 0 ? { ...device, revokedAtEpoch: f.epoch } : device),
+  };
+  const originalFilter = Array.prototype.filter;
+  let filterCalls = 0;
+  let authorityReads = 0;
+  try {
+    await assert.rejects(createProtectedRecipientShareOffer({
+      grant: f.grant, recipientPin: f.recipientPin, issuerPin: f.issuerPin,
+      readIndependentAuthority: async () => {
+        authorityReads++;
+        Array.prototype.filter = function (...args) {
+          filterCalls++;
+          return originalFilter.apply(this, args);
+        };
+        return revoked;
+      },
+      ownerPrivateKey: f.owner.privateKey, ownerHeldCek: f.ownerHeldCek,
+      metadata: f.metadata, objectRevision: 1, ciphertext: f.ciphertext,
+      ciphertextRoot: f.ciphertextRoot, authority: f.baseAuthority, nowSeconds: f.now,
+    }), /ZK_SHARE_OFFER_DENIED/);
+  } finally { Array.prototype.filter = originalFilter; }
+  assert.equal(authorityReads, 1, "a valid grant reaches one independent authority read");
+  assert.equal(filterCalls, 0,
+    "revoked authority must fail before any callback-poisonable array filter is invoked");
+});
+
+test("issue 68 P2: openPortableProtectedRecipientShareFile rejects getter reentrancy on redeemInput", async () => {
+  const f = await createMinimalOfferFixture();
+  let getterRan = false;
+
+  const hostileRedeemInput = {
+    get recipientUsername() {
+      getterRan = true;
+      return "alice";
+    },
+    get recipientDeviceId() {
+      getterRan = true;
+      return "device-recipient";
+    },
+    grant: f.grant,
+  };
+
+  const dummyOffer = {
+    schema: "rootark-zk1-recipient-share-offer-dev/v1",
+    authorizesProductionIo: false,
+    externalCustodyProven: false,
+    grant: f.grant,
+    recipientUsername: "alice",
+    recipientDeviceId: "device-recipient",
+    metadata: f.metadata,
+    envelope: {},
+  };
+
+  await assert.rejects(
+    openPortableProtectedRecipientShareFile({
+      offer: dummyOffer,
+      redeemInput: hostileRedeemInput,
+      authority: f.baseAuthority,
+      operatorMinimumSequence: 1,
+      deviceHpkePrivateKey: null,
+      nowSeconds: f.now,
+    }),
+    /ZK_SHARE_FILE_OPEN_DENIED/
+  );
+
+  assert.equal(getterRan, false, "getter on redeemInput must never be executed");
+});
+
+test("issue 68 P2: independent roster snapshots never execute hostile native byte-view properties", async () => {
+  const f = await createMinimalOfferFixture();
+  for (const target of ["recipient-key", "head-digest"]) {
+    let lengthReads = 0;
+    let valueOfReads = 0;
+    let iteratorReads = 0;
+    let authorityReads = 0;
+    const issuer = { ...f.baseAuthority.devices[0], revokedAtEpoch: f.epoch };
+    const recipient = { ...f.baseAuthority.devices[1] };
+    const head = { ...f.baseAuthority.head };
+    const bytes = target === "head-digest"
+      ? Uint8Array.from(head.digest)
+      : Uint8Array.from(recipient.authorizationPublicKey);
+    Object.defineProperties(bytes, {
+      length: { get() { lengthReads++; issuer.revokedAtEpoch = null; return 32; } },
+      valueOf: { value() { valueOfReads++; issuer.revokedAtEpoch = null; return bytes; } },
+      [Symbol.iterator]: { value() { iteratorReads++; issuer.revokedAtEpoch = null; return [][Symbol.iterator](); } },
+    });
+    if (target === "head-digest") head.digest = bytes;
+    else recipient.authorizationPublicKey = bytes;
+
+    await assert.rejects(createProtectedRecipientShareOffer({
+      grant: f.grant, recipientPin: f.recipientPin, issuerPin: f.issuerPin,
+      readIndependentAuthority: async () => {
+        authorityReads++;
+        return { scope: f.baseAuthority.scope, head, devices: [issuer, recipient] };
+      },
+      ownerPrivateKey: f.owner.privateKey, ownerHeldCek: f.ownerHeldCek,
+      metadata: f.metadata, objectRevision: 1, ciphertext: f.ciphertext,
+      ciphertextRoot: f.ciphertextRoot, authority: f.baseAuthority, nowSeconds: f.now,
+    }), /ZK_SHARE_OFFER_DENIED/);
+    assert.equal(authorityReads, 1, `${target}: independent roster must be checked`);
+    assert.equal(lengthReads, 0, `${target}: getter must not run`);
+    assert.equal(valueOfReads, 0, `${target}: valueOf must not run`);
+    assert.equal(iteratorReads, 0, `${target}: iterator must not run`);
+    assert.equal(issuer.revokedAtEpoch, f.epoch, `${target}: issuer must remain revoked`);
+  }
+});

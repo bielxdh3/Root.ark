@@ -4,10 +4,45 @@ on:
   push:
     branches:
       - Root/main
+      - 'cdx/issue68-owner-recipient-use-w60-20261106'
   pull_request:
     branches:
       - Root/main
       - 'cdx/zk65-split-pr*'
+      - 'cdx/issue68-*'
+      - 'cdx/issue242-p2p-grant-w47-20261106'
+      - 'cdx/issue63-auth-browser-select-w21-20261106'
+      - 'cdx/issue63-local-encrypted-index-w21-20261106'
+      - 'cdx/issue63-local-preview-w48-20261106'
+      - 'cdx/issue63-protected-search-bounded-20261106'
+      - 'cdx/issue63-protected-selected-get-w21-20261106'
+      - 'cdx/issue63-text-batch-prime-20261106'
+      - 'cdx/issue64-offline-w50-20261106'
+      - 'cdx/issue66-picker-pin-integration-prime-20261107'
+      - 'cdx/issue66-pinned-move-preobserve-w68-20261106'
+      - 'cdx/issue66-pinned-w20-20261106'
+      - 'cdx/issue67-multi-recovery-w45-v2-20261106'
+      - 'cdx/issue68-owner-recipient-use-w60-20261106'
+      - 'cdx/issue68-portable-cli-w60-20261106'
+      - 'cdx/issue68-recipient-enrollment-worker43-20261106'
+      - 'cdx/issue68-scoped-capabilities-worker22-20261106'
+      - 'cdx/issue68-zk-recipient-w32-20261106'
+      - 'cdx/issue68-zk-share-w32-20261106'
+      - 'cdx/rootark-android-paged-protected-w16-20261106'
+      - 'cdx/rootark-android-strict-json-prime-20261106'
+      - 'cdx/rootark-issue242-app-session-worker33-20261106'
+      - 'cdx/rootark-issue242-large-file-worker33-20261106'
+      - 'cdx/rootark-issue242-poc-20261106'
+      - 'cdx/rootark-issue242-research-20261106'
+      - 'cdx/rootark-issue242-session-w13-20261106'
+      - 'cdx/rootark-issue64-filelist-20261106'
+      - 'cdx/rootark-issue64-protected-fetch-worker28-20261106'
+      - 'cdx/rootark-issue66-ondemand-worker20-20261106'
+      - 'cdx/rootark-issue67-restore-20261106'
+      - 'cdx/rootark-issue67-resume-cli-20261106'
+      - 'cdx/rootark-roadmap-operational-20261105'
+      - 'feature/issue66-inventory-20261106'
+      - 'issue67-restore-preview-w25-20261106'
   workflow_dispatch:
 
 permissions:
@@ -18,6 +53,59 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  p2p-lifecycle-and-stall:
+    name: P2P Node 22 - room lifecycle and 1:N stall
+    if: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'cdx/issue242-p2p-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install disposable WebRTC dependencies
+        run: npm ci --ignore-scripts
+        working-directory: experiments/issue242-webrtc
+      - name: Require valid broker, client and transfer syntax
+        run: |
+          node --check experiments/issue242-webrtc/client.js
+          node --check experiments/issue242-webrtc/server.cjs
+          node --check experiments/issue242-webrtc/transfer-protocol.js
+      - name: Require full 1:N transport, security and lifecycle suite
+        run: npm test
+        working-directory: experiments/issue242-webrtc
+
+  p2p-edge-lifecycle:
+    name: P2P Windows Edge - 1:N and lifecycle
+    if: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'cdx/issue242-p2p-') }}
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Require Microsoft Edge
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe')) {
+            throw 'Microsoft Edge required for P2P browser lifecycle checks'
+          }
+      - name: Install Root.ark dependencies
+        run: npm ci --ignore-scripts
+      - name: Install disposable WebRTC dependencies
+        run: npm ci --ignore-scripts
+        working-directory: experiments/issue242-webrtc
+      - name: Require real standalone Edge DataChannel scenarios
+        run: npm run test:browser
+        working-directory: experiments/issue242-webrtc
+      - name: Require real Root.ark signed-session Edge lifecycle
+        run: node experiments/issue242-webrtc/tests/app-browser.cjs
+
   ubuntu-validation:
     name: Ubuntu Node 22 - full validation
     runs-on: ubuntu-latest

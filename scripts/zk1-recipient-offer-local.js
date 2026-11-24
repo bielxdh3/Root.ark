@@ -28,14 +28,22 @@ const EXPORT_KEYS = ["recipientPin", "issuerPin", "readIndependentAuthority",
   "ciphertext", "ciphertextRoot", "authority", "nowSeconds"];
 const REDEEM_KEYS = ["redeemInput", "authority", "operatorMinimumSequence",
   "deviceHpkePrivateKey", "nowSeconds"];
-const COMMON = ["--owned-dir", "--context-module", "--offer"];
+const COMMON = ["--owned-dir", "--context-module"];
 const MODE_KEYS = Object.freeze({
-  export: [...COMMON, "--grant"],
-  redeem: [...COMMON, "--output"],
+  export: [...COMMON, "--offer", "--grant"],
+  redeem: [...COMMON, "--offer", "--output"],
+  "redeem-batch": [...COMMON, "--manifest"],
 });
 const MAX_OUTPUT = 4 * 1024 * 1024;
+const MAX_BATCH = 8;
+const BATCH_SCHEMA = "rootark-zk1-recipient-object-set-dev/v1";
 
 function deny() { throw Error("ZK_RECIPIENT_OFFER_CLI_DENIED"); }
+class BatchIncomplete extends Error {
+  constructor(completed, total) {
+    super(`ZK_RECIPIENT_BATCH_INCOMPLETE_${completed}_OF_${total}_INSPECT_PRIVATE_OUTPUTS`);
+  }
+}
 function strict(value, fields) {
   if (!value || typeof value !== "object" || Array.isArray(value)
     || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) deny();
@@ -66,6 +74,41 @@ function parse(argv) {
   if (new Set(filenames).size !== filenames.length) deny();
   return { mode, opts };
 }
+function batchEntries(root, manifestName, contextName) {
+  const manifest = strict(files.readJson(root, manifestName), ["schema", "entries"]);
+  if (manifest.schema !== BATCH_SCHEMA || !Array.isArray(manifest.entries)
+    || manifest.entries.length < 1 || manifest.entries.length > MAX_BATCH) deny();
+  const reserved = new Set([contextName, manifestName].map((name) =>
+    process.platform === "win32" ? name.toLowerCase() : name));
+  const ids = new Set();
+  const grants = new Set();
+  // Validate the entire selected set before opening any ciphertext, issuing
+  // signed HTTP GETs or writing plaintext. Offer claims are only preflight
+  // selectors; each item's owner authority is independently verified below.
+  return manifest.entries.map((entry) => {
+    const { offer: offerName, output: outputName } =
+      strict(entry, ["offer", "output"]);
+    files.fileAt(root, offerName);
+    files.fileAt(root, outputName, false);
+    for (const name of [offerName, outputName]) {
+      const normalized = process.platform === "win32" ? name.toLowerCase() : name;
+      if (reserved.has(normalized)) deny();
+      reserved.add(normalized);
+    }
+    const offer = files.readJson(root, offerName);
+    if (offer?.schema !== "rootark-zk1-recipient-share-offer-dev/v1"
+      || offer?.authorizesProductionIo !== false
+      || offer?.externalCustodyProven !== false
+      || typeof offer?.metadata?.object_id !== "string"
+      || !offer.metadata.object_id
+      || typeof offer?.grant?.grantId !== "string"
+      || !offer.grant.grantId
+      || ids.has(offer.metadata.object_id) || grants.has(offer.grant.grantId)) deny();
+    ids.add(offer.metadata.object_id);
+    grants.add(offer.grant.grantId);
+    return { offer, outputName };
+  });
+}
 function privateOutput(root, name, bytes) {
   if (isProxy(bytes) || !isUint8Array(bytes)) deny();
   // Typed arrays may expose attacker-controlled own or inherited byteLength
@@ -83,9 +126,10 @@ function privateOutput(root, name, bytes) {
   // input, even when it is a symlink. An exclusive private leaf inherits the
   // already independently verified owner-only directory ACL.
   let fd = null;
+  let filename = null;
   try {
     files.safeDir(root);
-    const filename = files.fileAt(root, name, false);
+    filename = files.fileAt(root, name, false);
     const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
       | (fs.constants.O_NOFOLLOW || 0);
     fd = fs.openSync(filename, flags, 0o600);
@@ -117,6 +161,36 @@ function privateOutput(root, name, bytes) {
     }
   }
 }
+async function redeemBatch(root, opts, trustedBuilder) {
+  const entries = batchEntries(root, opts["--manifest"], opts["--context-module"]);
+  let completed = 0;
+  for (const entry of entries) {
+    let opened;
+    try {
+      // The trusted source must produce a fresh recipient session and live
+      // independent authority for each owner-issued object grant.
+      const trusted = strict(await trustedBuilder("redeem", entry.offer), REDEEM_KEYS);
+      opened = await openPortableProtectedRecipientShareFile({
+        ...trusted, offer: entry.offer,
+      });
+      if (opened.authorizesProductionIo !== false
+        || opened.externalCustodyProven !== false
+        || opened.ownerGrantSignatureVerified !== true
+        || opened.ownerCekTransferVerified !== true) deny();
+      privateOutput(root, entry.outputName, opened.data);
+      completed++;
+    } catch (_) {
+      // Already completed files remain private and intact; a failed write
+      // might have left an incomplete leaf. No atomicity/rollback is claimed.
+      throw new BatchIncomplete(completed, entries.length);
+    } finally {
+      if (opened && !isProxy(opened.data) && isUint8Array(opened.data)) {
+        nativeApply(nativeTypedFill, opened.data, [0]);
+      }
+    }
+  }
+  return `ZK_RECIPIENT_BATCH_REDEEMED_${completed}_OF_${entries.length}`;
+}
 async function run(argv) {
   let opened;
   try {
@@ -125,6 +199,9 @@ async function run(argv) {
     const moduleFile = files.trustedContextFile(root, opts["--context-module"]);
     const trustedBuilder = require(moduleFile);
     if (typeof trustedBuilder !== "function") deny();
+    if (mode === "redeem-batch") {
+      return await redeemBatch(root, opts, trustedBuilder);
+    }
     if (mode === "export") {
       files.fileAt(root, opts["--offer"], false);
       const grant = files.readJson(root, opts["--grant"]);
@@ -145,7 +222,10 @@ async function run(argv) {
       || opened.ownerCekTransferVerified !== true) deny();
     privateOutput(root, opts["--output"], opened.data);
     return "ZK_RECIPIENT_FILE_REDEEMED";
-  } catch (_) { deny(); }
+  } catch (error) {
+    if (error instanceof BatchIncomplete) throw error;
+    deny();
+  }
   finally {
     // A last authority callback may also replace `.fill` on a real byte view.
     // Use the captured native method so cleartext never survives CLI release.
@@ -157,10 +237,11 @@ async function run(argv) {
 if (require.main === module) {
   run(process.argv.slice(2)).then((status) => {
     process.stdout.write(status + "\n");
-  }).catch(() => {
+  }).catch((error) => {
     // No paths, server responses, account names, secret-bearing stack traces
     // or content bytes are included in process output.
-    process.stderr.write("ZK_RECIPIENT_OFFER_CLI_DENIED\n");
+    process.stderr.write((error instanceof BatchIncomplete
+      ? error.message : "ZK_RECIPIENT_OFFER_CLI_DENIED") + "\n");
     process.exitCode = 1;
   });
 }
