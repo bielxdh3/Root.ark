@@ -43,13 +43,18 @@ mkdir -p "$out"
   -classpath "$runtime_cp" -d "$out" \
   "$root/android/core/src/main/kotlin/dev/rootark/core/paths/PortablePathValidator.kt" \
   "$root/android/core/src/main/kotlin/dev/rootark/core/sync/SyncModels.kt" \
+  "$root/android/core/src/main/kotlin/dev/rootark/core/sync/RootArkApi.kt" \
   "$root/android/core/src/main/kotlin/dev/rootark/core/sync/ProtectedSyncContent.kt" \
   "$root/android/core/src/main/kotlin/dev/rootark/core/sync/OwnerPinnedOfflineAdmission.kt" \
+  "$root/android/core/src/main/kotlin/dev/rootark/core/sync/HpkeP256.kt" \
+  "$root/android/core/src/main/kotlin/dev/rootark/core/sync/OwnerEnrollmentAdmission.kt" \
+  "$root/android/core/src/main/kotlin/dev/rootark/core/sync/OwnerFloorRevisionIndex.kt" \
   "$root/android/core/src/test/kotlin/dev/rootark/core/sync/OwnerPinnedOfflineAdmissionTest.kt" \
+  "$root/android/core/src/test/kotlin/dev/rootark/core/sync/OwnerEnrollmentV2Test.kt" \
   "$root/android/app/src/main/java/dev/rootark/android/StrictRfc8259Json.kt" \
-  "$root/android/app/src/main/java/dev/rootark/android/OwnerPinnedOfflineImport.kt" \
-  "$root/android/app/src/test/java/dev/rootark/android/OwnerPinnedOfflineImportTest.kt"
+  "$root/android/app/src/test/java/dev/rootark/android/StrictRfc8259JsonTest.kt"
 "$java17" -cp "$out:$runtime_cp:$root/android/core/src/test/resources" \
   org.junit.platform.console.ConsoleLauncher execute \
   --disable-banner --select-class dev.rootark.core.sync.OwnerPinnedOfflineAdmissionTest \
-  --select-class dev.rootark.android.OwnerPinnedOfflineImportTest
+  --select-class dev.rootark.core.sync.OwnerEnrollmentV2Test \
+  --select-class dev.rootark.android.StrictRfc8259JsonTest

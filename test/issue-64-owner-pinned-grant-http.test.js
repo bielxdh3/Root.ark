@@ -24,14 +24,21 @@ test("Node HTTP fixture emits genuine signed grant/head and rejects changed fiel
   assert.match(source, /Signature\.getInstance\("Ed25519"\)/);
   assert.match(source, /revokedDeviceIds/);
   assert.match(source, /OwnerOfflineFloorStore/);
-  const importer = fs.readFileSync(path.join(__dirname,
-    "../android/app/src/main/java/dev/rootark/android/OwnerPinnedOfflineImport.kt"), "utf8");
+  const appSource = (name) => fs.readFileSync(path.join(__dirname,
+    "../android/app/src/main/java/dev/rootark/android", name), "utf8");
+  const importer = appSource("OwnerEnrollmentPackageJson.kt");
+  const provider = appSource("OwnerPinnedGrantProvider.kt");
+  const policy = appSource("AndroidKeySecurityPolicy.kt");
   const hardware = fs.readFileSync(path.join(__dirname,
     "../android/app/src/main/java/dev/rootark/android/OwnerOfflineHardwareFloor.kt"), "utf8");
   assert.match(importer, /StrictRfc8259Json\.validate/);
-  assert.match(importer, /withAuthorizedCek/);
+  assert.match(provider, /OwnerEnrollmentPackageJson\.parse/);
+  assert.match(provider, /OwnerEnrollmentAdmission\.withAuthorizedGrant/);
+  assert.doesNotMatch(provider, /withAuthorizedCek/);
   assert.match(hardware, /AndroidKeyStore/);
-  assert.match(hardware, /isInsideSecureHardware/);
+  assert.match(hardware, /AndroidKeySecurityPolicy\.requireHardwareDeviceCredentialKey/);
+  assert.match(policy, /isInsideSecureHardware/);
+  assert.match(policy, /check\(evidence\.insideSecureHardware && evidence\.authenticationEnforcedBySecureHardware\)/);
   assert.match(hardware, /setUserAuthenticationRequired\(true\)/);
   const saved = JSON.parse(fs.readFileSync(path.join(__dirname,
     "../android/core/src/test/resources/owner-pinned-grant.json"), "utf8"));
