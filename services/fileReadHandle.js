@@ -109,9 +109,8 @@ function windowsDirectoryAcl(directoryPath) {
     // Missing/inaccessible paths still fail; owner and ACE checks below apply
     // to the returned native ACL without relaxing any trust decision.
     "$acl = [System.IO.Directory]::GetAccessControl($target)",
-    "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()",
-    "$current = $identity.User.Value",
-    "$isAdmin = ([System.Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)",
+    "$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "$isAdmin = ([System.Security.Principal.WindowsPrincipal]::new([System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)",
     "$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
     "$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { [pscustomobject]@{ sid = $_.IdentityReference.Value; type = $_.AccessControlType.ToString(); rights = [int]$_.FileSystemRights } })",
     "[pscustomobject]@{ owner = $owner; current = $current; isAdmin = $isAdmin; protected = $acl.AreAccessRulesProtected; rules = $rules } | ConvertTo-Json -Depth 4 -Compress",
