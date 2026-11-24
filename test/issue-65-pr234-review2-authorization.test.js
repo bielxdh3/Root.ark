@@ -28,6 +28,7 @@ test("stored historical Sync v2 envelope retains signed bytes after expiration",
     device_1: publicKey }, revokedDeviceIds: [] };
   await new Promise((resolve) => setTimeout(resolve,
     Math.max(0, expiresAt - Date.now() + 30)));
+  assert.ok(Date.now() > operation.authorization.expiresAt);
   assert.throws(() => protocol.validateOperation(operation), /Expired device authorization/);
   const normalized = protocol.validateStoredOperation(operation);
   assert.equal(normalized.authorization.signature, operation.authorization.signature);
@@ -42,8 +43,8 @@ test("stored historical Sync v2 envelope retains signed bytes after expiration",
   assert.equal(bound.envelope.authorization.signature, operation.authorization.signature);
   await assert.rejects(auth.verifyHistoricalAuthorizationProof(
     normalized.authorization, normalized, { ...policy, revokedDeviceIds: ["device_1"] }),
-  (error) => error?.code === "authorization_device_revoked");
+    (error) => error?.code === "authorization_device_revoked");
   await assert.rejects(auth.verifyHistoricalAuthorizationProof(
     normalized.authorization, { ...normalized, objectId: "forged" }, policy),
-  (error) => error?.code === "authorization_scope");
+    (error) => error?.code === "authorization_scope");
 });

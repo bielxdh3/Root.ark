@@ -12,7 +12,8 @@ const test = require("node:test");
 const { promisify } = require("node:util");
 const express = require("express");
 const { createOperation } = require("../sync-client/rootark-sync-protocol");
-const { createAuthorizationProof, verifyAuthorizationProof } = require("../sync-client/rootark-sync-authorization");
+const { createAuthorizationProof, verifyAuthorizationProof } =
+  require("../sync-client/rootark-sync-authorization");
 const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 const { runMigrations } = require("../db/migrations");
@@ -299,6 +300,63 @@ test("atomic device authorization expires after real Ed25519 verification before
   }
   assert.equal(delayedStagingSync, 1,
     "the real signed write must pass verification and reach disk staging");
+  assert.deepEqual(store.list("alice"), [], "expired proof cannot durably write ciphertext");
+  const restarted = await new SyncObjectStore(path.join(directory, "objects.json"),
+    { atomicDeviceRegistry: true }).open();
+  assert.deepEqual(restarted.list("alice"), [], "expired proof cannot survive restart");
+});
+
+test("atomic device authorization expires after real Ed25519 verification but before durable commit", async (t) => {
+  const directory = await isolatedRegistryDirectory("rootark-sync-expiry-race-");
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = await new SyncObjectStore(path.join(directory, "objects.json"),
+    { atomicDeviceRegistry: true }).open();
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  await store.enrollDevice({ username: "alice", deviceId: "device-expiry", publicKey,
+    expectedEpoch: 0 });
+  const operation = createOperation({ operation: "create", objectId: "expired-object",
+    fileId: "expired-file", versionId: "expired-version", operationId: "expired-operation",
+    deviceId: "device-expiry", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-expiry" },
+    metadata: { path: "expired.txt" }, plaintext: Buffer.from("ciphertext fixture"),
+    fileKey: crypto.randomBytes(32) });
+  const expiresAt = Date.now() + 4_000;
+  operation.authorization = await createAuthorizationProof(operation,
+    { username: "alice", publicKey, privateKey: signer.privateKey, expiresAt });
+  assert.equal(await verifyAuthorizationProof(operation.authorization, operation, {
+    username: "alice", trustedDevicePublicKeys: { "device-expiry": publicKey },
+    revokedDeviceIds: [],
+  }), true, "positive control must verify with real pinned Ed25519 key");
+  // The store verifies the same signature inside its locked mutator. Delay
+  // only AFTER that mutator reports successful authenticated preparation and
+  // BEFORE the actual durableWrite/rename barrier. This hits the genuine
+  // expiration fence, rather than monkeypatching crypto.verify and Date.now
+  // after the security module captured its native intrinsics.
+  const transact = store.transact;
+  let reachedAuthenticatedMutation = false;
+  store.transact = function (mutator, options) {
+    return transact.call(this, async (next) => {
+      const result = await mutator(next);
+      assert.equal(result.kind, "stored",
+        "real verified operation must reach pending durable commit");
+      reachedAuthenticatedMutation = true;
+      await new Promise((resolve) => setTimeout(resolve,
+        Math.max(0, expiresAt - Date.now() + 25)));
+      return result;
+    }, options);
+  };
+  try {
+    await assert.rejects(store.put("alice", operation),
+      { code: "SYNC_ATOMIC_DEVICE_AUTH_REJECTED" },
+      "real signed proof must be rejected when its lease expires before physical rename");
+  } finally {
+    store.transact = transact;
+  }
+  assert.equal(reachedAuthenticatedMutation, true,
+    "authenticated mutation must be prepared before expiry; no vacuous early rejection");
+  assert.ok(Date.now() > expiresAt,
+    "the actual clock must expire before the durable rename barrier");
   assert.deepEqual(store.list("alice"), [], "expired proof cannot durably write ciphertext");
   const restarted = await new SyncObjectStore(path.join(directory, "objects.json"),
     { atomicDeviceRegistry: true }).open();

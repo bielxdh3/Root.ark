@@ -10,6 +10,7 @@ const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const { trustedAtomicBatchWitnessOptions,
   assertPinnedStrictLocalDeviceIdentity } = require("../sync-client/rootark-sync-v2");
 const DENIED_UNTRUSTED_WITNESS = /(?:independently pinned readback and external CAS floor|immutable canonical owner authority options|owner provision is not independently authenticated)/;
+const HISTORICAL_PROVIDER_DISABLED = /Independent historical admission is disabled pending full provider-chain hardening/;
 const sha256 = (value) => crypto.createHash("sha256").update(value, "utf8").digest("hex");
 const ownerTestSigners = new WeakMap();
 
@@ -54,6 +55,25 @@ function resignOwnerCertificate(base, statement) {
     ownerProvisionDigest: sha256(OWNER_PROVISION_DOMAIN + protocol.canonicalJson(ownerProvisioning)) };
 }
 
+// Direct SyncEngine validation is intentionally independent of the exported
+// standalone provider gate. These tests must not turn a correctly signed
+// low-level owner certificate into permission to enable the CLI provider.
+function directEngine(trusted, overrides = {}) {
+  return new SyncEngine({
+    adapter: { push: async () => null, list: async () => [] },
+    atomicBatchWitnessPublicKey: trusted.pinnedPublicKey,
+    atomicBatchWitnessScope: trusted.scope,
+    atomicBatchOwnerIdentity: trusted.ownerIdentity,
+    atomicBatchWitnessReadback: trusted.readback,
+    atomicBatchCasFloorPublicKey: trusted.casPinnedPublicKey,
+    atomicBatchCasFloorReadback: trusted.casReadback,
+    atomicBatchOwnerProvisionerPublicKey: trusted.ownerProvisionerPublicKey,
+    atomicBatchOwnerProvisioning: trusted.ownerProvisioning,
+    atomicBatchOwnerProvisionDigest: trusted.ownerProvisionDigest,
+    ...overrides,
+  });
+}
+
 test("P2: authentic owner provision cannot certify one physical Ed25519 witness as CAS", () => {
   const base = trustedFixture();
   const witness = crypto.createPublicKey({ key: base.pinnedPublicKey, format: "der", type: "spki" });
@@ -71,12 +91,7 @@ test("P2: authentic owner provision cannot certify one physical Ed25519 witness 
     witnessPublicKey: witness, casPublicKey: cas,
     provisioning: owner.ownerProvisioning, expectedDigest: owner.ownerProvisionDigest,
   });
-  const makeEngine = (owner) => {
-    const configured = trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: owner }, true);
-    return new SyncEngine({ ...configured,
-      adapter: { list: async () => ({ objects: [] }), push: async () => null },
-    });
-  };
+  const makeEngine = (owner) => directEngine(owner);
   const makeDirectEngine = (owner) => new SyncEngine({
     adapter: { list: async () => ({ objects: [] }), push: async () => null },
     atomicBatchWitnessPublicKey: owner.pinnedPublicKey,
@@ -218,21 +233,17 @@ test("P2: inherited witness key getter cannot retarget canonical owner A bytes t
   }), "legitimate signed A still verifies under independent pinned digest A");
 });
 
-test("atomic witness accepts a pinned Ed25519 KeyObject and retains canonical native material", () => {
-  // PR236 additionally requires owner-signed provision and a separate CAS
-  // floor. Preserve that full authority chain while testing KeyObject input.
+test("direct engine pins an Ed25519 KeyObject while standalone historical admission stays disabled", () => {
   const witness = trustedFixture();
   const publicKey = crypto.createPublicKey({ key: witness.pinnedPublicKey,
     format: "der", type: "spki" });
   witness.pinnedPublicKey = publicKey;
-  const configured = trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: witness }, true);
-  const makeEngine = (atomicBatchWitnessPublicKey) => new SyncEngine({
-    ...configured,
-    adapter: { push: async () => null, list: async () => [] },
-    atomicBatchWitnessPublicKey,
-  });
-  const held = makeEngine(configured.atomicBatchWitnessPublicKey).atomicBatchWitnessPublicKey;
-  assert.notEqual(held, publicKey, "never retain caller-owned mutable KeyObject");
+  assert.throws(() => trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: witness }, true),
+    HISTORICAL_PROVIDER_DISABLED);
+  const makeEngine = (atomicBatchWitnessPublicKey) => directEngine(witness,
+    { atomicBatchWitnessPublicKey });
+  const held = makeEngine(publicKey).atomicBatchWitnessPublicKey;
+  assert.notEqual(held, publicKey);
   assert.equal(crypto.KeyObject.prototype.equals.call(held, publicKey), true);
   assert.equal(makeEngine(publicKey.export({ type: "spki", format: "der" }))
     .atomicBatchWitnessPublicKey.asymmetricKeyType, "ed25519");
@@ -242,7 +253,7 @@ test("atomic witness accepts a pinned Ed25519 KeyObject and retains canonical na
 
 test("standalone Sync v2 keeps remote atomic witness disabled without external injection", () => {
   assert.deepEqual(trustedAtomicBatchWitnessOptions({}, false), {});
-  assert.deepEqual(trustedAtomicBatchWitnessOptions({}, true), {});
+  assert.throws(() => trustedAtomicBatchWitnessOptions({}, true), HISTORICAL_PROVIDER_DISABLED);
 });
 
 test("config-only or legacy admission cannot enable the atomic batch witness", () => {
@@ -252,11 +263,13 @@ test("config-only or legacy admission cannot enable the atomic batch witness", (
   }, false), DENIED_UNTRUSTED_WITNESS);
   assert.throws(() => trustedAtomicBatchWitnessOptions({
     trustedAtomicBatchWitness: null,
-  }, true), DENIED_UNTRUSTED_WITNESS);
+  }, true), HISTORICAL_PROVIDER_DISABLED);
 });
 
-test("external atomic witness requires a complete independent key, scope and readback", () => {
+test("disabled provider cannot be enabled with malformed or fully signed independent authority", () => {
   const base = trustedFixture();
+  assert.throws(() => trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: base }, true),
+    HISTORICAL_PROVIDER_DISABLED, "even complete independent pins cannot bypass the disabled CLI provider");
   for (const changed of [
     { readback: null }, { pinnedPublicKey: null }, { scope: "../unsafe" },
     { scope: "alice:store", remotePhysicalDurable: true },
@@ -270,7 +283,7 @@ test("external atomic witness requires a complete independent key, scope and rea
   ]) {
     assert.throws(() => trustedAtomicBatchWitnessOptions({
       trustedAtomicBatchWitness: { ...trustedFixture(), ...changed },
-    }, true), DENIED_UNTRUSTED_WITNESS);
+    }, true), HISTORICAL_PROVIDER_DISABLED);
   }
   // These are AUTHENTIC statements signed with the original trusted root,
   // with a matching updated digest. Denial cannot be attributed to a forged
@@ -286,81 +299,62 @@ test("external atomic witness requires a complete independent key, scope and rea
     { witnessSpki: base.casPinnedPublicKey.toString("base64url") },
     { casSpki: base.pinnedPublicKey.toString("base64url") },
   ]) {
+    const modified = resignOwnerCertificate(base, { ...statement, ...change });
     assert.throws(() => trustedAtomicBatchWitnessOptions({
-      trustedAtomicBatchWitness: resignOwnerCertificate(base, { ...statement, ...change }),
-    }, true), /owner provision is not independently authenticated/,
-    `valid Ed25519 certificate must still reject ${Object.keys(change)[0]}`);
+      trustedAtomicBatchWitness: modified,
+    }, true), HISTORICAL_PROVIDER_DISABLED);
+    assert.throws(() => directEngine(modified), { code: "authorization_required" },
+      `direct owner provisioning must still reject signed ${Object.keys(change)[0]}`);
   }
   const updated = resignOwnerCertificate(base, { ...statement, sequence: 2 });
-  assert.equal(trustedAtomicBatchWitnessOptions({
-    trustedAtomicBatchWitness: updated,
-  }, true).atomicBatchOwnerIdentity.storeId, base.ownerIdentity.storeId);
-  assert.throws(() => trustedAtomicBatchWitnessOptions({
-    trustedAtomicBatchWitness: { ...base,
-      ownerProvisionDigest: updated.ownerProvisionDigest },
-  }, true), /owner provision is not independently authenticated/,
+  assert.equal(directEngine(updated).atomicBatchOwnerIdentity.storeId,
+    base.ownerIdentity.storeId);
+  assert.throws(() => directEngine({ ...base,
+    ownerProvisionDigest: updated.ownerProvisionDigest }), { code: "authorization_required" },
   "authentic old certificate must fail under independently advanced current digest");
 });
 
-test("trusted batch witness snapshots owner key and keeps challenge arrays isolated", async () => {
+test("direct engine snapshots owner keys; disabled provider cannot expose readback callbacks", () => {
   const trusted = trustedFixture();
-  let received;
-  trusted.readback = async (challenge) => {
-    received = challenge;
-    challenge.operationIds[0] = "ATTACKER_REPLACED";
-    challenge.envelopeDigests[0] = "BAD_DIGEST";
-    return null;
-  };
-  trusted.casReadback = async (challenge) => {
-    received = challenge;
-    return null;
-  };
-  const opts = trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: trusted },
-    true, { username: "alice" }, "private");
-  const pinnedCopy = Buffer.from(opts.atomicBatchWitnessPublicKey);
-  const casPinnedCopy = Buffer.from(opts.atomicBatchCasFloorPublicKey);
-  const ownerPinCopy = opts.atomicBatchOwnerProvisionerPublicKey.export({ type: "spki", format: "der" });
+  assert.throws(() => trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: trusted },
+    true, { username: "alice" }, "private"), HISTORICAL_PROVIDER_DISABLED);
+  const engine = directEngine(trusted);
+  const pinnedCopy = engine.atomicBatchWitnessPublicKey.export({ type: "spki", format: "der" });
+  const casPinnedCopy = engine.atomicBatchCasFloorPublicKey.export({ type: "spki", format: "der" });
+  const ownerPinCopy = engine.atomicBatchOwnerProvisionerPublicKey.export({ type: "spki", format: "der" });
   trusted.pinnedPublicKey.fill(0);
   trusted.casPinnedPublicKey.fill(0);
-  assert.deepEqual(opts.atomicBatchWitnessPublicKey, pinnedCopy);
-  assert.deepEqual(opts.atomicBatchCasFloorPublicKey, casPinnedCopy);
-  assert.deepEqual(opts.atomicBatchOwnerProvisionerPublicKey.export({ type: "spki", format: "der" }), ownerPinCopy);
-  assert.equal(opts.atomicBatchWitnessScope, "alice:store");
-  assert.equal(Object.isFrozen(opts.atomicBatchOwnerIdentity), true);
-  assert.equal(opts.atomicBatchOwnerIdentity.accountId,
+  assert.deepEqual(engine.atomicBatchWitnessPublicKey.export({ type: "spki", format: "der" }), pinnedCopy);
+  assert.deepEqual(engine.atomicBatchCasFloorPublicKey.export({ type: "spki", format: "der" }), casPinnedCopy);
+  assert.deepEqual(engine.atomicBatchOwnerProvisionerPublicKey.export({ type: "spki", format: "der" }), ownerPinCopy);
+  assert.equal(engine.atomicBatchWitnessScope, "alice:store");
+  assert.equal(Object.isFrozen(engine.atomicBatchOwnerIdentity), true);
+  assert.equal(engine.atomicBatchOwnerIdentity.accountId,
     "ca628a48-765e-4b0d-a746-3bc67d53e3b1");
   trusted.ownerIdentity.storeId = "ad112afc-ff8e-4803-9f5c-b517cc778588";
   trusted.ownerProvisioning.statement.storeId = "ad112afc-ff8e-4803-9f5c-b517cc778588";
-  assert.equal(opts.atomicBatchOwnerIdentity.storeId,
+  assert.equal(engine.atomicBatchOwnerIdentity.storeId,
     "d95a7868-857c-4213-a5ad-3c10374b4fa7");
-  const challenge = {
-    scope: "alice:store", accountId: opts.atomicBatchOwnerIdentity.accountId,
-    storeId: opts.atomicBatchOwnerIdentity.storeId, nonce: "challenge-nonce",
-    operationIds: ["delete-id", "move-id"],
-    envelopeDigests: ["delete-digest", "move-digest"],
-  };
-  await opts.atomicBatchWitnessReadback(challenge);
-  assert.deepEqual(challenge.operationIds, ["delete-id", "move-id"]);
-  assert.deepEqual(challenge.envelopeDigests, ["delete-digest", "move-digest"]);
-  assert.equal(received.nonce, challenge.nonce);
-  const floorChallenge = {
-    scope: "alice:store", accountId: opts.atomicBatchOwnerIdentity.accountId,
-    storeId: opts.atomicBatchOwnerIdentity.storeId,
-    nonce: "second-nonce", commitId: "commit-1",
-    storeHeadSha256: "a".repeat(64), fencingEpoch: 3,
-  };
-  await opts.atomicBatchCasFloorReadback(floorChallenge);
-  assert.deepEqual(received, floorChallenge);
+  assert.equal(engine.atomicBatchWitnessReadback, trusted.readback);
+  assert.equal(engine.atomicBatchCasFloorReadback, trusted.casReadback);
+  assert.throws(() => { engine.atomicBatchWitnessReadback = () => "UNTRUSTED"; }, TypeError,
+    "external callbacks cannot replace captured engine authority");
 });
 
-test("external atomic witness rejects owner or compartment mismatches from trusted local policy", () => {
+test("disabled provider rejects external policies even with an independently signed certificate", () => {
   const trusted = trustedFixture();
   assert.throws(() => trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: trusted },
-    true, { username: "mallory" }, "private"), /external CAS floor/);
+    true, { username: "mallory" }, "private"), HISTORICAL_PROVIDER_DISABLED);
   assert.throws(() => trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: trusted },
-    true, { username: "alice" }, "other-compartment"), /external CAS floor/);
-  assert.deepEqual(trustedAtomicBatchWitnessOptions({}, true,
-    { username: "alice" }, "private"), {});
+    true, { username: "alice" }, "other-compartment"), HISTORICAL_PROVIDER_DISABLED);
+  assert.throws(() => trustedAtomicBatchWitnessOptions({}, true,
+    { username: "alice" }, "private"), HISTORICAL_PROVIDER_DISABLED);
+  assert.throws(() => directEngine(trusted, {
+    atomicBatchOwnerIdentity: { ...trusted.ownerIdentity, username: "mallory" },
+  }), { code: "authorization_required" });
+  assert.throws(() => directEngine(trusted, {
+    atomicBatchOwnerIdentity: { ...trusted.ownerIdentity, compartmentId: "other-compartment" },
+  }), { code: "authorization_required" });
 });
 
 test("owner provision requires exact independent signature, trusted root, scope and schema", () => {
@@ -391,31 +385,31 @@ test("owner provision requires exact independent signature, trusted root, scope 
     const supplied = { ...base, ...changed };
     assert.throws(() => trustedAtomicBatchWitnessOptions({
       trustedAtomicBatchWitness: supplied,
-    }, true), /(?:owner provision is not independently authenticated|distinct pinned keys)/);
+    }, true), HISTORICAL_PROVIDER_DISABLED);
+    assert.throws(() => directEngine(supplied), { code: "authorization_required" },
+      "direct engine must reject forged or mismatched owner provenance");
   }
   const attackerSigned = trustedFixture();
-  assert.throws(() => trustedAtomicBatchWitnessOptions({
-    trustedAtomicBatchWitness: { ...base, ownerProvisioning: attackerSigned.ownerProvisioning },
-  }, true), /owner provision is not independently authenticated/);
+  assert.throws(() => directEngine({ ...base,
+    ownerProvisioning: attackerSigned.ownerProvisioning,
+  }), { code: "authorization_required" });
   // Even compromise of an arbitrary second root is insufficient to swap
   // the current certificate when its digest is independently pinned.
-  assert.throws(() => trustedAtomicBatchWitnessOptions({
-    trustedAtomicBatchWitness: { ...base,
-      ownerProvisionerPublicKey: attackerSigned.ownerProvisionerPublicKey,
-      ownerProvisioning: attackerSigned.ownerProvisioning },
-  }, true), /owner provision is not independently authenticated/);
+  assert.throws(() => directEngine({ ...base,
+    ownerProvisionerPublicKey: attackerSigned.ownerProvisionerPublicKey,
+    ownerProvisioning: attackerSigned.ownerProvisioning,
+  }), { code: "authorization_required" });
   const olderDomainKey = crypto.generateKeyPairSync("ed25519");
   const legacyDomainReceipt = { statement: base.ownerProvisioning.statement,
     signature: crypto.sign(null, Buffer.from("rootark-sync-atomic-owner-provision-v1\0"
       + protocol.canonicalJson(base.ownerProvisioning.statement)),
     olderDomainKey.privateKey).toString("base64url") };
-  assert.throws(() => trustedAtomicBatchWitnessOptions({
-    trustedAtomicBatchWitness: { ...base,
-      ownerProvisionerPublicKey: olderDomainKey.publicKey,
-      ownerProvisioning: legacyDomainReceipt,
-      ownerProvisionDigest: sha256(OWNER_PROVISION_DOMAIN
-        + protocol.canonicalJson(legacyDomainReceipt)) },
-  }, true), /owner provision is not independently authenticated/);
+  assert.throws(() => directEngine({ ...base,
+    ownerProvisionerPublicKey: olderDomainKey.publicKey,
+    ownerProvisioning: legacyDomainReceipt,
+    ownerProvisionDigest: sha256(OWNER_PROVISION_DOMAIN
+      + protocol.canonicalJson(legacyDomainReceipt)),
+  }), { code: "authorization_required" });
 });
 
 test("direct SyncEngine callers cannot bypass externally signed owner provenance", () => {
@@ -430,7 +424,7 @@ test("direct SyncEngine callers cannot bypass externally signed owner provenance
     atomicBatchCasFloorReadback: trusted.casReadback,
   };
   assert.throws(() => new SyncEngine(plainOptions),
-    /owner provision is not independently authenticated/);
+    { code: "authorization_required" });
   const withRoot = { ...plainOptions,
     atomicBatchOwnerProvisionerPublicKey: trusted.ownerProvisionerPublicKey,
     atomicBatchOwnerProvisioning: trusted.ownerProvisioning,
@@ -450,22 +444,24 @@ test("direct SyncEngine callers cannot bypass externally signed owner provenance
   }
 });
 
-test("trusted atomic witness rejects getter authority swaps before construction", () => {
+test("disabled provider never reads accessor-controlled owner authority", () => {
   for (const key of ["scope", "pinnedPublicKey", "casPinnedPublicKey",
     "readback", "casReadback", "ownerIdentity", "ownerProvisioning",
     "ownerProvisionerPublicKey", "ownerProvisionDigest"]) {
     const supplied = trustedFixture();
+    let getterCalls = 0;
     Object.defineProperty(supplied, key, {
       enumerable: true, configurable: true,
-      get: () => { throw new Error("SHOULD_NOT_READ_ACCESSOR"); },
+      get: () => { getterCalls++; throw new Error("SHOULD_NOT_READ_ACCESSOR"); },
     });
     assert.throws(() => trustedAtomicBatchWitnessOptions({
       trustedAtomicBatchWitness: supplied,
-    }, true), /immutable canonical owner authority options/);
+    }, true), HISTORICAL_PROVIDER_DISABLED);
+    assert.equal(getterCalls, 0, `disabled provider must not inspect ${key}`);
   }
 });
 
-test("trusted atomic witness captures one Proxy descriptor snapshot, not mutable get traps", () => {
+test("disabled provider rejects a Proxy without invoking its mutable get traps", () => {
   const original = trustedFixture();
   let getTraps = 0;
   const supplied = new Proxy(original, {
@@ -476,10 +472,9 @@ test("trusted atomic witness captures one Proxy descriptor snapshot, not mutable
       return Reflect.get(target, prop, receiver);
     },
   });
-  const opts = trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: supplied }, true);
+  assert.throws(() => trustedAtomicBatchWitnessOptions({ trustedAtomicBatchWitness: supplied }, true),
+    HISTORICAL_PROVIDER_DISABLED);
   assert.equal(getTraps, 0, "capture must use only own property descriptors");
-  assert.equal(opts.atomicBatchWitnessScope, "alice:store");
-  assert.equal(opts.atomicBatchOwnerIdentity.username, "alice");
 });
 
 test("strict Sync v2 checks owner-pinned local device identity before opening the engine", () => {

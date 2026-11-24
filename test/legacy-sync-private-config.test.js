@@ -13,7 +13,7 @@ const { createPrivateAuthorityFixture } =
 const cli = path.resolve(__dirname, "../sync-client/rootark-sync.js");
 
 function runInit(folder, serverUrl, configPath, { preload = false, preseedTarget = "",
-  omitConfig = false, envOverrides = {} } = {}) {
+  omitConfig = false, envOverrides = {}, progressServer = null } = {}) {
   const args = [];
   if (preload) {
     args.push("-e", String.raw`
@@ -41,13 +41,49 @@ function runInit(folder, serverUrl, configPath, { preload = false, preseedTarget
         ROOTARK_TEST_PRESEEDED_PATH: configPath,
         ROOTARK_TEST_PRESEEDED_TARGET: preseedTarget },
     });
-    const timer = setTimeout(() => child.kill(), 10000);
+    // Two distinct synchronous Windows ACL phases can each legitimately take
+    // most of the 10s idle budget under a busy hosted Node test runner:
+    // private-path preflight, then private config publication after login.
+    // Renew the SAME 10s budget only once after this fixture's own completed
+    // login response. No untrusted stdout can keep the child alive, and the
+    // entire operation remains bounded by two 10s phases.
+    let timedOut = false;
+    let complete = false;
+    let phase = "preflight";
+    const timer = setTimeout(() => {
+      if (!complete && child.exitCode === null && child.signalCode === null) {
+        timedOut = child.kill();
+      }
+    }, 10000);
+    const onFixtureRequest = (req, res) => {
+      if (phase !== "preflight" || req.method !== "POST" || req.url !== "/auth/login") return;
+      res.once("finish", () => {
+        if (phase === "preflight" && !timedOut && !complete) {
+          phase = "post-login";
+          timer.refresh();
+        }
+      });
+    };
+    if (progressServer) progressServer.on("request", onFixtureRequest);
+    const cleanup = () => {
+      complete = true;
+      clearTimeout(timer);
+      if (progressServer) progressServer.off("request", onFixtureRequest);
+    };
     let output = "";
     for (const stream of [child.stdout, child.stderr]) {
       stream.on("data", (chunk) => { output += chunk.toString("utf8"); });
     }
-    child.once("error", (error) => { clearTimeout(timer); reject(error); });
-    child.once("close", (code) => { clearTimeout(timer); resolve({ code, output }); });
+    child.once("error", (error) => { cleanup(); reject(error); });
+    child.once("close", (code, signal) => {
+      cleanup();
+      // `close(null, SIGTERM)` is a timed-out TEST, never a successful CLI
+      // rejection. In particular, negative security tests must not pass when
+      // a hung child was killed before reaching the checked boundary.
+      if (timedOut) return reject(new Error(`SYNC_TEST_INIT_TIMEOUT_${phase.toUpperCase().replace("-", "_")}`));
+      if (code === null) return reject(new Error(signal ? "SYNC_TEST_INIT_SIGNALED" : "SYNC_TEST_INIT_NO_EXIT_CODE"));
+      resolve({ code, output });
+    });
   });
 }
 
@@ -227,7 +263,7 @@ test("legacy default config is stored in private user config home, not an arbitr
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const run = await runInit(dir, `http://127.0.0.1:${server.address().port}`, "",
-    { omitConfig: true, envOverrides: { APPDATA: profileConfigHome,
+    { omitConfig: true, progressServer: server, envOverrides: { APPDATA: profileConfigHome,
       XDG_CONFIG_HOME: profileConfigHome } });
   assert.equal(run.code, 0, run.output);
   const expected = path.join(profileConfigHome, "Rootark", "sync", "config.json");
@@ -258,7 +294,7 @@ test("legacy init cannot overwrite an existing private Sync v2 CWD config", asyn
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const result = await runInit(dir, `http://127.0.0.1:${server.address().port}`, "",
-    { omitConfig: true, envOverrides: { APPDATA: privateHome,
+    { omitConfig: true, progressServer: server, envOverrides: { APPDATA: privateHome,
       XDG_CONFIG_HOME: privateHome } });
   assert.equal(result.code, 0, result.output);
   assert.equal(await fsp.readFile(configPath, "utf8"), v2Contents,

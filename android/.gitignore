@@ -5,3 +5,4 @@ local.properties
 .idea/
 /app/release/
 /.kotlin/errors/errors-*.log
+/.kotlin/sessions/*.salive

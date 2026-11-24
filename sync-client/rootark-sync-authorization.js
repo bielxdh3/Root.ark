@@ -1,42 +1,178 @@
 "use strict";
 
-const {
-  createPublicKey: NATIVE_CREATE_PUBLIC_KEY,
-  createHash: NATIVE_CREATE_HASH,
-  hashUpdate: NATIVE_HASH_UPDATE,
-  hashDigest: NATIVE_HASH_DIGEST,
-  verify: NATIVE_VERIFY,
-  sign: NATIVE_SIGN,
-  randomBytes: NATIVE_RANDOM_BYTES,
-  bufferFrom: NATIVE_BUFFER_FROM,
-  bufferConcat: NATIVE_BUFFER_CONCAT,
-  bufferToString: NATIVE_BUFFER_TO_STRING,
-  jsonStringify: NATIVE_JSON_STRINGIFY,
-  arraySome: NATIVE_ARRAY_SOME,
-  arrayIncludes: NATIVE_ARRAY_INCLUDES,
-  dateNow: NATIVE_DATE_NOW,
-  keyType: NATIVE_KEY_TYPE,
-  keyAlgorithm: NATIVE_KEY_ALGORITHM,
-} = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
+const native = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
+const { types: nodeUtilTypes } = require("node:util");
 const zk = require("../src/crypto/rootark-zk-1");
+const nativeZkEncodeDeterministic = zk.encodeDeterministic;
+const nativeZkSuiteId = zk.SUITE_ID;
+const nativeZkAuthorizationDomain = zk.ASCII.AUTHORIZATION;
 
-const PROOF_FIELDS = Object.freeze([
+// Authorization binding is rechecked on retries, after the transport has had
+// a chance to mutate shared globals. Keep its digest/nonce/verification path
+// on the native primitives captured before that trust boundary.
+const nativeBufferFrom = native.bufferFrom;
+const nativeBufferConcat = native.bufferConcat;
+const nativeBufferToString = native.bufferToString;
+const nativeRandomBytes = native.randomBytes;
+const nativeCreateHash = native.createHash;
+const nativeHashUpdate = native.hashUpdate;
+const nativeHashDigest = native.hashDigest;
+const nativeSign = native.sign;
+const nativeCreatePublicKey = native.createPublicKey;
+const nativeVerify = native.verify;
+const nativeReflectApply = native.apply;
+const nativeJsonStringify = JSON.stringify.bind(JSON);
+const nativeArrayIsArray = native.arrayIsArray;
+const nativeArrayIncludes = native.arrayIncludes;
+const nativeRegExpExec = RegExp.prototype.exec;
+const nativeNumberIsSafeInteger = Number.isSafeInteger;
+const nativeDateNow = native.dateNow;
+const nativeObjectKeys = Object.keys;
+const nativeObjectHasOwn = Object.hasOwn;
+const nativeObjectAssign = Object.assign;
+const NativeArray = Array;
+const NativeObjectPrototype = Object.prototype;
+const nativeIsProxy = nodeUtilTypes.isProxy;
+const nativeObjectCreate = Object.create;
+const nativeObjectFreeze = Object.freeze;
+const nativeObjectGetPrototypeOf = Object.getPrototypeOf;
+const nativeObjectSetPrototypeOf = Object.setPrototypeOf;
+const nativeObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const nativeReflectOwnKeys = Reflect.ownKeys;
+
+function ownDataValue(value, key) {
+  if (!value || typeof value !== "object") return undefined;
+  const descriptor = nativeObjectGetOwnPropertyDescriptor(value, key);
+  if (descriptor && !nativeObjectHasOwn(descriptor, "value")) fail(`Invalid authorization accessor: ${key}`);
+  return descriptor && nativeObjectHasOwn(descriptor, "value") ? descriptor.value : undefined;
+}
+
+function assertPlainDataObject(value, name) {
+  if (!value || typeof value !== "object" || nativeArrayIsArray(value) || nativeIsProxy(value)) {
+    fail(`Invalid ${name}`);
+  }
+  const prototype = nativeObjectGetPrototypeOf(value);
+  if (prototype !== NativeObjectPrototype && prototype !== null) fail(`Invalid ${name}`);
+  const keys = nativeObjectKeys(value);
+  if (nativeReflectOwnKeys(value).length !== keys.length) fail(`Invalid ${name}`);
+  for (let index = 0; index < keys.length; index += 1) {
+    const descriptor = nativeObjectGetOwnPropertyDescriptor(value, keys[index]);
+    if (!descriptor || !nativeObjectHasOwn(descriptor, "value") || descriptor.enumerable !== true) {
+      fail(`Invalid ${name}`);
+    }
+  }
+}
+
+function regexTest(pattern, value) {
+  return nativeReflectApply(nativeRegExpExec, pattern, [value]) !== null;
+}
+
+function freezeJson(value) {
+  if (!value || typeof value !== "object") return value;
+  const keys = nativeObjectKeys(value);
+  for (let index = 0; index < keys.length; index += 1) {
+    const descriptor = nativeObjectGetOwnPropertyDescriptor(value, keys[index]);
+    if (!descriptor || !nativeObjectHasOwn(descriptor, "value")) fail("Invalid authorization JSON value");
+    freezeJson(descriptor.value);
+  }
+  nativeObjectSetPrototypeOf(value, null);
+  return nativeObjectFreeze(value);
+}
+
+function snapshotStringArray(value, code) {
+  if (!nativeArrayIsArray(value) || nativeIsProxy(value)
+    || (nativeObjectGetPrototypeOf(value) !== NativeArray.prototype
+      && nativeObjectGetPrototypeOf(value) !== null)) {
+    fail("Device revocation state is unavailable", code);
+  }
+  const length = value.length;
+  const keys = nativeObjectKeys(value);
+  if (keys.length !== length || nativeReflectOwnKeys(value).length !== length + 1) {
+    fail("Device revocation state is ambiguous", code);
+  }
+  const snapshot = new NativeArray(length);
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = nativeObjectGetOwnPropertyDescriptor(value, `${index}`);
+    if (!descriptor || !nativeObjectHasOwn(descriptor, "value") || typeof descriptor.value !== "string") {
+      fail("Device revocation state is ambiguous", code);
+    }
+    snapshot[index] = descriptor.value;
+  }
+  nativeObjectSetPrototypeOf(snapshot, null);
+  return nativeObjectFreeze(snapshot);
+}
+
+function canonicalizeJson(value) {
+  if (typeof value === "function" || typeof value === "symbol" || typeof value === "bigint") {
+    fail("Invalid authorization JSON value");
+  }
+  if (value === null || typeof value !== "object") return value;
+  if (nativeIsProxy(value)) fail("Invalid authorization JSON proxy");
+  if (nativeArrayIsArray(value)) {
+    const prototype = nativeObjectGetPrototypeOf(value);
+    if ((prototype !== NativeArray.prototype && prototype !== null)
+      || nativeObjectKeys(value).length !== value.length
+      || nativeReflectOwnKeys(value).length !== value.length + 1) {
+      fail("Invalid authorization JSON array");
+    }
+    const result = new NativeArray(value.length);
+    nativeObjectSetPrototypeOf(result, null);
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = nativeObjectGetOwnPropertyDescriptor(value, `${index}`);
+      if (!descriptor) fail("Sparse authorization JSON arrays are not accepted");
+      if (!nativeObjectHasOwn(descriptor, "value")) fail("Invalid authorization JSON value");
+      result[index] = canonicalizeJson(descriptor.value);
+    }
+    if (nativeReflectOwnKeys(value).length !== value.length + 1) fail("Invalid authorization JSON array");
+    return result;
+  }
+  assertPlainDataObject(value, "authorization JSON object");
+  const keys = nativeObjectKeys(value);
+  if (nativeReflectOwnKeys(value).length !== keys.length) fail("Invalid authorization JSON object");
+  for (let index = 1; index < keys.length; index += 1) {
+    const key = keys[index];
+    let cursor = index - 1;
+    while (cursor >= 0 && keys[cursor] > key) {
+      keys[cursor + 1] = keys[cursor];
+      cursor -= 1;
+    }
+    keys[cursor + 1] = key;
+  }
+  const result = nativeObjectCreate(null);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    const descriptor = nativeObjectGetOwnPropertyDescriptor(value, key);
+    if (!descriptor || !nativeObjectHasOwn(descriptor, "value")) {
+      fail("Invalid authorization JSON value");
+    }
+    result[key] = canonicalizeJson(descriptor.value);
+  }
+  return result;
+}
+
+function safeCanonicalJson(value) {
+  return nativeJsonStringify(canonicalizeJson(value));
+}
+
+function bufferToString(value, encoding) {
+  return nativeReflectApply(nativeBufferToString, value, [encoding]);
+}
+
+function sha256Base64Url(value) {
+  const hash = nativeCreateHash("sha256");
+  nativeReflectApply(nativeHashUpdate, hash, [value]);
+  return bufferToString(nativeReflectApply(nativeHashDigest, hash, []), "base64url");
+}
+
+const PROOF_FIELDS = nativeObjectFreeze([
   "schemaVersion", "type", "suite", "protocolVersion", "username", "deviceId", "operationId",
   "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch",
   "compartmentId", "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest",
   "expiresAt", "replayId", "idempotencyKey", "publicKey", "signature",
 ]);
-// This comparison runs after caller-owned native KeyObject callbacks in some
-// historical proof paths. Array.prototype[Symbol.iterator] can be replaced by
-// those callbacks; keep the exact binding field order and iterate own slots.
-const ENVELOPE_BINDING_FIELDS = Object.freeze([
-  "protocolVersion", "deviceId", "operationId", "objectId", "fileId",
-  "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId",
-  "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest",
-]);
 
 function fail(message, code = "invalid_device_authorization") {
-  throw Object.assign(new Error(message), { code });
+  throw nativeObjectAssign(new Error(message), { code });
 }
 
 // idempotencyKey is an opaque token: validated by charset and length only, never decoded as base64.
@@ -49,12 +185,12 @@ const GENERATED_IDEMPOTENCY_KEY_BYTES = 16;
 
 function isValidIdempotencyKey(value) {
   if (typeof value !== "string") return false;
-  if (IDEMPOTENCY_KEY_PATTERN.test(value)) return true;
-  return LEGACY_IDEMPOTENCY_KEY_PATTERN.test(value) && value.length % 4 !== 1;
+  if (regexTest(IDEMPOTENCY_KEY_PATTERN, value)) return true;
+  return regexTest(LEGACY_IDEMPOTENCY_KEY_PATTERN, value) && value.length % 4 !== 1;
 }
 
 function generateIdempotencyKey() {
-  return NATIVE_BUFFER_TO_STRING.call(NATIVE_RANDOM_BYTES(GENERATED_IDEMPOTENCY_KEY_BYTES), "base64url");
+  return bufferToString(nativeRandomBytes(GENERATED_IDEMPOTENCY_KEY_BYTES), "base64url");
 }
 
 function text(value, name) {
@@ -63,83 +199,114 @@ function text(value, name) {
 }
 
 function digest(value, name) {
-  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value) || value.length % 4 === 1) fail(`Invalid authorization ${name}`);
-  const bytes = NATIVE_BUFFER_FROM(value, "base64url");
-  if (bytes.length !== 32 || NATIVE_BUFFER_TO_STRING.call(bytes, "base64url") !== value) fail(`Invalid authorization ${name}`);
+  if (typeof value !== "string" || !regexTest(/^[A-Za-z0-9_-]+$/, value) || value.length % 4 === 1) fail(`Invalid authorization ${name}`);
+  const bytes = nativeBufferFrom(value, "base64url");
+  if (bytes.length !== 32 || bufferToString(bytes, "base64url") !== value) fail(`Invalid authorization ${name}`);
   return bytes;
 }
 
 function canonicalBytes(value, name, length = null, allowEmpty = false) {
   if (typeof value !== "string" || (!allowEmpty && value.length === 0)
-    || !/^[A-Za-z0-9_-]*$/.test(value)
-    || value.length % 4 === 1) fail(`Invalid authorization ${name}`);
-  const bytes = NATIVE_BUFFER_FROM(value, "base64url");
+    || !regexTest(/^[A-Za-z0-9_-]*$/, value) || value.length % 4 === 1) {
+    fail(`Invalid authorization ${name}`);
+  }
+  const bytes = nativeBufferFrom(value, "base64url");
   if ((length !== null && bytes.length !== length)
-    || NATIVE_BUFFER_TO_STRING.call(bytes, "base64url") !== value) {
+    || bufferToString(bytes, "base64url") !== value) {
     fail(`Invalid authorization ${name}`);
   }
   return bytes;
 }
 
 function exact(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)
-    || NATIVE_ARRAY_SOME.call(Object.keys(value), (key) => !NATIVE_ARRAY_INCLUDES.call(PROOF_FIELDS, key))
-    || NATIVE_ARRAY_SOME.call(PROOF_FIELDS, (key) => !Object.hasOwn(value, key))) fail("Invalid authorization schema");
-}
-
-function hashDigest(value, name) {
-  const hash = NATIVE_CREATE_HASH("sha256");
-  NATIVE_HASH_UPDATE.call(hash, canonicalBytes(value, name, null, name === "ciphertext"));
-  return NATIVE_BUFFER_TO_STRING.call(NATIVE_HASH_DIGEST.call(hash), "base64url");
+  assertPlainDataObject(value, "authorization schema");
+  const keys = nativeObjectKeys(value);
+  if (nativeReflectOwnKeys(value).length !== keys.length) fail("Invalid authorization schema");
+  for (let index = 0; index < keys.length; index += 1) {
+    if (!nativeReflectApply(nativeArrayIncludes, PROOF_FIELDS, [keys[index]])) {
+      fail("Invalid authorization schema");
+    }
+  }
+  const detached = nativeObjectCreate(null);
+  for (let index = 0; index < PROOF_FIELDS.length; index += 1) {
+    const field = PROOF_FIELDS[index];
+    const descriptor = nativeObjectGetOwnPropertyDescriptor(value, field);
+    if (!descriptor || !nativeObjectHasOwn(descriptor, "value")) {
+      fail("Invalid authorization schema");
+    }
+    detached[field] = canonicalizeJson(descriptor.value);
+  }
+  return freezeJson(detached);
 }
 
 function proofCore(operation, options, requireFresh = true) {
-  const expiresAt = options.expiresAt === undefined ? NATIVE_DATE_NOW() + 5 * 60 * 1000 : options.expiresAt;
-  if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0
-    || (requireFresh && expiresAt <= NATIVE_DATE_NOW())) fail("Authorization expired");
-  const replayId = options.replayId || NATIVE_BUFFER_TO_STRING.call(NATIVE_RANDOM_BYTES(16), "base64url");
-  const idempotencyKey = options.idempotencyKey === undefined ? generateIdempotencyKey() : options.idempotencyKey;
+  assertPlainDataObject(operation, "authorization operation");
+  assertPlainDataObject(options, "authorization options");
+  const capturedOperation = nativeObjectCreate(null);
+  const operationFields = ["protocolVersion", "deviceId", "operationId", "objectId", "fileId",
+    "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId",
+    "metadata", "aad", "ciphertext", "nonce", "tag"];
+  for (let index = 0; index < operationFields.length; index += 1) {
+    const field = operationFields[index];
+    const value = ownDataValue(operation, field);
+    if (value === undefined && field !== "baseRevision") fail(`Invalid authorization operation field: ${field}`);
+    capturedOperation[field] = field === "revision" || field === "baseRevision" || field === "metadata"
+      ? canonicalizeJson(value) : value;
+  }
+  freezeJson(capturedOperation);
+  const expiresAtOption = ownDataValue(options, "expiresAt");
+  const expiresAt = expiresAtOption === undefined ? nativeDateNow() + 5 * 60 * 1000 : expiresAtOption;
+  if (!nativeNumberIsSafeInteger(expiresAt) || expiresAt <= 0
+    || (requireFresh && expiresAt <= nativeDateNow())) fail("Authorization expired", "authorization_expired");
+  const replayIdOption = ownDataValue(options, "replayId");
+  const replayId = replayIdOption || bufferToString(nativeRandomBytes(16), "base64url");
+  const idempotencyKeyOption = ownDataValue(options, "idempotencyKey");
+  const idempotencyKey = idempotencyKeyOption === undefined ? generateIdempotencyKey() : idempotencyKeyOption;
   if (!isValidIdempotencyKey(idempotencyKey)) fail("Invalid device authorization");
   return {
     schemaVersion: 1,
     type: "rootark-sync-device-authorization-v1",
-    suite: zk.SUITE_ID,
-    protocolVersion: operation.protocolVersion,
-    username: text(options.username, "username"),
-    deviceId: text(operation.deviceId, "deviceId"),
-    operationId: text(operation.operationId, "operationId"),
-    objectId: text(operation.objectId, "objectId"),
-    fileId: text(operation.fileId, "fileId"),
-    versionId: text(operation.versionId, "versionId"),
-    operation: text(operation.operation, "operation"),
-    revision: operation.revision,
-    baseRevision: operation.baseRevision || null,
-    keyEpoch: text(operation.keyEpoch, "keyEpoch"),
-    compartmentId: text(operation.compartmentId, "compartmentId"),
-    metadata: operation.metadata,
-    aadDigest: hashDigest(operation.aad, "aad"),
-    ciphertextDigest: hashDigest(operation.ciphertext, "ciphertext"),
-    nonceDigest: hashDigest(operation.nonce, "nonce"),
-    tagDigest: hashDigest(operation.tag, "tag"),
+    suite: nativeZkSuiteId,
+    protocolVersion: capturedOperation.protocolVersion,
+    username: text(ownDataValue(options, "username"), "username"),
+    deviceId: text(capturedOperation.deviceId, "deviceId"),
+    operationId: text(capturedOperation.operationId, "operationId"),
+    objectId: text(capturedOperation.objectId, "objectId"),
+    fileId: text(capturedOperation.fileId, "fileId"),
+    versionId: text(capturedOperation.versionId, "versionId"),
+    operation: text(capturedOperation.operation, "operation"),
+    revision: capturedOperation.revision,
+    baseRevision: capturedOperation.baseRevision || null,
+    keyEpoch: text(capturedOperation.keyEpoch, "keyEpoch"),
+    compartmentId: text(capturedOperation.compartmentId, "compartmentId"),
+    metadata: capturedOperation.metadata,
+    aadDigest: sha256Base64Url(canonicalBytes(capturedOperation.aad, "aad")),
+    ciphertextDigest: sha256Base64Url(canonicalBytes(capturedOperation.ciphertext, "ciphertext", null, true)),
+    nonceDigest: sha256Base64Url(canonicalBytes(capturedOperation.nonce, "nonce")),
+    tagDigest: sha256Base64Url(canonicalBytes(capturedOperation.tag, "tag")),
     expiresAt,
     replayId,
     idempotencyKey,
-    publicKey: text(options.publicKey, "publicKey"),
+    publicKey: text(ownDataValue(options, "publicKey"), "publicKey"),
     signature: "",
   };
 }
 
 async function signedBytes(core) {
   const { signature: _signature, ...unsigned } = core;
-  return NATIVE_BUFFER_CONCAT([NATIVE_BUFFER_FROM(zk.ASCII.AUTHORIZATION, "ascii"),
-    NATIVE_BUFFER_FROM([0]), await zk.encodeDeterministic(unsigned)]);
+  return nativeBufferConcat([nativeBufferFrom(nativeZkAuthorizationDomain, "ascii"),
+    nativeBufferFrom([0]), await nativeReflectApply(nativeZkEncodeDeterministic, undefined, [unsigned])]);
 }
 
 async function createAuthorizationProof(operation, options = {}) {
-  if (!options.privateKey || !options.publicKey) fail("Authorization key material is required");
+  assertPlainDataObject(operation, "authorization operation");
+  assertPlainDataObject(options, "authorization options");
+  const privateKey = ownDataValue(options, "privateKey");
+  const publicKey = ownDataValue(options, "publicKey");
+  if (!privateKey || !publicKey) fail("Authorization key material is required");
   const core = proofCore(operation, options);
-  core.signature = NATIVE_BUFFER_TO_STRING.call(
-    NATIVE_SIGN(null, await signedBytes(core), options.privateKey), "base64url");
+  const signatureInput = await signedBytes(core);
+  core.signature = bufferToString(nativeSign(null, signatureInput, privateKey), "base64url");
   return core;
 }
 
@@ -147,18 +314,21 @@ async function createAuthorizationProof(operation, options = {}) {
 // identifier and encrypted-byte digest describes the actual envelope.
 // Neither the supplied key nor its signature is trusted by this check.
 function assertAuthorizationEnvelopeBinding(proof, operation) {
-  exact(proof);
-  if (!isValidIdempotencyKey(proof.idempotencyKey)) fail("Invalid device authorization");
-  if (proof.schemaVersion !== 1 || proof.type !== "rootark-sync-device-authorization-v1"
-    || proof.suite !== zk.SUITE_ID) fail("Unsupported authorization proof");
+  const normalized = exact(proof);
+  if (!isValidIdempotencyKey(normalized.idempotencyKey)) fail("Invalid device authorization");
+  if (normalized.schemaVersion !== 1 || normalized.type !== "rootark-sync-device-authorization-v1"
+    || normalized.suite !== nativeZkSuiteId) fail("Unsupported authorization proof");
   const expectedCore = proofCore(operation, {
-    username: proof.username, publicKey: proof.publicKey,
-    expiresAt: proof.expiresAt, replayId: proof.replayId,
-    idempotencyKey: proof.idempotencyKey,
+    username: normalized.username, publicKey: normalized.publicKey,
+    expiresAt: normalized.expiresAt, replayId: normalized.replayId,
+    idempotencyKey: normalized.idempotencyKey,
   }, false);
-  for (let index = 0; index < ENVELOPE_BINDING_FIELDS.length; index += 1) {
-    const field = ENVELOPE_BINDING_FIELDS[index];
-    if (NATIVE_JSON_STRINGIFY(proof[field]) !== NATIVE_JSON_STRINGIFY(expectedCore[field])) {
+  const boundFields = ["protocolVersion", "deviceId", "operationId", "objectId", "fileId",
+    "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId",
+    "metadata", "aadDigest", "ciphertextDigest", "nonceDigest", "tagDigest"];
+  for (let index = 0; index < boundFields.length; index += 1) {
+    const field = boundFields[index];
+    if (safeCanonicalJson(normalized[field]) !== safeCanonicalJson(expectedCore[field])) {
       fail("Authorization envelope binding mismatch", "authorization_scope");
     }
   }
@@ -166,16 +336,33 @@ function assertAuthorizationEnvelopeBinding(proof, operation) {
 }
 
 async function verifyAuthorizationProofInternal(proof, operation, expected, requireFresh) {
-  exact(proof);
-  const normalized = { ...proof };
+  assertPlainDataObject(operation, "authorization operation");
+  assertPlainDataObject(expected, "authorization scope");
+  const normalized = exact(proof);
   if (!isValidIdempotencyKey(normalized.idempotencyKey)) fail("Invalid device authorization");
-  if (normalized.schemaVersion !== 1 || normalized.type !== "rootark-sync-device-authorization-v1" || normalized.suite !== zk.SUITE_ID) fail("Unsupported authorization proof");
-  if (!Number.isSafeInteger(normalized.expiresAt) || normalized.expiresAt <= 0) fail("Invalid authorization expiry");
-  if (requireFresh && normalized.expiresAt <= NATIVE_DATE_NOW()) fail("Authorization expired", "authorization_expired");
-  if (normalized.protocolVersion !== operation.protocolVersion || normalized.username !== expected.username || normalized.deviceId !== operation.deviceId) fail("Authorization scope mismatch", "authorization_scope");
-  const pins = expected.trustedDevicePublicKeys;
-  const pinned = pins && typeof pins === "object" && !Array.isArray(pins)
-    && Object.hasOwn(pins, normalized.deviceId) ? pins[normalized.deviceId] : null;
+  if (normalized.schemaVersion !== 1 || normalized.type !== "rootark-sync-device-authorization-v1" || normalized.suite !== nativeZkSuiteId) fail("Unsupported authorization proof");
+  if (!nativeNumberIsSafeInteger(normalized.expiresAt) || normalized.expiresAt <= 0) fail("Invalid authorization expiry");
+  if (requireFresh && normalized.expiresAt <= nativeDateNow()) fail("Authorization expired", "authorization_expired");
+  if (!expected || typeof expected !== "object" || nativeArrayIsArray(expected)) fail("Invalid authorization scope", "authorization_scope");
+  const username = ownDataValue(expected, "username");
+  const pins = ownDataValue(expected, "trustedDevicePublicKeys");
+  const revokedDeviceIdsSource = ownDataValue(expected, "revokedDeviceIds");
+  const revokedDeviceIds = snapshotStringArray(revokedDeviceIdsSource,
+    "authorization_device_revoked");
+  if (normalized.protocolVersion !== ownDataValue(operation, "protocolVersion")
+    || normalized.username !== username || normalized.deviceId !== ownDataValue(operation, "deviceId")) {
+    fail("Authorization scope mismatch", "authorization_scope");
+  }
+  let pinned = null;
+  if (pins && typeof pins === "object" && !nativeArrayIsArray(pins)) {
+    if (nativeIsProxy(pins)) fail("Device signing key registry is ambiguous", "authorization_device_untrusted");
+    const prototype = nativeObjectGetPrototypeOf(pins);
+    if (prototype !== NativeObjectPrototype && prototype !== null) fail("Device signing key registry is ambiguous", "authorization_device_untrusted");
+    if (nativeReflectOwnKeys(pins).length !== nativeObjectKeys(pins).length) fail("Device signing key registry is ambiguous", "authorization_device_untrusted");
+    const pinDescriptor = nativeObjectGetOwnPropertyDescriptor(pins, normalized.deviceId);
+    if (pinDescriptor && !nativeObjectHasOwn(pinDescriptor, "value")) fail("Device signing key registry is ambiguous", "authorization_device_untrusted");
+    pinned = pinDescriptor && nativeObjectHasOwn(pinDescriptor, "value") ? pinDescriptor.value : null;
+  }
   // A signed envelope proves control of the *supplied* key. Authorization
   // always requires an independently provisioned device-to-key binding.
   // Do not permit callers to omit the pin option and silently downgrade
@@ -183,16 +370,45 @@ async function verifyAuthorizationProofInternal(proof, operation, expected, requ
   if (typeof pinned !== "string" || pinned !== normalized.publicKey) {
     fail("Device signing key is not trusted", "authorization_device_untrusted");
   }
-  if (!Array.isArray(expected.revokedDeviceIds)
-    || NATIVE_ARRAY_INCLUDES.call(expected.revokedDeviceIds, normalized.deviceId)) {
+  if (!nativeArrayIsArray(revokedDeviceIds)
+    || nativeReflectApply(nativeArrayIncludes, revokedDeviceIds,
+      [normalized.deviceId])) {
     fail("Device has been revoked or revocation state is invalid", "authorization_device_revoked");
   }
   assertAuthorizationEnvelopeBinding(normalized, operation);
+  // CBOR encoding yields before verify(). Do not reuse a prior trust-policy
+  // snapshot if the embedding authority revoked or replaced a pin mid-await.
+  const signedInput = await signedBytes(normalized);
+  const liveRevocationsSource = ownDataValue(expected, "revokedDeviceIds");
+  const liveRevocations = snapshotStringArray(liveRevocationsSource,
+    "authorization_device_revoked");
+  const livePins = ownDataValue(expected, "trustedDevicePublicKeys");
+  const livePin = livePins && typeof livePins === "object" && !nativeIsProxy(livePins)
+    ? ownDataValue(livePins, normalized.deviceId) : null;
+  if (ownDataValue(expected, "username") !== username || livePins !== pins
+    || livePin !== pinned) {
+    fail("Device trust policy changed during verification", "authorization_device_untrusted");
+  }
+  if (liveRevocationsSource !== revokedDeviceIdsSource
+    || liveRevocations.length !== revokedDeviceIds.length) {
+    fail("Device revocation policy changed during verification", "authorization_device_revoked");
+  }
+  for (let index = 0; index < revokedDeviceIds.length; index += 1) {
+    if (liveRevocations[index] !== revokedDeviceIds[index]) {
+      fail("Device revocation policy changed during verification", "authorization_device_revoked");
+    }
+  }
+  if (nativeReflectApply(nativeArrayIncludes, liveRevocations, [normalized.deviceId])) {
+    fail("Device has been revoked during verification", "authorization_device_revoked");
+  }
+  if (requireFresh && normalized.expiresAt <= nativeDateNow()) {
+    fail("Authorization expired during verification", "authorization_expired");
+  }
   const publicKeyBytes = canonicalBytes(normalized.publicKey, "public key");
   const signatureBytes = canonicalBytes(normalized.signature, "signature", 64);
-  const key = NATIVE_CREATE_PUBLIC_KEY({ key: publicKeyBytes, format: "der", type: "spki" });
-  if (NATIVE_KEY_TYPE.call(key) !== "public" || NATIVE_KEY_ALGORITHM.call(key) !== "ed25519"
-    || !NATIVE_VERIFY(null, await signedBytes(normalized), key, signatureBytes)) {
+  const key = nativeCreatePublicKey({ key: publicKeyBytes, format: "der", type: "spki" });
+  if (native.keyType.call(key) !== "public" || native.keyAlgorithm.call(key) !== "ed25519"
+    || !nativeVerify(null, signedInput, key, signatureBytes)) {
     fail("Authorization signature invalid", "authorization_signature");
   }
   return true;

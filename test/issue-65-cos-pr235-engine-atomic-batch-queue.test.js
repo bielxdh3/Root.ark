@@ -89,7 +89,7 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
   missingCapability = false, interleaved = false,
   missingWitnessReadback = false, missingCasReadback = false,
   onWitnessChallenge = null,
-  deleteExpiresInMs = 120000 } = {}) {
+  deleteExpiresInMs = 120000, clock } = {}) {
   const root = createPrivateAuthorityFixture("cos-pr235-engine-batch-");
   t.after(async () => {
     await fsp.rm(root, { recursive: true, force: true, maxRetries: 5 });
@@ -240,7 +240,7 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
   const journal = await new SyncJournal(journalPath).open();
   let lastWitnessReceipt;
   const engine = new SyncEngine({
-    rootDir: root, snapshotPath, journal, adapter,
+    rootDir: root, snapshotPath, journal, adapter, clock,
     deviceId: DEVICE, keyEpoch: "epoch-1", compartmentId: "private",
     fileKeyResolver: async () => fileKey,
     requireAuthorization: true,
@@ -698,20 +698,18 @@ test("lost network ACK with missing independent witness remains offline and BOTH
 test("expired already-admitted signed pair is readback-only: never POST or re-sign", {
   timeout: 120000,
 }, async (t) => {
-  const f = await fixture(t);
+  let simulatedNow = Date.now();
+  const f = await fixture(t, { clock: () => simulatedNow });
   const expiresAt = Math.min(f.deleted.authorization.expiresAt,
     f.moved.authorization.expiresAt);
-  const realNow = Date.now;
   f.engine.adapter.pushBatch = () => { throw new Error("EXPIRED_MUST_NEVER_POST"); };
-  try {
-    // Simulate recovery after the original, genuinely signed pair expires.
-    // The journal's original Ed25519 bytes are not rewritten or re-signed.
-    Date.now = () => expiresAt + 1;
-    const summary = f.summary();
-    await f.engine._pushPending(summary);
-    assert.equal(summary.pushed, 2);
-    assert.equal(summary.offline, false);
-  } finally { Date.now = realNow; }
+  // Inject the trusted clock before construction; mutating Date.now after
+  // construction cannot change the engine's pinned native clock.
+  simulatedNow = expiresAt + 1;
+  const summary = f.summary();
+  await f.engine._pushPending(summary);
+  assert.equal(summary.pushed, 2);
+  assert.equal(summary.offline, false);
   assert.equal(f.events.length, 0, "historical confirmation cannot issue POST");
   const disk = await f.reread();
   assert.deepEqual(await disk.recover(), []);
@@ -775,15 +773,15 @@ test("revoked or expired batch WITHOUT physical witness retains both original pe
 }, async (t) => {
   for (const condition of ["revoked", "expired"]) {
     await t.test(condition, async (innerT) => {
-      const f = await fixture(innerT, { witnessResponse: () => null });
-      const realNow = Date.now;
+      let simulatedNow = Date.now();
+      const f = await fixture(innerT, {
+        witnessResponse: () => null, clock: () => simulatedNow,
+      });
       f.engine.adapter.pushBatch = () => { throw new Error("UNAUTHORIZED_POST"); };
-      try {
-        if (condition === "revoked") f.engine.currentDeviceAuthorization = () => false;
-        else Date.now = () => f.deleted.authorization.expiresAt + 1;
-        await assert.rejects(f.engine._pushPending(f.summary()),
-          { code: "sync_atomic_batch_indeterminate" });
-      } finally { Date.now = realNow; }
+      if (condition === "revoked") f.engine.currentDeviceAuthorization = () => false;
+      else simulatedNow = f.deleted.authorization.expiresAt + 1;
+      await assert.rejects(f.engine._pushPending(f.summary()),
+        { code: "sync_atomic_batch_indeterminate" });
       assert.equal(f.events.length, 0);
       await f.assertBothPending();
     });
@@ -794,11 +792,12 @@ for (const condition of ["expired DELETE", "revoked DELETE"]) {
   test("delayed MOVE authorization cannot dispatch batch after " + condition, {
     timeout: 120000,
   }, async (t) => {
+    let simulatedNow = Date.now();
     const f = await fixture(t, {
       deleteExpiresInMs: 30000,
       witnessResponse: () => null,
+      clock: () => simulatedNow,
     });
-    const realNow = Date.now;
     let moveAuthChecks = 0;
     f.engine.authorizeOutgoing = async (operation) => {
       if (operation.operation === "move") {
@@ -806,8 +805,8 @@ for (const condition of ["expired DELETE", "revoked DELETE"]) {
         // Change the first member's authority AFTER its awaited local check,
         // but BEFORE the MOVE's final synchronous network dispatch gate.
         if (condition === "expired DELETE") {
-          Date.now = () => f.deleted.authorization.expiresAt + 1;
-          assert.ok(Date.now() < f.moved.authorization.expiresAt,
+          simulatedNow = f.deleted.authorization.expiresAt + 1;
+          assert.ok(simulatedNow < f.moved.authorization.expiresAt,
             "MOVE remains fresh while DELETE alone has expired");
         } else {
           f.engine.currentDeviceAuthorization = (member) => member.operation !== "delete";
@@ -815,10 +814,8 @@ for (const condition of ["expired DELETE", "revoked DELETE"]) {
       }
       return true;
     };
-    try {
-      await assert.rejects(f.engine._pushPending(f.summary()),
-        { code: "sync_atomic_batch_indeterminate" });
-    } finally { Date.now = realNow; }
+    await assert.rejects(f.engine._pushPending(f.summary()),
+      { code: "sync_atomic_batch_indeterminate" });
     assert.equal(moveAuthChecks, 1,
       "adversarial change must occur inside the second asynchronous authorization");
     assert.equal(f.events.length, 0,
@@ -874,7 +871,7 @@ test("legacy signed WebDAV DELETE orphan after local journal group deletion must
   const evidence = await snapshotPinnedJournal(f.journalPath);
   assert.deepEqual(evidence.bytes, bytes,
     "the forged orphan DELETE must be persisted in the original journal inode");
-  f.engine.journal = await new SyncJournal(f.journalPath).open();
+  await f.engine.journal.open();
   assertSameSignedEnvelopes(f.engine.journal.pending(), [f.deleted]);
   await assert.rejects(f.engine._pushPending(f.summary()),
     { code: "sync_atomic_batch_indeterminate" });
@@ -899,7 +896,7 @@ test("legacy signed WebDAV MOVE orphan after missing DELETE and group must NEVER
   const evidence = await snapshotPinnedJournal(f.journalPath);
   assert.deepEqual(evidence.bytes, bytes,
     "the forged orphan MOVE must be persisted in the original journal inode");
-  f.engine.journal = await new SyncJournal(f.journalPath).open();
+  await f.engine.journal.open();
   assertSameSignedEnvelopes(f.engine.journal.pending(), [f.moved]);
   await assert.rejects(f.engine._pushPending(f.summary()),
     { code: "sync_atomic_batch_indeterminate" });
