@@ -229,6 +229,20 @@ async function waitForServer(port, timeout = TIMEOUT_MS) {
   throw lastError;
 }
 
+async function waitForAssignedFixturePort(child, stdout, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`fixture server exited before readiness: exit=${child.exitCode} signal=${child.signalCode || "none"}`);
+    }
+    const announcement = stdout.join("").match(/^Servidor rodando em http:\/\/(?:\[[^\]\r\n]+\]|[^:\s]+):(\d{1,5})\r?$/m);
+    const port = announcement ? Number(announcement[1]) : 0;
+    if (port > 0 && port <= 65535) return port;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("fixture server did not announce its assigned port before the readiness deadline");
+}
+
 async function login(port, username, password) {
   const body = JSON.stringify({ username, password });
   const response = await request(port, "/auth/login", {
@@ -274,7 +288,10 @@ function testDeadQuotaOwnerEnv(...processIds) {
   return { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: ids.join(",") };
 }
 
-async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, readyTimeout = SERVER_BOOT_TIMEOUT_MS, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false } = {}) {
+async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, readyTimeout = SERVER_BOOT_TIMEOUT_MS, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false, kernelAssignedPort = false } = {}) {
+  if (kernelAssignedPort && (!waitForReady || Object.hasOwn(envOverrides, "PORT"))) {
+    throw new Error("kernel-assigned fixture port requires owned readiness and no PORT override");
+  }
   const password = crypto.randomBytes(24).toString("base64url");
   const fixtureBase = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
   const dir = fs.mkdtempSync(path.join(fixtureBase, "rootark-upload-safety-"));
@@ -332,7 +349,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   const preloadContents = [sqliteSetup, quotaFixtureShim, customPreload].filter(Boolean).join("\n");
   const preloadPath = preloadContents ? path.join(dir, "test-preload.js") : "";
   if (preloadPath) fs.writeFileSync(preloadPath, preloadContents);
-  const port = await getUnusedPort();
+  let port = kernelAssignedPort ? 0 : await getUnusedPort();
   const stdout = [];
   const stderr = [];
   const child = spawn(process.execPath, [...(preloadPath ? ["--require", preloadPath] : []), SERVER], {
@@ -377,7 +394,18 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   });
   if (waitForReady) {
     try {
-      assert.equal((await waitForServer(port, readyTimeout)).status, 200);
+      const readinessStarted = Date.now();
+      if (kernelAssignedPort) {
+        // Bind the listener atomically in the child and trust only its own
+        // completed startup announcement, not an unrelated HTTP listener.
+        port = await waitForAssignedFixturePort(child, stdout, readyTimeout);
+      }
+      const remaining = kernelAssignedPort ? Math.max(1, readyTimeout - (Date.now() - readinessStarted)) : readyTimeout;
+      assert.equal((await waitForServer(port, remaining)).status, 200);
+      if (kernelAssignedPort) {
+        assert.equal(child.exitCode, null);
+        assert.equal(child.signalCode, null);
+      }
     } catch (error) {
       throw new Error(`${error.message}\nserver exit: ${child.exitCode}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`);
     }
@@ -514,6 +542,16 @@ function waitForExit(child, timeout = TIMEOUT_MS) {
     child.once("exit", (code) => { clearTimeout(timer); resolve(code); });
   });
 }
+
+test("kernel-assigned HTTP fixture port is announced by its own server", { timeout: 60_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    kernelAssignedPort: true,
+    preloadSource: 'if (process.env.PORT !== "0") throw new Error("expected a kernel-assigned fixture port");',
+  });
+  assert.ok(Number.isInteger(harness.port) && harness.port > 0 && harness.port <= 65535);
+  assert.equal((await request(harness.port, "/login.html")).status, 200);
+  assert.equal(harness.child.exitCode, null);
+});
 
 async function waitForFile(filePath, timeout = TIMEOUT_MS) {
   const deadline = Date.now() + timeout;
@@ -4925,6 +4963,7 @@ test("tagged handoff rollback after pending-transition fault releases only its o
   const bytes = Buffer.from("case-sensitive pending-transition rollback ciphertext");
   const harness = await createHarness(t, {
     readyTimeout: 45_000,
+    kernelAssignedPort: true,
     preloadSource: () => `
       const quotaModule = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
       const originalFactory = quotaModule.createChunkUploadQuota;
@@ -4949,10 +4988,17 @@ test("tagged handoff rollback after pending-transition fault releases only its o
       };
     `,
   });
-  const session = await login(harness.port, "uploader", harness.password);
-  const first = await uploadChunk(harness.port, session, {
+  const fixtureRequest = async (phase, invoke) => {
+    try { return await invoke(); }
+    catch (error) {
+      const code = typeof error.code === "string" && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : "unknown";
+      throw new Error(`fixture ${phase} failed: code=${code} exit=${harness.child.exitCode ?? "running"} signal=${harness.child.signalCode || "none"} stderrChunks=${harness.stderr.length}`, { cause: error });
+    }
+  };
+  const session = await fixtureRequest("login", () => login(harness.port, "uploader", harness.password));
+  const first = await fixtureRequest("first-request", () => uploadChunk(harness.port, session, {
     uploadId, originalName: fileName, chunkIndex: 0, totalChunks: 1, encryptionLevel: "none", bytes,
-  });
+  }));
   assert.equal(first.status, 500, first.body);
   const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
   assert.deepEqual(fs.readFileSync(path.join(sessionDir, "0.part")), bytes);
@@ -4965,9 +5011,9 @@ test("tagged handoff rollback after pending-transition fault releases only its o
   } finally {
     database.close();
   }
-  const retry = await uploadChunk(harness.port, session, {
+  const retry = await fixtureRequest("retry-request", () => uploadChunk(harness.port, session, {
     uploadId, originalName: fileName, chunkIndex: 0, totalChunks: 1, encryptionLevel: "none", bytes,
-  });
+  }));
   assert.equal(retry.status, 200, retry.body);
   assert.deepEqual(fs.readFileSync(path.join(harness.dir, "temp", FOLDER_ID, fileName)), bytes);
 });
