@@ -65,6 +65,8 @@ function createTapProgressRecorder(write) {
   const categories = { assertion: 0, sqlite_busy: 0, filesystem: 0,
     network_timeout: 0, dependency: 0, runtime: 0, unknown: 0 };
   const failurePaths = new Map();
+  const moduleExits = new Map();
+  let moduleExitTotal = 0;
   const nestedFailurePaths = new Map();
   const nestedFailureDepths = { 2: 0, 4: 0, 6: 0, 8: 0, other: 0 };
   let pending = null;
@@ -95,6 +97,15 @@ function createTapProgressRecorder(write) {
     if (pending.pathHash !== "none") {
       failurePaths.set(pending.pathHash, (failurePaths.get(pending.pathHash) || 0) + 1);
     }
+    // Retain aggregate process evidence even after the individual detail cap.
+    // Use the existing bounded module-exit contract, not arbitrary TAP text.
+    const hasModuleExit = pending.fileProcessFailed && pending.failureType === "testCodeFailure"
+      && pending.code === "ERR_TEST_FAILURE" && pending.moduleExitCode !== null;
+    if (hasModuleExit) {
+      const exit = pending.moduleExitCode;
+      moduleExits.set(exit, (moduleExits.get(exit) || 0) + 1);
+      moduleExitTotal++;
+    }
     if (detailed < 12) {
       const acl = pending.acl
         ? ` aclStage=${pending.acl.stage} aclError=${pending.acl.code} aclTrust=${pending.acl.trust}` : "";
@@ -103,8 +114,7 @@ function createTapProgressRecorder(write) {
       // Node 22 reports a failed test-file process as an ERR_TEST_FAILURE
       // under the file's escaped TAP label. Its numeric exit status is the
       // only safe additional clue about this aggregate failure.
-      const moduleExit = pending.fileProcessFailed && pending.failureType === "testCodeFailure"
-        && pending.code === "ERR_TEST_FAILURE" && pending.moduleExitCode !== null
+      const moduleExit = hasModuleExit
         ? ` moduleExitCode=${pending.moduleExitCode}` : "";
       write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${acl}${edge}`);
       detailed++;
@@ -127,7 +137,10 @@ function createTapProgressRecorder(write) {
       const topNestedFailurePaths = [...nestedFailurePaths].sort((a, b) => b[1] - a[1]
         || a[0].localeCompare(b[0])).slice(0, 4)
         .map(([pathHash, count]) => `${pathHash}:${count}`).join(",") || "none";
-      return `failureCategories=${Object.entries(categories).map(([name, count]) => `${name}=${count}`).join(",")} pending=${pending ? 1 : 0} details=${detailed} failurePathGroups=${failurePaths.size} topFailurePaths=${topFailurePaths} subtests=${state.subtests} lastSubtestSha256=${state.lastSubtestHash} lastResultSha256=${state.lastResultHash} observedFailures=${state.observedFailures} topLevelTodos=${state.topLevelTodos} topLevelSkips=${state.topLevelSkips} nestedResults=${state.nestedResults} nestedObservedFailures=${state.nestedObservedFailures} nestedFailures=${state.nestedFailures} nestedTodos=${state.nestedTodos} nestedSkips=${state.nestedSkips} nestedPending=${nestedPending ? 1 : 0} nestedFailureDepths=${Object.entries(nestedFailureDepths).map(([depth, count]) => `${depth}:${count}`).join(",")} nestedDetails=${nestedDetailed} nestedFailurePathGroups=${nestedFailurePaths.size} topNestedFailurePaths=${topNestedFailurePaths} lastNestedFailureSha256=${state.lastNestedFailureHash} fileBoundaries=${state.fileBoundaries} lastFileSha256=${state.lastFileHash}`;
+      const topModuleExits = [...moduleExits].sort((a, b) => b[1] - a[1]
+        || a[0] - b[0]).slice(0, 4)
+        .map(([code, count]) => `${code}:${count}`).join(",") || "none";
+      return `failureCategories=${Object.entries(categories).map(([name, count]) => `${name}=${count}`).join(",")} pending=${pending ? 1 : 0} details=${detailed} failurePathGroups=${failurePaths.size} topFailurePaths=${topFailurePaths} subtests=${state.subtests} lastSubtestSha256=${state.lastSubtestHash} lastResultSha256=${state.lastResultHash} observedFailures=${state.observedFailures} topLevelTodos=${state.topLevelTodos} topLevelSkips=${state.topLevelSkips} nestedResults=${state.nestedResults} nestedObservedFailures=${state.nestedObservedFailures} nestedFailures=${state.nestedFailures} nestedTodos=${state.nestedTodos} nestedSkips=${state.nestedSkips} nestedPending=${nestedPending ? 1 : 0} nestedFailureDepths=${Object.entries(nestedFailureDepths).map(([depth, count]) => `${depth}:${count}`).join(",")} nestedDetails=${nestedDetailed} nestedFailurePathGroups=${nestedFailurePaths.size} topNestedFailurePaths=${topNestedFailurePaths} lastNestedFailureSha256=${state.lastNestedFailureHash} fileBoundaries=${state.fileBoundaries} lastFileSha256=${state.lastFileHash} moduleExitGroups=${moduleExits.size} moduleExitTotal=${moduleExitTotal} moduleExitTop=${topModuleExits}`;
     },
     accept(line) {
       const subtest = /^\s{0,8}# Subtest: (.{1,4096})$/.exec(line);
