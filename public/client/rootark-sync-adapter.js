@@ -18,6 +18,12 @@
 
   const PROTOCOL_VERSION = 2;
   const INVENTORY_MAX_PAGE_ITEMS = 64;
+  // The existing metadata-heavy 64-item integration fixture stays below
+  // 128 KiB; 512 KiB allows headroom without trusting a server body length.
+  // Limit bytes BEFORE parsing JSON; a 64-item cap after response.json() is
+  // too late to stop an untrusted sync peer exhausting the picker process.
+  const INVENTORY_MAX_RESPONSE_BYTES = 512 * 1024;
+  const INVENTORY_RESPONSE_DEADLINE_MS = 20_000;
   const OPERATION_FIELDS = ["protocolVersion", "operationId", "objectId", "fileId", "versionId", "operation", "revision", "baseRevision", "keyEpoch", "compartmentId", "deviceId", "metadata", "tombstone", "ciphertext", "nonce", "tag", "aad", "authorization"];
   const INVENTORY_FIELDS = OPERATION_FIELDS.filter((field) => !["ciphertext", "nonce", "tag", "aad", "authorization"].includes(field));
   const OPTIONAL_FIELDS = new Set(["authorization"]);
@@ -153,18 +159,79 @@
     };
   }
 
+  async function readBoundedInventoryJson(response) {
+    const reader = response.body?.getReader?.();
+    if (!reader) fail("Streaming metadata inventory response is required");
+    const parts = [];
+    let total = 0;
+    let completed = false;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) { completed = true; break; }
+        if (!(value instanceof Uint8Array)) fail("Invalid metadata inventory response bytes");
+        if (value.byteLength > INVENTORY_MAX_RESPONSE_BYTES - total) {
+          throw Object.assign(new Error("Metadata inventory response exceeds byte limit"),
+            { code: "inventory_response_too_large" });
+        }
+        parts.push(value);
+        total += value.byteLength;
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const part of parts) { bytes.set(part, offset); offset += part.byteLength; }
+      return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } finally {
+      // Cancellation is best effort. A hostile stream's cancel() promise can
+      // itself never settle; never let cleanup hold the picker's rejection.
+      if (!completed) {
+        try { Promise.resolve(reader.cancel()).catch(() => {}); } catch (_) {}
+      }
+      try { reader.releaseLock(); } catch (_) {}
+    }
+  }
+
   function createOpaqueSyncAdapter({ fetchImpl = fetch, baseUrl = "" } = {}) {
-    const request = async (url, options = {}) => {
+    const request = async (url, options = {}, boundedInventory = false) => {
       // A 307/308 replays the complete signed encrypted operation to the
       // redirect target. Never let an untrusted sync endpoint or proxy choose
       // a different recipient for ciphertext, AAD filenames or bearer tokens.
-      const response = await fetchImpl(`${baseUrl}${url}`, { ...options,
-        redirect: "error",
-        headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
-      const payload = await response.json().catch(() => ({}));
-      if (response.status === 409) throw new SyncConflictError(payload);
-      if (!response.ok) throw Object.assign(new Error(payload.error || "Falha de sincronizacao"), { status: response.status, payload });
-      return payload;
+      const abort = boundedInventory ? new AbortController() : null;
+      const perform = async () => {
+        const response = await fetchImpl(`${baseUrl}${url}`, { ...options,
+          ...(abort ? { signal: abort.signal } : {}),
+          redirect: "error",
+          headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
+        const payload = boundedInventory
+          ? await readBoundedInventoryJson(response).catch((error) => {
+            if (error?.code === "inventory_response_too_large" || abort.signal.aborted) throw error;
+            return {};
+          })
+          : await response.json().catch(() => ({}));
+        if (abort?.signal.aborted) {
+          throw Object.assign(new Error("Metadata inventory response deadline exceeded"),
+            { code: "inventory_response_timeout" });
+        }
+        if (response.status === 409) throw new SyncConflictError(payload);
+        if (!response.ok) throw Object.assign(new Error(payload.error || "Falha de sincronizacao"), { status: response.status, payload });
+        return payload;
+      };
+      if (!abort) return perform();
+      let timer;
+      const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          abort.abort();
+          reject(Object.assign(new Error("Metadata inventory response deadline exceeded"),
+            { code: "inventory_response_timeout" }));
+        }, INVENTORY_RESPONSE_DEADLINE_MS);
+      });
+      try {
+        // Native fetch honours abort; the independent rejection also bounds
+        // injected/alternate fetch implementations that ignore AbortSignal.
+        return await Promise.race([perform(), deadline]);
+      } finally {
+        clearTimeout(timer);
+      }
     };
     return {
       listInventory: async ({ limit = INVENTORY_MAX_PAGE_ITEMS, cursor = null } = {}) => {
@@ -172,7 +239,7 @@
         if (cursor !== null && (typeof cursor !== "string" || !cursor || cursor.length > 1024
           || !/^[A-Za-z0-9_-]+$/.test(cursor))) fail("Invalid inventory cursor");
         const query = `?view=metadata&limit=${limit}${cursor === null ? "" : `&cursor=${encodeURIComponent(cursor)}`}`;
-        const payload = await request(`/sync/v1/objects${query}`);
+        const payload = await request(`/sync/v1/objects${query}`, {}, true);
         if (!payload || payload.protocolVersion !== PROTOCOL_VERSION || payload.view !== "metadata"
           || !Array.isArray(payload.objects) || payload.objects.length > limit
           || (payload.nextCursor !== null && (typeof payload.nextCursor !== "string"
