@@ -3,7 +3,35 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const os = require("node:os");
+const { spawnSync } = require("node:child_process");
 const read = (p) => fs.readFileSync(path.join(__dirname, "..", p), "utf8");
+
+test("Android owner vector resource is not executed by default Node test discovery", () => {
+  const resourcePath = path.join("android", "core", "src", "test", "resources");
+  const source = path.join(__dirname, "..", resourcePath);
+  const resources = fs.readdirSync(source).filter((name) => name.startsWith("owner-enrollment-vector."));
+  assert.equal(resources.length, 1, "the Kotlin fixture must remain available");
+  assert.equal(resources[0], "owner-enrollment-vector.js.fixture", "the stdin-driven generator must not be a discoverable test script");
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-node-discovery-"));
+  try {
+    const target = path.join(scratch, resourcePath);
+    fs.mkdirSync(target, { recursive: true });
+    fs.copyFileSync(path.join(source, resources[0]), path.join(target, resources[0]));
+    fs.writeFileSync(path.join(scratch, "sentinel.test.js"), 'require("node:test")("sentinel", () => {});\n');
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const result = spawnSync(process.execPath, ["--test", "--test-reporter=tap"], {
+      cwd: scratch, env, encoding: "utf8", timeout: 10_000, windowsHide: true,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^# tests 1\r?$/m);
+    assert.match(result.stdout, /^# pass 1\r?$/m);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
 
 test("selected sync metadata retains opaque object id and never carries protected record bytes", () => {
   const policy = read("android/core/src/main/kotlin/dev/rootark/core/sync/ReadOnlyFileListPolicy.kt");

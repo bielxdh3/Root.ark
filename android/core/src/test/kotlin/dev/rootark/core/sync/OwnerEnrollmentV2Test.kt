@@ -562,7 +562,9 @@ class OwnerEnrollmentV2Test {
     }
 
     private fun runNode(input: String): String {
-        val script = File(javaClass.getResource("/owner-enrollment-vector.js")!!.toURI())
+        // Explicit invocation only: a .js resource under src/test would be
+        // auto-discovered by the repository's unfiltered Node test runner.
+        val script = File(javaClass.getResource("/owner-enrollment-vector.js.fixture")!!.toURI())
         val node = System.getenv("ROOTARK_NODE_BIN") ?: "node"
         val process = ProcessBuilder(node, script.absolutePath).redirectErrorStream(true).start()
         process.outputStream.use { it.write(input.toByteArray(Charsets.UTF_8)) }
