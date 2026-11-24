@@ -9,6 +9,13 @@ try {
 if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
   throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
 }
+// Validate the security-critical chunk limiter mode BEFORE loading third-party modules.
+// A malformed mode must fail closed even on slow/cold startup paths.
+const UPLOAD_CHUNK_RATE_LIMIT_STORE = process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE === undefined
+  ? "memory" : process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE;
+if (UPLOAD_CHUNK_RATE_LIMIT_STORE !== "memory" && UPLOAD_CHUNK_RATE_LIMIT_STORE !== "sqlite") {
+  throw new Error("Invalid UPLOAD_CHUNK_RATE_LIMIT_STORE: expected memory or sqlite");
+}
 const express = require("express");
 const { shouldDeferZk1JsonParsing } = require("./src/middlewares/zk1DeferredJsonParsing");
 const { rateLimit } = require("express-rate-limit");
@@ -197,11 +204,6 @@ const SIMPLE_UPLOAD_INCOMING_DIR = path.resolve("./temp/.incoming");
 const UPLOAD_STAGING_PATH = Symbol("rootarkUploadStagingPath");
 const MAX_UPLOAD_CHUNKS = 2000;
 const UPLOAD_CHUNK_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS, 1, MAX_UPLOAD_CHUNKS * 10);
-const UPLOAD_CHUNK_RATE_LIMIT_STORE = process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE === undefined
-  ? "memory" : process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE;
-if (UPLOAD_CHUNK_RATE_LIMIT_STORE !== "memory" && UPLOAD_CHUNK_RATE_LIMIT_STORE !== "sqlite") {
-  throw new Error("Invalid UPLOAD_CHUNK_RATE_LIMIT_STORE: expected memory or sqlite");
-}
 const UPLOAD_CHUNK_IP_RATE_LIMIT_MAX = parseBoundedNumber("UPLOAD_CHUNK_IP_RATE_LIMIT_MAX", MAX_UPLOAD_CHUNKS * 10, 1, MAX_UPLOAD_CHUNKS * 100);
 const CHUNK_UPLOAD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CHUNK_UPLOAD_EXPIRED_TOMBSTONE_TTL_MS = CHUNK_UPLOAD_SESSION_TTL_MS;
