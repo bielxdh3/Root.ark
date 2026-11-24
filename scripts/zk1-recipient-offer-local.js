@@ -66,10 +66,12 @@ function parse(argv) {
     opts[argv[i]] = argv[i + 1];
   }
   if (fields.some((field) => !Object.hasOwn(opts, field))) deny();
-  const names = fields.filter((field) => field !== "--owned-dir")
+  // On Windows, case-insensitive aliases resolve to the same private leaf.
+  // Reject collisions before reading grant/context files or opening output.
+  const filenames = fields.filter((field) => field !== "--owned-dir")
     .map((field) => process.platform === "win32"
       ? opts[field].toLowerCase() : opts[field]);
-  if (new Set(names).size !== names.length) deny();
+  if (new Set(filenames).size !== filenames.length) deny();
   return { mode, opts };
 }
 function batchEntries(root, manifestName, contextName) {
@@ -124,9 +126,10 @@ function privateOutput(root, name, bytes) {
   // input, even when it is a symlink. An exclusive private leaf inherits the
   // already independently verified owner-only directory ACL.
   let fd = null;
+  let filename = null;
   try {
     files.safeDir(root);
-    const filename = files.fileAt(root, name, false);
+    filename = files.fileAt(root, name, false);
     const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
       | (fs.constants.O_NOFOLLOW || 0);
     fd = fs.openSync(filename, flags, 0o600);
@@ -181,8 +184,6 @@ async function redeemBatch(root, opts, trustedBuilder) {
       // might have left an incomplete leaf. No atomicity/rollback is claimed.
       throw new BatchIncomplete(completed, entries.length);
     } finally {
-      // Match the single-file path: callback code must not replace the
-      // native wipe after the third independent authority read.
       if (opened && !isProxy(opened.data) && isUint8Array(opened.data)) {
         nativeApply(nativeTypedFill, opened.data, [0]);
       }
