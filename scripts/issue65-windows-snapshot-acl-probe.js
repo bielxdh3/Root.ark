@@ -114,7 +114,9 @@ function classifyReadAclSubstep(native, binary, args, options, snapshotDirectory
     ["$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value", "CURRENT_USER"],
     ["$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value", "OWNER_READ"],
     ["$rules = @($acl.GetAccessRules(", "RULES"],
-    ["[pscustomobject]@{ owner = $owner; current = $current; protected = $acl.AreAccessRulesProtected; rules = $rules } | ConvertTo-Json -Depth 4 -Compress", "JSON"],
+    [original.includes("isAdmin = $isAdmin")
+      ? "[pscustomobject]@{ owner = $owner; current = $current; isAdmin = $isAdmin; protected = $acl.AreAccessRulesProtected; rules = $rules } | ConvertTo-Json -Depth 4 -Compress"
+      : "[pscustomobject]@{ owner = $owner; current = $current; protected = $acl.AreAccessRulesProtected; rules = $rules } | ConvertTo-Json -Depth 4 -Compress", "JSON"],
   ];
   let script = original;
   for (const [needle, stage] of stages) {

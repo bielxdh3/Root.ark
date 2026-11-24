@@ -622,6 +622,14 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
       }
     }
   });
+  const wait = async (callback, label) => {
+    for (let i = 0; i < 150; i++) {
+      const result = await callback();
+      if (result) return result;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    }
+    throw Error("EDGE_V2_TIMEOUT_" + label);
+  };
   const cdpDeadline = Date.now() + 10_000;
   const retryCdp = async (label, attempt) => {
     while (Date.now() < cdpDeadline) {
