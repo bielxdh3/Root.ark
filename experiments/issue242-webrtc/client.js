@@ -15,31 +15,115 @@
   };
   const toHex = bytes => [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
   const sha = async bytes => toHex(await crypto.subtle.digest('SHA-256', bytes));
-  const wsUrl = location.origin.replace(/^http/, 'ws') + '/signal';
-  const MAX_FILE = 1024 * 1024;
-  const MAX_FILE_CHUNKS = MAX_FILE / (8 * 1024); // Honest sender emits at most 64.
-  let ws, roomId, hostKey, selfId, role;
-  let roomGeneration = 0;
+  const inRootark = Boolean(location.pathname?.startsWith('/p2p/'));
+  $('rootarkReturn').hidden = !inRootark;
+  $('boundObjectControls').hidden = !inRootark;
+  const wsUrl = location.origin.replace(/^http/, 'ws') + (inRootark ? '/ws' : '/signal');
+  const fileWire = window.P2PFileWire;
+  const MAX_FILE = fileWire ? fileWire.MAX_FILE : (32 * 1024 * 1024);
+  let preparingFile = false;
+  let preparingFileToken = 0;
+  let ws, roomId, hostKey, selfId, role, activeBoundObject = null;
+  let roomIntent = 0;
+  let protectedRoomRequired = false;
+  let creatingRoom = false;
+  let pendingCreateController = null;
   const peers = new Map(), invites = new Map();
+  // The broker may deliver earlier signaling after a local kick or peer-left.
+  // A departed peer ID is never eligible for a fresh RTC transport in this room.
+  const locallyRevokedPeers = new Set();
   const diagnostics = { verifiedFiles: [], verifiedTexts: [], rejected: [], channels: [] };
   const wire = data => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(data)); };
+  async function releaseUnusedRoom(reservation) {
+    // Only the real signed-session adapter can cancel an HTTP reservation.
+    // Standalone and synthetic fixture room IDs are not server capabilities.
+    if (!inRootark || typeof reservation?.roomId !== 'string' ||
+      !/^[a-f0-9]{16}$/.test(reservation.roomId) ||
+      typeof reservation.hostKey !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(reservation.hostKey)) return;
+    const csrf = document.cookie.split(';').map(value => value.trim())
+      .find(value => value.startsWith('rootark_csrf='));
+    if (!csrf) return;
+    try {
+      await fetch('/p2p/rooms/release', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json',
+          'X-CSRF-Token': csrf.slice('rootark_csrf='.length) },
+        body: JSON.stringify({ roomId: reservation.roomId, hostKey: reservation.hostKey }),
+      });
+    } catch { /* Expiry is still the fail-safe if the release request is lost. */ }
+  }
+  const setCreateButtonsDisabled = disabled => {
+    const awaitingAdmission = Boolean(ws && ws.readyState !== WebSocket.CLOSED && !role);
+    const locked = Boolean(disabled || awaitingAdmission);
+    $('create').disabled = locked;
+    $('createObjectRoom').disabled = locked;
+  };
 
-  function connect(credentials) {
-    roomGeneration++;
+  function retireRoom() {
     const oldSocket = ws;
-    ws = null; // old callbacks must not retain authority over the new room.
+    ws = null; // Ignore callbacks from the previous room immediately.
+    locallyRevokedPeers.clear();
+    ++preparingFileToken;
+    preparingFile = false;
     if (oldSocket && oldSocket.readyState < 2) oldSocket.close();
-    for (const p of peers.values()) p.pc.close();
+    // A room switch must not reuse peer channels, offers or invitations from
+    // the previous authenticated room while its old socket is still closing.
+    for (const peer of peers.values()) closePeer(peer);
     peers.clear();
     invites.clear();
-    $('peers').replaceChildren();
     $('invites').replaceChildren();
+    $('peers').replaceChildren();
     $('incoming').replaceChildren();
+    $('transfers').replaceChildren();
+    $('downloads').replaceChildren();
     selfId = null;
     role = null;
+    activeBoundObject = null;
     $('invite').disabled = true;
+    $('leave').disabled = true;
+    $('leave').textContent = 'Sair da sala';
+    $('leave').setAttribute('aria-label', 'Sair da sala');
+    setCreateButtonsDisabled(creatingRoom);
+  }
+  function invalidateRoomIntent() {
+    ++roomIntent;
+    const pending = pendingCreateController;
+    pendingCreateController = null;
+    if (pending) {
+      // A canceled request may still have a pending response/body promise.
+      // It must not hold the creation lock for a later user intent.
+      creatingRoom = false;
+      pending.abort();
+    }
+  }
+  function leaveRoom() {
+    const creating = Boolean(pendingCreateController);
+    if (!ws && !creating) return false;
+    const previousRole = role;
+    const connecting = Boolean(ws && !previousRole);
+    const unjoinedReservation = !previousRole ? { roomId, hostKey } : null;
+    invalidateRoomIntent(); // A pending create must not restore this room.
+    retireRoom();
+    roomId = null;
+    hostKey = null;
+    protectedRoomRequired = false;
+    $('room').textContent = '';
+    if (unjoinedReservation) void releaseUnusedRoom(unjoinedReservation);
+    log(creating && !previousRole ? 'Criação de sala cancelada' :
+      connecting ? 'Conexão cancelada' :
+      previousRole === 'host' ? 'Sala encerrada' : 'Você saiu da sala');
+    return true;
+  }
+  function connect(credentials) {
+    retireRoom();
+    setCreateButtonsDisabled(true);
     ws = new WebSocket(wsUrl);
     const eventSocket = ws;
+    // A stalled WebSocket handshake must be cancellable before `joined`.
+    $('leave').disabled = false;
+    $('leave').textContent = 'Cancelar conexão';
+    $('leave').setAttribute('aria-label', 'Cancelar conexão');
     ws.onopen = () => {
       if (ws !== eventSocket) return;
       wire({ type: 'join', roomId, ...credentials });
@@ -48,20 +132,57 @@
       if (ws !== eventSocket) return;
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
-      if (m.type === 'error') { record(diagnostics.rejected, m.code); return log('Erro: ' + m.code); }
+      if (m.type === 'error') {
+        record(diagnostics.rejected, m.code);
+        if (m.code === 'REVOKED' || m.code === 'ROOM_CLOSED') {
+          // An authoritative room denial must close direct WebRTC now, not
+          // after the broker's asynchronous WebSocket close handshake.
+          leaveRoom();
+          return log('Erro: ' + m.code);
+        }
+        // Any server error before `joined` is an admission failure. A bound
+        // room can lose ACL/object eligibility between its successful POST
+        // and the WebSocket recheck; never retain that pending room identity.
+        if (!role) {
+          void releaseUnusedRoom({ roomId, hostKey });
+          invalidateRoomIntent();
+          retireRoom();
+          roomId = null;
+          hostKey = null;
+          protectedRoomRequired = false;
+          activeBoundObject = null;
+          $('room').textContent = '';
+        }
+        setCreateButtonsDisabled(creatingRoom);
+        return log('Erro: ' + m.code);
+      }
       if (m.type === 'joined') {
         selfId = m.peerId; role = m.role;
+        activeBoundObject = inRootark && m.boundObject &&
+          fileWire.validDigest(m.boundObject.sha256) &&
+          Number.isSafeInteger(m.boundObject.size) &&
+          m.boundObject.size > 0 && m.boundObject.size <= MAX_FILE
+          ? m.boundObject : null;
         $('invite').disabled = role !== 'host';
-        log('Entrou na sala como ' + role);
+        const leaveLabel = role === 'host' ? 'Encerrar sala' : 'Sair da sala';
+        $('leave').textContent = leaveLabel;
+        $('leave').setAttribute('aria-label', leaveLabel);
+        $('leave').disabled = false;
+        setCreateButtonsDisabled(creatingRoom);
+        log('Entrou na sala como ' + role + (m.username ? ' (' + m.username + ')' : ''));
       } else if (m.type === 'invited') {
         invites.set(m.inviteId, m);
         const div = document.createElement('div');
         div.className = 'entry';
         const title = document.createElement('span');
-        title.textContent = 'Convite: ' + m.invitation + ' (60 s) ';
+        title.textContent = 'Convite' + (m.recipient ? ' para ' + m.recipient : '') +
+          ': ' + m.invitation + ' (60 s) ';
         const revoke = document.createElement('button');
         revoke.textContent = 'Revogar';
-        revoke.addEventListener('click', () => wire({ type: 'revoke', inviteId: m.inviteId }));
+        revoke.addEventListener('click', () => {
+          if (ws !== eventSocket) return;
+          wire({ type: 'revoke', inviteId: m.inviteId });
+        });
         div.append(title, revoke);
         div.dataset.id = m.inviteId;
         $('invites').append(div);
@@ -70,25 +191,32 @@
         invites.delete(m.inviteId);
         log('Convite revogado');
       } else if (m.type === 'peer-joined' && role === 'host') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const line = document.createElement('div');
         line.className = 'entry';
         line.dataset.peerId = m.peerId;
-        line.textContent = 'Convidado ' + m.peerId.slice(0, 5) + ' ';
+        line.textContent = 'Convidado ' + (m.username || m.peerId.slice(0, 5)) + ' ';
         const kick = document.createElement('button');
         kick.textContent = 'Revogar participante';
-        kick.addEventListener('click', () => wire({ type: 'kick', to: m.peerId }));
+        kick.addEventListener('click', () => {
+          if (ws !== eventSocket || locallyRevokedPeers.has(m.peerId)) return;
+          locallyRevokedPeers.add(m.peerId);
+          wire({ type: 'kick', to: m.peerId });
+          dropPeer(m.peerId);
+        });
         line.append(kick);
         $('peers').append(line);
         wire({ type: 'request-peer', to: m.peerId });
       } else if (m.type === 'peer-request') {
         const div = document.createElement('div');
         div.className = 'entry';
-        div.textContent = 'Host solicita conexão: ';
+        div.textContent = (m.username ? 'Host ' + m.username : 'Host') + ' solicita conexão: ';
         for (const accept of [true, false]) {
           const button = document.createElement('button');
           button.textContent = accept ? 'Aceitar conexão' : 'Recusar';
           button.dataset.testid = accept ? 'accept-peer' : 'decline-peer';
           button.addEventListener('click', () => {
+            if (ws !== eventSocket) return;
             wire({ type: 'consent', requestId: m.requestId, accept });
             div.remove();
           });
@@ -96,253 +224,597 @@
         }
         $('peers').append(div);
       } else if (m.type === 'peer-accepted') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const p = preparePeer(m.peerId, true);
-        const dc = p.pc.createDataChannel('fixture-transfer', { ordered: true });
-        attachChannel(p, dc);
-        await p.pc.setLocalDescription(await p.pc.createOffer());
-        if (ws !== eventSocket || peers.get(p.id) !== p) return;
-        wire({ type: 'signal', to: p.id, signal: { kind: 'offer', sdp: p.pc.localDescription } });
+        try {
+          const dc = p.pc.createDataChannel('fixture-transfer', { ordered: true });
+          attachChannel(p, dc);
+          if (p.dc !== dc) return;
+          const offer = await p.pc.createOffer();
+          if (ws !== eventSocket || peers.get(p.id) !== p) return;
+          await p.pc.setLocalDescription(offer);
+          if (ws !== eventSocket || peers.get(p.id) !== p) return;
+          wire({ type: 'signal', to: p.id, signal: { kind: 'offer', sdp: p.pc.localDescription } });
+        } catch (error) {
+          if (ws === eventSocket && peers.get(p.id) === p) {
+            peers.delete(p.id);
+            closePeer(p);
+            log('Negociação falhou: ' + error.name);
+          }
+        }
       } else if (m.type === 'peer-allowed') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         preparePeer(m.peerId, false);
       } else if (m.type === 'signal') {
+        if (locallyRevokedPeers.has(m.peerId)) return;
         const p = peers.get(m.peerId);
         if (!p) return;
         try {
           if (m.signal.kind === 'ice') {
             if (m.signal.candidate) {
-              if (p.pc.remoteDescription) await p.pc.addIceCandidate(m.signal.candidate);
+              if (p.pc.remoteDescription) {
+                await p.pc.addIceCandidate(m.signal.candidate);
+                if (ws !== eventSocket || peers.get(p.id) !== p) return;
+              }
               else p.candidates.push(m.signal.candidate);
             }
           } else if (m.signal.kind === 'offer') {
             await p.pc.setRemoteDescription(m.signal.sdp);
+            if (ws !== eventSocket || peers.get(p.id) !== p) return;
             await flushIce(p);
-            await p.pc.setLocalDescription(await p.pc.createAnswer());
+            if (ws !== eventSocket || peers.get(p.id) !== p) return;
+            const answer = await p.pc.createAnswer();
+            if (ws !== eventSocket || peers.get(p.id) !== p) return;
+            await p.pc.setLocalDescription(answer);
+            if (ws !== eventSocket || peers.get(p.id) !== p) return;
             wire({ type: 'signal', to: p.id, signal: { kind: 'answer', sdp: p.pc.localDescription } });
           } else if (m.signal.kind === 'answer') {
             await p.pc.setRemoteDescription(m.signal.sdp);
+            if (ws !== eventSocket || peers.get(p.id) !== p) return;
             await flushIce(p);
+            if (ws !== eventSocket || peers.get(p.id) !== p) return;
           }
-        } catch (e) { log('Negociação falhou: ' + e.name); }
+        } catch (e) {
+          if (ws === eventSocket && peers.get(p.id) === p) log('Negociação falhou: ' + e.name);
+        }
       } else if (m.type === 'peer-left') {
-        const p = peers.get(m.peerId);
-        if (p) p.pc.close();
-        peers.delete(m.peerId);
-        document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
-          if (el.dataset.peerId === m.peerId) el.remove();
-        });
+        locallyRevokedPeers.add(m.peerId);
+        dropPeer(m.peerId);
         log('Par desconectado');
       }
     };
     ws.onclose = () => {
       if (ws !== eventSocket) return;
-      $('invite').disabled = true;
-      for (const p of peers.values()) p.pc.close();
-      peers.clear();
+      if (!role) void releaseUnusedRoom({ roomId, hostKey });
+      // A signaling socket can close while a room-creation POST is still
+      // awaiting its response body. Retire that intent too, otherwise the
+      // late JSON response could reconnect a room after the socket was lost.
+      invalidateRoomIntent();
+      retireRoom();
+      roomId = null;
+      hostKey = null;
+      protectedRoomRequired = false;
+      $('room').textContent = '';
+      setCreateButtonsDisabled(creatingRoom);
       log('Conexão de sinalização encerrada');
     };
   }
   async function flushIce(p) {
-    for (const c of p.candidates.splice(0)) await p.pc.addIceCandidate(c);
+    for (const c of p.candidates.splice(0)) {
+      if (ws !== p.socket || peers.get(p.id) !== p) return;
+      await p.pc.addIceCandidate(c);
+      if (ws !== p.socket || peers.get(p.id) !== p) return;
+    }
   }
   function preparePeer(id, initiator) {
     if (peers.has(id)) return peers.get(id);
     // No STUN/TURN: prove only same-host WebRTC, never claim cross-NAT functionality.
+    const peerSocket = ws;
     const pc = new RTCPeerConnection({ iceServers: [] });
-    const p = { id, pc, initiator, dc: null, candidates: [], outgoing: null, incoming: null, pendingOffer: null };
+    const p = { id, pc, socket: peerSocket, initiator, dc: null, candidates: [], outgoing: null, incoming: null,
+      pendingOffer: null, outgoingUi: null, incomingUi: null, saved: null, peakBuffered: 0 };
     peers.set(id, p);
     pc.onicecandidate = e => {
+      if (ws !== peerSocket || peers.get(id) !== p) return;
       if (e.candidate) wire({ type: 'signal', to: id, signal: { kind: 'ice', candidate: e.candidate.toJSON() } });
     };
-    pc.ondatachannel = e => attachChannel(p, e.channel);
-    pc.onconnectionstatechange = () => log('WebRTC (' + id.slice(0, 5) + '): ' + pc.connectionState);
+    pc.ondatachannel = e => {
+      if (ws === peerSocket && peers.get(id) === p) attachChannel(p, e.channel);
+      else e.channel.close();
+    };
+    pc.onconnectionstatechange = () => {
+      if (ws !== peerSocket || peers.get(id) !== p) return;
+      log('WebRTC (' + id.slice(0, 5) + '): ' + pc.connectionState);
+      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) resetTransfers(p);
+    };
     return p;
   }
+  function sendControl(p, message) {
+    if (ws !== p.socket || peers.get(p.id) !== p || p.dc?.readyState !== 'open') return;
+    try { p.dc.send(JSON.stringify(message)); } catch { resetTransfers(p); }
+  }
+  function clearPending(p) {
+    p.pendingOffer?.element.remove();
+    p.pendingOffer = null;
+  }
+  function clearIncoming(p) {
+    if (p.incoming) {
+      p.incoming.chunks.length = 0;
+      p.incoming.chunksSize = 0;
+      p.incoming = null;
+    }
+    p.incomingUi?.node.remove();
+    p.incomingUi = null;
+  }
+  function clearOutgoing(p) {
+    if (p.outgoing) {
+      p.outgoing.abort.abort(); // Wakes a sender paused on bufferedamountlow.
+      clearTimeout(p.outgoing.timer);
+      p.outgoing.file = null;
+      p.outgoing = null;
+    }
+    p.outgoingUi?.node.remove();
+    p.outgoingUi = null;
+  }
+  function resetTransfers(p) {
+    clearPending(p);
+    clearIncoming(p);
+    clearOutgoing(p);
+  }
+  function closePeer(p) {
+    resetTransfers(p);
+    if (p.saved) {
+      URL.revokeObjectURL(p.saved.url);
+      p.saved.element.remove();
+      p.saved = null;
+    }
+    // Closing only RTCPeerConnection does not synchronously change the
+    // DataChannel state in every browser. Stop locally queued bytes first.
+    if (p.dc && p.dc.readyState !== 'closed') {
+      try { p.dc.close(); } catch { /* Closing the parent still retires RTC. */ }
+    }
+    p.pc.close();
+  }
+  function dropPeer(id) {
+    const p = peers.get(id);
+    peers.delete(id);
+    if (p) closePeer(p);
+    document.querySelectorAll('#peers [data-peer-id]').forEach(el => {
+      if (el.dataset.peerId === id) el.remove();
+    });
+  }
+  function transferUi(p, title, direction, cancel) {
+    const node = document.createElement('div');
+    node.className = 'entry';
+    const status = document.createElement('span');
+    status.textContent = title + ' ';
+    const button = document.createElement('button');
+    button.dataset.testid = direction === 'incoming' ? 'cancel-incoming' : 'cancel-outgoing';
+    button.textContent = 'Cancelar';
+    button.addEventListener('click', cancel);
+    node.append(status, button);
+    $('transfers').append(node);
+    return { node, status };
+  }
+  function showVerifiedDownload(p, rx, blob) {
+    if (p.saved) {
+      URL.revokeObjectURL(p.saved.url);
+      p.saved.element.remove();
+    }
+    const url = URL.createObjectURL(blob);
+    const element = document.createElement('div');
+    element.className = 'entry';
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    // The sender's filename is untrusted: no paths, control characters or executable MIME.
+    anchor.download = rx.name.replace(/[\x00-\x1f\\/<>:"|?*]/g, '_').slice(0, 100) || 'arquivo.bin';
+    anchor.textContent = 'Baixar arquivo verificado: ' + anchor.download + ' (' + rx.size + ' bytes)';
+    element.append(anchor);
+    $('downloads').append(element);
+    p.saved = { url, element };
+  }
   function attachChannel(p, dc) {
+    // One reliable, ordered channel per consented peer. A second or unordered
+    // peer-created channel must never replace the active transfer state.
+    const invalid = p.dc || !dc || dc.label !== 'fixture-transfer' ||
+      dc.ordered !== true ||
+      dc.maxRetransmits !== null || dc.maxPacketLifeTime !== null;
+    if (invalid) {
+      if (dc && typeof dc.close === 'function') dc.close();
+      record(diagnostics.rejected, 'INVALID_CHANNEL');
+      return;
+    }
     p.dc = dc;
     dc.binaryType = 'arraybuffer';
-    dc.bufferedAmountLowThreshold = 32 * 1024;
+    // bufferedamountlow fires only after crossing this threshold. Match the
+    // send-window limit so a peer that drains below 256 KiB wakes immediately.
+    dc.bufferedAmountLowThreshold = (fileWire.BUFFER_HIGH || 256 * 1024) - 1;
     dc.onopen = () => {
+      if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc) return;
       record(diagnostics.channels, p.id);
       log('DataChannel aberto: ' + p.id.slice(0, 5));
     };
     dc.onclose = () => {
-      p.incoming = null;
-      p.outgoing = null;
+      if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc) return;
+      resetTransfers(p);
       log('DataChannel fechado: ' + p.id.slice(0, 5));
     };
-    function abortIncoming() {
+    function abortIncoming(code) {
       const rx = p.incoming;
-      if (rx) {
-        p.incoming = null;
-        rx.chunks.length = 0;
-        rx.chunksSize = 0;
-        if (dc.readyState === 'open') dc.send(JSON.stringify({ type: 'abort-file', id: rx.id }));
-      }
-      record(diagnostics.rejected, 'INVALID_CHUNK');
-      log('Chunk rejeitado');
+      clearIncoming(p);
+      if (rx) sendControl(p, { type: 'abort-file', id: rx.id });
+      record(diagnostics.rejected, code);
+      log('Arquivo rejeitado: ' + code);
     }
     dc.onmessage = async event => {
+      if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc ||
+        dc.readyState !== 'open') return;
+      const messageRoomIntent = roomIntent;
       if (event.data instanceof ArrayBuffer) {
         const rx = p.incoming;
-        if (!rx || event.data.byteLength === 0 || rx.chunks.length >= MAX_FILE_CHUNKS ||
-          rx.chunksSize + event.data.byteLength > rx.size ||
-          rx.chunksSize + event.data.byteLength > MAX_FILE) return abortIncoming();
-        rx.chunks.push(new Uint8Array(event.data));
-        rx.chunksSize += event.data.byteLength;
+        if (!rx) { record(diagnostics.rejected, 'UNEXPECTED_CHUNK'); return; }
+        if (rx.phase !== 'receiving' || rx.chunks.length >= fileWire.MAX_CHUNKS) {
+          return abortIncoming('INVALID_CHUNK');
+        }
+        try {
+          const chunk = fileWire.parseFrame(event.data, rx.id, rx.chunksSize, rx.size);
+          rx.chunks.push(chunk.slice());
+          rx.chunksSize += chunk.byteLength;
+          if (rx.chunksSize % (256 * 1024) === 0 && p.incomingUi) {
+            p.incomingUi.status.textContent = 'Recebido ' + rx.chunksSize + '/' + rx.size + ' bytes ';
+          }
+        } catch { abortIncoming('INVALID_CHUNK'); }
         return;
+      }
+      if (typeof event.data !== 'string' || event.data.length > 4096) {
+        record(diagnostics.rejected, 'INVALID_CONTROL'); return;
       }
       let m;
       try { m = JSON.parse(event.data); } catch { return; }
+      if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+      if (m.type === 'text' && activeBoundObject) {
+        record(diagnostics.rejected, 'BOUND_ROOM_TEXT');
+        return;
+      }
       if (m.type === 'text' && typeof m.text === 'string' && m.text.length <= 1000 && /^[0-9a-f]{64}$/.test(m.digest)) {
         const hash = await sha(new TextEncoder().encode(m.text));
+        // A digest may finish after a room switch, peer retirement or the
+        // beginning of a protected-room intent. Never admit old plaintext
+        // into the new room's verified-text diagnostics or status.
+        if (ws !== p.socket || messageRoomIntent !== roomIntent || peers.get(p.id) !== p ||
+          p.dc !== dc || dc.readyState !== 'open' ||
+          protectedRoomRequired || activeBoundObject) return;
         if (hash === m.digest) {
           record(diagnostics.verifiedTexts, { from: p.id, text: m.text, sha256: hash });
           log('Texto SHA-256 OK de ' + p.id.slice(0, 5));
         } else record(diagnostics.rejected, 'TEXT_DIGEST');
-      } else if (m.type === 'offer-file' && typeof m.id === 'string' &&
-        /^[A-Za-z0-9_-]{1,64}$/.test(m.id) &&
-        typeof m.name === 'string' && m.name.length <= 100 &&
-        Number.isSafeInteger(m.size) && m.size > 0 && m.size <= MAX_FILE &&
-        /^[0-9a-f]{64}$/.test(m.digest) && !p.incoming && !p.pendingOffer) {
-        p.pendingOffer = m.id;
+      } else if (m.type === 'offer-file') {
+        const isValid = (fileWire && typeof fileWire.validOffer === 'function')
+          ? (fileWire.validOffer(m) && (
+              typeof m.id === 'string' &&
+              /^[A-Za-z0-9_-]{1,64}$/.test(m.id) &&
+              typeof m.name === 'string' && m.name.length > 0 && m.name.length <= 100 &&
+              Number.isSafeInteger(m.size) && m.size > 0 && m.size <= MAX_FILE &&
+              /^[0-9a-f]{64}$/.test(m.digest)
+            ))
+          : (
+              typeof m.id === 'string' &&
+              /^[A-Za-z0-9_-]{1,64}$/.test(m.id) &&
+              typeof m.name === 'string' && m.name.length > 0 && m.name.length <= 100 &&
+              Number.isSafeInteger(m.size) && m.size > 0 && m.size <= MAX_FILE &&
+              /^[0-9a-f]{64}$/.test(m.digest)
+            );
+        if (!isValid) {
+          record(diagnostics.rejected, 'BAD_OFFER'); return;
+        }
+        if (activeBoundObject && (m.name !== activeBoundObject.fileName ||
+          m.size !== activeBoundObject.size || m.digest !== activeBoundObject.sha256)) {
+          record(diagnostics.rejected, 'OBJECT_DIGEST_MISMATCH');
+          sendControl(p, { type: 'decline-file', id: m.id });
+          return;
+        }
+        if (p.incoming || p.pendingOffer) {
+          sendControl(p, { type: 'decline-file', id: m.id }); return;
+        }
         const div = document.createElement('div');
         div.className = 'entry';
         div.textContent = 'Arquivo ' + m.name + ' (' + m.size + ' bytes) ';
+        const pendingOffer = { id: m.id, element: div };
+        p.pendingOffer = pendingOffer;
         const button = document.createElement('button');
         button.textContent = 'Aceitar arquivo';
         button.dataset.testid = 'accept-file';
         button.addEventListener('click', () => {
-          p.incoming = { ...m, chunksSize: 0, chunks: [] };
-          p.pendingOffer = null;
-          dc.send(JSON.stringify({ type: 'accept-file', id: m.id }));
-          div.remove();
+          if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc ||
+            p.pendingOffer !== pendingOffer || dc.readyState !== 'open') return;
+          clearPending(p);
+          const incoming = { ...m, chunksSize: 0, chunks: [], phase: 'receiving' };
+          p.incoming = incoming;
+          p.incomingUi = transferUi(p, 'Recebendo ' + m.name, 'incoming', () => {
+            if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc
+              || p.incoming !== incoming) return;
+            clearIncoming(p);
+            sendControl(p, { type: 'cancel-file', id: m.id });
+            log('Recebimento cancelado');
+          });
+          sendControl(p, { type: 'accept-file', id: m.id });
         });
         const decline = document.createElement('button');
         decline.textContent = 'Recusar arquivo';
         decline.addEventListener('click', () => {
-          p.pendingOffer = null;
-          dc.send(JSON.stringify({ type: 'decline-file', id: m.id }));
-          div.remove();
+          if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc ||
+            p.pendingOffer !== pendingOffer) return;
+          clearPending(p);
+          sendControl(p, { type: 'decline-file', id: m.id });
         });
         div.append(button, decline);
         $('incoming').append(div);
-      } else if (m.type === 'accept-file' && p.outgoing && m.id === p.outgoing.id &&
-        p.outgoing.phase === 'offered') {
-        // Claim the offer synchronously before awaiting backpressure. Replayed
-        // accept frames must not start parallel sendChunks loops for one file.
+      } else if (m.type === 'accept-file' && p.outgoing?.id === m.id && p.outgoing.phase === 'offered') {
+        clearTimeout(p.outgoing.timer);
         p.outgoing.phase = 'sending';
-        await sendChunks(p);
+        void sendChunks(p, p.outgoing);
       } else if (m.type === 'decline-file' && p.outgoing && m.id === p.outgoing.id) {
-        p.outgoing = null;
+        clearOutgoing(p);
         log('Arquivo recusado pelo destinatário');
       } else if (m.type === 'abort-file' && p.outgoing && m.id === p.outgoing.id) {
-        p.outgoing = null;
+        clearOutgoing(p);
         log('Arquivo abortado pelo destinatário');
+      } else if (m.type === 'cancel-file' && fileWire.validId(m.id)) {
+        if (p.outgoing?.id === m.id) clearOutgoing(p);
+        if (p.incoming?.id === m.id) clearIncoming(p);
+        if (p.pendingOffer?.id === m.id) clearPending(p);
+        log('Transferência cancelada pelo par');
       } else if (m.type === 'end-file' && p.incoming && m.id === p.incoming.id) {
         const rx = p.incoming;
-        p.incoming = null;
-        if (rx.chunksSize !== rx.size) { record(diagnostics.rejected, 'SIZE_MISMATCH'); return log('Arquivo incompleto'); }
-        const bytes = new Uint8Array(rx.size);
-        let offset = 0;
-        for (const chunk of rx.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-        const digest = await sha(bytes);
-        if (digest !== rx.digest) { record(diagnostics.rejected, 'FILE_DIGEST'); return log('Arquivo corrompido'); }
-        record(diagnostics.verifiedFiles, { from: p.id, name: rx.name, size: rx.size, sha256: digest });
-        log('Arquivo SHA-256 OK: ' + rx.name);
+        if (rx.phase !== 'receiving') return abortIncoming('INVALID_CONTROL');
+        rx.phase = 'verifying';
+        if (rx.chunksSize !== rx.size) return abortIncoming('SIZE_MISMATCH');
+        try {
+          const blob = new Blob(rx.chunks, { type: 'application/octet-stream' });
+          const digest = await sha(await blob.arrayBuffer());
+          if (ws !== p.socket || peers.get(p.id) !== p || p.dc !== dc || p.incoming !== rx) return;
+          if (digest !== rx.digest) return abortIncoming('FILE_DIGEST');
+          clearIncoming(p);
+          showVerifiedDownload(p, rx, blob);
+          record(diagnostics.verifiedFiles, { from: p.id, name: rx.name, size: rx.size, sha256: digest });
+          sendControl(p, { type: 'verified-file', id: rx.id, digest });
+          log('Arquivo SHA-256 OK: ' + rx.name);
+        } catch { if (p.incoming === rx) abortIncoming('VERIFY_FAILED'); }
+      } else if (m.type === 'verified-file' && p.outgoing?.id === m.id &&
+        p.outgoing.phase === 'verifying' && m.digest === p.outgoing.digest) {
+        const name = p.outgoing.name;
+        clearOutgoing(p);
+        log('Recebimento confirmado SHA-256: ' + name);
       }
     };
   }
-  async function sendChunks(p) {
-    const { dc, outgoing } = p;
-    if (!outgoing) return;
-    for (let offset = 0; offset < outgoing.bytes.byteLength; offset += 16 * 1024) {
-      if (p.outgoing !== outgoing) return;
-      if (dc.readyState !== 'open') { p.outgoing = null; return; }
-      while (dc.bufferedAmount > 64 * 1024) {
-        await new Promise(resolve => {
-          const wake = () => {
-            dc.removeEventListener('bufferedamountlow', wake);
-            dc.removeEventListener('close', wake);
-            resolve();
-          };
-          dc.addEventListener('bufferedamountlow', wake, { once: true });
-          dc.addEventListener('close', wake, { once: true });
-        });
-        if (p.outgoing !== outgoing) return;
-        if (dc.readyState !== 'open') { p.outgoing = null; return; }
+  async function sendChunks(p, tx) {
+    const { dc } = p;
+    try {
+      for (let offset = 0; offset < tx.size; offset += fileWire.CHUNK_BYTES) {
+        await fileWire.waitForSendWindow(dc, tx.abort.signal);
+        if (p.outgoing !== tx || tx.abort.signal.aborted || dc.readyState !== 'open') return;
+        const bytes = new Uint8Array(await tx.file.slice(offset, offset + fileWire.CHUNK_BYTES).arrayBuffer());
+        if (p.outgoing !== tx || tx.abort.signal.aborted || dc.readyState !== 'open') return;
+        dc.send(fileWire.packFrame(tx.id, offset, bytes));
+        p.peakBuffered = Math.max(p.peakBuffered, dc.bufferedAmount);
+        if (p.outgoingUi && offset % (256 * 1024) === 0) {
+          p.outgoingUi.status.textContent = 'Enviando ' + (offset + bytes.byteLength) + '/' + tx.size + ' bytes ';
+        }
       }
-      dc.send(outgoing.bytes.slice(offset, offset + 16 * 1024));
+      if (p.outgoing !== tx || dc.readyState !== 'open') return;
+      tx.file = null; // Only the recipient's final SHA-256 acknowledgement completes the send.
+      tx.phase = 'verifying';
+      p.outgoingUi.status.textContent = 'Aguardando verificação SHA-256 ';
+      sendControl(p, { type: 'end-file', id: tx.id });
+      if (p.outgoing !== tx) return;
+      tx.timer = setTimeout(() => {
+        if (p.outgoing !== tx) return;
+        cancelOutgoing(p, true);
+        log('Confirmação de integridade expirou');
+      }, 30_000);
+    } catch (error) {
+      if (p.outgoing !== tx) return;
+      cancelOutgoing(p, true);
+      record(diagnostics.rejected, error?.message === 'P2P_SEND_BUFFER_STALLED'
+        ? 'P2P_SEND_BUFFER_STALLED' : 'SEND_FAILED');
+      log('Falha ao enviar arquivo para o par ' + p.id.slice(0, 5));
     }
-    if (p.outgoing !== outgoing) return;
-    dc.send(JSON.stringify({ type: 'end-file', id: outgoing.id }));
-    p.outgoing = null;
-    log('Enviado: ' + outgoing.name);
+  }
+  function cancelOutgoing(p, notify) {
+    const tx = p.outgoing;
+    if (!tx) return;
+    clearOutgoing(p);
+    if (notify) sendControl(p, { type: 'cancel-file', id: tx.id });
   }
   async function sendFile(file) {
-    if (!file || file.size === 0 || file.size > MAX_FILE) return log('Arquivo fora do limite de 1 MiB');
-    const generation = roomGeneration;
-    const targets = [...peers.values()].filter(p => p.dc?.readyState === 'open' && !p.outgoing)
-      .map(p => ({ peer: p, channel: p.dc }));
-    const bytes = await file.arrayBuffer();
-    if (generation !== roomGeneration) return;
-    const digest = await sha(bytes);
-    if (generation !== roomGeneration) return;
-    let count = 0;
-    for (const { peer: p, channel } of targets) {
-      if (peers.get(p.id) !== p || p.dc !== channel || channel.readyState !== 'open' || p.outgoing) continue;
-      const id = crypto.randomUUID();
-      p.outgoing = { id, name: file.name.slice(0, 100), bytes, digest, phase: 'offered' };
-      channel.send(JSON.stringify({ type: 'offer-file', id, name: file.name.slice(0, 100), size: bytes.byteLength, digest }));
-      count++;
+    if (protectedRoomRequired && !activeBoundObject) {
+      record(diagnostics.rejected, 'ROOM_CHANGED');
+      return log('Aguarde a confirmação da sala vinculada');
     }
-    log('Arquivo oferecido a ' + count + ' destinatário(s)');
+    if (!file || file.size === 0 || file.size > MAX_FILE || preparingFile) {
+      return log('Selecione arquivo de até 32 MiB');
+    }
+    if (activeBoundObject && (file.name !== activeBoundObject.fileName ||
+      file.size !== activeBoundObject.size)) {
+      record(diagnostics.rejected, 'OBJECT_DIGEST_MISMATCH');
+      return log('O arquivo selecionado não corresponde ao objeto vinculado');
+    }
+    const receivers = [...peers.values()].filter(p => p.dc?.readyState === 'open' && !p.outgoing);
+    if (!receivers.length) return log('Nenhum par disponível');
+    const sendingIntent = roomIntent;
+    const preparationToken = ++preparingFileToken;
+    preparingFile = true;
+    try {
+      const digest = await sha(await file.arrayBuffer());
+      if (sendingIntent !== roomIntent || (protectedRoomRequired && !activeBoundObject)) {
+        record(diagnostics.rejected, 'ROOM_CHANGED');
+        return log('Envio de arquivo cancelado após troca de sala');
+      }
+      if (activeBoundObject && digest !== activeBoundObject.sha256) {
+        record(diagnostics.rejected, 'OBJECT_DIGEST_MISMATCH');
+        return log('O SHA-256 não corresponde ao ciphertext da sala');
+      }
+      const name = file.name.slice(0, 100) || 'arquivo.bin';
+      let offered = 0;
+      for (const p of receivers) {
+        if (sendingIntent !== roomIntent) break;
+        if (peers.get(p.id) !== p || p.dc?.readyState !== 'open' || p.outgoing) continue;
+        const id = crypto.randomUUID().replace(/-/g, '');
+        const tx = { id, name, size: file.size, digest, file, phase: 'offered',
+          abort: new AbortController(), timer: null };
+        p.outgoing = tx;
+        p.outgoingUi = transferUi(p, 'Aguardando aceite de ' + p.id.slice(0, 5), 'outgoing',
+          () => { if (p.outgoing === tx) cancelOutgoing(p, true); });
+        sendControl(p, { type: 'offer-file', id, name, size: file.size, digest });
+        if (p.outgoing !== tx) continue;
+        tx.timer = setTimeout(() => {
+          if (p.outgoing === tx) cancelOutgoing(p, true);
+        }, 60_000);
+        offered++;
+      }
+      log(offered
+        ? 'Arquivo oferecido a ' + offered + ' destinatário(s)'
+        : 'Nenhum destinatário permaneceu disponível');
+    } catch { log('Falha ao ler ou oferecer arquivo'); }
+    finally {
+      if (preparationToken === preparingFileToken) preparingFile = false;
+    }
   }
   async function sendText(value) {
+    if (protectedRoomRequired || activeBoundObject) {
+      return log('Sala vinculada aceita somente ciphertext do arquivo selecionado');
+    }
     if (!value || value.length > 1000) return;
-    const generation = roomGeneration;
-    const targets = [...peers.values()].filter(p => p.dc?.readyState === 'open')
-      .map(p => ({ peer: p, channel: p.dc }));
+    const sendingSocket = ws;
+    const sendingRoom = roomId;
+    const sendingPeerId = selfId;
+    const sendingRole = role;
+    const sendingIntent = roomIntent;
+    const receivers = [...peers.values()].map(peer => ({ peer, dc: peer.dc }));
+    const sameRoom = () => ws === sendingSocket && roomId === sendingRoom &&
+      selfId === sendingPeerId && role === sendingRole &&
+      roomIntent === sendingIntent && !protectedRoomRequired && !activeBoundObject;
     const digest = await sha(new TextEncoder().encode(value));
-    if (generation !== roomGeneration) return;
+    if (!sameRoom()) {
+      record(diagnostics.rejected, 'ROOM_CHANGED');
+      return log('Envio de texto cancelado após troca de sala');
+    }
     let count = 0;
-    for (const { peer: p, channel } of targets) {
-      if (peers.get(p.id) !== p || p.dc !== channel || channel.readyState !== 'open') continue;
-      channel.send(JSON.stringify({ type: 'text', text: value, digest }));
+    for (const { peer, dc } of receivers) {
+      if (!sameRoom()) break;
+      if (peers.get(peer.id) !== peer || peer.dc !== dc || dc?.readyState !== 'open') continue;
+      dc.send(JSON.stringify({ type: 'text', text: value, digest }));
       count++;
     }
     log('Texto enviado a ' + count + ' destinatário(s)');
   }
-  async function createRoom() {
-    const generation = ++roomGeneration;
-    const response = await fetch('/rooms', { method: 'POST' });
-    if (generation !== roomGeneration) return;
-    if (!response.ok) throw new Error('room creation failed');
-    const result = await response.json();
-    if (generation !== roomGeneration) return;
-    ({ roomId, hostKey } = result);
-    $('room').textContent = roomId;
-    connect({ hostKey });
+  async function createRoom(boundObject = null) {
+    if (creatingRoom) return false;
+    creatingRoom = true;
+    setCreateButtonsDisabled(true);
+    const intent = ++roomIntent;
+    protectedRoomRequired = Boolean(boundObject);
+    if (protectedRoomRequired) {
+      retireRoom();
+      // The server may now deny this entire mode before hashing. Do not
+      // leave a stale manual room identifier or host key visible as if it
+      // authorized ciphertext sharing after a failed bound admission.
+      roomId = null;
+      hostKey = null;
+      $('room').textContent = '';
+    }
+    const controller = new AbortController();
+    pendingCreateController = controller;
+    if (!ws) {
+      $('leave').disabled = false;
+      $('leave').textContent = 'Cancelar criação';
+      $('leave').setAttribute('aria-label', 'Cancelar criação');
+    }
+    try {
+      const headers = {};
+      if (inRootark) {
+        const csrf = document.cookie.split(';').map(value => value.trim())
+          .find(value => value.startsWith('rootark_csrf='));
+        if (csrf) headers['X-CSRF-Token'] = csrf.slice('rootark_csrf='.length);
+        if (boundObject) headers['Content-Type'] = 'application/json';
+      }
+      const body = inRootark && boundObject ? JSON.stringify({ boundObject }) : undefined;
+      const response = await fetch(inRootark ? '/p2p/rooms' : '/rooms',
+        { method: 'POST', headers, body, credentials: 'same-origin', signal: controller.signal });
+      if (!response.ok) {
+        if (intent !== roomIntent) return false;
+        throw new Error('room creation failed');
+      }
+      const result = await response.json();
+      if (intent !== roomIntent) {
+        await releaseUnusedRoom(result);
+        return false;
+      }
+      ({ roomId, hostKey } = result);
+      $('room').textContent = roomId;
+      if (result.boundObject) log('Sala vinculada à ACL e SHA-256: ' +
+        result.boundObject.folderId + '/' + result.boundObject.fileName);
+      connect({ hostKey });
+      return true;
+    } catch (error) {
+      if (intent !== roomIntent) return false;
+      if (!ws) {
+        roomId = null;
+        hostKey = null;
+        activeBoundObject = null;
+        protectedRoomRequired = false;
+        $('room').textContent = '';
+      }
+      throw error;
+    } finally {
+      // A stale HTTP response must never unlock or alter a newer creation.
+      if (pendingCreateController === controller) {
+        pendingCreateController = null;
+        creatingRoom = false;
+        if (!ws) {
+          $('leave').disabled = true;
+          $('leave').textContent = 'Sair da sala';
+          $('leave').setAttribute('aria-label', 'Sair da sala');
+        }
+        if (!ws || (ws.readyState !== WebSocket.CONNECTING
+          && ws.readyState !== WebSocket.CLOSING)) setCreateButtonsDisabled(false);
+      }
+    }
   }
   function joinRoom(room, invitation) {
+    if (!role) void releaseUnusedRoom({ roomId, hostKey });
+    invalidateRoomIntent();
+    protectedRoomRequired = false;
     roomId = room; $('room').textContent = roomId;
     connect({ invitation });
   }
   $('create').onclick = () => createRoom().catch(e => log(e.message));
-  $('invite').onclick = () => wire({ type: 'invite' });
+  $('createObjectRoom').onclick = () => createRoom({
+    folderId: $('objectFolderInput').value.trim(),
+    fileName: $('objectFileInput').value.trim(),
+  }).catch(() => log('A autorização do arquivo foi negada'));
+  $('leave').onclick = () => leaveRoom();
+  $('invite').onclick = () => wire({ type: 'invite', recipient: $('recipientInput').value.trim() });
   $('join').onclick = () => joinRoom($('roomInput').value, $('inviteInput').value);
   $('sendFile').onclick = () => sendFile($('fileInput').files[0]);
   $('sendText').onclick = () => sendText($('textInput').value);
   // Diagnostic surface is in-memory and only used by the disposable Edge CDP test.
   window.__poc = {
     createRoom, joinRoom, sendFile, sendText,
-    invite: () => wire({ type: 'invite' }),
+    invite: recipient => wire({ type: 'invite', recipient }),
     invitations: () => [...invites.values()],
     // Exposed only for disposable Edge CDP adversarial regression tests.
     testChannel: index => [...peers.values()][index]?.dc,
-    snapshot: () => ({ roomId, role, peerId: selfId, peers: [...peers.values()].map(p => ({
+    snapshot: () => ({ roomId, role, peerId: selfId, boundObject: activeBoundObject,
+      peers: [...peers.values()].map(p => ({
       id: p.id, channel: p.dc?.readyState || 'none',
       incomingChunks: p.incoming?.chunks.length ?? 0,
-      incomingBytes: p.incoming?.chunksSize ?? 0
+      incomingBytes: p.incoming?.chunksSize ?? 0,
+      outgoingPhase: p.outgoing?.phase || null,
+      pendingOffer: Boolean(p.pendingOffer),
+      savedDownload: Boolean(p.saved),
+      peakBuffered: p.peakBuffered
     })), diagnostics })
   };
 })();

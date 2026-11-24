@@ -5,13 +5,34 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
+const fileWire = require('../transfer-protocol.js');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'client.js'), 'utf8');
 
-function clientFixture({ digest, fetchRoom } = {}) {
+function makeChannel(overrides = {}) {
+  return {
+    label: 'fixture-transfer',
+    ordered: true,
+    maxRetransmits: null,
+    maxPacketLifeTime: null,
+    readyState: 'open',
+    send() {},
+    bufferedAmount: 0,
+    close() { this.readyState = 'closed'; },
+    ...overrides
+  };
+}
+
+function clientFixture({ cryptoApi = {
+  subtle: crypto.webcrypto.subtle,
+  randomUUID: () => crypto.randomUUID(),
+}, fetchImpl } = {}) {
   const elements = new Map(), sockets = [], peerConnections = [];
   const makeNode = () => ({
-    children: [], dataset: {}, disabled: false, textContent: '',
+    children: [], dataset: {}, disabled: false, textContent: '', attributes: new Map(),
+    setAttribute(name, value) { this.attributes.set(name, String(value)); },
+    getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; },
+    removeAttribute(name) { this.attributes.delete(name); },
     append(...parts) { this.children.push(...parts); },
     replaceChildren(...parts) { this.children = [...parts]; },
     remove() { this.removed = true; },
@@ -28,28 +49,111 @@ function clientFixture({ digest, fetchRoom } = {}) {
     send(wire) { this.sent.push(JSON.parse(wire)); }
   }
   class FakePeer {
-    constructor() { this.closed = false; peerConnections.push(this); }
-    createDataChannel() {
-      const channel = { readyState: 'open', sent: [], bufferedAmount: 0,
-        send(value) { this.sent.push(typeof value === 'string' ? JSON.parse(value) : value); } };
-      this.channel = channel;
+    constructor() { this.closed = false; this.channels = []; peerConnections.push(this); }
+    createDataChannel(label, opts = {}) {
+      const channel = makeChannel({
+        label: label || 'fixture-transfer',
+        ordered: opts.ordered !== undefined ? opts.ordered : true,
+        maxRetransmits: opts.maxRetransmits ?? null,
+        maxPacketLifeTime: opts.maxPacketLifeTime ?? null
+      });
+      channel.sent = [];
+      channel.send = wire => channel.sent.push(JSON.parse(wire));
+      this.channels.push(channel);
       return channel;
     }
     async createOffer() { return { type: 'offer', sdp: 'disposable' }; }
     async setLocalDescription(description) { this.localDescription = description; }
-    close() { this.closed = true; if (this.channel) this.channel.readyState = 'closed'; }
+    close() { this.closed = true; }
   }
-  const ctx = { document, window: {}, WebSocket: FakeSocket, RTCPeerConnection: FakePeer,
-    crypto: digest ? { subtle: { digest }, randomUUID: crypto.randomUUID } : crypto.webcrypto,
-    fetch: fetchRoom, TextEncoder, TextDecoder, Uint8Array, ArrayBuffer,
-    location: { origin: 'http://127.0.0.1:1234' }, setTimeout, console };
+  const ctx = {
+    document,
+    window: { P2PFileWire: { ...fileWire } },
+    WebSocket: FakeSocket,
+    RTCPeerConnection: FakePeer,
+    crypto: cryptoApi,
+    fetch: fetchImpl,
+    TextEncoder,
+    TextDecoder,
+    Uint8Array,
+    ArrayBuffer,
+    AbortController,
+    DOMException,
+    location: { origin: 'http://127.0.0.1:1234', pathname: '/' },
+    setTimeout,
+    clearTimeout,
+    console
+  };
   vm.createContext(ctx);
   vm.runInContext(source, ctx);
   async function incoming(socket, value) {
     await socket.onmessage({ data: JSON.stringify(value) });
   }
-  return { ...ctx.window.__poc, sockets, elements, incoming, peerConnections };
+  return { ...ctx.window.__poc, window: ctx.window, sockets, elements, incoming, peerConnections };
 }
+
+test('P2 RED: hashing old-room text must not deliver it to a newly joined room', async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const cryptoApi = { subtle: { digest: async (...args) => {
+    await blocked;
+    return crypto.webcrypto.subtle.digest(...args);
+  } } };
+  const f = clientFixture({ cryptoApi });
+  f.joinRoom('room-A', 'invite-A');
+  const old = f.sockets[0];
+  await f.incoming(old, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(old, { type: 'peer-accepted', peerId: 'peer-A' });
+  const oldChannel = f.peerConnections[0].channels[0];
+  assert.ok(oldChannel, 'real client peer setup must create DataChannel A');
+  const pending = f.sendText('confidential text intended only for room A');
+  f.joinRoom('room-B', 'invite-B');
+  const fresh = f.sockets[1];
+  await f.incoming(fresh, { type: 'joined', role: 'host', peerId: 'host-B' });
+  await f.incoming(fresh, { type: 'peer-accepted', peerId: 'peer-B' });
+  const newChannel = f.peerConnections[1].channels[0];
+  assert.ok(newChannel, 'real client peer setup must create DataChannel B');
+  release();
+  await pending;
+  assert.deepEqual(newChannel.sent.filter(item => item.type === 'text'), [],
+    'bytes authorized for old room must never be sent to a new recipient after async hash');
+  assert.deepEqual(oldChannel.sent.filter(item => item.type === 'text'), [],
+    'departed room must not receive a delayed transmission either');
+  await f.sendText('fresh text intended only for room B');
+  assert.equal(newChannel.sent.filter(item => item.type === 'text').length, 1,
+    'a legitimate send in the new room must still work');
+});
+
+test('P2 RED: hashing an old-room file cannot offer it to a revoked peer after room switch', async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const f = clientFixture();
+  f.joinRoom('room-A', 'invite-A');
+  const old = f.sockets[0];
+  await f.incoming(old, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(old, { type: 'peer-accepted', peerId: 'peer-A' });
+  const oldChannel = f.peerConnections[0].channels[0];
+  const payload = new TextEncoder().encode('private file bytes for room A');
+  const file = { name: 'private.txt', size: payload.length,
+    async arrayBuffer() { await blocked; return payload.buffer.slice(0); } };
+  const pending = f.sendFile(file);
+  f.joinRoom('room-B', 'invite-B');
+  const fresh = f.sockets[1];
+  await f.incoming(fresh, { type: 'joined', role: 'host', peerId: 'host-B' });
+  await f.incoming(fresh, { type: 'peer-accepted', peerId: 'peer-B' });
+  const newChannel = f.peerConnections[1].channels[0];
+  release();
+  await pending;
+  assert.deepEqual(oldChannel.sent.filter(item => item.type === 'offer-file'), [],
+    'a stale DataChannel from a revoked room must not receive a delayed file offer');
+  assert.deepEqual(newChannel.sent.filter(item => item.type === 'offer-file'), [],
+    'file selected for the old room must not be offered to the new room');
+  await f.sendFile(file);
+  assert.equal(newChannel.sent.filter(item => item.type === 'offer-file').length, 1,
+    'legitimate offer in the new room must still work: denial must not be vacuous; state=' +
+      f.elements.get('state').textContent);
+  fresh.onclose(); // Cancel the 60s consent timer; do not leak handles across tests.
+});
 
 test('P2: delayed old-room close cannot revoke or tear down new-room peer', async () => {
   const f = clientFixture();
@@ -73,20 +177,187 @@ test('P2: delayed old-room close cannot revoke or tear down new-room peer', asyn
   assert.equal(f.peerConnections.at(-1).closed, false);
 });
 
+test('P2: a signaling connection can be canceled before joined without stale reconnection', async () => {
+  const f = clientFixture();
+  f.joinRoom('pending', 'invite-old');
+  const pendingSocket = f.sockets[0];
+  assert.equal(f.elements.get('leave').disabled, false,
+    'the user must be able to cancel a stalled signaling connection');
+  assert.equal(f.elements.get('leave').textContent, 'Cancelar conexão');
+  f.elements.get('leave').onclick();
+  assert.equal(pendingSocket.closeRequested, true);
+  assert.equal(f.snapshot().roomId, null);
+  assert.equal(f.elements.get('leave').disabled, true);
+
+  f.joinRoom('fresh', 'invite-new');
+  const newSocket = f.sockets[1];
+  pendingSocket.onopen();
+  await f.incoming(pendingSocket, { type: 'joined', role: 'host', peerId: 'stale' });
+  pendingSocket.onclose();
+  assert.equal(f.snapshot().roomId, 'fresh');
+  assert.equal(f.snapshot().role, null);
+  assert.equal(newSocket.closeRequested, undefined);
+
+  await f.incoming(newSocket, { type: 'joined', role: 'guest', peerId: 'fresh-peer' });
+  assert.equal(f.snapshot().role, 'guest');
+  assert.equal(f.elements.get('leave').textContent, 'Sair da sala');
+  assert.equal(f.elements.get('leave').disabled, false);
+});
+
+test('P2: leaving retires an old file-hash lock without clearing a newer room send', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'invite-A');
+  const oldSocket = f.sockets[0];
+  await f.incoming(oldSocket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(oldSocket, { type: 'peer-accepted', peerId: 'peer-A' });
+
+  let releaseOld;
+  const oldFile = { name: 'old.bin', size: 2,
+    arrayBuffer: () => new Promise(resolve => { releaseOld = resolve; }) };
+  const oldSend = f.sendFile(oldFile);
+  assert.equal(typeof releaseOld, 'function', 'old file hashing must be pending');
+
+  f.elements.get('leave').onclick();
+  assert.equal(f.snapshot().roomId, null);
+  assert.equal(f.snapshot().peers.length, 0);
+
+  f.joinRoom('room-B', 'invite-B');
+  const newSocket = f.sockets[1];
+  await f.incoming(newSocket, { type: 'joined', role: 'host', peerId: 'host-B' });
+  await f.incoming(newSocket, { type: 'peer-accepted', peerId: 'peer-B' });
+
+  let releaseNew;
+  const newFile = { name: 'new.bin', size: 2,
+    arrayBuffer: () => new Promise(resolve => { releaseNew = resolve; }) };
+  const newSend = f.sendFile(newFile);
+  assert.equal(typeof releaseNew, 'function', 'new room file hashing must be pending');
+
+  let thirdReadStarted = false;
+  const thirdFile = { name: 'third.bin', size: 2,
+    arrayBuffer: () => { thirdReadStarted = true; return Promise.resolve(new Uint8Array([7, 8]).buffer); } };
+  await f.sendFile(thirdFile);
+  assert.equal(thirdReadStarted, false, 'the new room must retain its own preparation lock');
+
+  releaseOld(new Uint8Array([1, 2]).buffer);
+  await oldSend;
+  await f.sendFile(thirdFile);
+  assert.equal(thirdReadStarted, false,
+    'a stale old-room finally block must not release the newer room preparation lock');
+
+  releaseNew(new Uint8Array([3, 4]).buffer);
+  await newSend;
+  assert.equal(f.snapshot().peers.some(peer => peer.outgoingPhase === 'offered'), true,
+    'the new room send must complete after its own hash resolves');
+});
+
+test('P2: a retired outgoing cancel callback cannot abort a later transfer to the same peer', async () => {
+  const f = clientFixture();
+  f.joinRoom('room', 'invitation');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'host', peerId: 'host' });
+  await f.incoming(f.sockets[0], { type: 'peer-accepted', peerId: 'peer-A' });
+  const channel = f.testChannel(0);
+  const sent = [];
+  channel.send = data => sent.push(JSON.parse(data));
+  const file = name => ({ name, size: 2,
+    arrayBuffer: async () => new Uint8Array([1, 2]).buffer });
+
+  await f.sendFile(file('old.bin'));
+  const retiredCancel = f.elements.get('transfers').children[0].children[1].onclick;
+  const firstOffer = sent.find(message => message.type === 'offer-file');
+  assert.ok(firstOffer);
+  await channel.onmessage({ data: JSON.stringify({ type: 'decline-file', id: firstOffer.id }) });
+  assert.equal(f.snapshot().peers[0].outgoingPhase, null);
+
+  await f.sendFile(file('current.bin'));
+  const currentOffer = sent.filter(message => message.type === 'offer-file').at(-1);
+  assert.notEqual(currentOffer.id, firstOffer.id);
+  assert.equal(f.snapshot().peers[0].outgoingPhase, 'offered');
+  retiredCancel(); // A previously queued click from a now-removed control.
+  assert.equal(f.snapshot().peers[0].outgoingPhase, 'offered',
+    'an obsolete cancel callback must not release the new transfer');
+  assert.equal(sent.some(message => message.type === 'cancel-file' && message.id === currentOffer.id), false);
+
+  f.elements.get('transfers').children[1].children[1].onclick();
+  assert.equal(f.snapshot().peers[0].outgoingPhase, null);
+  assert.equal(sent.some(message => message.type === 'cancel-file' && message.id === currentOffer.id), true,
+    'the current transfer must still be cancellable');
+});
+
+test('P2: a retired offer consent callback cannot accept or decline a replacement with a reused ID', async () => {
+  const f = clientFixture();
+  f.joinRoom('room', 'invitation');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+  await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+  const channel = makeChannel();
+  const sent = [];
+  channel.send = data => sent.push(JSON.parse(data));
+  f.peerConnections[0].ondatachannel({ channel });
+  const offer = { type: 'offer-file', id: 'a'.repeat(32), name: 'old.bin',
+    size: 2, digest: 'b'.repeat(64) };
+  await channel.onmessage({ data: JSON.stringify(offer) });
+  const oldUi = f.elements.get('incoming').children[0];
+  const oldAccept = oldUi.children[0].onclick;
+  const oldDecline = oldUi.children[1].onclick;
+  oldDecline();
+  assert.equal(f.snapshot().peers[0].pendingOffer, false);
+
+  await channel.onmessage({ data: JSON.stringify({ ...offer, name: 'new.bin' }) });
+  assert.equal(f.snapshot().peers[0].pendingOffer, true);
+  const sentBeforeStale = sent.length;
+  oldAccept();
+  oldDecline();
+  assert.equal(sent.length, sentBeforeStale,
+    'stale consent must neither accept nor decline a different offer with the same ID');
+  assert.equal(f.snapshot().peers[0].pendingOffer, true,
+    'replacement offer must retain its own consent');
+
+  const currentAccept = f.elements.get('incoming').children[1].children[0].onclick;
+  currentAccept();
+  assert.equal(f.snapshot().peers[0].pendingOffer, false);
+  assert.equal(sent.filter(message => message.type === 'accept-file' && message.id === offer.id).length, 1,
+    'the current consent button must still accept the replacement');
+});
+
+test('P2: an old incoming cancel callback cannot cancel a replacement receiving the same ID', async () => {
+  const f = clientFixture();
+  f.joinRoom('room', 'invitation');
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+  await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+  const channel = makeChannel();
+  const sent = [];
+  channel.send = data => sent.push(JSON.parse(data));
+  f.peerConnections[0].ondatachannel({ channel });
+  const offer = { type: 'offer-file', id: 'c'.repeat(32), name: 'old.bin',
+    size: 2, digest: 'd'.repeat(64) };
+  await channel.onmessage({ data: JSON.stringify(offer) });
+  f.elements.get('incoming').children[0].children[0].onclick();
+  const oldCancel = f.elements.get('transfers').children[0].children[1].onclick;
+  await channel.onmessage({ data: JSON.stringify({ type: 'cancel-file', id: offer.id }) });
+
+  await channel.onmessage({ data: JSON.stringify({ ...offer, name: 'current.bin' }) });
+  f.elements.get('incoming').children[1].children[0].onclick();
+  oldCancel();
+  assert.equal(sent.filter(message => message.type === 'cancel-file').length, 0,
+    'the obsolete cancel handler must not clear the new transfer');
+  f.elements.get('transfers').children[1].children[1].onclick();
+  assert.equal(sent.filter(message => message.type === 'cancel-file').length, 1,
+    'the current incoming cancellation must still notify the peer');
+});
+
 test('P2: empty offer IDs cannot create unbounded consent panels; valid offer still works', async () => {
   const f = clientFixture();
   f.joinRoom('room', 'invitation');
   await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
   await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
   const peer = f.peerConnections[0];
-  const channel = { readyState: 'open', send() {}, bufferedAmount: 0 };
+  const channel = makeChannel();
   peer.ondatachannel({ channel });
   const payload = { type: 'offer-file', id: '', name: 'fixture.bin', size: 2,
     digest: 'a'.repeat(64) };
   for (let i = 0; i < 128; i++) await channel.onmessage({ data: JSON.stringify(payload) });
   assert.equal(f.elements.get('incoming').children.length, 0,
     'empty IDs must be rejected rather than creating 128 consent dialogs');
-  payload.id = 'valid-offer-01';
+  payload.id = 'a'.repeat(32);
   await channel.onmessage({ data: JSON.stringify(payload) });
   assert.equal(f.elements.get('incoming').children.length, 1,
     'legitimate bounded ID must still create one consent dialog');
@@ -95,163 +366,309 @@ test('P2: empty offer IDs cannot create unbounded consent panels; valid offer st
     'repeated pending ID may not create more dialogs');
 });
 
-test('P2: repeated accept-file frames cannot start concurrent send loops during a stalled DataChannel', async () => {
+test('P1: offer validation requires both P2PFileWire.validOffer and strict inline checks', async () => {
   const f = clientFixture();
   f.joinRoom('room', 'invitation');
-  await f.incoming(f.sockets[0], { type: 'joined', role: 'host', peerId: 'host' });
-  await f.incoming(f.sockets[0], { type: 'peer-accepted', peerId: 'peer-A' });
-  const channel = f.testChannel(0);
-  const listeners = new Map();
-  channel.addEventListener = (type, callback) => {
-    if (!listeners.has(type)) listeners.set(type, new Set());
-    listeners.get(type).add(callback);
-  };
-  channel.removeEventListener = (type, callback) => listeners.get(type)?.delete(callback);
-  channel.close = () => {
-    channel.readyState = 'closed';
-    channel.onclose?.();
-    for (const callback of [...(listeners.get('close') || [])]) callback();
-  };
-  const originalSend = channel.send.bind(channel);
-  channel.send = value => {
-    originalSend(value);
-    if (value instanceof ArrayBuffer) channel.bufferedAmount = 128 * 1024;
-  };
-  channel.bufferedAmount = 128 * 1024;
+  await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+  await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+  const peer = f.peerConnections[0];
+  const channel = makeChannel();
+  peer.ondatachannel({ channel });
 
-  const bytes = new Uint8Array(32 * 1024).fill(7);
-  await f.sendFile({ name: 'replay.bin', size: bytes.byteLength,
-    arrayBuffer: async () => bytes.buffer });
-  const offer = channel.sent.find(message => message.type === 'offer-file');
-  assert.ok(offer, 'positive control: sender has a live offer before consent');
-  const accept = { type: 'accept-file', id: offer.id };
-  let first;
-  let replay;
-  try {
-    first = channel.onmessage({ data: JSON.stringify(accept) });
-    replay = channel.onmessage({ data: JSON.stringify(accept) });
-    assert.equal(listeners.get('bufferedamountlow')?.size || 0, 1,
-      'a repeated accept while the first send is stalled must not register a second send loop');
+  // 1. validOffer returning false still rejects even if inline fields pass
+  // id satisfies inline /^[A-Za-z0-9_-]{1,64}$/, but fails P2PFileWire.validOffer (requires 32 hex chars)
+  const offerFailingWire = {
+    type: 'offer-file',
+    id: 'valid-offer-inline-only-01',
+    name: 'test.bin',
+    size: 10,
+    digest: 'a'.repeat(64)
+  };
+  await channel.onmessage({ data: JSON.stringify(offerFailingWire) });
+  assert.equal(f.elements.get('incoming').children.length, 0,
+    'offer rejected by validOffer must not create consent dialog even if inline checks pass');
+  assert.ok(f.snapshot().diagnostics.rejected.includes('BAD_OFFER'));
 
-    const drain = () => {
-      channel.bufferedAmount = 0;
-      for (const callback of [...(listeners.get('bufferedamountlow') || [])]) callback();
-    };
-    drain();
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(channel.sent.filter(value => value instanceof ArrayBuffer).length, 1,
-      'one drain must release exactly one first chunk');
-    assert.equal(listeners.get('bufferedamountlow')?.size || 0, 1,
-      'the single sender waits once for the next chunk window');
+  // Also test when validOffer is stubbed to return false on an otherwise valid payload
+  f.window.P2PFileWire.validOffer = () => false;
+  const standardOffer = {
+    type: 'offer-file',
+    id: 'b'.repeat(32),
+    name: 'test.bin',
+    size: 10,
+    digest: 'a'.repeat(64)
+  };
+  await channel.onmessage({ data: JSON.stringify(standardOffer) });
+  assert.equal(f.elements.get('incoming').children.length, 0,
+    'validOffer returning false must reject offer even when inline fields are valid');
 
-    drain();
-    await Promise.all([first, replay]);
-    assert.equal(channel.sent.filter(value => value instanceof ArrayBuffer).length, 2,
-      'the file must be emitted as exactly two chunks');
-    assert.equal(channel.sent.filter(value => value.type === 'end-file').length, 1,
-      'the transfer must have exactly one completion frame');
-  } finally {
-    if (channel.readyState === 'open') channel.close();
-    await Promise.all([first, replay].filter(Boolean));
+  // 2. invalid id still rejects even if validOffer passes
+  f.window.P2PFileWire.validOffer = () => true;
+  const offerEmptyId = {
+    type: 'offer-file',
+    id: '',
+    name: 'test.bin',
+    size: 10,
+    digest: 'a'.repeat(64)
+  };
+  await channel.onmessage({ data: JSON.stringify(offerEmptyId) });
+  assert.equal(f.elements.get('incoming').children.length, 0,
+    'invalid empty id must reject offer even if validOffer returns true');
+
+  const offerInvalidChars = {
+    type: 'offer-file',
+    id: 'invalid id with spaces!',
+    name: 'test.bin',
+    size: 10,
+    digest: 'a'.repeat(64)
+  };
+  await channel.onmessage({ data: JSON.stringify(offerInvalidChars) });
+  assert.equal(f.elements.get('incoming').children.length, 0,
+    'disallowed id characters must reject offer even if validOffer returns true');
+});
+
+test('P2: attachChannel strictly rejects data channels with missing or invalid label, ordered, or retransmit constraints', async () => {
+  // Missing label
+  {
+    const f = clientFixture();
+    f.joinRoom('room', 'invitation');
+    await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+    await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+    const peer = f.peerConnections[0];
+    let closed = false;
+    const ch = makeChannel({ label: undefined, close() { closed = true; } });
+    peer.ondatachannel({ channel: ch });
+    assert.equal(closed, true, 'missing label must cause channel.close()');
+    assert.ok(f.snapshot().diagnostics.rejected.includes('INVALID_CHANNEL'));
+    assert.equal(f.snapshot().peers[0].channel, 'none');
+  }
+
+  // Label mismatch
+  {
+    const f = clientFixture();
+    f.joinRoom('room', 'invitation');
+    await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+    await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+    const peer = f.peerConnections[0];
+    let closed = false;
+    const ch = makeChannel({ label: 'wrong-label', close() { closed = true; } });
+    peer.ondatachannel({ channel: ch });
+    assert.equal(closed, true, 'wrong label must cause channel.close()');
+    assert.ok(f.snapshot().diagnostics.rejected.includes('INVALID_CHANNEL'));
+    assert.equal(f.snapshot().peers[0].channel, 'none');
+  }
+
+  // Missing or false ordered property
+  {
+    const f = clientFixture();
+    f.joinRoom('room', 'invitation');
+    await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+    await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+    const peer = f.peerConnections[0];
+    let closed = false;
+    const ch = makeChannel({ ordered: false, close() { closed = true; } });
+    peer.ondatachannel({ channel: ch });
+    assert.equal(closed, true, 'unordered channel must cause channel.close()');
+    assert.ok(f.snapshot().diagnostics.rejected.includes('INVALID_CHANNEL'));
+    assert.equal(f.snapshot().peers[0].channel, 'none');
+  }
+
+  // Non-null maxRetransmits
+  {
+    const f = clientFixture();
+    f.joinRoom('room', 'invitation');
+    await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+    await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+    const peer = f.peerConnections[0];
+    let closed = false;
+    const ch = makeChannel({ maxRetransmits: 3, close() { closed = true; } });
+    peer.ondatachannel({ channel: ch });
+    assert.equal(closed, true, 'non-null maxRetransmits must cause channel.close()');
+    assert.ok(f.snapshot().diagnostics.rejected.includes('INVALID_CHANNEL'));
+  }
+
+  // Non-null maxPacketLifeTime
+  {
+    const f = clientFixture();
+    f.joinRoom('room', 'invitation');
+    await f.incoming(f.sockets[0], { type: 'joined', role: 'guest', peerId: 'guest' });
+    await f.incoming(f.sockets[0], { type: 'peer-allowed', peerId: 'peer-A' });
+    const peer = f.peerConnections[0];
+    let closed = false;
+    const ch = makeChannel({ maxPacketLifeTime: 500, close() { closed = true; } });
+    peer.ondatachannel({ channel: ch });
+    assert.equal(closed, true, 'non-null maxPacketLifeTime must cause channel.close()');
+    assert.ok(f.snapshot().diagnostics.rejected.includes('INVALID_CHANNEL'));
   }
 });
 
-test('P2: delayed text hash cannot deliver to another room or a newly joined recipient', async () => {
-  let blocked = null;
-  function holdDigest() {
-    let release;
-    const promise = new Promise(resolve => { release = resolve; });
-    blocked = promise;
-    return release;
-  }
-  const f = clientFixture({ digest: async (...args) => {
-    const pause = blocked;
-    blocked = null;
-    if (pause) await pause;
-    return crypto.webcrypto.subtle.digest(...args);
-  } });
-  f.joinRoom('room-A', 'invite-A');
-  await f.incoming(f.sockets[0], { type: 'joined', role: 'host', peerId: 'host-A' });
-  await f.incoming(f.sockets[0], { type: 'peer-accepted', peerId: 'peer-A' });
-  const oldChannel = f.peerConnections[0].channel;
-  await f.sendText('valid A');
-  assert.deepEqual(oldChannel.sent.filter(x => x.type === 'text').map(x => x.text), ['valid A'],
-    'positive control: an established A peer receives ordinary text');
-
-  const finishHash = holdDigest();
-  const pending = f.sendText('private to room A');
-  f.joinRoom('room-B', 'invite-B');
-  await f.incoming(f.sockets[1], { type: 'joined', role: 'host', peerId: 'host-B' });
-  await f.incoming(f.sockets[1], { type: 'peer-accepted', peerId: 'peer-B' });
-  const newChannel = f.peerConnections[1].channel;
-  finishHash();
-  await pending;
-  assert.deepEqual(newChannel.sent.filter(x => x.type === 'text'), [],
-    'old room text must not escape to a new room after a delayed SHA-256');
-
-  const finishSecondHash = holdDigest();
-  const pendingB = f.sendText('only current B peers');
-  await f.incoming(f.sockets[1], { type: 'peer-accepted', peerId: 'late-peer-B' });
-  const lateChannel = f.peerConnections[2].channel;
-  finishSecondHash();
-  await pendingB;
-  assert.deepEqual(lateChannel.sent.filter(x => x.type === 'text'), [],
-    'joining after the send click must not retroactively authorize that text');
-  assert.deepEqual(newChannel.sent.filter(x => x.type === 'text').map(x => x.text),
-    ['only current B peers'], 'the original recipient must still receive its text');
-  await f.sendText('valid after join');
-  assert.deepEqual(lateChannel.sent.filter(x => x.type === 'text').map(x => x.text),
-    ['valid after join'], 'positive control: later explicit sends reach the new peer');
-});
-
-test('P2: delayed file reading cannot offer earlier room bytes to fresh peers', async () => {
+test('P2 merge: host kick closes an already-consented RTCDataChannel synchronously, ahead of broker peer-left', async () => {
   const f = clientFixture();
-  f.joinRoom('room-A', 'invite-A');
-  await f.incoming(f.sockets[0], { type: 'joined', role: 'host', peerId: 'host-A' });
-  await f.incoming(f.sockets[0], { type: 'peer-accepted', peerId: 'peer-A' });
-  let releaseRead;
-  const readGate = new Promise(resolve => { releaseRead = resolve; });
-  const pendingFile = f.sendFile({
-    name: 'private-A.bin', size: 3,
-    async arrayBuffer() { await readGate; return Uint8Array.of(1, 2, 3).buffer; }
-  });
-  f.joinRoom('room-B', 'invite-B');
-  await f.incoming(f.sockets[1], { type: 'joined', role: 'host', peerId: 'host-B' });
-  await f.incoming(f.sockets[1], { type: 'peer-accepted', peerId: 'peer-B' });
-  const newChannel = f.peerConnections[1].channel;
-  releaseRead();
-  await pendingFile;
-  assert.deepEqual(newChannel.sent.filter(x => x.type === 'offer-file'), [],
-    'bytes chosen for room A must never be offered to room B');
-
-  await f.sendFile({ name: 'valid-B.bin', size: 3, async arrayBuffer() {
-    return Uint8Array.of(4, 5, 6).buffer;
-  } });
-  assert.deepEqual(newChannel.sent.filter(x => x.type === 'offer-file').map(x => x.name),
-    ['valid-B.bin'], 'positive control: deliberate new-room file offer still works');
+  f.joinRoom('room-A', 'host-invite');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-joined', role: 'guest', peerId: 'guest-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const channel = f.testChannel(0);
+  const peer = f.peerConnections[0];
+  assert.equal(channel.readyState, 'open', 'positive: the consented RTC channel is open');
+  const kick = f.elements.get('peers').children[0].children.at(-1);
+  kick.onclick();
+  assert.deepEqual(socket.sent.at(-1), { type: 'kick', to: 'guest-A' });
+  assert.equal(channel.readyState, 'closed', 'local revocation must close the direct channel before a delayed peer-left');
+  assert.equal(peer.closed, true, 'direct PeerConnection must be closed at kick');
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  assert.equal(f.snapshot().peers.length, 0, 'queued peer-accepted cannot resurrect a kicked participant');
 });
 
-test('P2: a late create-room HTTP response cannot replace a newer join intent', async () => {
-  let finishFirstFetch, calls = 0;
-  const f = clientFixture({ fetchRoom: () => {
-    const n = ++calls;
-    if (n === 1) return new Promise(resolve => {
-      finishFirstFetch = () => resolve({
-        ok: true, json: async () => ({ roomId: 'late-created-A', hostKey: 'key-A' })
-      });
+test('P2 merge: broker REVOKED and ROOM_CLOSED close guest RTC before signaling socket shuts down', async () => {
+  for (const code of ['REVOKED', 'ROOM_CLOSED']) {
+    const f = clientFixture();
+    f.joinRoom('room-A', 'guest-invitation');
+    const socket = f.sockets[0];
+    await f.incoming(socket, { type: 'joined', role: 'guest', peerId: 'guest-A' });
+    await f.incoming(socket, { type: 'peer-allowed', peerId: 'host-A' });
+    const peer = f.peerConnections[0];
+    const channel = makeChannel();
+    peer.ondatachannel({ channel });
+    assert.equal(channel.readyState, 'open', 'positive: guest channel is live');
+    await f.incoming(socket, { type: 'error', code });
+    assert.equal(peer.closed, true, code + ' immediately closes direct RTC');
+    assert.equal(channel.readyState, 'closed', code + ' immediately closes the DataChannel');
+    assert.equal(f.snapshot().peers.length, 0, code + ' clears local consent');
+    await f.incoming(socket, { type: 'peer-allowed', peerId: 'host-A' });
+    assert.equal(f.snapshot().peers.length, 0, code + ' denies stale consent replay on same socket');
+  }
+});
+
+test('P2 merge: peer-left prevents a late peer-accepted from recreating its RTC transport', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'host-key');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const channel = f.testChannel(0);
+  await f.incoming(socket, { type: 'peer-left', peerId: 'guest-A' });
+  assert.equal(channel.readyState, 'closed', 'broker departure retires live transport');
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  assert.equal(f.snapshot().peers.length, 0, 'stale acceptance may not recreate a departed guest');
+  assert.equal(f.peerConnections.length, 1, 'no new RTCPeerConnection for departed peer ID');
+});
+
+test('P2 merge: host kick aborts a paused 32 MiB-capable sender without publishing late file frames', async () => {
+  const f = clientFixture();
+  f.joinRoom('room-A', 'host-key');
+  const socket = f.sockets[0];
+  await f.incoming(socket, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(socket, { type: 'peer-joined', role: 'guest', peerId: 'guest-A' });
+  await f.incoming(socket, { type: 'peer-accepted', peerId: 'guest-A' });
+  const channel = f.testChannel(0);
+  channel.sent = [];
+  channel.send = data => channel.sent.push(typeof data === 'string' ? JSON.parse(data) : data);
+  let reachedWindow, releaseWindow, aborted = false;
+  const paused = new Promise(resolve => { reachedWindow = resolve; });
+  f.window.P2PFileWire.waitForSendWindow = (_channel, signal) => {
+    reachedWindow();
+    return new Promise((resolve, reject) => {
+      releaseWindow = resolve;
+      signal.addEventListener('abort', () => {
+        aborted = true;
+        reject(new Error('canceled by revocation'));
+      }, { once: true });
     });
-    return Promise.resolve({
-      ok: true, json: async () => ({ roomId: 'chosen-C', hostKey: 'key-C' })
-    });
+  };
+  const payload = Uint8Array.of(1, 2, 3);
+  await f.sendFile({ name: 'disposable.bin', size: payload.length,
+    arrayBuffer: async () => payload.buffer,
+    slice: () => ({ arrayBuffer: async () => payload.buffer }) });
+  const offer = channel.sent.find(message => message.type === 'offer-file');
+  assert.ok(offer, 'positive: file offer passed digest and original consent checks');
+  await channel.onmessage({ data: JSON.stringify({ type: 'accept-file', id: offer.id }) });
+  await paused;
+  const kick = f.elements.get('peers').children[0].children.at(-1);
+  kick.onclick();
+  assert.equal(aborted, true, 'direct kick must abort the suspended send-window promise');
+  assert.equal(channel.readyState, 'closed');
+  releaseWindow();
+  await Promise.resolve();
+  assert.equal(channel.sent.some(message => message instanceof ArrayBuffer ||
+    message?.type === 'end-file'), false,
+  'a kicked recipient must receive no file chunks or completion while the old buffer drains');
+});
+
+test('P2 RED: late room creation response cannot hijack a newer signed room join', async () => {
+  let releaseFirst, calls = 0;
+  const f = clientFixture({ fetchImpl: async () => {
+    calls++;
+    if (calls === 1) await new Promise(resolve => { releaseFirst = resolve; });
+    return { ok: true, json: async () => ({ roomId: 'stale-created-A', hostKey: 'secret-A' }) };
   } });
-  const staleCreate = f.createRoom();
+  const pending = f.createRoom();
+  assert.equal(typeof releaseFirst, 'function', 'test must really hold the HTTP response');
   f.joinRoom('chosen-B', 'invite-B');
-  finishFirstFetch();
-  await staleCreate;
+  assert.equal(f.snapshot().roomId, 'chosen-B');
+  releaseFirst();
+  await pending;
   assert.equal(f.snapshot().roomId, 'chosen-B',
-    'older HTTP response must not silently take control of the current room');
-  assert.equal(f.sockets.length, 1, 'stale response must not open a replacement WebSocket');
-  await f.createRoom();
-  assert.equal(f.snapshot().roomId, 'chosen-C', 'fresh explicit room creation still works');
-  assert.equal(f.sockets.length, 2);
+    'obsolete HTTP creation response must not replace the newer room intent');
+  assert.equal(f.sockets.length, 1, 'no stale WebSocket should be created');
+});
+
+test('P2: createRoom starting during async hashing invalidates pending sendText and sendFile', async () => {
+  let releaseHash;
+  const releaseFetches = [];
+  const cryptoApi = {
+    subtle: {
+      digest: async (...args) => {
+        await new Promise(resolve => { releaseHash = resolve; });
+        return crypto.webcrypto.subtle.digest(...args);
+      }
+    },
+    randomUUID: () => crypto.randomUUID(),
+  };
+  const f = clientFixture({
+    cryptoApi,
+    fetchImpl: async () => {
+      await new Promise(resolve => { releaseFetches.push(resolve); });
+      return { ok: true, json: async () => ({ roomId: 'room-B', hostKey: 'host-B' }) };
+    }
+  });
+  f.joinRoom('room-A', 'invite-A');
+  const sockA = f.sockets[0];
+  await f.incoming(sockA, { type: 'joined', role: 'host', peerId: 'host-A' });
+  await f.incoming(sockA, { type: 'peer-accepted', peerId: 'peer-A' });
+  const channel = f.peerConnections[0].channels[0];
+
+  const pendingText = f.sendText('secret-for-A');
+  assert.equal(typeof releaseHash, 'function', 'hashing must pause before createRoom');
+  const pendingCreate = f.createRoom();
+  releaseHash();
+  await pendingText;
+  assert.equal(channel.sent.length, 0, 'pending sendText must abort once createRoom increments roomGeneration');
+  for (const r of releaseFetches.splice(0)) r();
+  await pendingCreate;
+
+  f.joinRoom('room-A2', 'invite-A2');
+  const sockA2 = f.sockets[f.sockets.length - 1];
+  await f.incoming(sockA2, { type: 'joined', role: 'host', peerId: 'host-A2' });
+  await f.incoming(sockA2, { type: 'peer-accepted', peerId: 'peer-A2' });
+  const channel2 = f.peerConnections[f.peerConnections.length - 1].channels[0];
+
+  releaseHash = null;
+  const file = {
+    name: 'secret.txt',
+    size: 5,
+    async arrayBuffer() { return new Uint8Array([1, 2, 3, 4, 5]).buffer; }
+  };
+  const pendingFile = f.sendFile(file);
+  // Wait a microtask for file.arrayBuffer() to settle before subtle.digest is entered
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof releaseHash, 'function', 'file hashing must pause before second createRoom');
+  const pendingCreate2 = f.createRoom();
+  releaseHash();
+  await pendingFile;
+  assert.equal(channel2.sent.length, 0, 'pending sendFile must abort once createRoom increments roomGeneration');
+
+  for (const r of releaseFetches.splice(0)) r();
+  await pendingCreate2;
 });
