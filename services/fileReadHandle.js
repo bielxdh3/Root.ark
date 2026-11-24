@@ -89,10 +89,12 @@ function windowsDirectoryAcl(directoryPath) {
     "$ErrorActionPreference = 'Stop'",
     `$target = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String('${encodedPath}'))`,
     "$acl = Get-Acl -LiteralPath $target",
-    "$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()",
+    "$current = $identity.User.Value",
+    "$isAdmin = ([System.Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)",
     "$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
     "$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { [pscustomobject]@{ sid = $_.IdentityReference.Value; type = $_.AccessControlType.ToString(); rights = [int]$_.FileSystemRights } })",
-    "[pscustomobject]@{ owner = $owner; current = $current; protected = $acl.AreAccessRulesProtected; rules = $rules } | ConvertTo-Json -Depth 4 -Compress",
+    "[pscustomobject]@{ owner = $owner; current = $current; isAdmin = $isAdmin; protected = $acl.AreAccessRulesProtected; rules = $rules } | ConvertTo-Json -Depth 4 -Compress",
   ].join("; ");
   const output = runPowerShell(script);
   const result = JSON.parse(output);
@@ -118,6 +120,39 @@ function secureNewWindowsSnapshotDirectory(directoryPath) {
   runPowerShell(script);
 }
 
+function validateWindowsDirectoryAclObject(acl, privateDirectory) {
+  const isAdmin = acl?.isAdmin === true;
+  const trustedOwners = new Set([acl?.current, WINDOWS_SYSTEM_SID]);
+  if (!privateDirectory || isAdmin) trustedOwners.add(WINDOWS_ADMINISTRATORS_SID);
+  if (!acl?.current || !trustedOwners.has(acl.owner)) {
+    throw fileReadError("PRIVATE_SNAPSHOT_DIRECTORY_INVALID", "Private snapshot directory owner does not match the service account");
+  }
+  const trusted = new Set([acl.current, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID,
+    WINDOWS_CREATOR_OWNER_SID, WINDOWS_OWNER_RIGHTS_SID]);
+  const effectiveCurrentSids = new Set([acl.current]);
+  if (isAdmin) effectiveCurrentSids.add(WINDOWS_ADMINISTRATORS_SID);
+  let currentRights = 0;
+  let currentDeniedRights = 0;
+  for (const rule of Array.isArray(acl.rules) ? acl.rules : []) {
+    const rights = Number(rule.rights) || 0;
+    if (effectiveCurrentSids.has(rule.sid) && rule.type === "Allow") currentRights |= rights;
+    if (effectiveCurrentSids.has(rule.sid) && rule.type === "Deny") currentDeniedRights |= rights;
+    if (rule.type === "Allow" && (privateDirectory
+      ? !trusted.has(rule.sid)
+      : !trusted.has(rule.sid) && (rights & WINDOWS_DIRECTORY_WRITE_RIGHTS) !== 0)) {
+      throw fileReadError("PRIVATE_SNAPSHOT_DIRECTORY_INVALID", "Private snapshot directory ACL grants unsafe access");
+    }
+  }
+  if (privateDirectory && ((currentRights & WINDOWS_FULL_CONTROL) !== WINDOWS_FULL_CONTROL
+    || (currentDeniedRights & (WINDOWS_FULL_CONTROL | 0x10000000 | 0x40000000)) !== 0)) {
+    throw fileReadError("PRIVATE_SNAPSHOT_DIRECTORY_INVALID", "Private snapshot directory ACL is not restricted to its owner");
+  }
+  if (!privateDirectory && ((currentRights & WINDOWS_PARENT_REQUIRED_RIGHTS) !== WINDOWS_PARENT_REQUIRED_RIGHTS
+    || (currentDeniedRights & WINDOWS_DIRECTORY_WRITE_RIGHTS) !== 0)) {
+    throw fileReadError("PRIVATE_SNAPSHOT_DIRECTORY_INVALID", "Snapshot parent is not writable by its owner");
+  }
+}
+
 function validateDirectorySecurity(directoryPath, privateDirectory) {
   const stat = fs.lstatSync(directoryPath);
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
@@ -125,33 +160,7 @@ function validateDirectorySecurity(directoryPath, privateDirectory) {
   }
 
   if (process.platform === "win32") {
-    const acl = windowsDirectoryAcl(directoryPath);
-    const trustedOwners = new Set([acl.current, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID]);
-    if (!acl.current || (privateDirectory ? acl.owner !== acl.current : !trustedOwners.has(acl.owner))) {
-      throw fileReadError("PRIVATE_SNAPSHOT_DIRECTORY_INVALID", "Private snapshot directory owner does not match the service account");
-    }
-    const trusted = new Set([acl.current, WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID,
-      WINDOWS_CREATOR_OWNER_SID, WINDOWS_OWNER_RIGHTS_SID]);
-    let currentRights = 0;
-    let currentDeniedRights = 0;
-    for (const rule of acl.rules) {
-      const rights = Number(rule.rights) || 0;
-      if (rule.sid === acl.current && rule.type === "Allow") currentRights |= rights;
-      if (rule.sid === acl.current && rule.type === "Deny") currentDeniedRights |= rights;
-      if (rule.type === "Allow" && (privateDirectory
-        ? !trusted.has(rule.sid)
-        : !trusted.has(rule.sid) && (rights & WINDOWS_DIRECTORY_WRITE_RIGHTS) !== 0)) {
-        throw fileReadError("PRIVATE_SNAPSHOT_DIRECTORY_INVALID", "Private snapshot directory ACL grants unsafe access");
-      }
-    }
-    if (privateDirectory && ((currentRights & WINDOWS_FULL_CONTROL) !== WINDOWS_FULL_CONTROL
-      || (currentDeniedRights & (WINDOWS_FULL_CONTROL | 0x10000000 | 0x40000000)) !== 0)) {
-      throw fileReadError("PRIVATE_SNAPSHOT_DIRECTORY_INVALID", "Private snapshot directory ACL is not restricted to its owner");
-    }
-    if (!privateDirectory && ((currentRights & WINDOWS_PARENT_REQUIRED_RIGHTS) !== WINDOWS_PARENT_REQUIRED_RIGHTS
-      || (currentDeniedRights & WINDOWS_DIRECTORY_WRITE_RIGHTS) !== 0)) {
-      throw fileReadError("PRIVATE_SNAPSHOT_DIRECTORY_INVALID", "Snapshot parent is not writable by its owner");
-    }
+    validateWindowsDirectoryAclObject(windowsDirectoryAcl(directoryPath), privateDirectory);
     return stat;
   }
 
@@ -896,4 +905,5 @@ module.exports = {
   readBoundedRegularFile,
   retryPendingPrivateShareSnapshotCleanup,
   snapshotReadHandle,
+  validateWindowsDirectoryAclObject,
 };

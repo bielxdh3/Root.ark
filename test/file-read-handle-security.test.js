@@ -10,7 +10,7 @@ const test = require("node:test");
 const { cleanupOrphanPrivateShareSnapshots, cleanupReadHandle, openReadHandle, readBoundedRegularFile,
   ensurePrivateShareSnapshotDirectory, getPrivateShareSnapshotCleanupState, getPrivateShareSnapshotDirectory,
   getPrivateShareSnapshotProcessInstance,
-  retryPendingPrivateShareSnapshotCleanup, snapshotReadHandle } = require("../services/fileReadHandle");
+  retryPendingPrivateShareSnapshotCleanup, snapshotReadHandle, validateWindowsDirectoryAclObject } = require("../services/fileReadHandle");
 const { createPrivateShareSnapshotBudget } = require("../services/privateShareSnapshotBudget");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
@@ -1036,4 +1036,53 @@ test("a second owned descriptor for a pending inode must close independently", (
   assert.equal(retryPendingPrivateShareSnapshotCleanup(), 2,
     "both pending descriptors were proven closed; their byte quotas release after the inode is gone");
   assert.deepEqual(budget.getState(), { active: 0, reservedBytes: 0 });
+});
+
+test("issue 68: Windows ACL validation accepts admin-owned private dir and admin-group parent when current user is Administrator", () => {
+  const current = "S-1-5-21-1000-2000-3000-1001";
+  const system = "S-1-5-18";
+  const admins = "S-1-5-32-544";
+  const users = "S-1-5-32-545";
+  const fullControl = 0x1f01ff;
+  // Private dir created by an Administrator process (e.g. runneradmin on windows-2022)
+  assert.doesNotThrow(() => validateWindowsDirectoryAclObject({
+    owner: admins,
+    current,
+    isAdmin: true,
+    rules: [
+      { sid: current, type: "Allow", rights: fullControl },
+      { sid: system, type: "Allow", rights: fullControl },
+      { sid: admins, type: "Allow", rights: fullControl },
+    ],
+  }, true));
+  // Parent ancestor dir granting write access via BUILTIN\Administrators
+  assert.doesNotThrow(() => validateWindowsDirectoryAclObject({
+    owner: admins,
+    current,
+    isAdmin: true,
+    rules: [
+      { sid: system, type: "Allow", rights: fullControl },
+      { sid: admins, type: "Allow", rights: fullControl },
+    ],
+  }, false));
+  // Non-admin user must still reject Administrators-owned private dir
+  assert.throws(() => validateWindowsDirectoryAclObject({
+    owner: admins,
+    current,
+    isAdmin: false,
+    rules: [
+      { sid: current, type: "Allow", rights: fullControl },
+      { sid: admins, type: "Allow", rights: fullControl },
+    ],
+  }, true), { code: "PRIVATE_SNAPSHOT_DIRECTORY_INVALID" });
+  // Untrusted SID with write access must still be rejected
+  assert.throws(() => validateWindowsDirectoryAclObject({
+    owner: current,
+    current,
+    isAdmin: true,
+    rules: [
+      { sid: current, type: "Allow", rights: fullControl },
+      { sid: users, type: "Allow", rights: 0x0002 },
+    ],
+  }, false), { code: "PRIVATE_SNAPSHOT_DIRECTORY_INVALID" });
 });
