@@ -2,7 +2,7 @@ const {
   assert, bcrypt, crypto, Database, fs, http, net, os, path, spawn, spawnSync, test,
   createFileLifecycleLock, classifyProcessOwner, createChunkUploadQuotaService, getCurrentProcessIdentity, ensureWindowsChunkUploadRoot,
   ROOT, SERVER, PUBLIC, TIMEOUT_MS, SERVER_BOOT_TIMEOUT_MS, FOLDER_ID, CHUNK_SESSION_TTL_MS, createChunkUploadQuota,
-  chunkBoundaryRequestTimeout, isCanonicalNpmTestInvocation, releaseGateFixtureToHost, releaseGateVmRequire,
+  chunkBoundaryRequestTimeout, isCanonicalNpmTestInvocation,
   getUnusedPort, request, waitForServer, login, multipartParts, multipart, isContained, testDeadQuotaOwnerEnv,
   createHarness, startGatedClamAv, upload, uploadPayload, uploadChunk, postJson, waitForExit, waitForFile,
   legacyChunkMetadata, auditLogs, auditLogFileSignature, waitForAuditLogs,
