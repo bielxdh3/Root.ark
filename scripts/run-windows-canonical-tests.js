@@ -4,7 +4,9 @@ const { spawn } = require("node:child_process");
 const { createHash } = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
+const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 const { getNpmInvocation } = require("./release-gate-environment");
 const { parseAclFailureDiagnostic } = require("./acl-test-failure-diagnostic");
 const { parseEdgeFailureDiagnostic } = require("./edge-test-failure-diagnostic");
@@ -14,7 +16,7 @@ const { parseEdgeFailureDiagnostic } = require("./edge-test-failure-diagnostic")
 // observed state even when the final TAP summary cannot be emitted.
 const HEARTBEAT_MS = 15_000;
 const IDLE_LIMIT_MS = 15 * 60_000;
-const TOTAL_LIMIT_MS = 55 * 60_000;
+const TOTAL_LIMIT_MS = 57 * 60_000;
 const SAFE_CODES = new Set(["ERR_ASSERTION", "ERR_TEST_FAILURE", "SQLITE_BUSY",
   "SQLITE_LOCKED", "ENOENT", "EACCES", "EPERM", "EADDRINUSE", "ETIMEDOUT",
   "ECONNRESET", "ERR_DLOPEN_FAILED", "MODULE_NOT_FOUND", "ERR_MODULE_NOT_FOUND"]);
@@ -327,11 +329,33 @@ function createCanonicalTapLineAcceptor(tracker, fromStderr) {
   };
 }
 
+function resolveWindowsTempRoot(environment = process.env, platform = process.platform) {
+  if (platform !== "win32") return { tempDir: os.tmpdir(), cleanup: () => {} };
+  const probeParent = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), "rootark-acl-probe-"));
+  let tempOk = false;
+  try {
+    ensureWindowsChunkUploadRoot(path.join(probeParent, "uploads"));
+    tempOk = true;
+  } catch {
+    tempOk = false;
+  } finally {
+    fs.rmSync(probeParent, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+  if (tempOk || !environment.LOCALAPPDATA) return { tempDir: os.tmpdir(), cleanup: () => {} };
+  const isolated = fs.mkdtempSync(path.join(fs.realpathSync.native(environment.LOCALAPPDATA), "rootark-canonical-tmp-"));
+  ensureWindowsChunkUploadRoot(isolated);
+  return {
+    tempDir: isolated,
+    cleanup: () => fs.rmSync(isolated, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
+  };
+}
+
 function run() {
   // The split branch does not export #228's canonicalTestArgs helper.
   // Preserve its exact Windows invocation without changing the release gate:
   // full npm test, TAP reporter, bounded file concurrency, NO test filters.
   const invocation = getNpmInvocation(["test", "--", "--test-reporter=tap", "--test-concurrency=2"]);
+  const tempRoot = resolveWindowsTempRoot();
   const started = Date.now();
   let lastOutput = started;
   let timedOut = false;
@@ -350,10 +374,10 @@ function run() {
     catch { console.error(message); }
   }
   const child = spawn(invocation.executable, invocation.args, {
-    cwd: require("node:path").resolve(__dirname, ".."),
+    cwd: path.resolve(__dirname, ".."),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
-    env: canonicalWindowsTestEnvironment(),
+    env: canonicalWindowsTestEnvironment(process.env, process.platform, tempRoot.tempDir),
   });
 
   function consume(stream, streamName) {
@@ -414,7 +438,7 @@ function run() {
     const idle = Math.floor((Date.now() - lastOutput) / 1000);
     writeProgressDiagnostic(`Windows canonical heartbeat: elapsedSeconds=${elapsed} idleSeconds=${idle} TAPresults=${tracker.state.results} failures=${tracker.state.failures} ${tracker.safeSummary()} ${childProgress.safeSummary()}`);
     if (idle * 1000 >= IDLE_LIMIT_MS) terminate("idle timeout (15 minutes without child output)");
-    else if (elapsed * 1000 >= TOTAL_LIMIT_MS) terminate("total timeout (55 minutes)");
+    else if (elapsed * 1000 >= TOTAL_LIMIT_MS) terminate("total timeout (57 minutes)");
   }, HEARTBEAT_MS);
 
   child.on("error", (error) => {
@@ -428,6 +452,7 @@ function run() {
   child.on("close", (code, signal) => {
     childProgress.finished(code, signal);
     clearInterval(heartbeat);
+    tempRoot.cleanup();
     tracker.finish();
     const { results, failures, plan, tests, reportedFailures, reportedPasses } = tracker.state;
     // A child that exits 0 with TAP "1..0 / # tests 0 / # fail 0", or only
