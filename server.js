@@ -11021,7 +11021,7 @@ function recoverWebDavMoveJournals() {
   for (const name of fs.readdirSync(WEBDAV_MOVE_JOURNAL_DIR).filter((entry) => /^rootark-webdav-move-[a-f0-9-]{36}\.json$/i.test(entry))) {
     const journalPath = path.join(WEBDAV_MOVE_JOURNAL_DIR, name);
     let journal;
-    try { journal = readWebDavMoveJournal(journalPath); } catch { throw new Error("Journal WebDAV invalido"); }
+    try { journal = readWebDavMoveJournal(journalPath, { retryAtomicReplacement: true }); } catch { throw new Error("Journal WebDAV invalido"); }
     if (!isSafeWebDavMoveJournal(journal)) throw new Error("Journal WebDAV ambiguo");
     if (busyTakeovers.has(journal.transactionId)) continue;
     if (isDurablyCompletedWebDavMove(journal)) {
@@ -11063,9 +11063,20 @@ function webDavMoveClaimToken(contents) {
   try { return JSON.parse(contents).token || null; } catch { return String(contents || ""); }
 }
 
-function readWebDavMoveJournal(journalPath) {
-  const { contents } = readBoundedRegularFile(journalPath, WEBDAV_MOVE_MAX_JOURNAL_BYTES);
-  return JSON.parse(contents.toString("utf8"));
+function readWebDavMoveJournal(journalPath, { retryAtomicReplacement = false } = {}) {
+  // Startup can overlap another worker's atomic journal rename. Never accept
+  // the rejected descriptor or bypass the bounded regular-file checks. Only
+  // restart the complete read for a replaced regular path, at most twice.
+  for (let attempt = 0; ; attempt++) {
+    let snapshot;
+    try {
+      snapshot = readBoundedRegularFile(journalPath, WEBDAV_MOVE_MAX_JOURNAL_BYTES);
+    } catch (error) {
+      if (!retryAtomicReplacement || attempt >= 2 || error.code !== "INVALID_INTERNAL_FILE" || error.reason !== "PATH_REPLACED") throw error;
+      continue;
+    }
+    return JSON.parse(snapshot.contents.toString("utf8"));
+  }
 }
 
 function readWebDavMoveClaimFile(lockPath) {
