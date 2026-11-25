@@ -23,7 +23,13 @@ const { syncCycleReport, assertOneShotSyncComplete } = require("../sync-client/r
 
 async function fixture(t, signedPath = "docs/a.txt") {
   const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-device-pin-"));
-  t.after(() => fsp.rm(tmp, { recursive: true, force: true }));
+  const openedEngines = [];
+  t.after(async () => {
+    for (const engine of openedEngines) {
+      await engine.close().catch(() => {});
+    }
+    await fsp.rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
   const rootDir = path.join(tmp, "device");
   const key = crypto.randomBytes(32);
   const signer = crypto.generateKeyPairSync("ed25519");
@@ -67,23 +73,27 @@ async function fixture(t, signedPath = "docs/a.txt") {
       throw Object.assign(new Error("outgoing push forbidden in pin fixture"), { code: "push_unexpected" });
     },
   };
-  const open = (excludedPaths = [], requireAuthorization = true, filesOnDemand = true,
-    selectedPaths = ["docs"]) => new SyncEngine({
-    rootDir, adapter, deviceId: "device-a", keyEpoch: "epoch-1",
-    compartmentId: "private", selectedPaths, excludedPaths, filesOnDemand,
-    fileKeyResolver: () => key, requireAuthorization,
-    verifyIncoming: requireAuthorization
-      ? async (operation) => verifyAuthorizationProof(operation.authorization, operation, trusted) : null,
-    authorizationFactory: (operation) => createAuthorizationProof(operation, {
-      username: "alice", privateKey: signer.privateKey, publicKey, expiresAt: Date.now() + 60_000,
-    }),
-  }).open();
+  const open = async (excludedPaths = [], requireAuthorization = true, filesOnDemand = true,
+    selectedPaths = ["docs"], nativeRootSession = true) => {
+    const engine = await new SyncEngine({
+      rootDir, adapter, deviceId: "device-a", keyEpoch: "epoch-1",
+      compartmentId: "private", selectedPaths, excludedPaths, filesOnDemand, nativeRootSession,
+      fileKeyResolver: () => key, requireAuthorization,
+      verifyIncoming: requireAuthorization
+        ? async (operation) => verifyAuthorizationProof(operation.authorization, operation, trusted) : null,
+      authorizationFactory: (operation) => createAuthorizationProof(operation, {
+        username: "alice", privateKey: signer.privateKey, publicKey, expiresAt: Date.now() + 60_000,
+      }),
+    }).open();
+    openedEngines.push(engine);
+    return engine;
+  };
   return { rootDir, open, adapter, state, remote, trusted };
 }
 
 test("issue 66: native-unavailable pin must fail closed without materializing or persisting a grant", async (t) => {
   const { rootDir, open, state } = await fixture(t);
-  const engine = await open();
+  const engine = await open([], true, true, ["docs"], false);
   const localFile = path.join(rootDir, "docs", "a.txt");
   const snapshotPath = path.join(rootDir, ".rootark-sync-index.json");
   const journalPath = engine.journal.filePath;
@@ -536,7 +546,7 @@ nativeTest("issue 66: failed local pin journal commit never claims pin; a verifi
 test("issue 66 #278 P1: FOD-off signed out-of-scope MOVE cannot discard offline pinned bytes or consume admission", async (t) => {
   const { rootDir, open, remote, state, adapter } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
-  const client = await open([], true, false, ["docs/a.txt"]);
+  const client = await open([], true, true, ["docs/a.txt"]);
   const move = await remote("move", "object-a", "archive/a.txt", "authenticated remote bytes", 2, "docs/a.txt");
   // The FOD fixture normally exposes full envelopes only by object ID;
   // a legacy FOD-disabled pull lists every signed envelope.
@@ -549,7 +559,7 @@ test("issue 66 #278 P1: FOD-off signed out-of-scope MOVE cannot discard offline 
   const journalBefore = await fsp.readFile(client.journal.filePath);
   const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
   const snapshotBefore = await fsp.readFile(snapshotFile);
-  await assert.rejects(client.syncOnce(), { code: "file_pinned" });
+  await assert.rejects(client.withMutationLock(() => client.reconcileOutOfScopeMove(move)), { code: "file_pinned" });
   assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore,
     "reject before signed admission pre-observation");
   const afterSnapshot = JSON.parse(await fsp.readFile(snapshotFile, "utf8"));
@@ -567,7 +577,7 @@ test("issue 66 #278 P1: FOD-off signed out-of-scope MOVE cannot discard offline 
 test("issue 66 #292 P1: untrusted Ed25519 B out-of-scope MOVE must fail authentication before pin preflight", async (t) => {
   const { rootDir, open, remote, state, adapter, trusted } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
-  const client = await open([], true, false, ["docs/a.txt"]);
+  const client = await open([], true, true, ["docs/a.txt"]);
   const valid = await remote("move", "object-a", "archive/a.txt",
     "authenticated remote bytes", 2, "docs/a.txt");
   assert.equal(await verifyAuthorizationProof(valid.authorization, valid, trusted), true,
@@ -604,7 +614,7 @@ test("issue 66 #292 P1: untrusted Ed25519 B out-of-scope MOVE must fail authenti
 test("issue 66 #292 P1: untrusted 409 conflict current cannot probe pinned origin before Ed25519 authentication", async (t) => {
   const { rootDir, open, remote, adapter, trusted, state } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
-  const client = await open([], true, false, ["docs"]);
+  const client = await open([], true, true, ["docs"]);
   const pending = await remote("create", "object-a", "docs/pending.txt", "local signed pending", 1);
   assert.equal(await verifyAuthorizationProof(pending.authorization, pending, trusted), true);
   await client.journal.enqueue(pending);
@@ -1025,7 +1035,7 @@ test("issue 66 #292 P2 FOD Windows: physical 8.3 ancestor blocks manual hydratio
   const dirRelative = "docs/longdirectoryname";
   const dir = await remote("create", "object-long-dir", dirRelative, "", 1,
     undefined, "inode/directory");
-  const client = await open([], true, true, ["docs"]);
+  const client = await open([], true, false, ["docs"]);
   await client.apply(dir);
   const longAbsolute = path.join(rootDir, dirRelative);
   const shortResult = spawnSync("cmd.exe", ["/d", "/q"], {
@@ -1144,7 +1154,7 @@ test("issue 66 #292 P2 POSIX: realpath delay cannot hide a late hardlink swap", 
   skip: process.platform === "win32",
 }, async (t) => {
   const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
-  const client = await open([], true, false, ["docs"]);
+  const client = await open([], true, true, ["docs"]);
   const original = state.records.get("object-a");
   // The fixture's object-filtered LIST does not materialize on pullRemote().
   // Apply the real signed CREATE so the alias test exercises a tracked inode.
@@ -1212,7 +1222,7 @@ test(`issue 66 #292 P2 POSIX: real ${aliasType} alias cannot advance signed 409 
   skip: process.platform === "win32",
 }, async (t) => {
   const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
-  const client = await open([], true, false, ["docs"]);
+  const client = await open([], true, true, ["docs"]);
   const original = state.records.get("object-a");
   await client.apply(original);
   const aPath = path.join(rootDir, "docs/a.txt");
@@ -1308,7 +1318,7 @@ test("issue 66 #292 P2 Windows: unavailable or rejecting native reparse probe ca
   skip: process.platform !== "win32",
 }, async (t) => {
   const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
-  const client = await open([], true, false, ["docs"]);
+  const client = await open([], true, true, ["docs"]);
   const original = state.records.get("object-a");
   await client.apply(original);
   const listOne = adapter.list.bind(adapter);
@@ -1376,7 +1386,7 @@ test("issue 66 #292 P2 Windows: real NTFS 8.3 alias cannot escape an unresolved 
   state.records.delete("object-a");
   const longRelative = "docs/longfilename.txt";
   const initial = await remote("create", "object-physical-a", longRelative, "signed original bytes");
-  const client = await open([], true, false, ["docs"]);
+  const client = await open([], true, true, ["docs"]);
   await client.apply(initial);
   const longAbsolute = path.join(rootDir, "docs", "longfilename.txt");
   assert.equal(await fsp.readFile(longAbsolute, "utf8"), "signed original bytes");
@@ -1458,7 +1468,7 @@ test("issue 66 #292 P2 Windows: 8.3 ancestor aliases block a missing child after
   const longDir = "docs/longdirectoryname";
   const initialDir = await remote("create", "object-long-dir", longDir, "", 1,
     undefined, "inode/directory");
-  const client = await open([], true, false, ["docs"]);
+  const client = await open([], true, true, ["docs"]);
   await client.apply(initialDir);
   const longAbsolute = path.join(rootDir, "docs", "longdirectoryname");
   assert.equal((await fsp.stat(longAbsolute)).isDirectory(), true);
@@ -1527,7 +1537,7 @@ test("issue 66 #292 P2 Windows: 8.3 ancestor aliases block a missing child after
 test("issue 66 #278 P2: pinned regular file rejects same-identity directory UPDATE before mutation", async (t) => {
   const { rootDir, open, remote } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
-  const client = await open([], true, false);
+  const client = await open([], true, true);
   const signed = await remote("update", "object-a", "docs/a.txt", "", 2,
     undefined, "inode/directory");
   const beforeJournal = await fsp.readFile(client.journal.filePath);
@@ -1544,7 +1554,7 @@ test("issue 66 #278 P2: pinned regular file rejects same-identity directory UPDA
 test("issue 66 #278 P2: local regular-to-directory replacement cannot corrupt pinned snapshot", async (t) => {
   const { rootDir, open } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
-  const client = await open([], true, false);
+  const client = await open([], true, true);
   const original = await fsp.readFile(path.join(rootDir, "docs/a.txt"));
   const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
   const snapshotBefore = await fsp.readFile(snapshotFile);
@@ -1564,7 +1574,7 @@ test("issue 66 POSIX: directory replacing pinned A.txt plus casefold alias a.txt
   if (process.platform === "win32") return t.skip("real case-distinct files require POSIX");
   const { rootDir, open, state } = await fixture(t, "docs/A.txt");
   await (await open()).pinLocal("docs/A.txt");
-  const client = await open([], true, false);
+  const client = await open([], true, true);
   const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
   const snapshotBefore = await fsp.readFile(snapshotFile);
   const journalBefore = await fsp.readFile(client.journal.filePath);
@@ -1619,7 +1629,7 @@ test("issue 66 POSIX: filtered scans cannot hide a replaced pinned directory beh
 test("issue 66: an excluded pinned directory or symlink is rejected before the journal changes", async (t) => {
   const { rootDir, open, state } = await fixture(t, "docs/A.txt");
   await (await open()).pinLocal("docs/A.txt");
-  const client = await open(["docs/A.txt"], true, false, ["docs"]);
+  const client = await open(["docs/A.txt"], true, true, ["docs"]);
   const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
   const snapshotBefore = await fsp.readFile(snapshotFile);
   const journalBefore = await fsp.readFile(client.journal.filePath);
@@ -1645,7 +1655,7 @@ test("issue 66: an excluded pinned directory or symlink is rejected before the j
 test("issue 66: scanned mixed-case pinned bucket rejects directory or file alias before mutation", async (t) => {
   const { rootDir, open, state } = await fixture(t, "docs/A.txt");
   await (await open()).pinLocal("docs/A.txt");
-  const client = await open([], true, false);
+  const client = await open([], true, true);
   const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
   const snapshotBefore = await fsp.readFile(snapshotFile);
   const journalBefore = await fsp.readFile(client.journal.filePath);
@@ -1670,7 +1680,7 @@ test("issue 66: scanned mixed-case pinned bucket rejects directory or file alias
 test("issue 66 #278 P2: signed CREATE of existing matching ancestor directory preserves pinned child", async (t) => {
   const { rootDir, open, remote } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
-  const client = await open([], true, false);
+  const client = await open([], true, true);
   const signed = await remote("create", "directory-docs", "docs", "", 1,
     undefined, "inode/directory");
   await client.apply(signed);
@@ -1685,7 +1695,7 @@ test("issue 66 #278 P2: signed CREATE of existing matching ancestor directory pr
 test("issue 66 #278 P2: ancestor CREATE cannot replace tracked directory identity of pinned child", async (t) => {
   const { rootDir, open, remote } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
-  const client = await open([], true, false);
+  const client = await open([], true, true);
   await client.apply(await remote("create", "directory-docs", "docs", "", 1,
     undefined, "inode/directory"));
   const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
@@ -1704,7 +1714,7 @@ test("issue 66 #278 POSIX: case-distinct existing ancestor cannot launder a pinn
   if (process.platform === "win32") return t.skip("POSIX case-distinct directory invariant");
   const { rootDir, open, remote } = await fixture(t);
   await (await open()).pinLocal("docs/a.txt");
-  const client = await open([], true, false);
+  const client = await open([], true, true);
   await fsp.mkdir(path.join(rootDir, "Docs"));
   const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
   const snapshotBefore = await fsp.readFile(snapshotFile);
@@ -1722,14 +1732,22 @@ test("issue 66 #278 P2: pinStatus listing passes known pins without quadratic re
   const client = await open();
   const count = 128;
   await fsp.mkdir(path.join(rootDir, "docs"), { recursive: true });
-  client.snapshot.pinnedFiles ||= {};
-  for (let i = 0; i < count; i++) {
-    const relative = `docs/pin-${i}.txt`;
-    await fsp.writeFile(path.join(rootDir, relative), "");
-    client.snapshot.pinnedFiles[`object-list-${i}`] = {
-      objectId: `object-list-${i}`, fileId: `file-list-${i}`, path: relative,
-    };
-  }
+  await client.withMutationLock(async () => {
+    client.snapshot.pinnedFiles ||= {};
+    for (let i = 0; i < count; i++) {
+      const relative = `docs/pin-${i}.txt`;
+      await fsp.writeFile(path.join(rootDir, relative), "");
+      client.snapshot.files[relative] = {
+        objectId: `object-list-${i}`, fileId: `file-list-${i}`, versionId: `ver-${i}`,
+        revision: { counter: 1, deviceId: "device-a" }, deleted: false, directory: false,
+      };
+      const keyHex = crypto.createHash("sha256").update(`object-list-${i}`, "utf8").digest("hex");
+      client.snapshot.pinnedFiles[keyHex] = {
+        objectId: `object-list-${i}`, fileId: `file-list-${i}`, path: relative,
+      };
+    }
+    await client.persistSnapshot();
+  });
   const pinnedObject = client.snapshot.pinnedFiles;
   const realValues = Object.values;
   let scans = 0;
@@ -1768,7 +1786,8 @@ test("issue 66 #278 P2 RED: rotated-fileId tombstone cannot delete a pinned file
   const previous = state.records.get("object-a");
   state.records.set("object-a", { ...previous, fileId: "file-rotated-a" });
   const tombstone = await remote("delete", "object-a", "docs/a.txt", "", 2);
-  await assert.rejects(client._reconcileOnDemandTombstone(tombstone), { code: "file_pinned" });
+  await assert.rejects(client.withMutationLock(() => client._reconcileOnDemandTombstone(tombstone)),
+    { code: "file_pinned" });
   assert.equal(await fsp.readFile(path.join(rootDir, "docs/a.txt"), "utf8"),
     "authenticated remote bytes");
   const reopened = await open();
