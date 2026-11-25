@@ -11,6 +11,7 @@ const nativeMathFloor = Math.floor;
 const nativeMathAbs = Math.abs;
 const nativeMathCeil = Math.ceil;
 const nativeMathMax = Math.max;
+const nativeReleaseNow = Date.now;
 const z = require("./rootark-zk-1");
 // The independent-authority callback is caller-controlled and may run after
 // several awaits. Capture the reflection, Buffer and crypto intrinsics used
@@ -105,7 +106,8 @@ function wipeOwnedBytes(value) {
 }
 function currentSeconds(wallClock, reject = deny) {
   if (Date.now !== wallClock) reject();
-  const milliseconds = wallClock();
+  // Keep the release clock pinned independently of per-call global changes.
+  const milliseconds = nativeReleaseNow();
   if (!nativeNumberIsFinite(milliseconds) || milliseconds < 0) reject();
   return nativeMathFloor(milliseconds / 1000);
 }
