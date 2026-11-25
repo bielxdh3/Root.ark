@@ -18,15 +18,16 @@ test("stored historical Sync v2 envelope retains signed bytes after expiration",
     metadata: { path: "notes.txt" }, plaintext: Buffer.from("encrypted fixture"),
     fileKey: crypto.randomBytes(32),
   });
+  // Use real elapsed time. The verifier intentionally captures the native
+  // clock before attacker-controlled callbacks can replace Date.now.
+  const expiresAt = Date.now() + 3000;
   operation.authorization = await auth.createAuthorizationProof(operation, {
-    username: "alice", publicKey, privateKey: keys.privateKey, expiresAt: Date.now() + 1000,
+    username: "alice", publicKey, privateKey: keys.privateKey, expiresAt,
   });
   const policy = { username: "alice", trustedDevicePublicKeys: {
     device_1: publicKey }, revokedDeviceIds: [] };
-  // The protocol and verifier pin native Date.now on import. Await actual
-  // expiry rather than overriding Date.now too late and obtaining a false RED.
   await new Promise((resolve) => setTimeout(resolve,
-    Math.max(0, operation.authorization.expiresAt - Date.now() + 25)));
+    Math.max(0, expiresAt - Date.now() + 30)));
   assert.ok(Date.now() > operation.authorization.expiresAt);
   assert.throws(() => protocol.validateOperation(operation), /Expired device authorization/);
   const normalized = protocol.validateStoredOperation(operation);

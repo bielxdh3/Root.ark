@@ -1,6 +1,12 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const {
+  keyType: ATOMIC_NATIVE_TYPE,
+  keyAlgorithm: ATOMIC_NATIVE_ALGORITHM,
+  publicExport: ATOMIC_NATIVE_EXPORT,
+  arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
+} = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const { types: nodeUtilTypes } = require("node:util");
 const fs = require("node:fs");
@@ -124,6 +130,7 @@ const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry, safeJsonStringify } = require("./rootark-sync-journal");
 const { SyncConflictError, assertOpaqueEnvelope } = require("../public/client/rootark-sync-adapter");
 const canonicalJson = protocol.canonicalJson;
+
 
 const SNAPSHOT_VERSION = 1;
 const INTERNAL_NAMES = nativeObjectFreeze([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
@@ -565,7 +572,7 @@ function pinnedAtomicWitnessKey(value) {
       fail("Atomic batch witness key is not canonical", "authorization_required");
     }
     key = nativeCreatePublicKey({ key: der, format: "der", type: "spki" });
-  } else if (nativeIsKeyObject(value) && value.type === "public") {
+  } else if (nativeIsKeyObject(value) && ATOMIC_NATIVE_TYPE.call(value) === "public") {
     // createPublicKey(publicKeyObject) throws ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE:
     // an independently supplied public pin is already a parsed KeyObject.
     key = value;
@@ -575,11 +582,12 @@ function pinnedAtomicWitnessKey(value) {
     fail("Atomic authority pin requires plain encoded Ed25519 key bytes",
       "authorization_required");
   }
-  if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") {
+  if (ATOMIC_NATIVE_TYPE.call(key) !== "public" || ATOMIC_NATIVE_ALGORITHM.call(key) !== "ed25519") {
     fail("Atomic batch witness pin must be an Ed25519 public key",
       "authorization_required");
   }
-  return key;
+  return nativeCreatePublicKey({ key: ATOMIC_NATIVE_EXPORT.call(key, { type: "spki", format: "der" }),
+    format: "der", type: "spki" });
 }
 function verifyAtomicBatchAdmission(response, operations, trustedWitnessKey, trustedScope, identity,
   historicalRestore = false) {
@@ -1964,9 +1972,9 @@ class SyncEngine {
       } catch {
         fail("Invalid sync snapshot", "invalid_snapshot");
       }
-      if (parsed.version !== SNAPSHOT_VERSION || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
+      if (parsed.version !== SNAPSHOT_VERSION || !parsed.files || typeof parsed.files !== "object" || NATIVE_ARRAY_IS_ARRAY(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
       if (parsed.remoteOnly === undefined) parsed.remoteOnly = {};
-      if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || Array.isArray(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
+      if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || NATIVE_ARRAY_IS_ARRAY(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
       if (parsed.excludedPaths !== undefined) {
         try { parsed.excludedPaths = normalizeExcludedPaths(parsed.excludedPaths); } catch { fail("Invalid excluded sync paths", "invalid_snapshot"); }
       }
@@ -5189,8 +5197,8 @@ class SyncEngine {
     if (hash !== prior.hash || !sameFileVersion(before, afterRead)) fail("Local file changed since its last sync", "local_changes_pending");
 
     const remoteResult = await this.adapter.list(prior.objectId);
-    const remoteRecords = Array.isArray(remoteResult) ? remoteResult
-      : Array.isArray(remoteResult?.objects) ? remoteResult.objects : remoteResult ? [remoteResult] : [];
+    const remoteRecords = NATIVE_ARRAY_IS_ARRAY(remoteResult) ? remoteResult
+      : NATIVE_ARRAY_IS_ARRAY(remoteResult?.objects) ? remoteResult.objects : remoteResult ? [remoteResult] : [];
     if (remoteRecords.length !== 1) fail("Current remote object is unavailable", "remote_object_missing");
     const remote = protocol.validateStoredOperation(remoteRecords[0]);
     if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId || !pathsEqual(remote.metadata.path, safePath)) {

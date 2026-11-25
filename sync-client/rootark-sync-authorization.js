@@ -1,6 +1,6 @@
 "use strict";
 
-const crypto = require("node:crypto");
+const native = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const { types: nodeUtilTypes } = require("node:util");
 const zk = require("../src/crypto/rootark-zk-1");
 const nativeZkEncodeDeterministic = zk.encodeDeterministic;
@@ -10,24 +10,23 @@ const nativeZkAuthorizationDomain = zk.ASCII.AUTHORIZATION;
 // Authorization binding is rechecked on retries, after the transport has had
 // a chance to mutate shared globals. Keep its digest/nonce/verification path
 // on the native primitives captured before that trust boundary.
-const NativeBuffer = Buffer;
-const nativeBufferFrom = NativeBuffer.from.bind(NativeBuffer);
-const nativeBufferConcat = NativeBuffer.concat.bind(NativeBuffer);
-const nativeBufferToString = NativeBuffer.prototype.toString;
-const nativeRandomBytes = crypto.randomBytes.bind(crypto);
-const nativeCreateHash = crypto.createHash.bind(crypto);
-const nativeHashUpdate = crypto.Hash.prototype.update;
-const nativeHashDigest = crypto.Hash.prototype.digest;
-const nativeSign = crypto.sign.bind(crypto);
-const nativeCreatePublicKey = crypto.createPublicKey.bind(crypto);
-const nativeVerify = crypto.verify.bind(crypto);
-const nativeReflectApply = Reflect.apply;
+const nativeBufferFrom = native.bufferFrom;
+const nativeBufferConcat = native.bufferConcat;
+const nativeBufferToString = native.bufferToString;
+const nativeRandomBytes = native.randomBytes;
+const nativeCreateHash = native.createHash;
+const nativeHashUpdate = native.hashUpdate;
+const nativeHashDigest = native.hashDigest;
+const nativeSign = native.sign;
+const nativeCreatePublicKey = native.createPublicKey;
+const nativeVerify = native.verify;
+const nativeReflectApply = native.apply;
 const nativeJsonStringify = JSON.stringify.bind(JSON);
-const nativeArrayIsArray = Array.isArray;
-const nativeArrayIncludes = Array.prototype.includes;
+const nativeArrayIsArray = native.arrayIsArray;
+const nativeArrayIncludes = native.arrayIncludes;
 const nativeRegExpExec = RegExp.prototype.exec;
 const nativeNumberIsSafeInteger = Number.isSafeInteger;
-const nativeDateNow = Date.now;
+const nativeDateNow = native.dateNow;
 const nativeObjectKeys = Object.keys;
 const nativeObjectHasOwn = Object.hasOwn;
 const nativeObjectAssign = Object.assign;
@@ -206,6 +205,19 @@ function digest(value, name) {
   return bytes;
 }
 
+function canonicalBytes(value, name, length = null, allowEmpty = false) {
+  if (typeof value !== "string" || (!allowEmpty && value.length === 0)
+    || !regexTest(/^[A-Za-z0-9_-]*$/, value) || value.length % 4 === 1) {
+    fail(`Invalid authorization ${name}`);
+  }
+  const bytes = nativeBufferFrom(value, "base64url");
+  if ((length !== null && bytes.length !== length)
+    || bufferToString(bytes, "base64url") !== value) {
+    fail(`Invalid authorization ${name}`);
+  }
+  return bytes;
+}
+
 function exact(value) {
   assertPlainDataObject(value, "authorization schema");
   const keys = nativeObjectKeys(value);
@@ -268,10 +280,10 @@ function proofCore(operation, options, requireFresh = true) {
     keyEpoch: text(capturedOperation.keyEpoch, "keyEpoch"),
     compartmentId: text(capturedOperation.compartmentId, "compartmentId"),
     metadata: capturedOperation.metadata,
-    aadDigest: sha256Base64Url(nativeBufferFrom(capturedOperation.aad, "base64url")),
-    ciphertextDigest: sha256Base64Url(nativeBufferFrom(capturedOperation.ciphertext, "base64url")),
-    nonceDigest: sha256Base64Url(nativeBufferFrom(capturedOperation.nonce, "base64url")),
-    tagDigest: sha256Base64Url(nativeBufferFrom(capturedOperation.tag, "base64url")),
+    aadDigest: sha256Base64Url(canonicalBytes(capturedOperation.aad, "aad")),
+    ciphertextDigest: sha256Base64Url(canonicalBytes(capturedOperation.ciphertext, "ciphertext", null, true)),
+    nonceDigest: sha256Base64Url(canonicalBytes(capturedOperation.nonce, "nonce")),
+    tagDigest: sha256Base64Url(canonicalBytes(capturedOperation.tag, "tag")),
     expiresAt,
     replayId,
     idempotencyKey,
@@ -392,9 +404,13 @@ async function verifyAuthorizationProofInternal(proof, operation, expected, requ
   if (requireFresh && normalized.expiresAt <= nativeDateNow()) {
     fail("Authorization expired during verification", "authorization_expired");
   }
-  const key = nativeCreatePublicKey({ key: nativeBufferFrom(normalized.publicKey, "base64url"), format: "der", type: "spki" });
-  if (!nativeVerify(null, signedInput, key,
-    nativeBufferFrom(normalized.signature, "base64url"))) fail("Authorization signature invalid", "authorization_signature");
+  const publicKeyBytes = canonicalBytes(normalized.publicKey, "public key");
+  const signatureBytes = canonicalBytes(normalized.signature, "signature", 64);
+  const key = nativeCreatePublicKey({ key: publicKeyBytes, format: "der", type: "spki" });
+  if (native.keyType.call(key) !== "public" || native.keyAlgorithm.call(key) !== "ed25519"
+    || !nativeVerify(null, signedInput, key, signatureBytes)) {
+    fail("Authorization signature invalid", "authorization_signature");
+  }
   return true;
 }
 

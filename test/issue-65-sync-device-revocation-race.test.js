@@ -250,6 +250,62 @@ test("registered signer can commit; wrong signer, revoked signer, and legacy pro
   assert.deepEqual(store.list("alice").map((record) => record.objectId), ["object-good"]);
 });
 
+test("atomic device authorization expires after real Ed25519 verification before durable rename", async (t) => {
+  const directory = await isolatedRegistryDirectory("rootark-sync-expiry-race-");
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = await new SyncObjectStore(path.join(directory, "objects.json"),
+    { atomicDeviceRegistry: true }).open();
+  const signer = crypto.generateKeyPairSync("ed25519");
+  const publicKey = signer.publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  await store.enrollDevice({ username: "alice", deviceId: "device-expiry", publicKey,
+    expectedEpoch: 0 });
+  const operation = createOperation({ operation: "create", objectId: "expired-object",
+    fileId: "expired-file", versionId: "expired-version", operationId: "expired-operation",
+    deviceId: "device-expiry", keyEpoch: "epoch-1", compartmentId: "private",
+    revision: { counter: 1, deviceId: "device-expiry" },
+    metadata: { path: "expired.txt" }, plaintext: Buffer.from("ciphertext fixture"),
+    fileKey: crypto.randomBytes(32) });
+  const expiresAt = Date.now() + 3000;
+  operation.authorization = await createAuthorizationProof(operation,
+    { username: "alice", publicKey, privateKey: signer.privateKey, expiresAt });
+  // Prove the exact real signature and device pin before introducing a
+  // post-verification delay. Mutating crypto.verify no longer intercepts the
+  // captured native Ed25519 verifier.
+  assert.equal(await verifyAuthorizationProof(operation.authorization, operation, {
+    username: "alice", trustedDevicePublicKeys: { "device-expiry": publicKey },
+    revokedDeviceIds: [],
+  }), true);
+  const originalOpen = fs.open;
+  let delayedStagingSync = 0;
+  try {
+    fs.open = async (filename, flags, ...args) => {
+      const handle = await originalOpen(filename, flags, ...args);
+      if (flags === "wx" && typeof filename === "string"
+        && filename.startsWith(`${store.filePath}.tmp-`)) {
+        delayedStagingSync++;
+        const nativeSync = handle.sync.bind(handle);
+        handle.sync = async () => {
+          await nativeSync();
+          await new Promise((resolve) => setTimeout(resolve,
+            Math.max(0, expiresAt - Date.now() + 30)));
+        };
+      }
+      return handle;
+    };
+    await assert.rejects(store.put("alice", operation),
+      { code: "SYNC_ATOMIC_DEVICE_AUTH_REJECTED" },
+      "valid signed proof cannot commit if it expires during durable staging");
+  } finally {
+    fs.open = originalOpen;
+  }
+  assert.equal(delayedStagingSync, 1,
+    "the real signed write must pass verification and reach disk staging");
+  assert.deepEqual(store.list("alice"), [], "expired proof cannot durably write ciphertext");
+  const restarted = await new SyncObjectStore(path.join(directory, "objects.json"),
+    { atomicDeviceRegistry: true }).open();
+  assert.deepEqual(restarted.list("alice"), [], "expired proof cannot survive restart");
+});
+
 test("atomic device authorization expires after real Ed25519 verification but before durable commit", async (t) => {
   const directory = await isolatedRegistryDirectory("rootark-sync-expiry-race-");
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

@@ -9,6 +9,7 @@ const { spawnSync } = require("node:child_process");
 const { DatabaseSync } = require("node:sqlite");
 const { inspectZk1LiveLegacyArchivedSqliteJoin: inspect } =
   require("../src/services/zk1LiveLegacyArchivedSqliteJoin");
+const { withPrivateWindowsTestTemp } = require("./support/issue-65-private-temp-environment");
 
 function archived(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-historical-private-"));
@@ -41,18 +42,19 @@ function archived(t) {
     ]) };
 }
 
-test("persisted historical versions, trash and links retain nonauthorizing joins across process restart", (t) => {
+test("persisted historical versions, trash and links retain nonauthorizing joins across process restart", async (t) => {
   const saved = archived(t);
-  const first = inspect({ sqliteBytes: saved.sqliteBytes, members: saved.members });
-  assert.equal(first.joinedVersionReferences, 1);
-  assert.equal(first.joinedTrashReferences, 1);
-  assert.equal(first.joinedMetadataReferences, 3);
-  assert.equal(first.joinedDerivedReferences, 1);
-  assert.equal(first.joinedRetentionReferences, 1);
-  assert.equal(first.authorizesCutover, false);
-  assert.equal(first.canDeleteLegacy, false);
-  assert.equal(first.globallyComplete, false);
-  const script = `const fs=require('node:fs');
+  await withPrivateWindowsTestTemp(() => {
+    const first = inspect({ sqliteBytes: saved.sqliteBytes, members: saved.members });
+    assert.equal(first.joinedVersionReferences, 1);
+    assert.equal(first.joinedTrashReferences, 1);
+    assert.equal(first.joinedMetadataReferences, 3);
+    assert.equal(first.joinedDerivedReferences, 1);
+    assert.equal(first.joinedRetentionReferences, 1);
+    assert.equal(first.authorizesCutover, false);
+    assert.equal(first.canDeleteLegacy, false);
+    assert.equal(first.globallyComplete, false);
+    const script = `const fs=require('node:fs');
     const { inspectZk1LiveLegacyArchivedSqliteJoin: inspect } =
       require('./src/services/zk1LiveLegacyArchivedSqliteJoin');
     const map=new Map([['uploads/old-version.ct',{size:8,digest:'synthetic'}],
@@ -62,13 +64,14 @@ test("persisted historical versions, trash and links retain nonauthorizing joins
     process.exit(result.joinedVersionReferences===1 && result.joinedTrashReferences===1
       && result.joinedMetadataReferences===3 && result.globallyComplete===false
       && result.authorizesCutover===false && result.canDeleteLegacy===false ? 0 : 9);`;
-  const child = spawnSync(process.execPath, ["-e", script], {
-    cwd: path.resolve(__dirname, ".."), encoding: "utf8", windowsHide: true,
-    timeout: 20000, env: { ...process.env, ROOTARK_ARCHIVED_SQL: saved.image },
+    const child = spawnSync(process.execPath, ["-e", script], {
+      cwd: path.resolve(__dirname, ".."), encoding: "utf8", windowsHide: true,
+      timeout: 20000, env: { ...process.env, ROOTARK_ARCHIVED_SQL: saved.image },
+    });
+    assert.equal(child.status, 0, "restart must preserve bounded real SQL joins: " + child.stderr);
+    assert.deepEqual(fs.readFileSync(saved.image), saved.sqliteBytes,
+      "archive source remains untouched across both observations");
   });
-  assert.equal(child.status, 0, "restart must preserve bounded real SQL joins: " + child.stderr);
-  assert.deepEqual(fs.readFileSync(saved.image), saved.sqliteBytes,
-    "archive source remains untouched across both observations");
 });
 
 test("POSIX refuses foreign-writable TEMP before any historical SQLite staging directory", {

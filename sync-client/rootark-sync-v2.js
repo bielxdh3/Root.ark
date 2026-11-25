@@ -1,6 +1,10 @@
 "use strict";
 
 const crypto = require("node:crypto");
+// Snapshot this at first load, not after a caller-owned KeyObject callback.
+const { randomBytes: NATIVE_RANDOM_BYTES,
+  bufferFrom: NATIVE_BUFFER_FROM, dateNow: NATIVE_DATE_NOW } =
+  require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const path = require("node:path");
 const { types: nodeUtilTypes } = require("node:util");
 const protocol = require("./rootark-sync-protocol");
@@ -401,10 +405,10 @@ async function start(options = {}) {
       const expected = independentlyPinnedDevicePolicy || { username: config.username,
         trustedDevicePublicKeys: config.trustedDevicePublicKeys,
         revokedDeviceIds: config.revokedDeviceIds };
-      if (operation.authorization.expiresAt > nativeDateNow()) {
+      if (operation.authorization.expiresAt > NATIVE_DATE_NOW()) {
         const verified = await verifyAuthorizationProof(operation.authorization, operation, expected);
         return verified === true && (!strictHistorical
-          || (operation.authorization.expiresAt > nativeDateNow()
+          || (operation.authorization.expiresAt > NATIVE_DATE_NOW()
             && currentlyAuthorized(operation)));
       }
       // A signed but expired record does not prove that the remote server
@@ -418,10 +422,10 @@ async function start(options = {}) {
         // was lost, recover with yet another fresh challenge; no nonce or
         // authority claim is accepted from the untrusted response.
         for (const recovery of [true, false, true]) {
-          const nonce = nativeCryptoRandomBytes(32);
+          const nonce = NATIVE_RANDOM_BYTES(32);
           try {
             const proof = await options.historicalEvidenceProvider(operation,
-              { nonce: nativeBufferFrom(nonce), recovery });
+              { nonce: NATIVE_BUFFER_FROM(nonce), recovery });
             if (!proof || typeof proof !== "object" || nativeArrayIsArray(proof)) continue;
             const verified = await strictVerifier({
               envelope: operation, scope: proof.scope,

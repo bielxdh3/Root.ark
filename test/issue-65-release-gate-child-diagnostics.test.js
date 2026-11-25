@@ -47,6 +47,29 @@ test("failure hashes are diagnostic-only, bounded, and absent for successful or 
   assert.doesNotMatch(safe, /password|Bearer|private|S-1-|host\.internal|ROOTARK|ACE_WRITE/);
 });
 
+test("aborted TAP without a failed test retains only hashes of last observed progress", () => {
+  const sha = (input) => createHash("sha256").update(input).digest("hex").slice(0, 24);
+  const lastName = `last-observed ${poisoned.replace(/\n/g, " ")}`;
+  const lastSubtest = `subtest ${poisoned.replace(/\n/g, " ")}`;
+  const stdout = ["npm test", "TAP version 13", `# Subtest: ${lastSubtest}`,
+    "ok 1 - initial", `ok 165 - ${lastName}`, "untrusted trailing data"].join("\n");
+  const result = summarizeFailedChildTests({ status: 1, stdout, stderr: poisoned });
+  assert.match(result, /^CHILD_TAIL_HASH_V1 /);
+  assert.match(result, /observed=2 subtests=1/);
+  assert.match(result, new RegExp(`lastResultSha256=${sha(lastName)}`));
+  assert.match(result, new RegExp(`lastSubtestSha256=${sha(lastSubtest)}`));
+  assert.match(result, /hintOnly=1$/);
+  assert.ok(result.length < 180);
+  assert.doesNotMatch(result, /password|Bearer|private|S-1-|host\.internal|ROOTARK|ACE_WRITE|untrusted/i);
+
+  assert.equal(summarizeFailedChildTests({ status: 0, stdout }), "",
+    "successful test processes never emit failure-only hints");
+  const complete = stdout + "\n1..165\n# tests 165\n# pass 165\n# fail 0\n"
+    + "# cancelled 0\n# skipped 0\n# todo 0";
+  assert.equal(summarizeFailedChildTests({ status: 1, stdout: complete }), "",
+    "complete TAP with no test failures must not be misdiagnosed as truncated");
+});
+
 test("realistic 79KB non-TAP Windows Node child exception yields bounded category without source details", () => {
   const stdout = `${"unrecognized opaque stdout\n".repeat(3000)}\nnode:internal/modules/cjs/loader:1234\nReferenceError: private key reference\n${poisoned}`;
   const value = summarizeUnrecognizedChild({ status: 1, signal: null, stdout, stderr: poisoned });
