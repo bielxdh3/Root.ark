@@ -350,11 +350,19 @@ function resolveWindowsTempRoot(environment = process.env, platform = process.pl
   };
 }
 
+function canonicalTestArgs(argv) {
+  const args = ["test", "--", "--test-reporter=tap", "--test-concurrency=2"];
+  if (argv.length === 0) return args;
+  if (argv.length !== 1 || !["--shard=1/2", "--shard=2/2"].includes(argv[0])) {
+    throw new Error("Invalid canonical test shard");
+  }
+  return [...args, `--test-shard=${argv[0].slice("--shard=".length)}`];
+}
+
 function run() {
-  // The split branch does not export #228's canonicalTestArgs helper.
-  // Preserve its exact Windows invocation without changing the release gate:
-  // full npm test, TAP reporter, bounded file concurrency, NO test filters.
-  const invocation = getNpmInvocation(["test", "--", "--test-reporter=tap", "--test-concurrency=2"]);
+  // Without a shard, run the full suite exactly as before. The separate CI
+  // matrix requires both disjoint Node shards on the same immutable SHA.
+  const invocation = getNpmInvocation(canonicalTestArgs(process.argv.slice(2)));
   const tempRoot = resolveWindowsTempRoot();
   const started = Date.now();
   let lastOutput = started;
@@ -472,4 +480,4 @@ function run() {
 if (require.main === module) run();
 
 module.exports = { createTapProgressRecorder, createCanonicalTapLineAcceptor,
-  createChildProcessProgress, canonicalWindowsTestEnvironment };
+  createChildProcessProgress, canonicalWindowsTestEnvironment, canonicalTestArgs };
