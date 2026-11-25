@@ -1,0 +1,71 @@
+name: Issue 66 CFAPI native cancel fence (candidate only)
+
+on:
+  push:
+    branches:
+      - agent/pr300-cfapi-native-w181-20261122
+      - agent/pr300-fetch-positive-w190-20261122
+      - agent/pr300-native-fixes-w190-20261122-r3
+      - cdx/issue66-cfapi-native-w8-20261107
+    paths:
+      - '.github/workflows/issue66-cfapi-cancel-fence-w181.yml'
+      - 'sync-client/rootark-sync-windows-cfapi-cancel-fence.hpp'
+      - 'sync-client/rootark-sync-windows-cfapi-cancel-fence-test.cpp'
+      - 'sync-client/rootark-sync-windows-cfapi-provider.hpp'
+      - 'sync-client/rootark-sync-windows-cfapi-live-fixture.cpp'
+      - 'test/issue-66-cfapi-live-fetch-native.test.js'
+      - 'test/issue-66-cfapi-build-receipt.test.js'
+      - 'test/support/issue-66-cfapi-built-artifact.js'
+
+permissions:
+  contents: read
+
+jobs:
+  native-cancel-fence:
+    name: Windows MSVC /W4 /WX callback cancellation (no registration)
+    runs-on: windows-2022
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile and run mock-only native cancellation adversarials
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          if (!(Test-Path -LiteralPath $vswhere)) { throw 'MSVC discovery unavailable' }
+          $vcvars = & $vswhere -all -products '*' -prerelease -find 'VC\Auxiliary\Build\vcvars64.bat' | Select-Object -First 1
+          if (!$vcvars -or !(Test-Path -LiteralPath $vcvars)) { throw 'MSVC x64 tools missing' }
+          $source = Join-Path $env:GITHUB_WORKSPACE 'sync-client\rootark-sync-windows-cfapi-cancel-fence-test.cpp'
+          $out = Join-Path $env:RUNNER_TEMP 'rootark-cfapi-cancel-fence-w181'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          foreach ($mode in @('normal', 'optimized')) {
+            $flag = if ($mode -eq 'optimized') { '/O2' } else { '/Od' }
+            $exe = Join-Path $out "cancel-fence-$mode.exe"
+            $obj = Join-Path $out "cancel-fence-$mode.obj"
+            $pdb = Join-Path $out "cancel-fence-$mode.pdb"
+            $command = 'call "' + $vcvars + '" >nul && cl /nologo /std:c++17 /W4 /WX /EHsc /Zc:__cplusplus ' + $flag + ' /Fe:"' + $exe + '" /Fo:"' + $obj + '" /Fd:"' + $pdb + '" "' + $source + '" Advapi32.lib CldApi.lib'
+            & cmd.exe /d /s /c $command
+            if ($LASTEXITCODE -ne 0) { throw "MSVC $mode /W4 /WX compile failed" }
+            for ($iteration = 0; $iteration -lt 16; $iteration++) {
+              $output = & $exe --self-test
+              if ($LASTEXITCODE -ne 0) { throw "CFAPI $mode iteration $iteration failed" }
+            }
+            Write-Output "$mode /W4 /WX: 16/16 native adversarial tests passed."
+          }
+  native-kernel-pin-generation:
+    name: Windows NTFS CFAPI positive FETCH_DATA and pin-reissue denial
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install exact native fixture dependencies
+        run: npm ci
+      - name: Validate live CFAPI register/connect, signed hydration and same-inode repin denial
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --test test/issue-66-cfapi-live-fetch-native.test.js test/issue-66-cfapi-build-receipt.test.js test/issue-66-cfapi-fixture-argv-scope.test.js

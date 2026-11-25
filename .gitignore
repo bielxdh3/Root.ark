@@ -23,3 +23,4 @@ service-account*.json
 .tmp-rootark-sync-test-config.json
 .tmp-webdav-*
 .tmp-upload-scan-*
+native/build/

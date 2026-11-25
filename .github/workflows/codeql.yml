@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - Root/main
+      # PR #300 is stacked on an issue66 base whose existing PR-trigger
+      # allowlist excludes that base. Scan THIS exact Draft head on push,
+      # without mutating its upstream stack, main or other PR workflows.
+      - 'cdx/issue66-cfapi-native-w8-20261107'
   pull_request:
     branches:
       - Root/main

@@ -10,6 +10,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } =
@@ -89,7 +90,7 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
   missingCapability = false, interleaved = false,
   missingWitnessReadback = false, missingCasReadback = false,
   onWitnessChallenge = null,
-  deleteExpiresInMs = 120000 } = {}) {
+  deleteExpiresInMs = 120000, filesOnDemand = false } = {}) {
   const root = createPrivateAuthorityFixture("cos-pr235-engine-batch-");
   t.after(async () => {
     await fsp.rm(root, { recursive: true, force: true, maxRetries: 5 });
@@ -237,10 +238,18 @@ async function fixture(t, { batchResponse, witnessResponse, casResponse,
   };
   const adapter = { list: async () => ({ objects: [] }), push };
   if (!missingCapability) adapter.pushBatch = pushBatch;
+  if (filesOnDemand) {
+    // This test opens an isolated *real* FOD root but never uses unsigned
+    // inventory as proof of historical batch admission.
+    adapter.listInventory = async () => ({
+      protocolVersion: 2, view: "metadata", objects: [], nextCursor: null,
+    });
+  }
   const journal = await new SyncJournal(journalPath).open();
   let lastWitnessReceipt;
   const engine = new SyncEngine({
     rootDir: root, snapshotPath, journal, adapter,
+    filesOnDemand,
     deviceId: DEVICE, keyEpoch: "epoch-1", compartmentId: "private",
     fileKeyResolver: async () => fileKey,
     requireAuthorization: true,
@@ -391,6 +400,98 @@ test("signed pair plus separate pinned synthetic admission witness ACKs both in 
   assert.deepEqual(summary.conflicts, []);
 });
 
+test("issue 66 strict FOD: expired DELETE historical batch cannot release lock after real journal observation and EIO", {
+  timeout: 120000,
+}, async (t) => {
+  // The fixture's signed synthetic witness is test-only; it does NOT grant
+  // native RootSession or authenticate production root custody.
+  const f = await fixture(t, { deleteExpiresInMs: 30000, filesOnDemand: true });
+  const originalNow = Date.now;
+  const originalObserve = f.journal.observeAdmission.bind(f.journal);
+  let observed = false;
+  f.journal.observeAdmission = async (...args) => {
+    const result = await originalObserve(...args);
+    observed = true;
+    throw Object.assign(new Error("historical observed journal fsynced, then EIO"), { code: "EIO" });
+  };
+  try {
+    Date.now = () => f.deleted.authorization.expiresAt + 1;
+    assert.ok(Date.now() < f.moved.authorization.expiresAt,
+      "MOVE remains fresh even when the DELETE has expired");
+    await assert.rejects(f.engine.withMutationLock(() =>
+      f.engine.pushAtomicSignedOverwritePair([f.deleted, f.moved], f.summary())),
+    { code: "EIO" });
+  } finally {
+    Date.now = originalNow;
+    f.journal.observeAdmission = originalObserve;
+  }
+  assert.equal(observed, true, "a real local journal commit must precede the injected EIO");
+  assert.deepEqual(f.events, [], "historical admission cannot send a new remote POST");
+  assert.equal(fs.existsSync(path.join(f.root, ".rootark-sync.lock")), true,
+    "an indeterminate durable journal observation must retain the native-required root lock");
+  await f.assertBothPending();
+});
+
+for (const witnessFailure of ["null-receipt", "transport-error"]) {
+  test("issue 66 strict FOD: JS-overridden authorization cannot dispatch fresh signed batch with "
+    + witnessFailure, { timeout: 120000 }, async (t) => {
+    // A disposable physical file would prove that an untrusted JS override
+    // reached the outbound batch transport. This is never root authority.
+    const remoteRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-batch-server-"));
+    t.after(() => fsp.rm(remoteRoot, { recursive: true, force: true }));
+    const remoteCommit = path.join(remoteRoot, "durable-atomic-commit.bin");
+    let completedPhysicalWrite = false;
+    const f = await fixture(t, {
+      filesOnDemand: true,
+      batchResponse: (pair) => {
+        const data = Buffer.from(protocol.canonicalJson(pair));
+        const fd = fs.openSync(remoteCommit,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+        try {
+          let written = 0;
+          while (written < data.length) {
+            written += fs.writeSync(fd, data, written, data.length - written);
+          }
+          fs.fsyncSync(fd);
+          completedPhysicalWrite = true;
+        } finally {
+          fs.closeSync(fd);
+        }
+        throw Object.assign(new Error("server fsync completed, HTTP ACK lost"),
+          { code: "ETIMEDOUT" });
+      },
+      witnessResponse: () => {
+        if (witnessFailure === "transport-error") {
+          throw Object.assign(new Error("independent witness unavailable"),
+            { code: "offline" });
+        }
+        return null;
+      },
+    });
+    // Adversarial in-process override: a writable JS method is NOT an
+    // independent native RootSession capability or trusted device grant.
+    // The module-owned negative custody fence must remain effective.
+    const originalAuthorization = f.engine.assertOutgoingAuthorized;
+    f.engine.assertOutgoingAuthorized = async (_operation, authorizedAction = null) =>
+      authorizedAction ? authorizedAction() : true;
+    const summary = f.summary();
+    try {
+      await assert.rejects(f.engine.withMutationLock(() =>
+        f.engine.pushAtomicSignedOverwritePair([f.deleted, f.moved], summary)),
+      { code: "sync_atomic_batch_indeterminate" },
+      "JS method replacement must not authorize a signed DELETE/MOVE batch");
+    } finally {
+      f.engine.assertOutgoingAuthorized = originalAuthorization;
+    }
+    assert.equal(completedPhysicalWrite, false,
+      "the forged JS authorization must never reach even a disposable remote writer");
+    assert.equal(fs.existsSync(remoteCommit), false);
+    assert.deepEqual(f.events, [], "no outbound batch transport may run");
+    assert.equal(fs.existsSync(path.join(f.root, ".rootark-sync.lock")), false,
+      "a pre-dispatch rejection without side effects must not poison the root lock");
+    await f.assertBothPending();
+  });
+}
 for (const mode of ["only-signed-echo", "forged-witness", "other-operation-witness",
   "other-account-witness", "other-immutable-account-id", "other-immutable-store-id",
   "other-username-witness", "other-compartment-witness", "legacy-v1-witness",

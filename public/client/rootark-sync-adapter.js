@@ -446,5 +446,6 @@
     };
   }
 
-  return { PROTOCOL_VERSION, OPERATION_FIELDS, SyncConflictError, assertOpaqueEnvelope, createOpaqueSyncAdapter, normalizeOpaqueEnvelope: assertOpaqueEnvelope };
+  return { PROTOCOL_VERSION, OPERATION_FIELDS, SyncConflictError, assertOpaqueEnvelope,
+    assertInventoryEntry, createOpaqueSyncAdapter, normalizeOpaqueEnvelope: assertOpaqueEnvelope };
 }));

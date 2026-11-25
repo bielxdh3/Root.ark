@@ -20,11 +20,15 @@ const cli = path.resolve(__dirname, "../sync-client/rootark-sync-v2.js");
 const { args } = require("../sync-client/rootark-sync-v2");
 
 test("issue 66: Sync v2 CLI --once parses boolean values instead of truthy strings", () => {
+  assert.strictEqual(args([]).once, undefined);
   assert.strictEqual(args(["--once"]).once, true);
   assert.strictEqual(args(["--once", "true"]).once, true);
   assert.strictEqual(args(["--once", "false"]).once, false);
   assert.strictEqual(args(["--once=true"]).once, true);
   assert.strictEqual(args(["--once=false"]).once, false);
+  const withConfig = args(["--once", "false", "--config", "example.json"]);
+  assert.strictEqual(withConfig.once, false);
+  assert.strictEqual(withConfig.config, "example.json");
   assert.throws(() => args(["--once=bad"]), /Invalid Sync v2 --once value/);
 });
 
@@ -147,6 +151,7 @@ test(`issue 66 Windows: real signed picker hydrate ${filename}, relativeRoot=${r
   assert.equal(requests.filter((request) => request === `/sync/v1/objects/${objectId}`).length, 1);
   const reveal = JSON.parse((await fsp.readFile(launch, "utf8")).replace(/^\uFEFF/, ""));
   assert.match(reveal.executable, /explorer\.exe$/i);
+  assert.ok(reveal.args.join(" ").includes(filename));
   assert.deepEqual(reveal.args, [`/select,"${path.join(localFolder, remotePath)}"`],
     "Explorer must receive /select,\"<target>\" without a space after the comma under Node's resolved root");
   if (relativeRoot) {

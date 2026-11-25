@@ -226,6 +226,14 @@ O cliente pode usar `adapter.listInventory({ limit, cursor })` ou
 `engine.browseRemoteInventory({ limit, cursor })` para navegar sem baixar
 conteudo cifrado. `selectedOnDevice` e apenas a politica local dessa
 instancia do engine; o inventario e **informativo, sem verificacao de assinatura**.
+O `browseRemoteInventory` tambem exige o formato metadata-only no limite do
+motor, inclusive para adapters customizados: recusa envelopes completos, campos
+extras, pagina/cursor invalido, objetos com getters ou Proxy e respostas que
+ultrapassem o limite. Essa validacao evita emitir campos nao aprovados ao
+picker/CLI: aceita apenas primitivas JSON, arrays densos e objetos planos,
+com teto agregado de 128 KiB e limites para nos/chaves; nao executa metodos
+de conversao enviados por adapters. Ela **nao** concede autoridade de
+materializacao ou RootSession.
 Antes de materializar, reconciliar ou admitir operacoes protegidas, o cliente
 continua usando a leitura completa por `objectId` com validacao independente
 de assinatura, dispositivo e revogacao. O fluxo normal `syncOnce` preserva
@@ -451,6 +459,24 @@ node sync-client/rootark-sync-v2.js unpin --config E:\sync-private\.rootark-sync
 ```
 
 Para listar a pagina seguinte, substitua `<nextCursor>` pelo valor `nextCursor` da resposta anterior. Quando nao houver proximo cursor, a listagem terminou. Se o inventario mudar durante a navegacao (HTTP 409), reinicie a listagem sem `--cursor`.
+
+**Restricao S0 atual:** sem RootSession nativa com custodia independente e
+publicacao atomica sem substituir arquivos estrangeiros, **toda operacao
+remota selecionada que percorra `SyncEngine._apply()` no modo
+`filesOnDemand: true` ou `requireNativeRootRecovery: true`** fica bloqueada
+com `root_session_native_unavailable`, inclusive CREATE/UPDATE/MOVE de arquivos
+ou diretorios e DELETE/tombstone (estes ultimos ja negados antes da verificacao
+de entrada). O bloqueio de CREATE/UPDATE/MOVE ocorre apos a pre-validacao
+criptografica, mas **antes** de `journal.observeAdmission`, criar conteudo
+inbound, diretorios da carga, temporarios de publicacao, `stageExisting` ou
+`rename` JS da carga. O lock cooperativo da raiz e sua admissao podem ter
+feito I/O de controle anteriormente; S0 **nao** promete ausencia total de I/O
+nem protege esse lock contra escritores hostis. Inventario consultivo e
+`browse` continuam disponiveis. `hydrate`, `pin` que exija hidratacao e
+aplicacao de mutacoes remotas selecionadas ficam indisponiveis; a manutencao
+de metadados remotos fora da selecao nao e uma publicacao local de carga.
+Nao existe fallback inseguro nem ativacao automatica de RootSession. O sync
+legado sem exigencia nativa mantem o comportamento anterior.
 
 `hydrate` identifica o objeto pelo inventario e baixa **somente** seu envelope completo; o motor valida identidade, revisao, autorizacao assinada e integridade AEAD antes de materializar os bytes. Se houver modificacao local nao sincronizada, arquivo nao rastreado, ambiguidades ou mudanca entre a consulta de metadados e o download, a hidratacao e recusada sem sobrescrever o arquivo. `evict` preserva a copia remota e exige que o arquivo local esteja limpo e que seus bytes sejam iguais ao objeto remoto verificado. Arquivos evictados continuam remotos, nao viram tombstones; offline, os arquivos ja materializados permanecem acessiveis e novas hidratacoes aguardam conexao.
 

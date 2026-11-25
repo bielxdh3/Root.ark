@@ -9,6 +9,214 @@ PRs #195–#201 are merged. This milestone includes the aggregate chunk-upload q
 
 Historical sections below preserve their original evidence and claims; they are not current live status. Validation statements are tied to their named SHA and do not transfer to later commits.
 
+2026-11-12 UTC — **newest execution checkpoint (source/local tests, not release):**
+`Root/main` remains `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+Published OPEN/Draft HEADs: #298 `e209a6ee`, #300 `c928d894`,
+#301 `e1ca644b`, #302 `e0af8397`; #306 is OPEN/non-Draft
+`b13b29f9` without formal APPROVED review. #298 CodeQL workflow
+`43126620790` succeeded while distinct GitHub CodeQL check-run
+`130881048062` FAILED; #300 CodeQL workflow/check-run on `c928` succeeded.
+These are not all-platform product or release validations.
+
+Unpublished #300 native lab child `7a4fdc1b` from `c928` has two independent
+SOURCE GO **only for experimental C#/C++ held-HANDLE/dirfd no-replace**;
+Windows NTFS/Node22 2 PASS, 1 Linux-only SKIP, 0 FAIL. Parent already PASS:
+the two FileShare.Delete read updates are defensive, not RED→GREEN. No exact
+child WSL, product RootSession, independent root-A custody or positive FOD.
+#301 has divergent local native-crypto candidates `a4220c4f` and `91ef9b81`,
+still requiring reconciliation; #301 published `e1ca` Security Regression
+failed its stale issuer Proxy oracle. #302 local DEV-OFF integrated
+`67b3d5dc` (parent `72211129`) reproduced **two genuine physical Windows
+signed-A/SQLite-B RED**: GENESIS sequence 1 persisted 2 and UPDATE sequence
+2 persisted 3 under mutated iterator; patched explicit SQL scalar binding,
+83 total Windows tests / 79 PASS / 4 POSIX SKIP / 0 FAIL. Exact-child WSL
+and independent SOURCE pair were not yet complete at this checkpoint.
+`3c68d325` is a separate preserved
+lineage, not proof that all cumulative patches were merged.
+
+**Four distinct all-required gates** remain LAB, NATIVE PRODUCT, independent
+self-hosted off-process/operator custody, and MERGE/RELEASE. Product still
+lacks original physical A and **all ancestor** independent pre-first-pin
+enrollment, protected UID/SID writer isolation, native rooted transactional
+no-replace stage/cleanup, signed durable cold PREPARE/COMMIT and `required-v2`
+reopen, positive CFAPI hydration/pin/picker, and signed ingress/egress fences.
+External gates require Windows **10** CFAPI physical tests, off-host operator
+and real powercut; WSL currently unavailable. Prior #300 positive FOD/pin/
+picker hosted failures (**49 Windows / 59 Ubuntu** on older `a598eb47`) remain
+unresolved by S0 refusal. Do not turn them into expected-denial positives.
+**ISSUE #66 INCOMPLETE · RootSession OFF · MERGE NO-GO · RELEASE NO-GO.**
+
+2026-11-11 late continuation — **newest execution checkpoint**: confirmed
+`Root/main` `202146bb73ca8577a0a4017c4556cb8b1e9588a6` unchanged. PR #298
+was advanced by ordinary FF to `73c2be30` after **two independent SOURCE GO
+limited to 11 LAB experiments**; OPEN/Draft, with held-HANDLE Windows11/NTFS
+and Linux/WSL/ext4 no-replace experiments 7/7 per OS. On published #298,
+the CodeQL Action workflow `43118997507` and Analyze job `130854325688`
+are **SUCCESS**, but the SEPARATE GitHub Advanced Security `CodeQL` PR
+check-run `130855351016` is **FAILURE** with 20 new high-severity
+`js/file-system-race` alerts (19 in lab experiments, 1 in a historical test).
+The scanner running successfully is not the security-alert gate passing;
+other mandatory jobs must be examined, and **no native product implementation**
+was released. PR #300 remains OPEN/Draft `984a62ef` (prior docs-only FF);
+PR #301 remote remains OPEN/Draft `e1ca644b`; PR #302 remains OPEN/Draft
+`e0af8397`; PR #306 remains OPEN/non-Draft `b13b29f9`, without APPROVED.
+
+PR #301 has **unpublished** local child `7da07252` (parent `25b2649c`):
+two physically RED Windows P2 regressions, fake Hash facade via mutable
+`Object.freeze` and inherited numeric array setter signed A / applied B,
+now Windows targeted 2/2 and related 34/34 GREEN; **exact-SHA WSL and two
+independent SOURCE GO pending**. PR #302 has **unpublished** local child
+`be3170e3` (parent `34b4d39e`): callback-poisoned WeakMap ticket relookup
+unsigned B and Set nonce replay physically RED Windows on parent, patched
+with early native methods; full Windows Node22 70 tests / 66 PASS / 4 SKIP.
+**Exact-child WSL and two independent SOURCE GO pending.** Current WSL
+process launches are stalled; do not silently inherit prior successful WSL
+results. PR #301 published `e1ca` Security Regression 1 old issuer Proxy
+oracle FAIL; PR #300 published earlier `a598` had 49 Windows and 59 Ubuntu
+positive FOD/pin/picker failures. All #298 native file linkage results are
+**LAB ONLY**; writable `RootSession` still unconditionally denies product
+recovery. First-pin original-A independent root+ALL ancestors, real
+same-UID/SID writer isolation, no-replace PREPARE/COMMIT, owner-signed
+off-host CURRENT, CFAPI physical Windows **10** and real powercut remain
+unproven. Four evidence planes in latest
+`docs/roadmap/issue-66-pr300-native-custody-gates.md` are conjunctive.
+**ISSUE #66 INCOMPLETE · MERGE NO-GO · RELEASE NO-GO · RootSession OFF.**
+
+2026-11-11 continuation — **newest live CI checkpoint**: all published HEADs
+remain #298 `ce393b75`, #300 `a598eb47`, #301 `e1ca644b`, #302 `e0af8397`,
+#306 `b13b29f9`, with unchanged `Root/main` `202146bb`. #300 exact Security
+Regression `43094656916` is now completed FAILURE: **59 Ubuntu positive
+FOD/pin failures and 49 Windows positive FOD/pin/picker failures**; CodeQL
+SUCCESS is insufficient. #301 new published checks CodeQL, PG18, dependency,
+provider/Android SUCCESS, but Security Regression `43100369644` remained
+in_progress at this check. #298/#302 Security Regression `startup_failure`
+with zero jobs is neither passing nor failing code coverage; other workflows
+are queued. Four isolated unpublished children remain protected: #298
+`67c850c` evidence RED, #300 `30657c46` docs, #301 `afde2432` native crypto
+intrinsics fix, #302 `47c95899` DEV-OFF crypto fix; exact-child SOURCE pairs
+are still required before any FF. **Native positive FOD/root original-A,
+independent custodian, Win10 CFAPI and real powercut remain unproven.**
+**RootSession OFF · MERGE NO-GO · RELEASE NO-GO.** See latest roadmap section.
+
+2026-11-11 ~21:00Z — **newer verified cross-PR checkpoint** (supersedes
+subsequent older "current" notes): PR #298 `ce393b75` OPEN/Draft,
+#300 `a598eb47` OPEN/Draft, #301 `e1ca644b` OPEN/Draft (two exact-SHA
+SOURCE GO for narrow crypto split-read fix, 40/40 local Win22 and 40/40
+WSL22 ext4, FF published), #302 `e0af8397` OPEN/Draft, #306 `b13b29f9`
+OPEN/non-Draft with 0 GitHub APPROVED reviews. `Root/main` remains
+`202146bb73ca8577a0a4017c4556cb8b1e9588a6`. #300 exact CodeQL
+`43094498755` succeeded but Ubuntu canonical still reports 59 positive
+FOD/pin failures on run `43094656916`, Windows result pending. #298
+`43097069140` and #302 `43096175973` Security Regression completed
+`startup_failure` with **no jobs**, not a code-test verdict; their CodeQL
+and PG18 runs still queued. Fresh #301 e1ca hosted checks are pending,
+not inherited from green 50d. Three real pathname-dependent #298 RED
+reproductions were isolated in **unpublished evidence commit** `67c850c`;
+PR #302 also has two local dynamic crypto factory / `Symbol(kHandle)`
+P2 RED scenarios requiring remediation. The four separate laboratory,
+native product, off-host self-hosted custody and release gates remain
+conjunctively unmet. No positive native root-session FOD path, independent
+original-A/ancestor ownership, Windows 10 CFAPI or physical powercut
+proof. **MERGE NO-GO · RELEASE NO-GO · RootSession OFF.** See the
+`docs/roadmap/issue-66-pr300-native-custody-gates.md` top checkpoint.
+
+2026-11-11 — **latest verified PR HEADs, authoritative over older
+"current" entries below:** #300 `b774ce13398e2486fd08e3ff7b47d53d66c046c2`
+(OPEN/Draft), #301 `50d76c686f7d47799344ea8994fd0b8adb3293cc`
+(OPEN/Draft), #302 `9096cfa75598f23cd640242febe4118e0df64acd`
+(OPEN/Draft); `Root/main` unchanged at
+`202146bb73ca8577a0a4017c4556cb8b1e9588a6`. PR #300 exact HEAD
+CodeQL `43058440999` SUCCESS, Security Regression `43058657386`
+FAIL (FOD/native-positive CI remains unimplemented); S0 deny-before-inbound
+is fail-closed **not** functioning native hydration. PR #301 exact HEAD
+CodeQL/Ubuntu22/Windows22 canonical/mandatory/PG18/dependency/provider
+checks SUCCESS, but logical owner CURRENT mapping is not independent
+off-host/physical FileId custody. PR #302 exact HEAD CodeQL/Ubuntu22/
+Windows mandatory/PG18/dependency SUCCESS, but Windows canonical single
+`ERR_ASSERTION` in a partial-clock-rollback owner-lease test and aggregator
+FAIL. DEV-OFF same-host SQLite does not authorize production. Native no-replace
+publication, original-A pre-first-pin enrollment, separate UID/SID custodian,
+PREPARE/COMMIT and signed floor cold replay, real Windows 10 CFAPI and
+physical powercut remain unproven. See
+`docs/roadmap/issue-66-pr300-native-custody-gates.md` for full conjunctive
+gate/CI table. No merge or deploy; **MERGE/RELEASE NO-GO**.
+
+2026-11-11 — **live PR #300 #66 checkpoint, not release authorization:**
+published HEAD `23cc31b69c5efb6f218eb74e556b49e297e79297` remains
+OPEN/Draft; `Root/main` stayed `202146bb73ca8577a0a4017c4556cb8b1e9588a6`.
+Two exact-SHA SOURCE GO reviews approved advisory-inventory boundary
+sanitization; Windows Node22 and WSL Node22 inventory tests each passed
+13/13. CodeQL run `43048299591` succeeded on the published SHA;
+Security Regression `43048466075` was still running and must be checked
+separately. The product FOD inbound `fsp.rename` destination-collision
+P2 remains confirmed physical RED on Windows NTFS and WSL ext4; its
+non-destructive attack fixture is preserved unpublished. `RootSession`
+remains OFF. Independent original-A enrollment, native no-replace
+publication, owner-signed monotonic cold floor, crash/powercut and real
+Windows 10 CFAPI remain unproven. PR #302 exact `dcd65b6b` hosted
+Security Regression is green but its custodian is DEV-OFF, not external
+authority; PR #301 cryptographic signer-role changes require their own
+exact-SHA review/CI, not reuse of PR #300 checks. **MERGE/RELEASE NO-GO.**
+
+2026-11-11 — **S0 denial is not a native FOD implementation:** local composed
+PR #300 candidate `226652ff8504477c2fba2b7d4d2d35de0886528b` includes
+the private fail-closed `SyncEngine._apply` native-required signed inbound
+guard before journal/payload mutations. A hostile same-principal second
+process inserts an exclusive `fsync`ed foreign inode after authentic Ed25519
+verification; four focused negative tests each passed on Windows Node22/NTFS
+and WSL Node22/ext4 in the composed tree, with retained original FD and no
+rename/link/temp, journal admission, snapshot change or remote push. Browse
+and signed non-FOD legacy CREATE remain operational; other native-required
+operations are intentionally unavailable. Linux/Windows product native
+publisher, independently enrolled original-A and ancestors, owner-signed
+off-host floor, real Windows 10 CFAPI and physical powercut are **still
+missing**. CodeQL/hosted CI on this local SHA have **not** been run;
+predecessor `23cc31b6` had CodeQL SUCCESS but Ubuntu 18 positive FOD FAIL.
+The legacy JS rename remains overwrite-capable outside S0. **No merge,
+deploy, RootSession activation or release authorization.**
+
+2026-11-11 — Issue #66 / PR #300 W26 integration status: current bounded
+native NTFS evidence is recorded in
+`docs/roadmap/issue-66-pr300-native-custody-gates.md`. Four post-native-pin
+W26 test/lab commits were integrated without conflicts above published
+`057241e0`; local tree `e1e8b548` received two narrow independent SOURCE
+GO reviews, Windows 11 NTFS/Node22 completed two **22/22** repeat runs
+after one unclassified 21/22 result, and WSL/ext4 W3 remains **38 PASS /
+3 SKIP**. Root/main is untouched; PR300 remains Draft. Formal CodeQL
+**0 alerts** applies to the prior published `057241e0`, **not** to the
+new candidate. The initial original-A identity prior to first native
+pin, independent cold custodian and signed floor, Win10 CFAPI and real
+powercut remain release blockers; the post-pin lab never authorizes
+RootSession, merge or deploy.
+
+2026-11-11 — laboratório W26 de aquisição fria pré-pin, ainda não
+publicado: uma alteração opt-in testa A→B antes do primeiro HANDLE nativo,
+para B comum ou junction, e exige recusa sem escrever no diretório
+estrangeiro enquanto inexiste FileId original atestado por custodiador
+independente. A primeira revisão SOURCE detectou falso verde por ausência
+de `READ_CONTROL` no HANDLE usado por `GetSecurityInfo`; contraprova RED
+0/2, correção exigindo leitura real do SID no B comum, e suíte Windows
+Node22/NTFS 25/25 PASS. O modo NORMAL permanece vulnerável à substituição
+pré-pin: isso não é prova positiva de identidade A, nem autoriza merge,
+RootSession ou release. A nova revisão SOURCE/CI pertence ao novo SHA.
+
+2026-11-11 — Issue #66 / PR #300, W22 inert remote-only source:
+pre-rename `EIO` em checkpoint da snapshot ou ACK do journal deixa
+um `.tmp-<pid>-<uuid>` físico não autorizador. O temporário deve ser
+preservado: excluir por pathname depois da falha poderia apagar um inode
+estrangeiro substituído por escritor do mesmo UID/SID. O classificador W22
+de raiz vazia **rejeita** esse nome com `unsafe_path` antes de qualquer
+ACK/replay; não existe prova nativa independente que autorize o descarte.
+Os dois testes legados que prometiam retry automático foram alterados para
+provar os mesmos inodes/bytes originais por descritores retidos, journal
+observed/seen, snapshot anterior, nenhum push/DELETE e ausência de
+autorização fria. Testes físicos RED anteriores: 2 falhas no WSL22;
+GREEN WSL22/ext4: **15 PASS / 0 FAIL** no arquivo W22 completo, incluindo
+recuperação legítima sem órfão após saída abrupta de processo. Não é
+recuperação operacional de órfão hostil: requer custódia nativa protegida
+para reconciliação independente. Os testes não ativam `RootSession` nem
+transferem resultado à CI hospedada de outro SHA. **MERGE/RELEASE NO-GO**.
+
 2026-11-06 — Issue #66, etapa parcial em revisao: inventario de metadados
 autenticado, paginado e limitado por resposta, com cursores invalidaveis por
 mudanca na biblioteca e isolamento por conta. Adapter e SyncEngine expõem
@@ -590,3 +798,39 @@ When completing a task:
 6. link the PR, issue, validation report, or architecture decision;
 7. select the next item based on remaining risk, not novelty;
 8. stop instead of inventing filler phases.
+
+## 2026-11-11 late Issue #66 four-plane execution checkpoint
+
+1. `[LAB PARTIAL]` PR #300 W31 unpublished `16ea2e919b1b` retains Windows volume-root, every ancestor, and source HANDLEs; NTFS lab 18 PASS/1 expected SKIP reported. Separate same-SID lab issuer is not an independently operated self-hosted custodian; WSL unavailable for this SHA.
+2. `[LAB REVIEWED / NOT PUBLISHED]` PR #298 `5eca8be765c2` (parent published `e209a6ee`) received two independent narrow SOURCE GO for CodeQL lab-only scope and foreign-FD test. Windows full suite 18 PASS / 1 expected SKIP / 0 FAIL; WSL evidence remains outstanding; exact-child hosted CodeQL/GHAS unavailable.
+3. `[SECURITY BLOCKED]` PR #301 child `1b608915` has worker-reported RED-to-GREEN repairs but two new independent SOURCE NO-GO on postcallback crypto.verify/timingSafeEqual, revocation push/includes, and mutable compartments; needs a new tested child, two fresh SOURCE GO and Windows/WSL full gates; PR #302 cryptographic/DEV-OFF candidates still require closure of remaining P2 findings and same-SHA independent review; no DEV-OFF result authorizes production IO.
+4. `[PRODUCT BLOCKED]` Implement real protected original-A/all-ancestor native `RootSession`, signed durable PREPARE/COMMIT and positive CFAPI/FOD pin/picker without changing success tests into expected denials.
+5. `[EXTERNAL GATES]` Provision distinct self-hosted operator/monotonic custody, prove Windows 10 CFAPI and physical powercut, then rerun both-platform tests and hosted CI before considering Draft change/merge/release. Current decision: NO-GO.
+
+### Subsequent exact-SHA reconciliation (unpublished, not a release verdict)
+
+- `[LAB / CODEQL PARTIAL]` PR #298 remote remains `e209a6ee`; local `5eca8be` has two independent narrow SOURCE GO (workers 33 and 42). The Windows Node 22 `issue-67-controlled-restore.test.js` completed **18 PASS, 0 FAIL, 1 SKIP** on the exact child, and the swapped-foreign-inode targeted test passed separately. No WSL/ext4 result or child-hosted CodeQL/GHAS check is available; do not publish or call the product ready on these facts alone.
+- `[SECURITY NO-GO]` PR #301 published `e1ca644b`; local `bba41b9f` and sibling `72d65e4b` have identical trees, not sequential patches. Independent SOURCE NO-GO identified post-KeyObject `Date.now`/nonce replay and authorization-crypto concerns, post-getter `Array.prototype[Symbol.iterator]` omission in owner/CURRENT role-key separation, and late capture of expected account scope/operation/minimumHead/nonce in inventory/physical proof verification (including anti-rollback). Corrections and genuine Ed25519 RED-to-GREEN evidence are not yet validated at a final SHA. No publication.
+- `[DEV-OFF REVIEW PARTIAL]` PR #302 remote remains `e0af8397`; local descendant `7baea943` (parent `cadf2789`) passed Windows Node22 **62 PASS, 0 FAIL, 4 SKIP** in a detached verification worktree. One independent SOURCE GO for this exact child was received; second review and WSL/ext4 validation remain necessary. Local dual-SQLite floor state is **not** independent operator custody or permission for production I/O.
+- `[PRODUCT STILL BLOCKED]` PR #300 remote `c928d894` has only two returned successful checks in the latest compact query, not evidence of an entire passing canonical matrix. RootSession is unconditionally unavailable; original physical A, all ancestors, same-SID/UID write exclusion, native ingress no-replace, complete FOD positive behavior, cold PREPARE/COMMIT and separately administered self-hosted witness are still unproven. #306 is tracked separately and is not a release authority.
+- `[RELEASE GATES]` Windows 11 does not prove Windows 10 CFAPI and process-exit testing is not physical powercut. Keep all PRs in their current state, do not change `Root/main`, and do not merge, deploy, or release. The four planes remain LAB / native product / independent custody / release.
+
+### Later local code checkpoints — still not publish/release approvals
+
+- `[LAB POSITIVE / PRODUCT NO-GO]` PR #300 local `fc837826998f7fb9ac93d9b4a43df94a79d7fae9` descends directly from published `c928d894` (not from this documentation lineage). It exercises a genuinely signed Sync v2 Ed25519 operation, selection, AES-GCM decryption and native Windows NTFS HANDLE-relative no-replace publication. The parent lacked this mode (RED); the child passed **6/6 Windows Node22 tests** in a separate worktree. A subsequent full W26 run returned **24 PASS / 1 FAIL**, then a full rerun returned **25 PASS / 0 FAIL**; do not erase the initial failure. It remains LAB only: no registered CFAPI callbacks, independent enrolled original-A/ancestor custody, RootSession, durability proof or production authorization. Exact-SHA source reviews and Linux remain outstanding at this checkpoint.
+- `[CRYPTO CANDIDATE / NO MERGE]` PR #301 local `f5b666e292f3f23c9efd0a9b7038333af1e93ab4` is a direct child of `bba41b9f`, addressing post-KeyObject clock/RNG/authorization/owner-key iterator hazards and late expected scope/operation/nonce/inventory-floor snapshots. Implementer reports genuine Ed25519 A/B **13 RED parent → 13 GREEN child** and 122 selected ZK green tests. An independent Windows Node22 run passed **44/44** focused tests and **9/9** issuer bridge tests. A broader run had three Windows ACL-bootstrap failures also reproduced on the parent; do not suppress. Exact-SHA SOURCE, WSL/ext4 and hosted CI remain outstanding. Capturing Date.now does not prove a monotonic external clock.
+- `[DEV-OFF SOURCE REVIEWED]` PR #302 local `7baea943` now has **two** independent exact-SHA SOURCE GO (workers 41 and 42) for its bounded SQLite/owner-signature patch, and separately run Windows22 **62 PASS / 4 SKIP**. WSL and independent operator proof are absent. No production I/O authority is granted.
+
+### Latest same-SID FOD race / CodeQL verification (local, not published)
+
+- `[LAB POSITIVE / NO PRODUCT AUTHORITY]` #300 new child `fbc503a70a2f907984c89ef05be35d86e42c8434` from `fc837826` adds a real **second same-SID Node process** that waits for native retained-directory rendezvous, creates and fsyncs a competing destination, holds its descriptor during native atomic no-replace, and leaves the exact foreign bytes/FileId intact. Native code now also reopens the surviving stage relative to the held directory HANDLE and compares identity/actual bytes to the original source HANDLE. Newly introduced feature test RED on parent (parent returned `FOD_POSITIVE`), then **1/1 GREEN** on child; full isolated child signed FOD suite **7 PASS / 0 FAIL**. This is a capability RED, **not** a demonstrated parent security exploit. Concurrent execution of signed FOD + W26 yielded **31 PASS / 1 FAIL** in `PRECREATE_SCRATCH_DIRECTORY` (invalid/timed-out precreate signal); that test subsequently passed alone **1/1**. Preexisting W26 on `fc837826` was observed **24 PASS / 1 FAIL**, then **25/25** twice. Do not infer stable canonical CI from these runs. WSL absent, no second independent SOURCE GO for child, no push.
+- `[CODEQL / GHAS PARTIAL]` #298 published `e209a6ee` has a failed GHAS CodeQL check with **25 HIGH annotations**: 24 located in four disposable Issue #67 laboratory scripts and 1 historical test alert at `test/issue-67-controlled-restore.test.js:541`. The local `5eca8be` excludes only the experimental lab directory and replaces the test's mutable-path read with its held foreign FD. It has two narrow SOURCE GO and Windows **18 PASS / 1 SKIP**, but the prospective exact-child hosted GHAS outcome is unknown; the repo-wide open code-scanning API returned zero, which does not invalidate the historical PR-specific failed check.
+- `[RELEASE NO-GO]` #306 remains OPEN/non-Draft with eight applicable checks green at its published head, without a recorded approving review. #65 is CLOSED; #66 and #67 remain OPEN. This is monitoring information, not permission to merge. Windows 10 physical CFAPI, independent 100% self-hosted operator, original-A/ancestor custody, durable recovery, powercut and both-platform signoff are still absent.
+
+- `[INTEGRATED LOCAL LAB / NO PUSH]` #300 integrated candidate `f5cd2e63`
+  combines the earlier held-file and ancestor W21/W31 tests with signed
+  FOD publication and external same-SID collision. The actor now retains
+  its foreign file descriptor until a post-kernel completion signal, not an
+  arbitrary sleep. Windows Node22 combined physical LAB tests **17 PASS,
+  0 FAIL, 1 SKIP**. RootSession remains OFF; no independent root-A custody,
+  positive CFAPI product operation, Windows10 proof or powercut.

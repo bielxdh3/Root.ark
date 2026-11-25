@@ -10,18 +10,17 @@ const test = require("node:test");
 const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 const { writePrivateSyncConfig } = require("../sync-client/rootark-sync-private-config");
 
-test("two relative paths with identical remote basename must fail closed before HTTP", {
-  timeout: 60000,
-}, async (t) => {
+async function verifyCollisionBeforeHttp(t, names) {
   const privateDir = createPrivateAuthorityFixture("rootark-basename-private-");
   const shared = await fs.mkdtemp(path.join(os.tmpdir(), "rootark-basename-source-"));
   t.after(async () => {
     await fs.rm(shared, { recursive: true, force: true });
     await fs.rm(privateDir, { recursive: true, force: true });
   });
-  for (const dir of ["first", "second"]) {
-    await fs.mkdir(path.join(shared, dir));
-    await fs.writeFile(path.join(shared, dir, "same.txt"), `UNIQUE_${dir}`);
+  for (const name of names) {
+    const destination = path.join(shared, name);
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.writeFile(destination, `UNIQUE_${name}`, { flag: "wx" });
   }
   let uploads = 0;
   const server = http.createServer((req, res) => {
@@ -62,6 +61,20 @@ test("two relative paths with identical remote basename must fail closed before 
   assert.notEqual(done, 0, "ambiguous remote basename must not report successful mirror");
   assert.match(output, /SYNC_REMOTE_BASENAME_COLLISION/);
   assert.equal(uploads, 0, "collision preflight must reject before remote side effects");
+}
+
+test("two relative paths with identical remote basename must fail closed before HTTP", {
+  timeout: 60000,
+}, async (t) => {
+  await verifyCollisionBeforeHttp(t, ["first/same.txt", "second/same.txt"]);
+});
+
+test("POSIX A.txt and a.txt remain distinct local entries but cannot alias one remote basename", {
+  timeout: 60000,
+  skip: process.platform === "win32"
+    ? "The standard Windows fixture directory is case insensitive" : false,
+}, async (t) => {
+  await verifyCollisionBeforeHttp(t, ["A.txt", "a.txt"]);
 });
 
 test("renaming the source during an unacknowledged POST cannot release remote basename ownership", {

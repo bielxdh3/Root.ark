@@ -4,9 +4,14 @@ const DOS_RESERVED = /^(?:con|prn|aux|nul|clock\$|com[1-9]|lpt[1-9])(?:\..*)?$/i
 const INTERNAL = new Set([
   ".rootark-trash", ".rootark-sync", ".rootark-sync-state.json",
   ".rootark-sync.json", ".rootark-sync-journal.json", ".rootark-sync-index.json",
+  ".rootark-sync-evictions", ".rootark-sync-ever-fod",
   ".rootark-sync.lock", ".rootark-webdav-owner.lock",
 ]);
-const INTERNAL_PREFIXES = [".rootark-sync-lock-init-", ".rootark-recovery-execution-"];
+const INTERNAL_PREFIXES = [
+  ".rootark-sync-lock-init-", ".rootark-sync-evictions-archive-",
+  ".rootark-sync-index.json.tmp-", ".rootark-sync-journal.json.tmp-",
+  ".rootark-recovery-execution-",
+];
 
 function isInternalSegment(segment) {
   const normalized = segment.toLowerCase();

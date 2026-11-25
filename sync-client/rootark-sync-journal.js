@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const { canonicalJson } = require("./rootark-sync-protocol");
+const { readExactOpenedControlBytes } = require("./rootark-sync-held-control-read");
 
 const JOURNAL_VERSION = 1;
 const MAX_PENDING = 10000;
@@ -184,6 +185,55 @@ async function renameWithRetry(source, destination) {
   }
 }
 
+function sameJournalInodeVersion(left, right) {
+  return Boolean(left && right && left.dev === right.dev && left.ino === right.ino
+    && left.size === right.size && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs);
+}
+
+function invalidJournalIdentity() {
+  return Object.assign(new Error("Sync journal inode changed during cold read"), {
+    code: "invalid_sync_journal",
+  });
+}
+
+async function readHeldJournal(filePath) {
+  // A historical readFile(path) accepted a new, valid-looking foreign journal
+  // after the name was rebound. Acquire an exact inode first, never reopen
+  // the mutable path for bytes, and detect changes around the held read.
+  // This is NOT independently protected root/parent custody or rollback proof.
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+    | (fs.constants.O_NONBLOCK || 0);
+  const handle = await fsp.open(filePath, flags);
+  try {
+    const heldBefore = await handle.stat({ bigint: true });
+    const namedBefore = await fsp.lstat(filePath, { bigint: true });
+    if (!heldBefore.isFile() || heldBefore.ino === 0n || heldBefore.nlink !== 1n
+      || !namedBefore.isFile() || namedBefore.isSymbolicLink()
+      || !sameJournalInodeVersion(heldBefore, namedBefore)) {
+      throw invalidJournalIdentity();
+    }
+    const bytes = await readExactOpenedControlBytes(
+      handle, heldBefore.size, invalidJournalIdentity);
+    const heldAfter = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(filePath, { bigint: true });
+    if (!sameJournalInodeVersion(heldBefore, heldAfter)
+      || !sameJournalInodeVersion(heldBefore, namedAfter)
+      || BigInt(bytes.length) !== heldBefore.size) {
+      throw invalidJournalIdentity();
+    }
+    return JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    // Only a missing file at the ORIGINAL open is a new empty journal.
+    // A disappeared name after opening an inode is foreign interference;
+    // never reinitialize durable pending/seen evidence on that ENOENT.
+    if (error.code === "ENOENT") throw invalidJournalIdentity();
+    throw error;
+  } finally {
+    await handle.close();
+  }
+}
+
 async function durableWrite(filePath, value) {
   const directory = path.dirname(filePath);
   await fsp.mkdir(directory, { recursive: true });
@@ -202,7 +252,10 @@ async function durableWrite(filePath, value) {
   try {
     await renameWithRetry(temporary, filePath);
   } catch (error) {
-    await fsp.unlink(temporary).catch(() => {});
+    // Do not unlink a path after a failed publish. Another process with
+    // directory-write access may have replaced the original temporary
+    // inode since close; unlink would remove an unrelated foreign file.
+    // An uncommitted .tmp never becomes replay authority.
     throw error;
   }
   try {
@@ -211,6 +264,45 @@ async function durableWrite(filePath, value) {
     error.journalCommitted = true;
     throw error;
   }
+}
+
+async function createInitialJournalExclusive(filePath, value) {
+  // A first cold open may see ENOENT, then a different same-principal writer
+  // can occupy the journal name BEFORE the bootstrap write. The ordinary
+  // temp->rename path is replace-capable and would destroy that foreign inode.
+  // For the initial empty journal only, create the final leaf exclusively.
+  // A crash during this first write can leave a torn journal; subsequent
+  // cold open must fail closed, never silently reset pending/seen authority.
+  const directory = path.dirname(filePath);
+  await fsp.mkdir(directory, { recursive: true });
+  let handle;
+  try {
+    handle = await fsp.open(filePath, fs.constants.O_WRONLY | fs.constants.O_CREAT
+      | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0), 0o600);
+  } catch (error) {
+    if (error.code === "EEXIST") {
+      throw Object.assign(new Error("Foreign journal appeared during cold bootstrap"), {
+        code: "invalid_sync_journal", cause: error,
+      });
+    }
+    throw error;
+  }
+  try {
+    const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.writeFile(bytes);
+    await handle.sync();
+    const original = await handle.stat({ bigint: true });
+    const named = await fsp.lstat(filePath, { bigint: true });
+    if (!original.isFile() || original.ino === 0n || original.nlink !== 1n
+      || original.size !== BigInt(bytes.length)
+      || !named.isFile() || named.isSymbolicLink()
+      || !sameJournalInodeVersion(original, named)) {
+      throw invalidJournalIdentity();
+    }
+  } finally {
+    await handle.close();
+  }
+  await syncDirectory(directory);
 }
 
 class SyncJournal {
@@ -223,8 +315,9 @@ class SyncJournal {
   }
 
   async open({ requireExisting = false } = {}) {
+    const previousState = this.state;
     try {
-      this.state = JSON.parse(await fsp.readFile(this.filePath, "utf8"));
+      this.state = await readHeldJournal(this.filePath);
       if (this.state.version !== JOURNAL_VERSION || !Array.isArray(this.state.pending)
         || this.state.pending.length > MAX_PENDING || !Array.isArray(this.state.seen)
         || this.state.seen.length > MAX_OBSERVATIONS) {
@@ -284,6 +377,9 @@ class SyncJournal {
         throw new Error("Invalid previously observed sync envelope journal");
       }
     } catch (error) {
+      // Invalid cold evidence must not remain usable in memory after a
+      // rejected open or be consumed by a later retry on this same instance.
+      this.state = previousState;
       if (error.code !== "ENOENT") throw error;
       // Recovery previews are advisory READS. They must never replace lost
       // journal evidence with an empty outbox if a file vanished after open.
@@ -292,7 +388,7 @@ class SyncJournal {
           code: "history_preview_unavailable",
         });
       }
-      await durableWrite(this.filePath, this.state);
+      await createInitialJournalExclusive(this.filePath, this.state);
     }
     return this;
   }
@@ -617,6 +713,125 @@ class SyncJournal {
         throw new Error("Conflicting local sync admission evidence");
       }
       next.observed[operationId] = digest;
+    });
+  }
+  async batchObserveAdmission(entries, beforePersist = null) {
+    // Called ONLY after every envelope in the enclosing remote LIST has been
+    // independently authorized and its exact canonical digest frozen. This
+    // primitive persists that already verified evidence; it never verifies a
+    // signature or turns a remote LIST response into its own authority.
+    if (!Array.isArray(entries) || entries.length > MAX_OBSERVATIONS
+      || (beforePersist !== null && typeof beforePersist !== "function")) {
+      throw new Error("Invalid bounded sync admission batch");
+    }
+    if (!entries.length) {
+      // A complete signed LIST replay can consist entirely of previously
+      // observed/admitted digests. Its owner-policy/revocation gate is still
+      // mandatory, even though there is no new journal state to persist.
+      // Serialize the gate behind prior writes without issuing an unnecessary
+      // durable rename or manufacturing a new signed observation.
+      if (beforePersist) {
+        const check = this.queue.then(() => beforePersist());
+        this.queue = check.catch(() => {});
+        await check;
+      }
+      return;
+    }
+    const unique = new Set();
+    const frozenEntries = [];
+    for (const entry of entries) {
+      // A verifier can pass mutable network objects or getters. Read each
+      // field once and detach the primitive identity before the queued fsync.
+      const operationId = entry?.operationId;
+      const digest = entry?.digest;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)
+        || typeof operationId !== "string" || !VALID_OPERATION_ID.test(operationId)
+        || typeof digest !== "string" || !VALID_DIGEST.test(digest)
+        || unique.has(operationId)) {
+        throw new Error("Invalid or duplicated sync admission batch identity");
+      }
+      unique.add(operationId);
+      frozenEntries.push({ operationId, digest });
+    }
+    await this.commit(async (next) => {
+      // Run freshness/owner-policy checks AFTER earlier journal transactions
+      // leave the queue, immediately before mutating this durable batch.
+      if (beforePersist) await beforePersist();
+      const pending = new Map(next.pending.map((entry) => [entry.operationId, entry]));
+      const seen = new Set(next.seen);
+      let count = Object.keys(next.observed).length;
+      for (const { operationId, digest } of frozenEntries) {
+        const priorAdmitted = Object.hasOwn(next.admitted, operationId)
+          ? next.admitted[operationId] : null;
+        const priorObserved = Object.hasOwn(next.observed, operationId)
+          ? next.observed[operationId] : null;
+        if ((priorAdmitted !== null && priorAdmitted !== digest)
+          || (priorObserved !== null && priorObserved !== digest)
+          || (pending.has(operationId)
+            && signedEnvelopeDigest(pending.get(operationId)) !== digest)) {
+          throw Object.assign(new Error("Conflicting local sync admission evidence"),
+            { code: "remote_authorization_rejected" });
+        }
+        if (priorObserved !== null || (priorAdmitted !== null
+          && seen.has(operationId))) continue;
+        count += 1;
+        if (count > MAX_OBSERVATIONS) {
+          throw new Error("Sync pre-observation journal capacity exceeded");
+        }
+        // Null-prototype maps also preserve IDs such as "__proto__" exactly.
+        next.observed[operationId] = digest;
+      }
+    });
+  }
+  async batchMarkSeenRemoteOnly(entries, beforePersist = null) {
+    // Inert until an independently reviewed, root-handle-bound remote-only
+    // caller exists. This cannot be used for signed WebDAV DELETE/MOVE pairs:
+    // each exact digest must already have an observed or admitted journal pin.
+    if (!Array.isArray(entries) || !entries.length || entries.length > 640
+      || (beforePersist !== null && typeof beforePersist !== "function")) {
+      throw new Error("Invalid bounded remote-only acknowledgement batch");
+    }
+    const ids = new Set();
+    const frozen = [];
+    for (const entry of entries) {
+      const operationId = entry?.operationId;
+      const digest = entry?.digest;
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)
+        || typeof operationId !== "string" || !VALID_OPERATION_ID.test(operationId)
+        || typeof digest !== "string" || !VALID_DIGEST.test(digest)
+        || ids.has(operationId)) {
+        throw new Error("Invalid or duplicated remote-only admission evidence");
+      }
+      ids.add(operationId);
+      frozen.push({ operationId, digest });
+    }
+    await this.commit(async (next) => {
+      // Recheck the independently pinned current revocation/epoch policy
+      // AFTER older queued journal operations, not only before enqueueing ACK.
+      if (beforePersist) await beforePersist();
+      const pending = new Set(next.pending.map((item) => item.operationId));
+      const seen = new Set(next.seen);
+      const grouped = new Set(Object.values(next.atomicSignedGroups)
+        .flatMap((pair) => [pair.deleteId, pair.moveId]));
+      for (const { operationId, digest } of frozen) {
+        if (pending.has(operationId) || grouped.has(operationId)) {
+          throw new Error("Remote-only acknowledgement overlaps pending atomic work");
+        }
+        if (seen.has(operationId)) {
+          if (!Object.hasOwn(next.admitted, operationId)
+            || next.admitted[operationId] !== digest) {
+            throw new Error("Previously admitted remote-only evidence conflict");
+          }
+        } else if (!Object.hasOwn(next.observed, operationId)
+          || next.observed[operationId] !== digest) {
+          throw new Error("Remote-only acknowledgement requires exact durable observation");
+        }
+      }
+      for (const { operationId, digest } of frozen) {
+        if (!seen.has(operationId)) next.seen.push(operationId);
+        next.admitted[operationId] = digest;
+        delete next.observed[operationId];
+      }
     });
   }
   hasLocalAdmission(operationId, digest) {

@@ -6,20 +6,366 @@ const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
+const { types: { isProxy } } = require("node:util");
 
 const protocol = require("./rootark-sync-protocol");
 const { verifyPinnedAtomicOwnerProvision } = require("./rootark-sync-atomic-owner-provision");
 const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
-const { SyncConflictError } = require("../public/client/rootark-sync-adapter");
+const { readExactOpenedControlBytes } = require("./rootark-sync-held-control-read");
+const { SyncConflictError, assertInventoryEntry } = require("../public/client/rootark-sync-adapter");
+const {
+  openNativeRootSession,
+  openCompiledNativeRootSession,
+  isVerifiedNativeRootSession,
+} = require("./rootark-sync-native-root-session-contract");
+const NATIVE_ROOT_SESSIONS = new WeakMap();
+function hasNativeCustody(engine) {
+  const session = NATIVE_ROOT_SESSIONS.get(engine);
+  return Boolean(session && isVerifiedNativeRootSession(session));
+}
 
 const SNAPSHOT_VERSION = 1;
-const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync.lock", ".rootark-webdav-owner.lock"]);
-const INTERNAL_NAME_PREFIXES = [".rootark-sync-lock-init-", ".rootark-recovery-execution-"];
+// A v2 snapshot fences old clients that do not know how to replay the
+// fsynced per-object eviction overlay. Upgrade durably BEFORE first PREPARE,
+// not after staging a file; old v1 binaries must reject version 2. The
+// explicit required flag prevents a vanished *entire* active journal from
+// looking like a successfully compacted empty journal.
+const EVICTION_LEDGER_SNAPSHOT_VERSION = 2;
+// v1 added portable case-folding on POSIX, but marked migration complete even
+// when a dirty legacy alias was retained. Revisit v1 snapshots under v2 so
+// an already-stranded alias gets a durable watch when its bytes become clean.
+const EXCLUDED_PATHS_CASEFOLD_VERSION = 2;
+// Root-local availability fence, never an independently trusted ownership or
+// rollback witness. Its location MUST NOT depend on caller snapshotPath.
+const EVER_FOD_MARKER_NAME = ".rootark-sync-ever-fod";
+const EVER_FOD_MARKER_BYTES = "rootark-sync-ever-fod-v1\n";
+const INTERNAL_NAMES = new Set([".rootark-trash", ".rootark-conflicts", ".rootark-sync-journal.json", ".rootark-sync-index.json", ".rootark-sync-evictions", ".rootark-sync.lock", ".rootark-webdav-owner.lock", EVER_FOD_MARKER_NAME]);
+const INTERNAL_NAME_PREFIXES = [
+  ".rootark-sync-lock-init-", ".rootark-sync-evictions-archive-",
+  // A failed O_EXCL temp publication must not be cleaned by mutable name.
+  // Its orphan is nonauthorizing transaction debris, never user content to
+  // upload or a physical-cache path to reject during safe cold replay.
+  ".rootark-sync-index.json.tmp-", ".rootark-sync-journal.json.tmp-",
+];
+const RESERVED_CONTROL_TEMP_PREFIXES = Object.freeze([
+  ".rootark-sync-index.json.tmp-", ".rootark-sync-journal.json.tmp-",
+]);
+const INBOUND_PAYLOAD_TEMP_PREFIX = ".rootark-sync-index.json.tmp-inbound-";
+function isReservedHistoricalControlTemp(relative) {
+  // The portable path validator reserves these prefixes in EVERY segment,
+  // not just at root. Historical legitimate nested names therefore need
+  // the same explicit fail-closed migration fence, never implicit deletion.
+  return typeof relative === "string"
+    && relative.split(/[\\/]/).some((segment) =>
+      RESERVED_CONTROL_TEMP_PREFIXES.some((prefix) =>
+        segment.toLowerCase().startsWith(prefix)));
+}
+function internalRootMetadata(rootDir, snapshotPath, journalPath) {
+  const names = [...INTERNAL_NAMES];
+  const prefixes = [...INTERNAL_NAME_PREFIXES];
+  const newlyReservedNames = new Set();
+  const newlyReservedPrefixes = new Set(RESERVED_CONTROL_TEMP_PREFIXES);
+  for (const candidate of [snapshotPath, journalPath]) {
+    if (typeof candidate !== "string") continue;
+    const relative = path.relative(rootDir, path.resolve(candidate));
+    if (relative === ".." || relative.startsWith(".." + path.sep)
+      || path.isAbsolute(relative)) continue;
+    // A nested custom control file would require trusted traversal and
+    // reservation of every parent. Fail closed instead of uploading its
+    // metadata or misclassifying it as recovery evidence.
+    if (!relative || relative.includes(path.sep)) {
+      fail("Nested sync control metadata inside cache root is unsupported", "unsafe_path");
+    }
+    if (!names.some((name) => name.toLowerCase() === relative.toLowerCase())) {
+      names.push(relative);
+      newlyReservedNames.add(relative.toLowerCase());
+    }
+    const prefix = relative + ".tmp-";
+    if (!prefixes.some((name) => name.toLowerCase() === prefix.toLowerCase())) {
+      prefixes.push(prefix);
+      newlyReservedPrefixes.add(prefix.toLowerCase());
+    }
+  }
+  return { names, prefixes, newlyReservedNames, newlyReservedPrefixes };
+}
+function isReservedHistoricalControlTempInMetadata(relative, metadata) {
+  if (isReservedHistoricalControlTemp(relative)) return true;
+  if (typeof relative !== "string" || relative.includes("/") || relative.includes("\\")) return false;
+  const lower = relative.toLowerCase();
+  return metadata.newlyReservedNames.has(lower)
+    || [...metadata.newlyReservedPrefixes].some((prefix) => lower.startsWith(prefix));
+}
+function denyHistoricallyTrackedControlTemp(snapshot, metadata) {
+  // These prefixes were user-legal on older clients. Silently skipping a
+  // previously tracked file makes _reconcileLocal synthesize a signed DELETE.
+  // Treat legacy overlap as an explicit migration/availability blocker,
+  // never as physical evidence of user-requested deletion.
+  for (const name of Object.keys(snapshot.files || {})) {
+    if (isReservedHistoricalControlTempInMetadata(name, metadata)) {
+      fail("Legacy tracked file collides with reserved control temporary", "invalid_snapshot");
+    }
+  }
+  for (const entry of Object.values(snapshot.remoteOnly || {})) {
+    if (isReservedHistoricalControlTempInMetadata(entry?.path, metadata)) {
+      fail("Legacy remote-only file collides with reserved control temporary", "invalid_snapshot");
+    }
+  }
+  for (const entry of Object.values(snapshot.pendingEvictions || {})) {
+    if (isReservedHistoricalControlTempInMetadata(entry?.path, metadata)
+      || isReservedHistoricalControlTempInMetadata(entry?.localPath, metadata)) {
+      fail("Legacy pending eviction collides with reserved control temporary", "invalid_snapshot");
+    }
+  }
+  for (const entry of Object.values(snapshot.pinnedFiles || {})) {
+    if (isReservedHistoricalControlTempInMetadata(entry?.path, metadata)) {
+      fail("Legacy pinned file collides with reserved control temporary", "invalid_snapshot");
+    }
+  }
+}
 const ROOT_MUTATION_QUEUES = new Map();
 const MAX_EVICTION_ATTEMPTS = 3;
 const TRANSIENT_EVICTION_CODES = new Set(["EBUSY", "EPERM", "EAGAIN"]);
 const ROOT_MUTATION_CONTEXT = new AsyncLocalStorage();
+const ROOT_MUTATION_OPERATION_CONTEXT = new AsyncLocalStorage();
+const ROOT_MUTATION_PROMISE_TICKETS = new WeakMap();
+// Only the module's cold admission and marker writers may set this latch.
+// A successful and verified step clears it; a rejected potentially mutating
+// syscall keeps the physical lock despite any later wrapper error.
+function noteColdAdmissionWrite(rootDir, uncertain) {
+  const lease = ROOT_MUTATION_CONTEXT.getStore();
+  const key = process.platform === "win32" ? rootDir.toLowerCase() : rootDir;
+  if (lease?.active === true && lease.queueKey === key) {
+    lease.coldAdmissionUncertain = Boolean(uncertain);
+  }
+}
+// A successfully published FOD payload with a failed later checkpoint may
+// look like an unrelated local CREATE during the next reconciliation. This
+// module-private negative-only latch retains the existing cross-process lock
+// until independent operator recovery; it grants NO native root authority.
+const INDETERMINATE_FOD_INBOUND = new WeakSet();
+function denyIndeterminateInbound(engine) {
+  if (INDETERMINATE_FOD_INBOUND.has(engine)) {
+    fail("Incoming payload was published without a durable snapshot checkpoint",
+      "sync_inbound_indeterminate");
+  }
+}
+// Internal native-required mutation methods may be called by other methods
+// only AFTER withMutationLock has acquired the exclusive physical root lock.
+// The AsyncLocalStorage lease is private and cannot be forged by assigning an
+// engine property. It becomes INACTIVE BEFORE releasing the kernel lock: an
+// asynchronous callback can otherwise inherit the stale context and mutate
+// after the lock owner returned. This is a cooperative call-graph fence, NOT
+// root custody or authorization against hostile same-SID/UID writers.
+function requireNativeRootMutationContext(engine) {
+  if (!engine.requireNativeRootRecovery) return null;
+  const queueKey = process.platform === "win32" ? engine.rootDir.toLowerCase() : engine.rootDir;
+  const lease = ROOT_MUTATION_CONTEXT.getStore();
+  if (!lease || lease.queueKey !== queueKey || lease.active !== true) {
+    fail("Native-required sync mutation lacks its physical root lock", "sync_root_busy");
+  }
+  return lease;
+}
+// A private operation may pass an entry guard, await an attacker-controlled
+// adapter/key callback, and continue AFTER the owner's callback returned.
+// Keep the actual OS lock until EVERY started native-required operation has
+// settled. Never treat a scheduled-but-not-started stale callback as active.
+function retainNativeRootMutation(engine) {
+  const lease = requireNativeRootMutationContext(engine);
+  if (!lease) return { finish() {}, fail() {} };
+  const ticket = { lease, possibleMutation: false };
+  lease.inFlight.add(ticket);
+  let retained = true;
+  return {
+    ticket,
+    fail(error) {
+      // A rejected read-only preflight has not started a root/remote write.
+      // Do NOT poison the process lock for local_changes_pending, invalid
+      // inventory, or a deliberate native-custody denial before publication.
+      // Once a potentially mutating syscall starts, the opposite rule holds.
+      if (ticket.possibleMutation || INDETERMINATE_FOD_INBOUND.has(engine)
+        || engine.pinnedPolicyIndeterminate) lease.failures.set(ticket, error);
+    },
+    finish() {
+      if (!retained) return;
+      retained = false;
+      lease.inFlight.delete(ticket);
+      if (lease.inFlight.size === 0) {
+        for (const notify of lease.idleWaiters.splice(0)) notify();
+      }
+    },
+  };
+}
+function markNativeRootMutationAttempt(engine) {
+  if (!engine.requireNativeRootRecovery) return;
+  const lease = requireNativeRootMutationContext(engine);
+  const ticket = ROOT_MUTATION_OPERATION_CONTEXT.getStore();
+  if (!ticket || ticket.lease !== lease) {
+    fail("Root mutation has no live private operation context", "sync_root_busy");
+  }
+  ticket.possibleMutation = true;
+}
+function markNativeRootMutationCompleted(engine) {
+  if (!engine.requireNativeRootRecovery) return;
+  const lease = requireNativeRootMutationContext(engine);
+  const ticket = ROOT_MUTATION_OPERATION_CONTEXT.getStore();
+  if (!ticket || ticket.lease !== lease) {
+    fail("Root mutation completion has no private operation context", "sync_root_busy");
+  }
+  ticket.possibleMutation = false;
+}
+async function withNativeDurableMutationIntent(engine, write) {
+  // An I/O API may report EIO after the durable write actually completed.
+  // Keep that specific private ticket unsafe until a successful return.
+  markNativeRootMutationAttempt(engine);
+  const result = await write();
+  markNativeRootMutationCompleted(engine);
+  return result;
+}
+// Only a trusted caller that has durably/completely handled the EXACT child
+// promise can acknowledge its failure. Error-object equality alone is unsafe:
+// an adapter could reject two independent operations with one shared Error.
+function acknowledgeHandledNativeMutationPromise(engine, promise, error) {
+  if (!engine.requireNativeRootRecovery || !promise) return;
+  const lease = requireNativeRootMutationContext(engine);
+  const ticket = ROOT_MUTATION_PROMISE_TICKETS.get(promise);
+  if (ticket && lease.failures.get(ticket) === error) lease.handledFailures.add(ticket);
+}
+// Module-private and deliberately non-overridable. A future verified native
+// opener returning successfully must NEVER resume the legacy pathname replay.
+function denyLegacyNativeRootReplay() {
+  openNativeRootSession(true);
+  fail("Legacy eviction recovery is not authorized by native custody", "root_session_native_unavailable");
+}
+function denyUntrustedNativeEviction() {
+  // The recovery fence alone cannot make pathname-based stage/rename/unlink
+  // safe. Reject both explicit and automatic Files On-Demand eviction before
+  // consulting a path or changing remote-only/durable eviction state.
+  // A future native opener returning does not enable this legacy JS route.
+  openNativeRootSession(true);
+  fail("Native rooted cache eviction is not operational", "root_session_native_unavailable");
+}
+function denyUntrustedNativeSignedDelete() {
+  // A disappearance in a pathname scan (or an old pending signed tombstone)
+  // is not independently verified authority to delete a remote object.
+  // Even a future native opener cannot authorize this old JS write path.
+  openNativeRootSession(true);
+  fail("Native rooted signed DELETE is not operational", "root_session_native_unavailable");
+}
+function denyUntrustedNativeInboundPublish() {
+  // A verified remote envelope is not authority to replace a physical cache
+  // entry. The legacy inbound path still uses pathname rename(), which can
+  // clobber a foreign same-UID/SID destination planted after its last check.
+  // Even if a future native opener starts returning, never resume that path.
+  openNativeRootSession(true);
+  fail("Native rooted inbound publication is not operational", "root_session_native_unavailable");
+}
+// Called under the ordinary root mutation lock for all public operations.
+// Never accept a mutable snapshot or config flag as proof that a root which
+// has run Files On-Demand can return to legacy pathname mutation. An actor
+// with write access to this same root can remove/replace this marker: it is
+// NOT protection against same-SID tampering, rollback or malicious ancestry.
+async function enforceEverFodRootMode(rootDir, filesOnDemand) {
+  const markerPath = path.join(rootDir, EVER_FOD_MARKER_NAME);
+  const checkExisting = async () => {
+    // Open the entry first, then inspect and read the SAME held handle.
+    // Do not authorize a pathname which changed between lstat and readFile.
+    // This does not establish independent parent custody against same-SID ABA.
+    let markerHandle;
+    try {
+      // A hostile same-user writer may substitute a FIFO with no writer.
+      // O_NONBLOCK makes open fail/return immediately for that special file;
+      // the held-descriptor regular-file check below then fails closed.
+      markerHandle = await fsp.open(markerPath,
+        fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)
+          | (fs.constants.O_NONBLOCK || 0));
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        // A dangling symlink is NOT a virgin root. Only a genuinely absent
+        // directory entry permits an ordinary never-FOD client to continue.
+        try { await fsp.lstat(markerPath); }
+        catch (probeError) {
+          if (probeError.code === "ENOENT") return false;
+        }
+      }
+      fail("Unreadable Files On-Demand root marker", "root_mode_marker_invalid");
+    }
+    try {
+      const heldBefore = await markerHandle.stat({ bigint: true });
+      if (!heldBefore.isFile() || heldBefore.nlink !== 1n
+        || heldBefore.size !== BigInt(Buffer.byteLength(EVER_FOD_MARKER_BYTES))) {
+        fail("Invalid Files On-Demand root marker", "root_mode_marker_invalid");
+      }
+      const pathBefore = await fsp.lstat(markerPath, { bigint: true });
+      if (!pathBefore.isFile() || pathBefore.isSymbolicLink()
+        || !sameFileVersion(heldBefore, pathBefore)) {
+        fail("Replaced Files On-Demand root marker", "root_mode_marker_invalid");
+      }
+      // The size in the first fstat is only a precondition: another same-UID
+      // writer could enlarge this file before a readFile() consumes EOF.
+      // Read no more than the literal expected length plus one sentinel byte
+      // through this same held descriptor, even under concurrent growth.
+      const expected = Buffer.from(EVER_FOD_MARKER_BYTES, "utf8");
+      const bounded = Buffer.alloc(expected.length + 1);
+      let bytesReadTotal = 0;
+      while (bytesReadTotal < bounded.length) {
+        const { bytesRead } = await markerHandle.read(bounded, bytesReadTotal,
+          bounded.length - bytesReadTotal, bytesReadTotal);
+        if (bytesRead === 0) break;
+        bytesReadTotal += bytesRead;
+      }
+      const heldAfter = await markerHandle.stat({ bigint: true });
+      const pathAfter = await fsp.lstat(markerPath, { bigint: true });
+      if (bytesReadTotal !== expected.length
+        || !bounded.subarray(0, bytesReadTotal).equals(expected)
+        || !sameFileVersion(heldBefore, heldAfter)
+        || !sameFileVersion(heldBefore, pathAfter)) {
+        fail("Changed Files On-Demand root marker", "root_mode_marker_invalid");
+      }
+      return true;
+    } catch (error) {
+      if (error.code === "root_mode_marker_invalid") throw error;
+      fail("Unreadable Files On-Demand root marker", "root_mode_marker_invalid");
+    } finally { await markerHandle.close(); }
+  };
+  const exists = await checkExisting();
+  if (exists) {
+    if (!filesOnDemand) fail("Files On-Demand root cannot return to legacy sync", "root_mode_fod_required");
+    return;
+  }
+  if (!filesOnDemand) return;
+
+  // Create the marker before opening the journal, initial snapshot, or any
+  // path-based reconciliation. A crash before a complete write leaves an
+  // invalid marker and therefore denies subsequent opens, not a downgrade.
+  let handle;
+  noteColdAdmissionWrite(rootDir, true);
+  try { handle = await fsp.open(markerPath, "wx", 0o600); }
+  catch (error) {
+    if (error.code === "EEXIST") {
+      if (!(await checkExisting())) fail("Missing Files On-Demand root marker", "root_mode_marker_invalid");
+      noteColdAdmissionWrite(rootDir, false);
+      return;
+    }
+    throw error;
+  }
+  try {
+    await handle.writeFile(EVER_FOD_MARKER_BYTES, "utf8");
+    await handle.sync();
+  } finally { await handle.close(); }
+  // Windows may reject opening a directory for fsync; POSIX can fsync the
+  // parent directory to durably publish the O_EXCL entry.
+  let directoryHandle;
+  try {
+    directoryHandle = await fsp.open(rootDir, "r");
+    await directoryHandle.sync();
+  } catch (error) {
+    if (!(process.platform === "win32" && ["EPERM", "EACCES", "EINVAL"].includes(error.code))
+      && !["ENOTSUP", "EINVAL"].includes(error.code)) throw error;
+  } finally { if (directoryHandle) await directoryHandle.close(); }
+  if (!(await checkExisting())) fail("Missing Files On-Demand root marker", "root_mode_marker_invalid");
+  noteColdAdmissionWrite(rootDir, false);
+}
 function signedEnvelopeDigest(operation) {
   return crypto.createHash("sha256")
     .update(protocol.canonicalJson(operation), "utf8").digest("hex");
@@ -265,14 +611,30 @@ function sameFileVersion(left, right) {
     && left.birthtimeNs === right.birthtimeNs && left.mode === right.mode;
 }
 
+// Track metadata changes to a deliberately retained dirty excluded file without
+// rereading or hashing its private content on every future sync. Any detected
+// change still goes through the full verified _evictLocal guard before eviction.
+function evictionFileVersionStamp(stats) {
+  if (!stats.isFile() || stats.isSymbolicLink()) return null;
+  return crypto.createHash("sha256").update([
+    stats.dev, stats.ino, stats.size, stats.mtimeNs, stats.ctimeNs,
+    stats.birthtimeNs, stats.mode, stats.nlink,
+  ].map(String).join(":"), "utf8").digest("hex");
+}
+
 function isWithinPath(root, target) {
   const relative = path.relative(root, target);
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
-async function readContainedFile(rootDir, relativePath, expectedStats = null) {
+async function readContainedFile(rootDir, relativePath, expectedStats = null, internalLedgerRead = false) {
   const root = path.resolve(rootDir);
-  const target = await contained(root, relativePath, false);
+  // The internal eviction ledger must be invisible to normal local/remote
+  // sync paths, but still needs the same nofollow + FD/inode verification.
+  // Only its fixed, hash-validated record names take this internal branch.
+  const target = internalLedgerRead
+    ? await containedAbsolute(root, path.resolve(root, ...relativePath.split("/")), false)
+    : await contained(root, relativePath, false);
   const before = expectedStats || await fsp.lstat(target, { bigint: true });
   // A hardlink into the selected root can alias an unrelated file outside it.
   // Canonical path and FD identity checks alone cannot detect that provenance.
@@ -340,6 +702,136 @@ async function canonicalRelativePath(rootDir, relativePath) {
   return path.relative(root, current).split(path.sep).join("/");
 }
 
+// Resolve a *negative* (excluded) tracked path on both NTFS and POSIX, where
+// the casing on disk may differ from the remote/snapshot identity. This never
+// confers selection or authorization: callers must verify both the tracked
+// key and physical alias before evicting. Reject ambiguous aliases and links;
+// cap each directory read so a damaged root cannot trigger an unbounded scan.
+async function uniqueExcludedPhysicalPath(rootDir, trackedPath, directoryCache) {
+  const safe = protocol.safeRelativePath(trackedPath, "path");
+  const root = path.resolve(rootDir);
+  await containedAbsolute(root, root, false);
+  const segments = safe.split("/");
+  let current = root;
+  for (let i = 0; i < segments.length; i += 1) {
+    const directoryStats = await fsp.lstat(current, { bigint: true });
+    if (directoryStats.isSymbolicLink() || !directoryStats.isDirectory()) {
+      fail("Excluded path parent is not a regular directory", "unsafe_path");
+    }
+    // Cache only for this migration pass. Validate directory identity/version
+    // on every lookup; if a concurrent rename/create changes it, rescan.
+    // This avoids opening the same parent N times for N dirty sibling files.
+    let cached = directoryCache.get(current);
+    if (!cached || !sameFileVersion(cached.stats, directoryStats)) {
+      const names = new Map();
+      let count = 0;
+      for await (const entry of await fsp.opendir(current)) {
+        if (++count > 16384) fail("Excluded path directory has too many entries", "unsafe_path");
+        const key = entry.name.toLowerCase();
+        if (names.has(key)) names.set(key, null); // ambiguous portable alias
+        else names.set(key, entry.name);
+      }
+      const afterRead = await fsp.lstat(current, { bigint: true });
+      if (!sameFileVersion(directoryStats, afterRead)) {
+        fail("Excluded path directory changed during casefold lookup", "unsafe_path");
+      }
+      cached = { stats: afterRead, names };
+      directoryCache.set(current, cached);
+    }
+    const chosen = cached.names.get(segments[i].toLowerCase());
+    if (chosen === null) fail("Ambiguous excluded portable case alias", "unsafe_path");
+    if (chosen === undefined) return null;
+    current = path.join(current, chosen);
+    const stats = await fsp.lstat(current, { bigint: true });
+    if (stats.isSymbolicLink() || (i < segments.length - 1 && !stats.isDirectory())) {
+      fail("Excluded path contains a link or non-directory parent", "unsafe_path");
+    }
+  }
+  await containedAbsolute(root, current, false);
+  return path.relative(root, current).split(path.sep).join("/");
+}
+
+// After a successful, *fully verified* eviction the sync engine itself moved
+// a single cache file out of its parent directory and rewrote its own snapshot
+// in the root. Account for only those known local operations in the in-pass
+// index, rather than rescanning N siblings for each of N safe evictions.
+// All affected directories are independently re-enumerated before a migration
+// is certified complete; unknown additions/aliases never become authorized.
+async function observeVerifiedExcludedEviction(rootDir, physicalPath, directoryCache) {
+  const root = path.resolve(rootDir);
+  const target = path.resolve(root, ...protocol.safeRelativePath(physicalPath, "path").split("/"));
+  const parent = path.dirname(target);
+  const parentCache = directoryCache.get(parent);
+  if (!parentCache) fail("Verified eviction lost its physical directory index", "unsafe_path");
+  const basename = path.basename(target);
+  const casefold = basename.toLowerCase();
+  if (parentCache.names.get(casefold) !== basename || await exists(target)) {
+    fail("Verified eviction left an unexpected physical cache entry", "unsafe_path");
+  }
+  const afterParent = await fsp.lstat(parent, { bigint: true });
+  if (!afterParent.isDirectory() || !sameFileIdentity(parentCache.stats, afterParent)) {
+    fail("Verified eviction changed its parent directory identity", "unsafe_path");
+  }
+  parentCache.names.delete(casefold);
+  parentCache.stats = afterParent;
+  await refreshExcludedInternalRoot(root, directoryCache);
+}
+
+// stageExisting creates the dedicated trash directory *before* a rename. A
+// transient EBUSY can therefore leave that empty, safe internal directory
+// behind even when no eviction succeeded. Keep that one known root entry in
+// the in-pass index, but still compare the entire directory at the end.
+async function refreshExcludedInternalRoot(rootDir, directoryCache) {
+  const root = path.resolve(rootDir);
+  const rootCache = directoryCache.get(root);
+  if (!rootCache) return;
+  const afterRoot = await fsp.lstat(root, { bigint: true });
+  if (!afterRoot.isDirectory() || !sameFileIdentity(rootCache.stats, afterRoot)) {
+    fail("Excluded sync root identity changed", "unsafe_path");
+  }
+  for (const internalName of [".rootark-trash", EVICTION_LEDGER_DIR]) {
+    const internalPath = path.join(root, internalName);
+    if (!(await exists(internalPath))) continue;
+    const stats = await fsp.lstat(internalPath);
+    if (!stats.isDirectory() || stats.isSymbolicLink()) fail("Unsafe internal sync directory", "unsafe_path");
+    if (rootCache.names.has(internalName) && rootCache.names.get(internalName) !== internalName) {
+      fail("Ambiguous internal sync directory", "unsafe_path");
+    }
+    rootCache.names.set(internalName, internalName);
+  }
+  rootCache.stats = afterRoot;
+}
+
+// The engine's own removals were the only names subtracted from the cache.
+// Compare against physical names once per directory after the batch: external
+// concurrent additions, case collisions and unexpected replacements fail
+// closed instead of being recorded as an entirely applied exclusion.
+async function verifyExcludedDirectoryIndexes(directoryCache) {
+  for (const [directory, cached] of directoryCache) {
+    const before = await fsp.lstat(directory, { bigint: true });
+    if (!before.isDirectory() || !sameFileIdentity(cached.stats, before)) {
+      fail("Excluded directory identity changed during batch", "unsafe_path");
+    }
+    const actual = new Map();
+    let count = 0;
+    for await (const entry of await fsp.opendir(directory)) {
+      if (++count > 16384) fail("Excluded path directory has too many entries", "unsafe_path");
+      const key = entry.name.toLowerCase();
+      if (actual.has(key)) fail("Ambiguous excluded portable case alias", "unsafe_path");
+      actual.set(key, entry.name);
+    }
+    const after = await fsp.lstat(directory, { bigint: true });
+    if (!sameFileVersion(before, after) || actual.size !== cached.names.size) {
+      fail("Excluded directory changed outside verified evictions", "unsafe_path");
+    }
+    for (const [key, name] of actual) {
+      if (cached.names.get(key) !== name) {
+        fail("Excluded directory names changed outside verified evictions", "unsafe_path");
+      }
+    }
+  }
+}
+
 function canonicalMapPath(relativePath, ...maps) {
   if (process.platform !== "win32") return relativePath;
   for (const map of maps) {
@@ -360,6 +852,7 @@ async function durableJson(filePath, value) {
   const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
     | (fs.constants.O_SYNC || 0);
   let handle;
+  let published = false;
   try {
     handle = await fsp.open(temporary, flags, 0o600);
     await handle.writeFile(`${JSON.stringify(value)}\n`);
@@ -367,6 +860,7 @@ async function durableJson(filePath, value) {
     await handle.close();
     handle = null;
     await renameWithRetry(temporary, filePath);
+    published = true;
     // Node cannot reliably fsync directory handles on Windows. Flush the
     // containing directory where the platform supports it; the file itself
     // is opened with O_SYNC and explicitly synced before the atomic rename.
@@ -376,9 +870,1198 @@ async function durableJson(filePath, value) {
     }
   } catch (error) {
     if (handle) await handle.close().catch(() => {});
-    await fsp.rm(temporary, { force: true }).catch(() => {});
+    // An untrusted same-UID/SID writer can replace the temp filename
+    // after the original FD was closed but before rename() fails. An
+    // unchecked rm(temp) would then delete the FOREIGN replacement.
+    // Do not cleanup by mutable name on failed or indeterminate publish.
+    // The orphan .tmp cannot itself authorize snapshot/ledger recovery.
+    if (published) {
+      // The new metadata inode already replaced the old filename. Any
+      // subsequent parent fsync failure is an indeterminate publication,
+      // not a retryable per-file EIO. Use the existing invalid_snapshot
+      // admission fence to abort the entire pass before signed reconcile.
+      throw evictionError("invalid_snapshot",
+        "Metadata rename completed but parent durability is indeterminate", error);
+    }
     throw error;
   }
+}
+// The default snapshot temp prefix is already a reserved, nonauthorizing
+// namespace in normal scanning and cold required-v2 replay. Keep inbound
+// temporaries IN the target directory, so nested mount/bind-mounted subtrees
+// can still use same-volume atomic rename. Their reserved names cannot become
+// user uploads or authoritative metadata after a failed publication.
+// There must be no pathname unlink/rm in this helper: a same-SID/UID writer
+// can replace a temp entry after an error. Retain the original temporary FD
+// across the entire publication and compare it with the resulting named
+// inode: equal bytes from a substituted foreign inode grant no authority.
+// This is ONLY a fail-closed identity check *after* legacy pathname rename.
+// It cannot stop a hostile late-destination overwrite or same-UID ABA;
+// fully safe publication still requires trusted native RootSession custody.
+async function publishInboundPayload(target, bytes, prepareTarget = null,
+  beforeTargetPublication = null) {
+  const temporary = path.join(path.dirname(target),
+    `${INBOUND_PAYLOAD_TEMP_PREFIX}${process.pid}-${crypto.randomUUID()}`);
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_SYNC || 0);
+  const handle = await fsp.open(temporary, flags, 0o600);
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+    const original = await handle.stat({ bigint: true });
+    if (!original.isFile() || original.ino === 0n || original.nlink !== 1n
+      || original.size !== BigInt(bytes.length)) {
+      fail("Inbound staged file is not an exclusive original inode", "invalid_snapshot");
+    }
+    if (prepareTarget) await prepareTarget();
+    // The temporary uses a reserved, nonauthorizing name; only this syscall
+    // can place its inode at the user-visible target. Mark a potential target
+    // mutation BEFORE invoking it: EIO can be reported after a real rename.
+    if (beforeTargetPublication) beforeTargetPublication();
+    await fsp.rename(temporary, target);
+    const heldAfter = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(target, { bigint: true });
+    if (!namedAfter.isFile() || namedAfter.isSymbolicLink()
+      || heldAfter.nlink !== 1n || namedAfter.nlink !== 1n
+      || !sameFileIdentity(original, heldAfter)
+      || !sameFileIdentity(original, namedAfter)
+      || heldAfter.size !== original.size || namedAfter.size !== original.size
+      || heldAfter.mtimeNs !== original.mtimeNs
+      || namedAfter.mtimeNs !== original.mtimeNs) {
+      fail("Inbound publish replaced the original staged inode", "invalid_snapshot");
+    }
+  } finally { await handle.close(); }
+}
+
+// A bounded, per-object write-ahead snapshot overlay. Full snapshots remain
+// the authoritative compaction format; small independently synced PREPARE and
+// COMMIT records only protect the window between verified remote content and
+// removing its local cache file. No record ever authorizes a remote write.
+const EVICTION_LEDGER_DIR = ".rootark-sync-evictions";
+const EVICTION_LEDGER_VERSION = 1;
+const EVICTION_LEDGER_MAX = 16384;
+const EVICTION_LEDGER_HASH = /^[a-f0-9]{64}$/;
+const EVICTION_LEDGER_ZERO = "0".repeat(64);
+const EVICTION_LEDGER_ARCHIVE = ".rootark-sync-evictions-archive-";
+// v1 clients already ignore .rootark-trash. Atomically stage the synced
+// head file there until v2 is durable; a crash must not strand a half-built
+// genesis directory that would block startup before any PREPARE.
+const EVICTION_GENESIS_STAGE = ".rootark-eviction-genesis-head.json";
+const EVICTION_LEDGER_EPOCH = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+function evictionLedgerDirectory(rootDir) { return path.join(rootDir, EVICTION_LEDGER_DIR); }
+function evictionLedgerName(objectId, phase) {
+  return `${crypto.createHash("sha256").update(objectId, "utf8").digest("hex")}.${phase}.json`;
+}
+function evictionLedgerDigest(item) {
+  return crypto.createHash("sha256").update(protocol.canonicalJson(item), "utf8").digest("hex");
+}
+function validEvictionLedgerHead(head) {
+  return head && typeof head === "object" && !Array.isArray(head)
+    && Object.keys(head).sort().join(",") === "digest,epoch,sequence"
+    && typeof head.epoch === "string" && EVICTION_LEDGER_EPOCH.test(head.epoch)
+    && Number.isSafeInteger(head.sequence) && head.sequence >= 0 && head.sequence <= EVICTION_LEDGER_MAX
+    && typeof head.digest === "string" && EVICTION_LEDGER_HASH.test(head.digest);
+}
+async function fsyncEvictionDirectory(directory) {
+  if (process.platform === "win32") return;
+  const handle = await fsp.open(directory, fs.constants.O_RDONLY);
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+// Immutable ledger records must never overwrite an existing name between a
+// preflight and rename; a torn exclusive file is deliberately fail-closed.
+async function createDurableEvictionRecord(filePath, value) {
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+    | (fs.constants.O_SYNC || 0) | (fs.constants.O_NOFOLLOW || 0)
+    | (fs.constants.O_NONBLOCK || 0);
+  const handle = await fsp.open(filePath, flags, 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.sync();
+  } finally { await handle.close(); }
+  await fsyncEvictionDirectory(path.dirname(filePath));
+}
+// Unlike durableJson's replaceable rename, a staged genesis is a reserved
+// authority-bearing name: a competing file must NEVER be overwritten after
+// the earlier absence preflight. Sync a unique temporary, publish by atomic
+// no-replace hard link, sync the containing directory on Linux, then retire
+// the temp name after a fresh identity check. That name-based unlink is NOT
+// race-free under a hostile same-UID/SID writer with directory write access.
+// A hard exit after link leaves nlink=2 and
+// intentionally blocks staged-genesis recovery instead of manufacturing GO.
+// This remains a *legacy cooperative* fence, not trusted same-UID/SID custody.
+async function createDurableExclusiveGenesisStage(filePath, value) {
+  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+    | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_SYNC || 0);
+  let handle;
+  let original;
+  let linked = false;
+  try {
+    handle = await fsp.open(temporary, flags, 0o600);
+    await handle.writeFile(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.sync();
+    original = await handle.stat({ bigint: true });
+    if (!original.isFile() || original.isSymbolicLink()
+      || original.ino === 0n || original.nlink !== 1n || original.size > 8192n) {
+      fail("Unsafe staged genesis temporary inode", "invalid_snapshot");
+    }
+    await handle.close();
+    handle = null;
+    const namedTemp = await fsp.lstat(temporary, { bigint: true });
+    if (!namedTemp.isFile() || namedTemp.isSymbolicLink()
+      || !sameFileVersion(original, namedTemp)) {
+      fail("Staged genesis temporary changed before publication", "invalid_snapshot");
+    }
+    try { await fsp.link(temporary, filePath); }
+    catch (error) {
+      if (error.code === "EEXIST") {
+        fail("Existing staged genesis blocks exclusive creation", "invalid_snapshot");
+      }
+      throw error;
+    }
+    linked = true;
+    const verifyLinked = async () => {
+      const stage = await fsp.lstat(filePath, { bigint: true });
+      const temp = await fsp.lstat(temporary, { bigint: true });
+      if (!stage.isFile() || stage.isSymbolicLink()
+        || !temp.isFile() || temp.isSymbolicLink()
+        || !sameFileIdentity(original, stage)
+        || !sameFileIdentity(original, temp)
+        || stage.size !== original.size || temp.size !== original.size
+        || stage.mtimeNs !== original.mtimeNs || temp.mtimeNs !== original.mtimeNs
+        || stage.nlink !== 2n || temp.nlink !== 2n) {
+        fail("Indeterminate exclusive staged genesis publication", "invalid_snapshot");
+      }
+    };
+    await verifyLinked();
+    await fsyncEvictionDirectory(path.dirname(filePath));
+    await verifyLinked();
+    await fsp.unlink(temporary);
+    await fsyncEvictionDirectory(path.dirname(filePath));
+  } catch (error) {
+    if (handle) await handle.close().catch(() => {});
+    // Do not delete a temp pathname on a failed/indeterminate transaction:
+    // even an lstat immediately beforehand cannot make this unlink atomic
+    // against an untrusted same-UID writer. An orphan unique .tmp name does
+    // NOT authorize genesis; preserve it for independently reviewed cleanup.
+    // The successful link→unlink path still requires external root custody
+    // before native RootSession may be activated.
+    throw error;
+  }
+}
+async function openEvictionLedger(rootDir, create = false) {
+  const directory = evictionLedgerDirectory(rootDir);
+  if (process.platform === "linux") {
+    if (!Number.isInteger(fs.constants.O_DIRECTORY)
+      || !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+      fail("Held eviction ledger directories are unavailable", "root_session_native_unavailable");
+    }
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+    // Only follow a fixed child name relative to a retained root descriptor.
+    // The root itself still needs independently protected initial custody;
+    // this is NOT a same-UID or same-mount recovery-authority proof.
+    const root = await fsp.open(rootDir, flags);
+    let held;
+    try {
+      const childPath = `/proc/self/fd/${root.fd}/${EVICTION_LEDGER_DIR}`;
+      if (create) {
+        let created = false;
+        try {
+          await fsp.mkdir(childPath, { mode: 0o700 });
+          created = true;
+        } catch (error) {
+          if (error.code !== "EEXIST") throw error;
+        }
+        if (created) await root.sync();
+      }
+      try {
+        held = await fsp.open(childPath, flags);
+      } catch (error) {
+        if (!create && error.code === "ENOENT") return null;
+        fail("Unsafe eviction ledger directory", "invalid_snapshot");
+      }
+      const rootBefore = await root.stat({ bigint: true });
+      const childBefore = await held.stat({ bigint: true });
+      const rootPathStats = await fsp.lstat(rootDir, { bigint: true });
+      const childPathStats = await fsp.lstat(directory, { bigint: true });
+      if (!rootBefore.isDirectory() || !childBefore.isDirectory()
+        || !sameFileVersion(rootBefore, rootPathStats)
+        || !sameFileVersion(childBefore, childPathStats)) {
+        fail("Eviction ledger root or directory changed", "invalid_snapshot");
+      }
+      await containedAbsolute(rootDir, directory, false);
+      if (!sameFileVersion(rootBefore, await root.stat({ bigint: true }))
+        || !sameFileVersion(childBefore, await held.stat({ bigint: true }))) {
+        fail("Eviction ledger root or directory changed", "invalid_snapshot");
+      }
+      return directory;
+    } finally {
+      if (held) await held.close();
+      await root.close();
+    }
+  }
+  if (create) {
+    // Do not walk an existing junction or symlink via recursive mkdir.
+    // This remains a path-based Windows compatibility route; native NTFS
+    // RootDirectory handles are still mandatory for hostile same-SID trust.
+    try { await fsp.mkdir(directory, { mode: 0o700 }); }
+    catch (error) { if (error.code !== "EEXIST") throw error; }
+  }
+  let stats;
+  try { stats = await fsp.lstat(directory, { bigint: true }); }
+  catch (error) {
+    if (!create && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stats.isDirectory() || stats.isSymbolicLink()) fail("Unsafe eviction ledger directory", "invalid_snapshot");
+  await containedAbsolute(rootDir, directory, false);
+  return directory;
+}
+// A crash after the durable full checkpoint can leave an old archive before
+// its records are retired. The snapshot may already say "required: false";
+// absence of an ACTIVE ledger is not proof that the archive was reconciled.
+// Never silently drop that evidence or automatically delete it. A separate
+// independent recovery authority is required for destructive archive repair.
+async function assertNoOrphanedEvictionArchive(rootDir) {
+  if (process.platform !== "linux") {
+    // A Windows legacy writer can also crash immediately after moving the
+    // full, checkpointed ledger into an archive. An empty/missing ACTIVE
+    // ledger does not authorize replay while that archive survives.
+    // Windows Node directory traversal is pathname-based, not a native
+    // RootDirectory/NTFS lease: this is cooperative fail-closed recovery,
+    // NOT a same-SID hostile-root custody proof.
+    const before = await fsp.lstat(rootDir, { bigint: true });
+    if (!before.isDirectory() || before.isSymbolicLink()) {
+      fail("Unsafe eviction archive root", "invalid_snapshot");
+    }
+    // Avoid unbounded readdir arrays; the root may legitimately have more
+    // than 16,384 unrelated cache names. Every reserved archive alias must
+    // block cold replay, regardless of the snapshot's required marker.
+    for await (const entry of await fsp.opendir(rootDir)) {
+      if (entry.name.toLowerCase().startsWith(EVICTION_LEDGER_ARCHIVE)) {
+        fail("Orphaned eviction archive needs independent recovery", "invalid_snapshot");
+      }
+    }
+    const after = await fsp.lstat(rootDir, { bigint: true });
+    if (!after.isDirectory() || after.isSymbolicLink()
+      || !sameFileIdentity(before, after)) {
+      fail("Eviction archive root changed during cold inspection", "invalid_snapshot");
+    }
+    return;
+  }
+  const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+    | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+  const root = await fsp.open(rootDir, flags);
+  try {
+    const before = await root.stat({ bigint: true });
+    const directory = `/proc/self/fd/${root.fd}`;
+    // Stream at constant memory: a genuine sync root may contain many valid
+    // physical files, and an attacker can create arbitrarily many names.
+    for await (const entry of await fsp.opendir(directory)) {
+      if (entry.name.toLowerCase().startsWith(EVICTION_LEDGER_ARCHIVE)) {
+        fail("Orphaned eviction archive needs independent recovery", "invalid_snapshot");
+      }
+    }
+    const visible = await fsp.lstat(rootDir, { bigint: true });
+    if (!before.isDirectory() || !visible.isDirectory()
+      || visible.isSymbolicLink()
+      || !sameFileIdentity(before, visible)
+      || !sameFileIdentity(before, await root.stat({ bigint: true }))) {
+      fail("Eviction archive root changed during cold inspection", "invalid_snapshot");
+    }
+  } finally { await root.close(); }
+}
+// The read path above deliberately returns a public pathname only to legacy
+// callers. Linux ledger mutations must instead retain the SAME opened root
+// and child directory across PREPARE/COMMIT and every fsync. A same-UID writer
+// can still alter content or replace the namespace before acquisition: this
+// does NOT authorize native RootSession, malicious-root recovery or rollback.
+async function withHeldEvictionLedgerWrite(rootDir, work) {
+  if (process.platform !== "linux") {
+    // Windows legacy operation remains outside the native root-custody gate.
+    return work(evictionLedgerDirectory(rootDir), async () => {});
+  }
+  if (!Number.isInteger(fs.constants.O_DIRECTORY)
+    || !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+    fail("Held eviction ledger write is unavailable", "root_session_native_unavailable");
+  }
+  const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+    | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+  const rootPath = path.resolve(rootDir);
+  const ledgerPath = evictionLedgerDirectory(rootPath);
+  let heldRoot;
+  let heldLedger;
+  try {
+    heldRoot = await fsp.open(rootPath, flags);
+    heldLedger = await fsp.open(
+      `/proc/self/fd/${heldRoot.fd}/${EVICTION_LEDGER_DIR}`, flags);
+    const rootBefore = await heldRoot.stat({ bigint: true });
+    const ledgerBefore = await heldLedger.stat({ bigint: true });
+    const verify = async () => {
+      const currentRoot = await fsp.lstat(rootPath, { bigint: true });
+      const currentLedger = await fsp.lstat(ledgerPath, { bigint: true });
+      // Our own O_EXCL PREPARE/COMMIT and atomic HEAD replacement mutate
+      // ledger directory mtime/ctime. Require the SAME inode/volume while
+      // retaining the handles; comparing the old *version* here incorrectly
+      // rejected every legitimate transaction after its first write.
+      if (!rootBefore.isDirectory() || !ledgerBefore.isDirectory()
+        || !currentRoot.isDirectory() || !currentLedger.isDirectory()
+        || !sameFileIdentity(rootBefore, currentRoot)
+        || !sameFileIdentity(ledgerBefore, currentLedger)
+        || !sameFileIdentity(rootBefore, await heldRoot.stat({ bigint: true }))
+        || !sameFileIdentity(ledgerBefore, await heldLedger.stat({ bigint: true }))) {
+        fail("Eviction ledger changed during durable write", "invalid_snapshot");
+      }
+      await containedAbsolute(rootPath, ledgerPath, false);
+    };
+    await verify();
+    const result = await work(`/proc/self/fd/${heldLedger.fd}`, verify);
+    await verify();
+    return result;
+  } finally {
+    if (heldLedger) await heldLedger.close();
+    if (heldRoot) await heldRoot.close();
+  }
+}
+async function stagedEvictionGenesis(rootDir) {
+  const trash = path.join(rootDir, ".rootark-trash");
+  // No count bound here: legacy trash can contain arbitrarily many legitimate
+  // retained files when a process crashes after the required-v2 checkpoint.
+  // Scan the *entire* directory in O(1) memory for every portable case alias
+  // of the sole authoritative marker, not just the first 16,384 entries.
+  // Other trash content does not witness an eviction and grants no authority.
+  // Linux must traverse root -> trash, enumerate and read the genesis relative
+  // to retained directory FDs. A validated pathname and a held stat alone do
+  // not anchor later opendir/readFile calls across a rename or junction swap.
+  // Node lacks openat2; /proc/self/fd provides a bounded Linux FD-relative
+  // route. Failure to resolve procfd is fatal; never fall back to a pathname.
+  // Neither root acquisition nor the local head is independent same-UID proof.
+  // Windows has no portable directory FD traversal via fs.promises.open and
+  // retains its existing checked pathname behavior.
+  const linux = process.platform === "linux";
+  let heldRoot = null;
+  let held = null;
+  let candidate = null;
+  let rootStats;
+  let trashStats;
+  const assertUnchanged = async () => {
+    await containedAbsolute(rootDir, trash, false);
+    const currentRoot = await fsp.lstat(rootDir, { bigint: true });
+    const currentTrash = await fsp.lstat(trash, { bigint: true });
+    if (!sameFileVersion(rootStats, currentRoot)
+      || !sameFileVersion(trashStats, currentTrash)
+      || (heldRoot && !sameFileVersion(rootStats, await heldRoot.stat({ bigint: true })))
+      || (held && !sameFileVersion(trashStats, await held.stat({ bigint: true })))) {
+      fail("Eviction genesis parent changed during streamed proof", "invalid_snapshot");
+    }
+  };
+  try {
+    if (linux) {
+      if (!Number.isInteger(fs.constants.O_DIRECTORY)
+        || !Number.isInteger(fs.constants.O_NOFOLLOW)) {
+        fail("Held eviction directories are unavailable", "root_session_native_unavailable");
+      }
+      const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+        | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+      // Acquire the parent first; a pathname lstat/containment check BEFORE
+      // open is not an authority for the eventual opened inode. The retained
+      // handle is compared against its pathname only AFTER acquisition.
+      heldRoot = await fsp.open(rootDir, flags);
+      // The child lookup is relative to the live root handle. POSIX path
+      // rebinding after the handle is acquired cannot redirect it elsewhere.
+      try { held = await fsp.open(`/proc/self/fd/${heldRoot.fd}/.rootark-trash`, flags); }
+      catch (error) {
+        if (error.code !== "ENOENT") {
+          fail("Unsafe pre-upgrade eviction genesis parent", "invalid_snapshot");
+        }
+        const currentRoot = await fsp.lstat(rootDir, { bigint: true });
+        const openedRoot = await heldRoot.stat({ bigint: true });
+        if (!currentRoot.isDirectory() || currentRoot.isSymbolicLink()
+          || !sameFileIdentity(currentRoot, openedRoot)
+          || await exists(trash)) {
+          fail("Eviction genesis parent changed during absent-stage check", "invalid_snapshot");
+        }
+        return null;
+      }
+    } else if (process.platform !== "win32") {
+      fail("Held eviction directories are unavailable on this platform",
+        "root_session_native_unavailable");
+    } else if (!(await exists(trash))) {
+      return null;
+    }
+    await containedAbsolute(rootDir, trash, false);
+    rootStats = await fsp.lstat(rootDir, { bigint: true });
+    trashStats = await fsp.lstat(trash, { bigint: true });
+    if (!rootStats.isDirectory() || rootStats.isSymbolicLink() || rootStats.ino === 0n
+      || !trashStats.isDirectory() || trashStats.isSymbolicLink() || trashStats.ino === 0n) {
+      fail("Unsafe pre-upgrade eviction genesis parent", "invalid_snapshot");
+    }
+    await assertUnchanged();
+    for await (const entry of await fsp.opendir(linux ? `/proc/self/fd/${held.fd}` : trash)) {
+      if (entry.name.toLowerCase() !== EVICTION_GENESIS_STAGE) continue;
+      if (candidate !== null || entry.name !== EVICTION_GENESIS_STAGE) {
+        fail("Ambiguous staged eviction genesis", "invalid_snapshot");
+      }
+      candidate = entry.name;
+    }
+    await assertUnchanged();
+    if (candidate === null) return null;
+    const headFile = path.join(trash, EVICTION_GENESIS_STAGE);
+    let head;
+    try {
+      let raw;
+      if (linux) {
+        const heldHeadPath = `/proc/self/fd/${held.fd}/${EVICTION_GENESIS_STAGE}`;
+        const headHandle = await fsp.open(
+          heldHeadPath,
+          fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (fs.constants.O_NONBLOCK || 0));
+        try {
+          const before = await headHandle.stat({ bigint: true });
+          if (!before.isFile() || before.ino === 0n || before.nlink !== 1n
+            || before.size > 8192n) {
+            fail("Unsafe staged eviction genesis head", "invalid_snapshot");
+          }
+          // Bounded read: a concurrent writer cannot turn an 8 KiB head into
+          // an unbounded allocation while the directory FD is pinned.
+          const bytes = Buffer.alloc(8193);
+          let count = 0;
+          while (count < bytes.length) {
+            const { bytesRead } = await headHandle.read(bytes, count, bytes.length - count, count);
+            if (bytesRead === 0) break;
+            count += bytesRead;
+          }
+          const after = await headHandle.stat({ bigint: true });
+          const stillNamed = await fsp.lstat(heldHeadPath, { bigint: true });
+          if (count > 8192 || BigInt(count) !== before.size || !after.isFile()
+            || after.nlink !== 1n || !stillNamed.isFile()
+            || stillNamed.isSymbolicLink() || stillNamed.nlink !== 1n
+            || !sameFileIdentity(after, stillNamed)
+            || !sameFileVersion(before, after)) {
+            fail("Staged eviction genesis changed during read", "invalid_snapshot");
+          }
+          raw = bytes.subarray(0, count);
+        } finally { await headHandle.close(); }
+      } else {
+        const headStats = await fsp.lstat(headFile, { bigint: true });
+        if (!headStats.isFile() || headStats.isSymbolicLink()
+          || headStats.nlink !== 1n || headStats.size > 8192n) {
+          fail("Unsafe staged eviction genesis head", "invalid_snapshot");
+        }
+        raw = await readContainedFile(rootDir, `.rootark-trash/${EVICTION_GENESIS_STAGE}`,
+          headStats, true);
+      }
+      head = JSON.parse(raw.toString("utf8"));
+    } catch {
+      fail("Unreadable staged eviction genesis head", "invalid_snapshot");
+    }
+    await assertUnchanged();
+    if (!validEvictionLedgerHead(head) || head.sequence !== 0
+      || head.digest !== EVICTION_LEDGER_ZERO) {
+      fail("Invalid staged eviction genesis", "invalid_snapshot");
+    }
+    return { trash, file: headFile, head };
+  } finally {
+    if (held) await held.close();
+    if (heldRoot) await heldRoot.close();
+  }
+}
+async function createStagedEvictionGenesis(rootDir) {
+  const existing = await stagedEvictionGenesis(rootDir);
+  if (existing) return existing;
+  const trash = path.join(rootDir, ".rootark-trash");
+  if (process.platform === "linux") {
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+    let root;
+    let heldTrash;
+    try {
+      root = await fsp.open(rootDir, flags);
+      const relativeTrash = `/proc/self/fd/${root.fd}/.rootark-trash`;
+      let created = false;
+      try {
+        await fsp.mkdir(relativeTrash, { mode: 0o700 });
+        created = true;
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+      }
+      if (created) await root.sync();
+      heldTrash = await fsp.open(relativeTrash, flags);
+      const rootBefore = await root.stat({ bigint: true });
+      const trashBefore = await heldTrash.stat({ bigint: true });
+      const verify = async () => {
+        const rootNow = await fsp.lstat(rootDir, { bigint: true });
+        const trashNow = await fsp.lstat(trash, { bigint: true });
+        if (!rootBefore.isDirectory() || !trashBefore.isDirectory()
+          || !rootNow.isDirectory() || !trashNow.isDirectory()
+          || !sameFileIdentity(rootBefore, rootNow)
+          || !sameFileIdentity(trashBefore, trashNow)
+          || !sameFileIdentity(rootBefore, await root.stat({ bigint: true }))
+          || !sameFileIdentity(trashBefore, await heldTrash.stat({ bigint: true }))) {
+          fail("Staged genesis parent changed during creation", "invalid_snapshot");
+        }
+        await containedAbsolute(rootDir, trash, false);
+      };
+      await verify();
+      const head = { epoch: crypto.randomUUID(), sequence: 0, digest: EVICTION_LEDGER_ZERO };
+      await createDurableExclusiveGenesisStage(
+        `/proc/self/fd/${heldTrash.fd}/${EVICTION_GENESIS_STAGE}`, head);
+      await verify();
+      return { trash, file: path.join(trash, EVICTION_GENESIS_STAGE), head };
+    } finally {
+      if (heldTrash) await heldTrash.close();
+      if (root) await root.close();
+    }
+  }
+  if (!(await exists(trash))) {
+    await fsp.mkdir(trash, { mode: 0o700 });
+    await fsyncEvictionDirectory(rootDir);
+  }
+  await containedAbsolute(rootDir, trash, false);
+  const stats = await fsp.lstat(trash, { bigint: true });
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    fail("Unsafe pre-upgrade eviction genesis parent", "invalid_snapshot");
+  }
+  const head = { epoch: crypto.randomUUID(), sequence: 0, digest: EVICTION_LEDGER_ZERO };
+  const file = path.join(trash, EVICTION_GENESIS_STAGE);
+  // The staged authority name must never replace a concurrently created
+  // head. A hard-link publication with two names is fail-closed if crashed
+  // before temporary-name retirement.
+  await createDurableExclusiveGenesisStage(file, head);
+  return { trash, file, head };
+}
+async function promoteStagedEvictionGenesis(rootDir, staged) {
+  const active = await readEvictionLedger(rootDir);
+  if (active.head || active.entries.size) {
+    fail("Existing eviction journal prevents genesis promotion", "invalid_snapshot");
+  }
+  const directory = active.directory || await openEvictionLedger(rootDir, true);
+  const headFile = path.join(directory, "head.json");
+  if (await exists(headFile)) fail("Eviction head appeared during promotion", "invalid_snapshot");
+  if (process.platform === "linux") {
+    // A pathname rename could overwrite head.json in a replaced ledger (or
+    // erase a competing head). Keep both parent directories pinned and
+    // publish via an EXCLUSIVE hard link: unlike rename, link fails EEXIST
+    // without replacing any preexisting destination. This remains a bounded
+    // legacy gate, NOT same-UID root custody or a powercut proof.
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+    let root;
+    let trash;
+    let ledger;
+    let heldHead;
+    try {
+      root = await fsp.open(rootDir, flags);
+      const parent = `/proc/self/fd/${root.fd}`;
+      trash = await fsp.open(`${parent}/.rootark-trash`, flags);
+      ledger = await fsp.open(`${parent}/${EVICTION_LEDGER_DIR}`, flags);
+      const rootBefore = await root.stat({ bigint: true });
+      const trashBefore = await trash.stat({ bigint: true });
+      const ledgerBefore = await ledger.stat({ bigint: true });
+      const source = `/proc/self/fd/${trash.fd}/${EVICTION_GENESIS_STAGE}`;
+      const dest = `/proc/self/fd/${ledger.fd}/head.json`;
+      const verifyDirectories = async () => {
+        for (const [name, fd, original] of [
+          [rootDir, root, rootBefore],
+          [path.join(rootDir, ".rootark-trash"), trash, trashBefore],
+          [directory, ledger, ledgerBefore],
+        ]) {
+          const current = await fsp.lstat(name, { bigint: true });
+          if (!current.isDirectory() || current.isSymbolicLink()
+            || !sameFileIdentity(original, current)
+            || !sameFileIdentity(original, await fd.stat({ bigint: true }))) {
+            fail("Genesis publication parent changed", "invalid_snapshot");
+          }
+        }
+      };
+      await verifyDirectories();
+      heldHead = await fsp.open(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+        | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_CLOEXEC || 0));
+      const before = await heldHead.stat({ bigint: true });
+      if (!before.isFile() || before.nlink !== 1n || before.size > 8192n) {
+        fail("Unsafe staged genesis publication source", "invalid_snapshot");
+      }
+      const bytes = Buffer.alloc(8193);
+      let count = 0;
+      while (count < bytes.length) {
+        const { bytesRead } = await heldHead.read(bytes, count, bytes.length - count, count);
+        if (!bytesRead) break;
+        count += bytesRead;
+      }
+      let head;
+      try { head = JSON.parse(bytes.subarray(0, count).toString("utf8")); }
+      catch { fail("Invalid staged genesis publication bytes", "invalid_snapshot"); }
+      const named = await fsp.lstat(source, { bigint: true });
+      if (count > 8192 || BigInt(count) !== before.size
+        || !named.isFile() || named.isSymbolicLink()
+        || !sameFileVersion(before, await heldHead.stat({ bigint: true }))
+        || !sameFileVersion(before, named)
+        || !validEvictionLedgerHead(head)
+        || head.epoch !== staged.head.epoch
+        || head.sequence !== 0 || head.digest !== EVICTION_LEDGER_ZERO) {
+        fail("Staged genesis changed before publication", "invalid_snapshot");
+      }
+      await verifyDirectories();
+      try { await fsp.link(source, dest); }
+      catch (error) {
+        if (error.code === "EEXIST") fail("Existing genesis head blocks exclusive publication", "invalid_snapshot");
+        throw error;
+      }
+      // Do not remove the stage unless the new destination is exactly the
+      // retained source inode. If a hostile writer substituted a leaf during
+      // the link, leave the ambiguous state for fail-closed recovery.
+      const published = await fsp.lstat(dest, { bigint: true });
+      const stagedNow = await fsp.lstat(source, { bigint: true });
+      if (!published.isFile() || published.isSymbolicLink()
+        || !stagedNow.isFile() || stagedNow.isSymbolicLink()
+        || !sameFileIdentity(before, published)
+        || !sameFileIdentity(before, stagedNow)) {
+        fail("Indeterminate exclusive genesis publication", "invalid_snapshot");
+      }
+      await ledger.sync();
+      await verifyDirectories();
+      // The prior post-link source stat happens before directory fsync and
+      // parent revalidation. A hostile same-UID writer can swap the STAGE
+      // leaf during that gap; never unlink it without a fresh check against
+      // the original held inode. This still cannot make unlink atomic.
+      const finalSource = await fsp.lstat(source, { bigint: true });
+      const finalHeld = await heldHead.stat({ bigint: true });
+      if (!finalSource.isFile() || finalSource.isSymbolicLink()
+        || finalSource.nlink !== 2n
+        || !sameFileIdentity(before, finalSource)
+        || !sameFileIdentity(before, finalHeld)
+        || finalSource.size !== before.size
+        || finalSource.mtimeNs !== before.mtimeNs
+        || finalHeld.size !== before.size
+        || finalHeld.mtimeNs !== before.mtimeNs) {
+        fail("Staged genesis changed before final unlink", "invalid_snapshot");
+      }
+      await fsp.unlink(source);
+      await trash.sync();
+      await ledger.sync();
+    } finally {
+      if (heldHead) await heldHead.close();
+      if (ledger) await ledger.close();
+      if (trash) await trash.close();
+      if (root) await root.close();
+    }
+  } else if (process.platform === "win32") {
+    // A Windows RenameFile over a competing head can silently replace it,
+    // even after the earlier existence preflight. NTFS hard-link creation
+    // refuses an existing destination atomically. This is only a legacy
+    // no-overwrite fence; same-SID directory substitution and durability
+    // still require native RootDirectory handles and an external custodian.
+    // Never precheck a mutable staged pathname and THEN open it. Hold the
+    // actual source inode first, inspect it through the same HANDLE, and
+    // only afterwards confirm the public stage name still points to it.
+    const heldSource = await fsp.open(staged.file, fs.constants.O_RDONLY
+      | (fs.constants.O_NONBLOCK || 0));
+    try {
+      const beforeRead = await heldSource.stat({ bigint: true });
+      const namedAtOpen = await fsp.lstat(staged.file, { bigint: true });
+      if (!beforeRead.isFile() || beforeRead.ino === 0n
+        || beforeRead.nlink !== 1n || beforeRead.size > 8192n
+        || !namedAtOpen.isFile() || namedAtOpen.isSymbolicLink()
+        || !sameFileVersion(beforeRead, namedAtOpen)) {
+        fail("Staged genesis changed before publication", "invalid_snapshot");
+      }
+      // The source can grow after HANDLE.stat on NTFS. Read at most one
+      // byte beyond the 8 KiB contract from the retained HANDLE.
+      const buffer = Buffer.alloc(8193);
+      let count = 0;
+      while (count < buffer.length) {
+        const { bytesRead } = await heldSource.read(buffer, count, buffer.length - count, count);
+        if (!bytesRead) break;
+        count += bytesRead;
+      }
+      const afterRead = await heldSource.stat({ bigint: true });
+      const namedBefore = await fsp.lstat(staged.file, { bigint: true });
+      if (count > 8192 || BigInt(count) !== beforeRead.size
+        || !namedBefore.isFile() || namedBefore.isSymbolicLink()
+        || !sameFileVersion(beforeRead, afterRead)
+        || !sameFileVersion(beforeRead, namedBefore)) {
+        fail("Staged genesis changed before publication", "invalid_snapshot");
+      }
+      let candidate;
+      try { candidate = JSON.parse(buffer.subarray(0, count).toString("utf8")); }
+      catch { fail("Invalid staged genesis publication bytes", "invalid_snapshot"); }
+      if (!validEvictionLedgerHead(candidate)
+        || candidate.epoch !== staged.head.epoch
+        || candidate.sequence !== 0 || candidate.digest !== EVICTION_LEDGER_ZERO) {
+        fail("Staged genesis changed before publication", "invalid_snapshot");
+      }
+      try { await fsp.link(staged.file, headFile); }
+      catch (error) {
+        if (error.code === "EEXIST") {
+          fail("Existing genesis head blocks exclusive publication", "invalid_snapshot");
+        }
+        throw error;
+      }
+      // A hard link updates ctime/nlink, so only identity + size/mtime can
+      // be compared after publication; never treat this as same-SID custody.
+      const afterLink = await heldSource.stat({ bigint: true });
+      const published = await fsp.lstat(headFile, { bigint: true });
+      const remaining = await fsp.lstat(staged.file, { bigint: true });
+      if (!published.isFile() || published.isSymbolicLink()
+        || !remaining.isFile() || remaining.isSymbolicLink()
+        || !sameFileIdentity(beforeRead, published)
+        || !sameFileIdentity(beforeRead, remaining)
+        || !sameFileIdentity(beforeRead, afterLink)
+        || afterLink.size !== beforeRead.size
+        || afterLink.mtimeNs !== beforeRead.mtimeNs) {
+        fail("Indeterminate exclusive genesis publication", "invalid_snapshot");
+      }
+      const finalStage = await fsp.lstat(staged.file, { bigint: true });
+      if (!finalStage.isFile() || finalStage.isSymbolicLink()
+        || finalStage.nlink !== 2n
+        || !sameFileIdentity(beforeRead, finalStage)
+        || finalStage.size !== beforeRead.size
+        || finalStage.mtimeNs !== beforeRead.mtimeNs) {
+        fail("Staged genesis changed before final unlink", "invalid_snapshot");
+      }
+      await fsp.unlink(staged.file);
+    } finally { await heldSource.close(); }
+  } else {
+    await fsp.rename(staged.file, headFile);
+    await fsyncEvictionDirectory(directory);
+    await fsyncEvictionDirectory(staged.trash);
+  }
+  const promoted = await readEvictionLedger(rootDir, staged.head.epoch);
+  if (promoted.entries.size || !promoted.head
+    || promoted.head.sequence !== 0 || promoted.head.digest !== EVICTION_LEDGER_ZERO) {
+    fail("Durable genesis promotion is indeterminate", "invalid_snapshot");
+  }
+}
+function validateEvictionPrepare(item, filename) {
+  if (!item || typeof item !== "object" || Array.isArray(item)
+    || Object.keys(item).sort().join(",") !== "epoch,fileId,hash,objectId,path,physical,previousDigest,record,remoteDigest,sequence,tx,version"
+    || item.version !== EVICTION_LEDGER_VERSION
+    || typeof item.tx !== "string" || !/^[a-f0-9-]{36}$/.test(item.tx)
+    || typeof item.epoch !== "string" || !EVICTION_LEDGER_EPOCH.test(item.epoch)
+    || !Number.isSafeInteger(item.sequence) || item.sequence < 1 || item.sequence > EVICTION_LEDGER_MAX
+    || typeof item.previousDigest !== "string" || !EVICTION_LEDGER_HASH.test(item.previousDigest)
+    || typeof item.remoteDigest !== "string" || !EVICTION_LEDGER_HASH.test(item.remoteDigest)
+    || typeof item.objectId !== "string" || !item.objectId || item.objectId.length > 512
+    || ["__proto__", "prototype", "constructor"].includes(item.objectId)
+    || typeof item.fileId !== "string" || !item.fileId || item.fileId.length > 512
+    || !EVICTION_LEDGER_HASH.test(item.hash)
+    || filename !== evictionLedgerName(item.objectId, "prepare")) {
+    fail("Invalid durable eviction PREPARE", "invalid_snapshot");
+  }
+  try {
+    protocol.safeRelativePath(item.path, "path");
+    protocol.safeRelativePath(item.physical, "physical");
+  } catch { fail("Invalid durable eviction path", "invalid_snapshot"); }
+  if (item.path.toLowerCase() !== item.physical.toLowerCase()
+    || !item.record || item.record.objectId !== item.objectId
+    || item.record.fileId !== item.fileId || item.record.path !== item.path
+    || item.record.hash !== item.hash || item.record.reason !== "evicted"
+    || item.record.directory !== false || item.record.deleted !== false
+    || Object.keys(item.record).sort().join(",") !== "deleted,directory,fileId,hash,objectId,path,reason,revision,versionId") {
+    fail("Invalid durable eviction identity", "invalid_snapshot");
+  }
+  return item;
+}
+// Linux-only bounded read via the exact retained ledger directory. The
+// pathname is used only for a descriptor-relative child lookup, never as
+// authority to reopen the ledger directory after enumeration.
+async function readHeldEvictionEntry(heldDirectory, filename) {
+  const child = `/proc/self/fd/${heldDirectory.fd}/${filename}`;
+  const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+    | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_CLOEXEC || 0);
+  let handle;
+  try { handle = await fsp.open(child, flags); }
+  catch { fail("Unsafe eviction ledger entry", "invalid_snapshot"); }
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.ino === 0n || before.nlink !== 1n
+      || before.size > 8192n) {
+      fail("Unsafe eviction ledger entry", "invalid_snapshot");
+    }
+    const namedBefore = await fsp.lstat(child, { bigint: true });
+    if (!namedBefore.isFile() || namedBefore.isSymbolicLink()
+      || !sameFileVersion(before, namedBefore)) {
+      fail("Eviction ledger entry changed before read", "invalid_snapshot");
+    }
+    const buffer = Buffer.alloc(8193);
+    let count = 0;
+    while (count < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, count, buffer.length - count, count);
+      if (bytesRead === 0) break;
+      count += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    const namedAfter = await fsp.lstat(child, { bigint: true });
+    if (count > 8192 || BigInt(count) !== before.size
+      || !after.isFile() || !namedAfter.isFile()
+      || namedAfter.isSymbolicLink() || namedAfter.nlink !== 1n
+      || !sameFileVersion(before, after)
+      || !sameFileVersion(before, namedAfter)) {
+      fail("Eviction ledger entry changed during read", "invalid_snapshot");
+    }
+    return { bytes: buffer.subarray(0, count), identity: before };
+  } finally { await handle.close(); }
+}
+async function readEvictionLedger(rootDir, expectedEpoch = null) {
+  const directory = await openEvictionLedger(rootDir);
+  if (!directory) return { directory: null, entries: new Map(), head: null };
+  const linux = process.platform === "linux";
+  let heldRoot;
+  let heldDirectory;
+  let heldRootStats;
+  let heldDirectoryStats;
+  let windowsDirectoryStats;
+  const verifyHeldLedger = async () => {
+    if (!linux) return;
+    const currentRoot = await fsp.lstat(rootDir, { bigint: true });
+    const currentDirectory = await fsp.lstat(directory, { bigint: true });
+    if (!sameFileVersion(heldRootStats, currentRoot)
+      || !sameFileVersion(heldDirectoryStats, currentDirectory)
+      || !sameFileVersion(heldRootStats, await heldRoot.stat({ bigint: true }))
+      || !sameFileVersion(heldDirectoryStats, await heldDirectory.stat({ bigint: true }))) {
+      fail("Eviction ledger root or directory changed during read", "invalid_snapshot");
+    }
+    await containedAbsolute(rootDir, directory, false);
+  };
+  try {
+    if (linux) {
+      const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+        | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+      heldRoot = await fsp.open(rootDir, flags);
+      heldDirectory = await fsp.open(
+        `/proc/self/fd/${heldRoot.fd}/${EVICTION_LEDGER_DIR}`, flags);
+      heldRootStats = await heldRoot.stat({ bigint: true });
+      heldDirectoryStats = await heldDirectory.stat({ bigint: true });
+      await verifyHeldLedger();
+    } else if (process.platform === "win32") {
+      // The legacy Windows reader cannot pin an NTFS directory across
+      // operations, but it must at least bind its output to a particular
+      // named directory identity before any later destructive retirement.
+      windowsDirectoryStats = await fsp.lstat(directory, { bigint: true });
+      if (!windowsDirectoryStats.isDirectory() || windowsDirectoryStats.isSymbolicLink()) {
+        fail("Unsafe eviction ledger directory", "invalid_snapshot");
+      }
+    }
+  // A same-UID writer can place an arbitrary number of junk names here.
+  // readdir() would allocate the ENTIRE name array before checking the cap;
+  // stream via the already pinned Linux dirfd, and stop at the fixed bound.
+  const files = [];
+  const listPath = linux ? `/proc/self/fd/${heldDirectory.fd}` : directory;
+  for await (const entry of await fsp.opendir(listPath)) {
+    if (files.length >= EVICTION_LEDGER_MAX * 2 + 1) {
+      fail("Eviction ledger capacity exceeded", "invalid_snapshot");
+    }
+    files.push(entry.name);
+  }
+  let head = null;
+  let headIdentity = null;
+  const entries = new Map();
+  for (const filename of files) {
+    const match = /^([a-f0-9]{64})\.(prepare|commit)\.json$/.exec(filename);
+    if (!match && filename !== "head.json") fail("Malformed or torn eviction ledger entry", "invalid_snapshot");
+    let item;
+    let recordIdentity = null;
+    try {
+      let bytes;
+      if (linux) {
+        const opened = await readHeldEvictionEntry(heldDirectory, filename);
+        bytes = opened.bytes;
+        recordIdentity = opened.identity;
+      } else {
+        const file = path.join(directory, filename);
+        const stats = await fsp.lstat(file, { bigint: true });
+        if (!stats.isFile() || stats.isSymbolicLink()
+          || stats.nlink !== 1n || stats.size > 8192n) {
+          fail("Unsafe eviction ledger entry", "invalid_snapshot");
+        }
+        bytes = await readContainedFile(rootDir, `${EVICTION_LEDGER_DIR}/${filename}`, stats, true);
+        // Carry the identity of the exact validated record into retirement.
+        // A held directory alone does not prevent a same-SID process from
+        // replacing a record leaf under the original directory.
+        recordIdentity = stats;
+      }
+      if (bytes.length > 8192) fail("Oversized eviction ledger entry", "invalid_snapshot");
+      item = JSON.parse(bytes.toString("utf8"));
+    }
+    catch { fail("Torn eviction ledger entry", "invalid_snapshot"); }
+    if (filename === "head.json") {
+      if (!validEvictionLedgerHead(item)) fail("Invalid eviction ledger head", "invalid_snapshot");
+      head = item;
+      headIdentity = recordIdentity;
+      continue;
+    }
+    const row = entries.get(match[1]) || {};
+    if (row[match[2]]) fail("Duplicated eviction ledger entry", "invalid_snapshot");
+    row[match[2]] = { item, filename, identity: recordIdentity };
+    entries.set(match[1], row);
+  }
+  // A synced zero-sequence genesis may precede the snapshot's v2 upgrade.
+  // No cache file may leave its path until the v2 required marker is durable.
+  if ((!head && entries.size > 0)
+    || (head && entries.size === 0
+      && (head.sequence !== 0 || head.digest !== EVICTION_LEDGER_ZERO))) {
+    fail("Missing eviction ledger head or PREPARE entries", "invalid_snapshot");
+  }
+  let sequence = 0;
+  let digest = EVICTION_LEDGER_ZERO;
+  const ordered = [...entries.values()].sort((left, right) =>
+    left.prepare?.item?.sequence - right.prepare?.item?.sequence);
+  for (const row of ordered) {
+    if (!row.prepare) fail("Eviction COMMIT without PREPARE", "invalid_snapshot");
+    validateEvictionPrepare(row.prepare.item, row.prepare.filename);
+    if (row.prepare.item.sequence !== sequence + 1
+      || row.prepare.item.previousDigest !== digest
+      || row.prepare.item.epoch !== head.epoch) {
+      fail("Eviction journal sequence or chain is not monotonic", "invalid_snapshot");
+    }
+    sequence += 1;
+    digest = evictionLedgerDigest(row.prepare.item);
+  }
+  if (head && (head.sequence !== sequence || head.digest !== digest
+    || (expectedEpoch !== null && head.epoch !== expectedEpoch))) {
+    fail("Eviction ledger head is not anchored to the sync snapshot", "invalid_snapshot");
+  }
+  for (const [id, row] of entries) {
+    if (!row.prepare) fail("Eviction COMMIT without PREPARE", "invalid_snapshot");
+    validateEvictionPrepare(row.prepare.item, row.prepare.filename);
+    if (evictionLedgerName(row.prepare.item.objectId, "prepare").slice(0, 64) !== id) {
+      fail("Conflicting eviction ledger identity", "invalid_snapshot");
+    }
+    if (row.commit && (!row.commit.item || row.commit.item.version !== EVICTION_LEDGER_VERSION
+      || row.commit.item.tx !== row.prepare.item.tx
+      || row.commit.item.digest !== crypto.createHash("sha256")
+        .update(JSON.stringify(row.prepare.item)).digest("hex")
+      || Object.keys(row.commit.item).sort().join(",") !== "digest,tx,version")) {
+      fail("Eviction COMMIT differs from PREPARE", "invalid_snapshot");
+    }
+  }
+  if (entries.size > EVICTION_LEDGER_MAX) fail("Eviction ledger has too many objects", "invalid_snapshot");
+  await verifyHeldLedger();
+  if (windowsDirectoryStats) {
+    const after = await fsp.lstat(directory, { bigint: true });
+    if (!after.isDirectory() || after.isSymbolicLink()
+      || !sameFileIdentity(windowsDirectoryStats, after)) {
+      fail("Eviction ledger changed during Windows read", "invalid_snapshot");
+    }
+  }
+  return { directory, entries, head, headIdentity,
+    directoryIdentity: linux
+      ? { dev: heldDirectoryStats.dev, ino: heldDirectoryStats.ino }
+      : windowsDirectoryStats
+        ? { dev: windowsDirectoryStats.dev, ino: windowsDirectoryStats.ino }
+        : null };
+  } finally {
+    if (heldDirectory) await heldDirectory.close();
+    if (heldRoot) await heldRoot.close();
+  }
+}
+async function writeEvictionPrepare(rootDir, prepare, currentHead) {
+  const filename = evictionLedgerName(prepare.objectId, "prepare");
+  validateEvictionPrepare(prepare, filename);
+  if (!validEvictionLedgerHead(currentHead) || currentHead.epoch !== prepare.epoch
+    || prepare.sequence !== currentHead.sequence + 1
+    || prepare.previousDigest !== currentHead.digest) {
+    fail("Eviction PREPARE lost its monotonic snapshot anchor", "invalid_snapshot");
+  }
+  await openEvictionLedger(rootDir, true);
+  return withHeldEvictionLedgerWrite(rootDir, async (directory, verify) => {
+    const file = path.join(directory, filename);
+    const headPath = path.join(directory, "head.json");
+    if (!(await exists(headPath))) {
+      fail("Unreconciled eviction journal head", "invalid_snapshot");
+    }
+    if (currentHead.sequence === 0) {
+      const initial = await readEvictionLedger(rootDir, currentHead.epoch);
+      if (initial.entries.size || !initial.head || initial.head.sequence !== 0
+        || initial.head.digest !== EVICTION_LEDGER_ZERO) {
+        fail("Missing or replaced durable eviction genesis", "invalid_snapshot");
+      }
+    }
+    // One in-flight version per object; never overwrite an earlier PREPARE
+    // whose physical state might still be awaiting replay.
+    if (await exists(file)
+      || await exists(path.join(directory, evictionLedgerName(prepare.objectId, "commit")))) {
+      fail("Unreconciled durable eviction PREPARE/COMMIT", "invalid_snapshot");
+    }
+    await verify();
+    await createDurableEvictionRecord(file, prepare);
+    await verify();
+    const head = { epoch: prepare.epoch, sequence: prepare.sequence,
+      digest: evictionLedgerDigest(prepare) };
+    await durableJson(headPath, head);
+    await verify();
+    return head;
+  });
+}
+async function writeEvictionCommit(rootDir, prepare) {
+  const digest = crypto.createHash("sha256").update(JSON.stringify(prepare)).digest("hex");
+  await withHeldEvictionLedgerWrite(rootDir, async (directory, verify) => {
+    await createDurableEvictionRecord(path.join(directory,
+      evictionLedgerName(prepare.objectId, "commit")),
+    { version: EVICTION_LEDGER_VERSION, tx: prepare.tx, digest });
+    await verify();
+  });
+}
+async function clearEvictionLedger(rootDir, expectedEpoch = null) {
+  const { directory, entries, directoryIdentity, headIdentity } =
+    await readEvictionLedger(rootDir, expectedEpoch);
+  if (!directory || !entries.size) return;
+  // The full snapshot is durable. Atomically retire the whole old ledger
+  // before removing individual files, so a crash during cleanup cannot
+  // expose a partial active chain to the next process.
+  const archivedName = `${EVICTION_LEDGER_ARCHIVE}${crypto.randomUUID()}`;
+  if (process.platform === "linux") {
+    // A returned path from the read helper is NOT an authority to rename or
+    // delete. Reacquire the actual inode read above from a held parent, then
+    // retire relative to that parent. Never follow an archive symlink when
+    // removing individual records: all unlinks target the held OLD ledger FD.
+    // Same-UID adversarial A->B->A remains unsolved without protected parent
+    // custody; this is narrow legacy-path containment only, not RootSession.
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY
+      | fs.constants.O_NOFOLLOW | (fs.constants.O_CLOEXEC || 0);
+    let heldRoot;
+    let heldLedger;
+    try {
+      heldRoot = await fsp.open(rootDir, flags);
+      const rootPath = `/proc/self/fd/${heldRoot.fd}`;
+      const current = `${rootPath}/${EVICTION_LEDGER_DIR}`;
+      const archived = `${rootPath}/${archivedName}`;
+      heldLedger = await fsp.open(current, flags);
+      const ledgerStats = await heldLedger.stat({ bigint: true });
+      if (!directoryIdentity || !sameFileIdentity(directoryIdentity, ledgerStats)) {
+        fail("Eviction ledger changed after authenticated read", "invalid_snapshot");
+      }
+      const verifyCurrent = async () => {
+        const visible = await fsp.lstat(current, { bigint: true });
+        if (!visible.isDirectory() || visible.isSymbolicLink()
+          || !sameFileIdentity(ledgerStats, visible)
+          || !sameFileIdentity(ledgerStats, await heldLedger.stat({ bigint: true }))) {
+          fail("Eviction ledger replaced before retirement", "invalid_snapshot");
+        }
+      };
+      const verifyArchived = async () => {
+        const visible = await fsp.lstat(archived, { bigint: true });
+        if (!visible.isDirectory() || visible.isSymbolicLink()
+          || !sameFileIdentity(ledgerStats, visible)
+          || !sameFileIdentity(ledgerStats, await heldLedger.stat({ bigint: true }))) {
+          fail("Eviction ledger archive identity is indeterminate", "invalid_snapshot");
+        }
+      };
+      const verifyRecord = async (filename, identity) => {
+        if (!identity || identity.nlink !== 1n) {
+          fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+        }
+        let visible;
+        try {
+          visible = await fsp.lstat(
+            `/proc/self/fd/${heldLedger.fd}/${filename}`, { bigint: true });
+        } catch {
+          fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+        }
+        if (!visible.isFile() || visible.isSymbolicLink()
+          || visible.nlink !== 1n || !sameFileVersion(identity, visible)) {
+          fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+        }
+      };
+      await verifyCurrent();
+      await fsp.rename(current, archived);
+      // If a same-UID process swapped the name just before rename, the moved
+      // archive may be a symlink or a different directory. Reject *before*
+      // touching any child name and leave all foreign bytes unchanged.
+      await verifyArchived();
+      await heldRoot.sync();
+      await fsp.mkdir(current, { mode: 0o700 });
+      await heldRoot.sync();
+      for (const row of entries.values()) {
+        await verifyArchived();
+        if (row.commit) {
+          await verifyRecord(row.commit.filename, row.commit.identity);
+          await fsp.unlink(`/proc/self/fd/${heldLedger.fd}/${row.commit.filename}`);
+        }
+        await verifyArchived();
+        await verifyRecord(row.prepare.filename, row.prepare.identity);
+        await fsp.unlink(`/proc/self/fd/${heldLedger.fd}/${row.prepare.filename}`);
+      }
+      await verifyArchived();
+      await verifyRecord("head.json", headIdentity);
+      await fsp.unlink(`/proc/self/fd/${heldLedger.fd}/head.json`);
+      await verifyArchived();
+      await fsp.rmdir(archived);
+      await heldRoot.sync();
+    } finally {
+      if (heldLedger) await heldLedger.close();
+      if (heldRoot) await heldRoot.close();
+    }
+    return;
+  }
+  const archived = path.join(rootDir, archivedName);
+  if (process.platform === "win32") {
+    // Never use a successfully parsed journal's filenames as delete
+    // authority against an archive that does not identify the same
+    // directory. Real NTFS tests demonstrated that a same-SID writer can
+    // swap the source name just before rename and redirect legacy cleanup.
+    // This narrow check blocks that substitution; it is NOT a protected
+    // RootDirectory/ACL or ABA guarantee for an actively hostile SID.
+    const current = await fsp.lstat(directory, { bigint: true });
+    if (!directoryIdentity || !current.isDirectory() || current.isSymbolicLink()
+      || !sameFileIdentity(directoryIdentity, current)) {
+      fail("Eviction ledger changed before Windows retirement", "invalid_snapshot");
+    }
+    await fsp.rename(directory, archived);
+    const verifyArchived = async () => {
+      const actual = await fsp.lstat(archived, { bigint: true });
+      if (!actual.isDirectory() || actual.isSymbolicLink()
+        || !sameFileIdentity(directoryIdentity, actual)) {
+        fail("Eviction ledger archive identity is indeterminate", "invalid_snapshot");
+      }
+    };
+    const verifyRecord = async (filename, identity) => {
+      if (!identity || identity.nlink !== 1n) {
+        fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+      }
+      let actual;
+      try { actual = await fsp.lstat(path.join(archived, filename), { bigint: true }); }
+      catch {
+        fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+      }
+      if (!actual.isFile() || actual.isSymbolicLink()
+        || actual.nlink !== 1n || !sameFileVersion(identity, actual)) {
+        fail("Eviction ledger record identity changed before removal", "invalid_snapshot");
+      }
+    };
+    await verifyArchived();
+    await fsyncEvictionDirectory(rootDir);
+    await fsp.mkdir(directory, { mode: 0o700 });
+    await fsyncEvictionDirectory(rootDir);
+    for (const row of entries.values()) {
+      await verifyArchived();
+      if (row.commit) {
+        await verifyRecord(row.commit.filename, row.commit.identity);
+        await fsp.unlink(path.join(archived, row.commit.filename));
+      }
+      await verifyArchived();
+      await verifyRecord(row.prepare.filename, row.prepare.identity);
+      await fsp.unlink(path.join(archived, row.prepare.filename));
+    }
+    await verifyArchived();
+    await verifyRecord("head.json", headIdentity);
+    await fsp.unlink(path.join(archived, "head.json"));
+    await verifyArchived();
+    await fsp.rmdir(archived);
+    await fsyncEvictionDirectory(rootDir);
+    return;
+  }
+  await fsp.rename(directory, archived);
+  await fsyncEvictionDirectory(rootDir);
+  await fsp.mkdir(directory, { mode: 0o700 });
+  await fsyncEvictionDirectory(rootDir);
+  for (const row of entries.values()) {
+    if (row.commit) await fsp.unlink(path.join(archived, row.commit.filename));
+    await fsp.unlink(path.join(archived, row.prepare.filename));
+  }
+  await fsp.unlink(path.join(archived, "head.json"));
+  await fsp.rmdir(archived);
+  await fsyncEvictionDirectory(rootDir);
 }
 
 async function createDurableRestoreProgress(filePath, value) {
@@ -486,6 +2169,95 @@ function pathWithin(relativePath, parentPath) {
 
 function pathsEqual(left, right) {
   return pathWithin(left, right) && pathWithin(right, left);
+}
+
+// A custom adapter is an untrusted source of advisory UI data. Snapshot only
+// JSON primitives, dense arrays and plain/null-prototype records without
+// invoking getters, toString, valueOf or Proxy traps. Share ONE resource
+// budget across the complete page, not a per-record allocation allowance.
+const ADVISORY_DTO_MAX_BYTES = 128 * 1024;
+const ADVISORY_DTO_MAX_NODES = 4096;
+const ADVISORY_DTO_MAX_KEYS = 4096;
+function detachedAdvisoryData(value, depth = 0, budget = { nodes: 0, keys: 0, bytes: 0 }) {
+  if (++budget.nodes > ADVISORY_DTO_MAX_NODES || depth > 4) {
+    fail("Invalid metadata inventory budget", "invalid_inventory");
+  }
+  const addBytes = (count) => {
+    budget.bytes += count;
+    if (budget.bytes > ADVISORY_DTO_MAX_BYTES) {
+      fail("Invalid metadata inventory size", "invalid_inventory");
+    }
+  };
+  if (value === null || typeof value !== "object") {
+    if (value !== null && typeof value !== "string" && typeof value !== "boolean"
+      && (typeof value !== "number" || !Number.isFinite(value))) {
+      fail("Non-JSON metadata inventory value", "invalid_inventory");
+    }
+    // Restrict length before encoding to avoid constructing a huge JSON string.
+    if (typeof value === "string" && value.length > ADVISORY_DTO_MAX_BYTES) {
+      fail("Invalid metadata inventory size", "invalid_inventory");
+    }
+    addBytes(Buffer.byteLength(JSON.stringify(value), "utf8"));
+    return value;
+  }
+  if (isProxy(value)) fail("Invalid metadata inventory Proxy", "invalid_inventory");
+  const array = Array.isArray(value);
+  const prototype = Object.getPrototypeOf(value);
+  if (array ? prototype !== Array.prototype || value.length > 64
+    : prototype !== Object.prototype && prototype !== null) {
+    fail("Invalid metadata inventory object type", "invalid_inventory");
+  }
+  addBytes(2); // JSON array/object punctuation.
+  const entries = [];
+  // Walk enumerable JSON fields one at a time, stopping at the local/global
+  // cap. Do not enumerate all own keys up front (including thousands of
+  // nonenumerable/symbol keys) and do not evaluate hidden properties: they
+  // are never copied into the returned advisory DTO.
+  for (const key in value) {
+    if (!Object.hasOwn(value, key)) continue;
+    if (entries.length >= (array ? 64 : 32) || ++budget.keys > ADVISORY_DTO_MAX_KEYS) {
+      fail("Invalid metadata inventory key budget", "invalid_inventory");
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) {
+      fail("Invalid metadata inventory accessor", "invalid_inventory");
+    }
+    addBytes(Buffer.byteLength(JSON.stringify(key), "utf8") + (array ? 1 : 2));
+    entries.push([key, descriptor.value]);
+  }
+  if (array) {
+    if (entries.length !== value.length || entries.some(([key], index) => key !== String(index))) {
+      fail("Invalid metadata inventory array", "invalid_inventory");
+    }
+    return entries.map(([, child]) => detachedAdvisoryData(child, depth + 1, budget));
+  }
+  const detached = Object.create(null);
+  for (const [key, child] of entries) {
+    detached[key] = detachedAdvisoryData(child, depth + 1, budget);
+  }
+  return detached;
+}
+
+function requireAdvisoryInventoryFieldTypes(entry) {
+  for (const key of ["operationId", "objectId", "fileId", "versionId",
+    "operation", "keyEpoch", "compartmentId", "deviceId"]) {
+    if (typeof entry[key] !== "string") fail("Invalid metadata inventory id", "invalid_inventory");
+  }
+  for (const revision of [entry.revision, entry.baseRevision]) {
+    if (revision !== null && (!revision || typeof revision !== "object"
+      || typeof revision.deviceId !== "string")) {
+      fail("Invalid metadata inventory revision", "invalid_inventory");
+    }
+  }
+  if (!entry.metadata || typeof entry.metadata !== "object") {
+    fail("Invalid metadata inventory metadata", "invalid_inventory");
+  }
+  for (const [key, value] of Object.entries(entry.metadata)) {
+    if (key === "size" ? !Number.isSafeInteger(value) || value < 0
+      : typeof value !== "string") {
+      fail("Invalid metadata inventory field type", "invalid_inventory");
+    }
+  }
 }
 
 function evictionError(code, message, cause, rollbackCause) {
@@ -805,12 +2577,26 @@ class SyncEngine {
     if (options.selectedPaths != null && !Array.isArray(options.selectedPaths)) fail("Selected paths must be an array", "invalid_selected_paths");
     this.selectedPaths = options.selectedPaths == null ? null : [...new Set(options.selectedPaths.map((value) => protocol.safeRelativePath(value, "selectedPath")))].sort();
     this.excludedPaths = normalizeExcludedPaths(options.excludedPaths);
-    this.filesOnDemand = options.filesOnDemand === true;
+    Object.defineProperty(this, "filesOnDemand", {
+      value: options.filesOnDemand === true,
+    });
+    // A future Files On-Demand recovery must use native, independently rooted
+    // custody. The old path-based required-v2 replay is not safe against
+    // same-principal A→B→A. This strict bit cannot be downgraded by callbacks;
+    // non-Files-On-Demand legacy recovery is unchanged unless explicitly opted
+    // into the stricter fail-closed policy.
+    Object.defineProperty(this, "nativeRootSession", {
+      value: options.nativeRootSession === true,
+    });
+    Object.defineProperty(this, "requireNativeRootRecovery", {
+      value: this.filesOnDemand || options.requireNativeRootRecovery === true,
+    });
     if (this.filesOnDemand && typeof this.adapter.listInventory !== "function") {
       fail("Files On-Demand requires a metadata inventory adapter", "inventory_unavailable");
     }
     this.snapshot = { version: SNAPSHOT_VERSION, files: {}, remoteOnly: {} };
     this.snapshotDiskRevision = null;
+    this.evictionLedgerHead = null;
     // If a failed pin-policy compensation cannot be durably verified, keep
     // the pre-existing process lock on disk: no restart may silently evict.
     this.pinnedPolicyIndeterminate = false;
@@ -819,7 +2605,8 @@ class SyncEngine {
 
   withMutationLock(work, { requireExistingState = false } = {}) {
     const queueKey = process.platform === "win32" ? this.rootDir.toLowerCase() : this.rootDir;
-    if (ROOT_MUTATION_CONTEXT.getStore() === queueKey) {
+    const inherited = ROOT_MUTATION_CONTEXT.getStore();
+    if (inherited?.queueKey === queueKey && inherited.active === true) {
       fail("Sync mutations cannot re-enter a root operation", "sync_root_busy");
     }
     const previous = ROOT_MUTATION_QUEUES.get(queueKey) || Promise.resolve();
@@ -830,14 +2617,54 @@ class SyncEngine {
       if (!requireExistingState) await fsp.mkdir(this.rootDir, { recursive: true });
       await containedAbsolute(this.rootDir, this.rootDir, false);
       const processLock = await this.acquireProcessLock();
+      const lease = { queueKey, active: true, inFlight: new Set(),
+        failures: new Map(), handledFailures: new Set(), idleWaiters: [],
+        coldAdmissionUncertain: false };
+      let ownerFulfilled = false;
       try {
-        await this._open({ readOnly: requireExistingState });
-        return await ROOT_MUTATION_CONTEXT.run(queueKey, work);
+        denyIndeterminateInbound(this);
+        const result = await ROOT_MUTATION_CONTEXT.run(lease, async () => {
+          // Cold admission can create the journal/genesis snapshot. It must
+          // hold the SAME lease as the following mutation, not run before
+          // the AsyncLocalStorage context exists.
+          await openEngineBuiltIn.call(this, { readOnly: requireExistingState });
+          lease.coldAdmissionUncertain = false;
+          return await work();
+        });
+        ownerFulfilled = true;
+        return result;
       } finally {
+        // A returned callback is not necessarily its last I/O. An unawaited
+        // native-required private operation can still hold the original
+        // lease; draining it is required BEFORE dropping the process lock.
+        // No timeout may silently convert pending writes into authorization
+        // to remove the cross-process exclusion marker.
+        while (lease.inFlight.size !== 0) {
+          await new Promise((resolve) => lease.idleWaiters.push(resolve));
+        }
+        lease.active = false;
+        // A failed child can settle and leave inFlight BEFORE the owner
+        // callback returns. A snapshot of *active* tickets alone would
+        // silently lose that error and authorize release of the real lock.
+        // A failed owner may propagate the same Error object from an awaited
+        // child, but a DIFFERENT detached operation may independently reject
+        // with that identical object. Error identity is not operation proof.
+        // Only a trusted exact-Promise acknowledgement can clear a recorded
+        // failure. Prefer conservative physical-lock custody to a false
+        // release after an unknown remote/local side effect.
+        const failedDetached = [...lease.failures.keys()].find((ticket) =>
+          !lease.handledFailures.has(ticket));
         // The same exclusive mkdir marker is understood by fresh processes.
         // Never release it after an indeterminate failed unpin rollback;
         // explicit operator recovery is required instead of trusting disk.
-        if (!this.pinnedPolicyIndeterminate) await this.releaseProcessLock(processLock);
+        if (!failedDetached && !lease.coldAdmissionUncertain
+          && !this.pinnedPolicyIndeterminate
+          && !INDETERMINATE_FOD_INBOUND.has(this)) {
+          await this.releaseProcessLock(processLock);
+        }
+        // Preserve an already-throwing owner's original error; its physical
+        // exclusion still remains if another detached child failed too.
+        if (failedDetached && ownerFulfilled) throw lease.failures.get(failedDetached);
       }
     };
     const operation = previous.then(run, run);
@@ -898,6 +2725,15 @@ class SyncEngine {
     });
   }
 
+  async close() {
+    const session = NATIVE_ROOT_SESSIONS.get(this);
+    if (session) {
+      try { session.close(); } catch { /* best-effort close */ }
+      NATIVE_ROOT_SESSIONS.delete(this);
+    }
+    this.opened = false;
+  }
+
   async open({ readOnly = false } = {}) {
     return readOnly
       ? this.withReadOnlyRoot(() => this, { allowUnopened: true })
@@ -932,36 +2768,110 @@ class SyncEngine {
   }
 
   async _open({ readOnly = false } = {}) {
+    denyIndeterminateInbound(this);
+    if (!readOnly) requireNativeRootMutationContext(this);
+    const configuredMetadata = internalRootMetadata(
+      this.rootDir, this.snapshotPath, this.journal?.filePath);
+    noteColdAdmissionWrite(this.rootDir, true);
     if (!readOnly) await fsp.mkdir(this.rootDir, { recursive: true });
+    noteColdAdmissionWrite(this.rootDir, false);
     await containedAbsolute(this.rootDir, this.rootDir, false);
+    // Always recheck, including previously opened non-FOD instances whose
+    // snapshot cache looks unchanged after another instance marked the root.
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
+    noteColdAdmissionWrite(this.rootDir, true);
     this.journal = await this.journal.open({ requireExisting: readOnly });
+    noteColdAdmissionWrite(this.rootDir, false);
+    // A rejected native-required cold open must never let a later open use
+    // public, mutable this.snapshot as if it were still the disk contents.
+    // Re-parse the durable snapshot on every strict entry, including retries
+    // after a previously failed recovery. This is a JS-state safeguard; it
+    // does not authenticate the disk or protect against hostile root swaps.
+    if (this.requireNativeRootRecovery) this.snapshotDiskRevision = null;
+    const snapshotOpenFlags = fs.constants.O_RDONLY
+      | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+    let snapshotHandle;
     let snapshotStats;
+    let snapshotBytes = null;
     try {
-      snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
+      // Acquire the exact inode BEFORE observing its pathname. lstat followed
+      // by readFile(path) could open a different, attacker-rebound snapshot.
+      snapshotHandle = await fsp.open(this.snapshotPath, snapshotOpenFlags);
     } catch (error) {
       if (error.code !== "ENOENT" || this.opened || readOnly) fail("Sync snapshot is unavailable", "invalid_snapshot");
+      noteColdAdmissionWrite(this.rootDir, true);
       await durableJson(this.snapshotPath, this.snapshot);
-      snapshotStats = await fsp.lstat(this.snapshotPath, { bigint: true });
+      noteColdAdmissionWrite(this.rootDir, false);
+      snapshotHandle = await fsp.open(this.snapshotPath, snapshotOpenFlags);
     }
-    if (!snapshotStats.isFile() || snapshotStats.isSymbolicLink()) fail("Sync snapshot is not a regular file", "invalid_snapshot");
-    if (!sameSnapshotRevision(this.snapshotDiskRevision, snapshotStats)) {
-      let parsed;
-      try {
-        parsed = JSON.parse(await fsp.readFile(this.snapshotPath, "utf8"));
-      } catch {
-        fail("Invalid sync snapshot", "invalid_snapshot");
+    try {
+      snapshotStats = await snapshotHandle.stat({ bigint: true });
+      const namedBefore = await fsp.lstat(this.snapshotPath, { bigint: true });
+      if (!snapshotStats.isFile() || snapshotStats.ino === 0n
+        || snapshotStats.nlink !== 1n
+        || !namedBefore.isFile() || namedBefore.isSymbolicLink()
+        || !sameSnapshotRevision(snapshotStats, namedBefore)) {
+        fail("Sync snapshot inode differs from the opened file", "invalid_snapshot");
       }
-      if (parsed.version !== SNAPSHOT_VERSION || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
+      if (!sameSnapshotRevision(this.snapshotDiskRevision, snapshotStats)) {
+        snapshotBytes = await readExactOpenedControlBytes(snapshotHandle,
+          snapshotStats.size, () => evictionError("invalid_snapshot",
+            "Sync snapshot grew beyond its original size or safety budget"));
+        const heldAfter = await snapshotHandle.stat({ bigint: true });
+        const namedAfter = await fsp.lstat(this.snapshotPath, { bigint: true });
+        if (!sameSnapshotRevision(snapshotStats, heldAfter)
+          || !sameSnapshotRevision(snapshotStats, namedAfter)
+          || BigInt(snapshotBytes.length) !== snapshotStats.size) {
+          fail("Sync snapshot changed during held-inode read", "invalid_snapshot");
+        }
+      }
+    } finally {
+      await snapshotHandle.close();
+    }
+    if (snapshotBytes !== null) {
+      let parsed;
+      try { parsed = JSON.parse(snapshotBytes.toString("utf8")); }
+      catch { fail("Invalid sync snapshot", "invalid_snapshot"); }
+      if (![SNAPSHOT_VERSION, EVICTION_LEDGER_SNAPSHOT_VERSION].includes(parsed.version)
+        || !parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) fail("Invalid sync snapshot", "invalid_snapshot");
+      if ((parsed.version === EVICTION_LEDGER_SNAPSHOT_VERSION
+        && (typeof parsed.evictionLedgerEpoch !== "string"
+          || !EVICTION_LEDGER_EPOCH.test(parsed.evictionLedgerEpoch)
+          || typeof parsed.evictionLedgerRequired !== "boolean"))
+        || (parsed.version === SNAPSHOT_VERSION
+          && (parsed.evictionLedgerEpoch !== undefined
+            || parsed.evictionLedgerRequired !== undefined))) {
+        fail("Sync snapshot has an invalid eviction replay epoch", "invalid_snapshot");
+      }
       if (parsed.remoteOnly === undefined) parsed.remoteOnly = {};
       if (!parsed.remoteOnly || typeof parsed.remoteOnly !== "object" || Array.isArray(parsed.remoteOnly)) fail("Invalid remote-only sync state", "invalid_snapshot");
+      denyHistoricallyTrackedControlTemp(parsed, configuredMetadata);
       if (parsed.excludedPaths !== undefined) {
         try { parsed.excludedPaths = normalizeExcludedPaths(parsed.excludedPaths); } catch { fail("Invalid excluded sync paths", "invalid_snapshot"); }
+      }
+      if (parsed.excludedPathsCasefoldVersion !== undefined
+        && ![1, EXCLUDED_PATHS_CASEFOLD_VERSION].includes(parsed.excludedPathsCasefoldVersion)) {
+        fail("Unknown excluded sync policy version", "invalid_snapshot");
       }
       if (parsed.pendingEvictions !== undefined) {
         if (!parsed.pendingEvictions || typeof parsed.pendingEvictions !== "object" || Array.isArray(parsed.pendingEvictions)) fail("Invalid pending evictions", "invalid_snapshot");
         for (const entry of Object.values(parsed.pendingEvictions)) {
           if (!entry || typeof entry !== "object" || typeof entry.code !== "string" || !Number.isInteger(entry.attempts) || entry.attempts < 0) fail("Invalid pending eviction", "invalid_snapshot");
           try { protocol.safeRelativePath(entry.path, "path"); } catch { fail("Invalid pending eviction path", "invalid_snapshot"); }
+          if (entry.localVersionStamp !== undefined
+            && (entry.code !== "local_changes_pending" || typeof entry.localVersionStamp !== "string"
+              || !/^[a-f0-9]{64}$/.test(entry.localVersionStamp))) {
+            fail("Invalid retained excluded-file version", "invalid_snapshot");
+          }
+          if (entry.localPath !== undefined) {
+            try {
+              protocol.safeRelativePath(entry.localPath, "localPath");
+              if (entry.code !== "local_changes_pending" || entry.localVersionStamp === undefined
+                || entry.localPath.toLowerCase() !== entry.path.toLowerCase()) {
+                fail("Invalid retained excluded-file path", "invalid_snapshot");
+              }
+            } catch { fail("Invalid retained excluded-file path", "invalid_snapshot"); }
+          }
         }
       }
       if (parsed.pinnedFiles !== undefined) {
@@ -1025,9 +2935,282 @@ class SyncEngine {
       this.snapshot = parsed;
       this.snapshotDiskRevision = snapshotStats;
     }
-    await this.recoverPendingHydrations();
+    // A crash between a per-object durable PREPARE and the final full
+    // checkpoint must be recovered BEFORE local reconciliation or outbound
+    // sync. Replay never unlinks anything or authorizes a remote operation.
+    this.evictionLedgerHead = null;
+    if (this.nativeRootSession && this.filesOnDemand) {
+      await fsp.mkdir(this.rootDir, { recursive: true });
+      const existingSession = NATIVE_ROOT_SESSIONS.get(this);
+      if (existingSession && isVerifiedNativeRootSession(existingSession)) {
+        existingSession.reacquireRoot();
+      } else {
+        NATIVE_ROOT_SESSIONS.set(this, openCompiledNativeRootSession(this.rootDir));
+      }
+    }
+    if (this.requireNativeRootRecovery && this.snapshot.evictionLedgerRequired && !hasNativeCustody(this)) {
+      denyLegacyNativeRootReplay();
+    }
+    // Run the module-captured implementation, never a caller-replaced
+    // instance or prototype hook which could silently disarm required-v2.
+    if (!readOnly) {
+      await replayEvictionLedgerBuiltIn.call(this);
+      if (!this.requireNativeRootRecovery) await this.recoverPendingHydrations();
+    }
     this.opened = true;
     return this;
+  }
+
+  async replayEvictionLedger() {
+    if (this.requireNativeRootRecovery && this.snapshot.evictionLedgerRequired && !hasNativeCustody(this)) {
+      // The only currently available RootSession contract rejects activation.
+      // Do not read legacy path-based staging/ledger trees, clear the required
+      // marker, emit operations, or accept a caller-supplied fake native object.
+      denyLegacyNativeRootReplay();
+    }
+    requireNativeRootMutationContext(this);
+    await assertNoOrphanedEvictionArchive(this.rootDir);
+    const { entries, head } = await readEvictionLedger(this.rootDir,
+      this.snapshot.evictionLedgerRequired ? this.snapshot.evictionLedgerEpoch : null);
+    if (this.requireNativeRootRecovery && entries.size && !hasNativeCustody(this)) {
+      // Even if a future native backend can be opened, legacy JS path replay
+      // must never be selected for an unfinished ledger transaction.
+      denyLegacyNativeRootReplay();
+    }
+    // A normal v1 snapshot or an already-compacted v2 checkpoint has no
+    // active eviction to replay. Do not inspect accumulated .rootark-trash
+    // here: its legitimate contents can exceed the strict genesis scan cap,
+    // and its staged head is only authoritative while a v2 snapshot explicitly
+    // requires replay (or an active ledger must be reconciled). A subsequent
+    // migration still validates the staged genesis before any PREPARE.
+    if (!this.snapshot.evictionLedgerRequired && !entries.size) {
+      if (!head) return;
+      // A successfully recovered zero-PREPARE epoch may retain head.json
+      // after its full durable checkpoint. No cached file was moved by it;
+      // a later ordinary restart must not scan unrelated retained trash.
+      if (head.sequence === 0 && head.digest === EVICTION_LEDGER_ZERO) {
+        if (this.snapshot.version === EVICTION_LEDGER_SNAPSHOT_VERSION
+          && head.epoch !== this.snapshot.evictionLedgerEpoch) {
+          fail("Inactive eviction genesis epoch differs from durable checkpoint", "invalid_snapshot");
+        }
+        return;
+      }
+    }
+    const staged = await stagedEvictionGenesis(this.rootDir);
+    if (this.snapshot.evictionLedgerRequired && !head) {
+      // A crash after the v2 snapshot but before promoting the genesis can
+      // leave the only durable head in v1's already-internal trash namespace.
+      // No PREPARE is allowed before promotion. Still demand full physical
+      // proof, since a forged staged genesis cannot attest to lost files.
+      if (!staged || staged.head.epoch !== this.snapshot.evictionLedgerEpoch) {
+        fail("Required active eviction ledger is missing", "invalid_snapshot");
+      }
+      await this.recoverUnstartedEvictionLedger(staged);
+      return;
+    }
+    if (head && !entries.size) {
+      if (staged) fail("Conflicting staged and active eviction genesis", "invalid_snapshot");
+      if (this.snapshot.evictionLedgerRequired) {
+        if (head.epoch !== this.snapshot.evictionLedgerEpoch
+          || head.sequence !== 0 || head.digest !== EVICTION_LEDGER_ZERO) {
+          fail("Eviction genesis is not anchored to required snapshot", "invalid_snapshot");
+        }
+        // An empty genesis alone could have been fabricated after losing a
+        // post-PREPARE ledger. Require all original plaintext cache files to
+        // be present and clean before disarming its required marker.
+        await this.recoverUnstartedEvictionLedger();
+      }
+      return;
+    }
+    if (entries.size && (this.snapshot.version !== EVICTION_LEDGER_SNAPSHOT_VERSION
+      || head.epoch !== this.snapshot.evictionLedgerEpoch || staged)) {
+      fail("Eviction journal requires a matching v2 snapshot", "invalid_snapshot");
+    }
+    if (!entries.size) return;
+    if (this.snapshot.version !== EVICTION_LEDGER_SNAPSHOT_VERSION) {
+      fail("Eviction overlay requires durable snapshot version fence", "invalid_snapshot");
+    }
+    const recovered = JSON.parse(JSON.stringify(this.snapshot));
+    const directoryCache = new Map();
+    for (const row of entries.values()) {
+      const item = row.prepare.item;
+      const tracked = Object.hasOwn(recovered.files, item.path)
+        ? recovered.files[item.path] : null;
+      const marker = Object.hasOwn(recovered.remoteOnly, item.objectId)
+        ? recovered.remoteOnly[item.objectId] : null;
+      if (!tracked && (!marker
+        || protocol.canonicalJson(marker) !== protocol.canonicalJson(item.record))) {
+        fail("Eviction journal has neither its tracked file nor a committed marker", "invalid_snapshot");
+      }
+      if (tracked && (tracked.deleted || tracked.directory || tracked.objectId !== item.objectId
+        || tracked.fileId !== item.fileId || tracked.hash !== item.hash)) {
+        fail("Eviction journal no longer matches its tracked identity", "invalid_snapshot");
+      }
+      const physical = await uniqueExcludedPhysicalPath(this.rootDir, item.path, directoryCache);
+      if (physical === null) {
+        if (recovered.pinnedFiles?.[pinnedKey(item.objectId)]?.fileId === item.fileId) {
+          fail("Pinned file cannot be replay-evicted", "invalid_snapshot");
+        }
+        if (tracked) {
+          // A PREPARE is local intent, never proof that the remote copy still
+          // exists. Re-fetch its exact previously authenticated envelope and
+          // verify the owner signature/current revocation policy and AEAD
+          // plaintext hash before trusting a missing local cache file.
+          let remote;
+          try {
+            const response = await this.adapter.list(item.objectId);
+            const records = Array.isArray(response) ? response
+              : Array.isArray(response?.objects) ? response.objects : response ? [response] : [];
+            if (records.length !== 1) throw new Error("Missing exact remote eviction witness");
+            remote = protocol.validateStoredOperation(records[0]);
+            if (remote.objectId !== item.objectId || remote.fileId !== item.fileId
+              || remote.versionId !== item.record.versionId
+              || remote.metadata.path !== item.path
+              || remote.tombstone || remote.operation === "delete"
+              || signedEnvelopeDigest(remote) !== item.remoteDigest
+              || protocol.canonicalJson(remote.revision) !== protocol.canonicalJson(item.record.revision)) {
+              throw new Error("Remote eviction witness no longer matches PREPARE");
+            }
+            await this.verifyIncomingOperation(remote, { preObserve: false });
+            const key = await this.keyFor(remote);
+            const plaintext = protocol.decryptPayload(remote, key);
+            const content = remote.operation === "move"
+              ? protocol.decodeMovePayload(plaintext, key) || plaintext : plaintext;
+            if (crypto.createHash("sha256").update(content).digest("hex") !== item.hash) {
+              throw new Error("Remote content no longer matches evicted cache");
+            }
+          } catch {
+            fail("Missing or unauthenticated remote eviction replay witness", "invalid_snapshot");
+          }
+        }
+        // JSON object indexes may legally contain names like "__proto__";
+        // assigning through [] would mutate the prototype rather than store
+        // a durable own remote-only entry on those names.
+        Object.defineProperty(recovered.remoteOnly, item.objectId, {
+          value: item.record, enumerable: true, writable: true, configurable: true,
+        });
+        if (tracked) delete recovered.files[item.path];
+        if (recovered.pendingEvictions) delete recovered.pendingEvictions[item.objectId];
+      } else if (tracked) {
+        // PREPARE alone is not a deletion receipt. An existing local file
+        // could contain new dirty bytes; preserve it and arrange a fresh full
+        // signed verification once the engine resumes, never unlink on replay.
+        recovered.pendingEvictions = recovered.pendingEvictions || {};
+        if (!Object.hasOwn(recovered.pendingEvictions, item.objectId)) {
+          Object.defineProperty(recovered.pendingEvictions, item.objectId, {
+            value: { path: item.path, code: "sync_operation_pending", attempts: 0 },
+            enumerable: true, writable: true, configurable: true,
+          });
+        }
+      } else {
+        // A stale old journal record must not suppress an unrelated new file
+        // whose local identity was never part of this eviction.
+        fail("Untracked file occupies a recorded eviction path", "invalid_snapshot");
+      }
+    }
+    if (recovered.pendingEvictions && !Object.keys(recovered.pendingEvictions).length) {
+      delete recovered.pendingEvictions;
+    }
+    // Every committed eviction now has a durable remote-only marker, and
+    // every still-present local file retains its tracked identity/watch.
+    // Retire the guard in that same full durable checkpoint, before cleanup.
+    recovered.evictionLedgerRequired = false;
+    const previous = this.snapshot;
+    this.snapshot = recovered;
+    try { await this.persistSnapshot(); }
+    catch (error) { this.snapshot = previous; throw error; }
+    await clearEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch);
+  }
+
+  async recoverUnstartedEvictionLedger(staged = null) {
+    if (this.requireNativeRootRecovery) denyLegacyNativeRootReplay();
+    // Called under the cross-process exclusive root lock, only when required
+    // is true and the anchored genesis exists without any PREPARE records.
+    // Repeated full-file verification is intentional: this exceptional path
+    // must not use a metadata-only stamp as proof of clean retained bytes.
+    const assertAllTrackedBytesPresent = async () => {
+      try {
+        const live = Object.entries(this.snapshot.files).filter(([, item]) => !item.deleted);
+        if (!live.some(([, item]) => !item.directory)) {
+          fail("Empty active eviction recovery has no tracked cache files", "invalid_snapshot");
+        }
+        const names = await fsp.readdir(this.rootDir);
+        if (names.length > 16384 || names.some((name) =>
+          (name.toLowerCase() === EVICTION_LEDGER_DIR && name !== EVICTION_LEDGER_DIR)
+          || name.toLowerCase().startsWith(EVICTION_LEDGER_ARCHIVE))) {
+          fail("An ambiguous or archived eviction ledger remains", "invalid_snapshot");
+        }
+        // The regular sync scanner obeys the *current* mutable selection and
+        // exclusion policy. A restart with the same excluded path as before
+        // the crash would hide its intact tracked bytes and strand required
+        // genesis forever. Recovery must inspect physical entries regardless
+        // of that policy, without silently ignoring unknown names or links.
+        const scanned = await this.scanPhysicalCacheForEvictionRecovery();
+        const trackedKeys = new Set();
+        const physicalCache = new Map();
+        const emptyHash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
+        for (const [relative, prior] of live) {
+          protocol.safeRelativePath(relative, "path");
+          const folded = relative.toLowerCase();
+          if (trackedKeys.has(folded) || !EVICTION_LEDGER_HASH.test(prior.hash)) {
+            fail("Ambiguous or unhashable tracked cache file", "invalid_snapshot");
+          }
+          trackedKeys.add(folded);
+          // Reject case-only aliases even on POSIX: reconcileLocal could
+          // otherwise DELETE the old tracked spelling and CREATE the alias.
+          const physical = await uniqueExcludedPhysicalPath(this.rootDir, relative, physicalCache);
+          if (physical !== relative) fail("Tracked cache path is not physically intact", "invalid_snapshot");
+          const target = await contained(this.rootDir, relative, false);
+          const stats = await fsp.lstat(target, { bigint: true });
+          if (prior.directory) {
+            if (!stats.isDirectory() || stats.isSymbolicLink() || prior.hash !== emptyHash) {
+              fail("Tracked cache directory is not intact", "invalid_snapshot");
+            }
+          } else {
+            if (!stats.isFile() || stats.isSymbolicLink()) {
+              fail("Tracked cache file is not intact", "invalid_snapshot");
+            }
+            const bytes = await readContainedFile(this.rootDir, relative, stats);
+            if (crypto.createHash("sha256").update(bytes).digest("hex") !== prior.hash) {
+              fail("Tracked cache bytes differ from the last durable snapshot", "invalid_snapshot");
+            }
+          }
+          if (!Object.hasOwn(scanned, relative)
+            || scanned[relative].directory !== Boolean(prior.directory)
+            || scanned[relative].hash !== prior.hash) {
+            fail("Tracked file is absent from the complete local scan", "invalid_snapshot");
+          }
+        }
+        for (const relative of Object.keys(scanned)) {
+          if (!Object.hasOwn(this.snapshot.files, relative)
+            || this.snapshot.files[relative].deleted) {
+            fail("Untracked local content prevents empty-ledger recovery", "invalid_snapshot");
+          }
+        }
+      } catch {
+        fail("Unproven physical state after required eviction ledger loss", "invalid_snapshot");
+      }
+    };
+    await assertAllTrackedBytesPresent();
+    const reread = async () => {
+      const { entries, head } = await readEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch);
+      const stagedNow = staged ? await stagedEvictionGenesis(this.rootDir) : null;
+      if (entries.size || (staged ? (head || !stagedNow
+        || stagedNow.file !== staged.file || stagedNow.head.epoch !== staged.head.epoch)
+        : (!head || head.epoch !== this.snapshot.evictionLedgerEpoch
+          || head.sequence !== 0 || head.digest !== EVICTION_LEDGER_ZERO))) {
+        fail("Eviction genesis changed during physical proof", "invalid_snapshot");
+      }
+    };
+    await reread();
+    await assertAllTrackedBytesPresent();
+    await reread();
+    this.snapshot.evictionLedgerRequired = false;
+    try { await this.persistSnapshot(); }
+    catch (error) {
+      this.snapshot.evictionLedgerRequired = true;
+      throw error;
+    }
   }
 
   async recoverPendingHydrations() {
@@ -1044,14 +3227,8 @@ class SyncEngine {
             fsp.lstat(target, { bigint: true }),
           ]);
           if (sameFileIdentity(tempStats, targetStats)) {
-            const targetHash = crypto.createHash("sha256").update(await fsp.readFile(target)).digest("hex");
-            if (entry.payloadHash && targetHash === entry.payloadHash) {
-              await fsp.unlink(target);
-              await fsp.rm(tempPath, { force: true });
-            } else {
-              // Preserve locally edited published bytes; only drop the private alias.
-              await fsp.rm(tempPath, { force: true });
-            }
+            await fsp.unlink(target);
+            await fsp.rm(tempPath, { force: true });
           }
         }
       }
@@ -1068,13 +3245,13 @@ class SyncEngine {
     await this.persistSnapshot();
   }
 
-  async writeSnapshotDurable() {
+  async persistSnapshot() {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    markNativeRootMutationAttempt(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     await durableJson(this.snapshotPath, this.snapshot);
     this.snapshotDiskRevision = await fsp.lstat(this.snapshotPath, { bigint: true });
-  }
-
-  async persistSnapshot() {
-    await this.writeSnapshotDurable();
   }
 
   async keyFor(operation) {
@@ -1738,7 +3915,10 @@ class SyncEngine {
       fail("Remote sync envelope changed during authorization", "remote_authorization_rejected");
     }
     this.journal.assertCompatibleAdmission(operation.operationId, digest);
-    if (candidate && preObserve) await this.journal.observeAdmission(operation.operationId, candidate);
+    if (candidate && preObserve) {
+      await withNativeDurableMutationIntent(this,
+        () => this.journal.observeAdmission(operation.operationId, candidate));
+    }
     // The exact historical digest already pinned locally can complete its
     // observed->admitted transition after a crash, even after expiry. Never
     // derive this from operation-ID-only legacy `seen` entries.
@@ -1756,7 +3936,16 @@ class SyncEngine {
   }
 
   isExcluded(relativePath) {
-    return this.excludedPaths.some((excluded) => pathWithin(relativePath, excluded));
+    // Exclusion is a DENY policy, so apply the portable Windows case-fold
+    // comparison on POSIX too. Otherwise an excluded "private" silently
+    // permits "PRIVATE/secret.txt" to be uploaded or hydrated on Linux.
+    // Keep selectedPaths and object-identity comparisons platform-specific:
+    // those positive decisions must not gain access through a case alias.
+    const portablePath = relativePath.toLowerCase();
+    return this.excludedPaths.some((excluded) => {
+      const portableExcluded = excluded.toLowerCase();
+      return portablePath === portableExcluded || portablePath.startsWith(`${portableExcluded}/`);
+    });
   }
 
   isSelected(relativePath) {
@@ -1782,14 +3971,40 @@ class SyncEngine {
     if (typeof this.adapter.listInventory !== "function") {
       fail("Metadata inventory is not supported by this sync adapter", "inventory_unavailable");
     }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 64
+      || (cursor !== null && (typeof cursor !== "string" || !cursor
+        || cursor.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(cursor)))) {
+      fail("Invalid metadata inventory request", "invalid_inventory");
+    }
     // Browsing is read-only and advisory. No remote-only pins, journal entries
     // or local files may be created from metadata without fetching and
     // independently verifying the complete signed envelope.
-    const page = await this.adapter.listInventory({ limit, cursor });
-    if (!page || !Array.isArray(page.objects)) fail("Invalid metadata inventory page", "invalid_inventory");
+    const page = detachedAdvisoryData(await this.adapter.listInventory({ limit, cursor }));
+    if (!page || typeof page !== "object" || Array.isArray(page)
+      || Object.keys(page).sort().join(",") !== "nextCursor,objects,protocolVersion,view"
+      || page.protocolVersion !== 2 || page.view !== "metadata"
+      || !Array.isArray(page.objects) || page.objects.length > limit
+      || (page.objects.length === 0 && page.nextCursor !== null)
+      || (page.nextCursor !== null && (typeof page.nextCursor !== "string"
+        || !page.nextCursor || page.nextCursor.length > 1024
+        || !/^[A-Za-z0-9_-]+$/.test(page.nextCursor)))) {
+      fail("Invalid metadata inventory page", "invalid_inventory");
+    }
+    let objects;
+    try {
+      // Custom adapters must not make browser/picker output a full ciphertext
+      // envelope or extra metadata. Reuse the canonical adapter's exact
+      // inventory schema, not the untrusted source object's spread shape.
+      objects = page.objects.map((entry) => {
+        requireAdvisoryInventoryFieldTypes(entry);
+        return assertInventoryEntry(entry);
+      });
+    } catch {
+      fail("Invalid metadata inventory entry", "invalid_inventory");
+    }
     return {
-      ...page, advisory: true,
-      objects: page.objects.map((record) => ({
+      protocolVersion: 2, view: "metadata", nextCursor: page.nextCursor, advisory: true,
+      objects: objects.map((record) => ({
         ...record, selectedOnDevice: this.operationDestinationIsSelected(record),
       })),
     };
@@ -1889,6 +4104,13 @@ class SyncEngine {
     const directoryRecord = directoryMove || (tombstone && Boolean(prior?.directory));
     if (!prior || prior.deleted || Boolean(prior.directory) !== directoryRecord
       || prior.objectId !== operation.objectId || prior.fileId !== operation.fileId) return null;
+
+    // The destination is outside the selected scope but a tracked origin is
+    // inside it. Reconciliation can stage/rename/unlink that local origin via
+    // paths without passing through _apply(). Deny BEFORE remote verification
+    // side effects or any local reads, for direct and pull callers alike.
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this)) denyUntrustedNativeEviction();
+
     // Reconciliation can stage/rename the origin and then discard its tracked
     // snapshot entry. A signed MOVE/DELETE outside selectedPaths must never
     // sidestep the local pin policy merely because _apply() is not called.
@@ -1905,9 +4127,17 @@ class SyncEngine {
   }
 
   async reconcileOutOfScopeMove(operation, summary, options = {}) {
+    denyIndeterminateInbound(this);
+    // The module-captured negative FOD origin fence is purely a snapshot
+    // calculation; it must run BEFORE the lock-context rejection so even
+    // direct callers receive the original native-custody denial rather
+    // than ever attempting a pathname-based cache stage or mode write.
+    if (this.requireNativeRootRecovery) preflightOutOfScopeMoveBuiltIn.call(this, operation);
+    requireNativeRootMutationContext(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // The same side-effect-free check runs BEFORE signature pre-observation.
     // Keep it here too for direct callers and changes during verification.
-    const source = this.preflightOutOfScopeMove(operation);
+    const source = preflightOutOfScopeMoveBuiltIn.call(this, operation);
     // No pull/reconciliation entry point may separately advance a member of
     // a locally durable signed DELETE+MOVE remote transaction. A partial LIST
     // or out-of-scope sweep is not a two-envelope atomic admission receipt.
@@ -2000,13 +4230,16 @@ class SyncEngine {
       if (pathsEqual(relativePath, sourcePath)) delete this.snapshot.files[relativePath];
     }
     this.rememberRemoteOnly(operation, "excluded", { directory: directoryRecord });
-    for (const item of pending) await this.journal.markSeen(item.operationId);
+    for (const item of pending) {
+      await withNativeDurableMutationIntent(this, () => this.journal.markSeen(item.operationId));
+    }
     await this.pruneEmptyUntrackedParents(path.dirname(target));
     await this.persistSnapshot();
     return true;
   }
 
   async buildOperation(input) {
+    denyIndeterminateInbound(this);
     const key = input.fileKey || await this.fileKeyResolver(input);
     let operationInput = input;
     if (input.operation === "move") {
@@ -2037,6 +4270,10 @@ class SyncEngine {
   }
 
   async assertOutgoingAuthorized(operation, authorizedAction = null) {
+    denyIndeterminateInbound(this);
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && (operation.operation === "delete" || operation.tombstone)) {
+      denyUntrustedNativeSignedDelete();
+    }
     let locallyAuthorized;
     try { locallyAuthorized = await this.authorizeOutgoing(operation); } catch {
       fail("Local sync authorization rejected", "authorization_rejected");
@@ -2153,13 +4390,19 @@ class SyncEngine {
   }
 
   async _enqueueChange(input) {
-    if (!this.opened) await this._open();
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
+    if (!this.opened) await openEngineBuiltIn.call(this);
     const remoteOnly = this.snapshot.remoteOnly[input.objectId];
     if (remoteOnly?.reason === "evicted") fail("Materialize a remote-only file before enqueuing changes", "remote_only_object");
     const key = input.fileKey || await this.fileKeyResolver(input);
     const operation = protocol.validateOperation(await this.buildOperation({ ...input, fileKey: key }));
     await this.assertOutgoingPinnedPolicy(operation);
-    await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
+    await this.assertOutgoingAuthorized(operation, () => {
+      markNativeRootMutationAttempt(this);
+      return this.journal.enqueue(operation);
+    });
     let hash;
     if (operation.operation === "move") {
       const plaintext = protocol.decodeMovePayload(protocol.decryptPayload(operation, key), key);
@@ -2171,10 +4414,26 @@ class SyncEngine {
   }
 
   async translateWebDavMutation(event) {
-    if (!this.opened) await this.open();
+    // Translation can open a cold FOD root, installing its durable mode
+    // marker. It must acquire the kernel-backed root exclusion FIRST, not
+    // call enforceEverFodRootMode outside withMutationLock.
+    // Preserve the module-private negative latch on an already-indeterminate
+    // engine before attempting another physical lock acquisition.
+    denyIndeterminateInbound(this);
+    return this.withMutationLock(() => this._translateWebDavMutation(event));
+  }
+
+  async _translateWebDavMutation(event) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!event || typeof event.operationId !== "string" || !event.operationId) fail("WebDAV mutation id is required", "invalid_webdav_mutation");
     const kind = String(event.kind || "");
     if (!["put", "move", "delete"].includes(kind)) fail("Unsupported WebDAV mutation", "invalid_webdav_mutation");
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && (kind === "delete" || kind === "move")) {
+      // MOVE may also generate a destination tombstone in an overwrite pair.
+      denyUntrustedNativeSignedDelete();
+    }
     const operationPrefixes = [`webdav-${event.operationId}-`,
       `webdavsolo-${event.operationId}-`];
     const pendingForEvent = (await this.journal.recover()).filter((operation) =>
@@ -2420,13 +4679,65 @@ class SyncEngine {
   }
 
   async retryPush(operation) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    // The public instance method assertOutgoingAuthorized is replaceable JS.
+    // A direct retryPush caller must NEVER use that override to dispatch a
+    // destructive signed DELETE while required-v2 native root custody is
+    // unavailable. This negative guard is module-owned, runs before mode
+    // I/O or any adapter callback and cannot be waived by an object flag.
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this)
+      && (operation?.operation === "delete" || operation?.tombstone === true)) {
+      denyUntrustedNativeSignedDelete();
+    }
+    // Bind the exact stored envelope before any asynchronous authorization.
+    // A caller-owned object may be mutated by a replaceable JavaScript
+    // authorization callback; a one-time operation/tombstone check is NOT a
+    // custody fence against a signed DELETE substituted before dispatch.
+    const nativeRequiredEnvelopeDigest = this.requireNativeRootRecovery
+      ? signedEnvelopeDigest(protocol.validateStoredOperation(operation)) : null;
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     let lastError;
     for (let attempt = 0; attempt < this.maxRetries; attempt += 1) {
       // The journal's prior authorization is not a live device grant. Check
       // again on EVERY attempt, after all queue/retry waits, before HTTP PUT.
       // An in-flight request still needs independent server-side revocation
       // fencing in the atomic PUT transaction.
-      try { return await this.assertOutgoingAuthorized(operation, () => this.adapter.push(operation)); } catch (error) {
+      try {
+        return await this.assertOutgoingAuthorized(operation, () => {
+          let dispatchEnvelope = operation;
+          let nativePush;
+          let nativeAdapter;
+          if (nativeRequiredEnvelopeDigest !== null) {
+            // Resolve a potentially hostile adapter getter BEFORE the final
+            // verification. A getter can synchronously replace the original
+            // caller-owned object without yielding to the event loop.
+            nativeAdapter = this.adapter;
+            nativePush = nativeAdapter.push;
+            try {
+              // validateStoredOperation reconstructs all nested signed fields;
+              // the transport must receive this detached normalized envelope,
+              // never the caller-controlled reference that was checked.
+              dispatchEnvelope = protocol.validateStoredOperation(operation);
+            } catch {
+              fail("Outgoing signed envelope changed before dispatch", "invalid_snapshot");
+            }
+            if (signedEnvelopeDigest(dispatchEnvelope) !== nativeRequiredEnvelopeDigest) {
+              fail("Outgoing signed envelope changed before dispatch", "invalid_snapshot");
+            }
+            // Check exactly the detached object that will reach the transport.
+            // Neither a late caller getter nor adapter.push lookup can change
+            // the object after this comparison.
+            if (dispatchEnvelope.operation === "delete" || dispatchEnvelope.tombstone === true) {
+              if (!hasNativeCustody(this)) denyUntrustedNativeSignedDelete();
+            }
+          }
+          markNativeRootMutationAttempt(this);
+          return nativeRequiredEnvelopeDigest !== null
+            ? Reflect.apply(nativePush, nativeAdapter, [dispatchEnvelope])
+            : this.adapter.push(operation);
+        });
+      } catch (error) {
         lastError = error;
         if (error?.code === "authorization_rejected" || error?.code === "authorization_required") throw error;
         if (!transient(error) || attempt + 1 === this.maxRetries) throw error;
@@ -2436,11 +4747,17 @@ class SyncEngine {
   }
 
   async recoverConflict(operation, summary) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    // Direct callers must not bypass the persisted root-mode fence by writing
+    // conflict recovery payloads outside the ordinary mutation lock.
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (operation.operation === "delete" || operation.tombstone) return;
     const key = await this.keyFor(operation);
     const decrypted = protocol.decryptPayload(operation, key);
     const plaintext = operation.operation === "move" ? (protocol.decodeMovePayload(decrypted, key) || decrypted) : decrypted;
     const conflictRoot = path.join(this.rootDir, ".rootark-conflicts");
+    markNativeRootMutationAttempt(this);
     await fsp.mkdir(conflictRoot, { recursive: true });
     await containedAbsolute(this.rootDir, conflictRoot, false);
     const target = path.join(conflictRoot, `${operation.operationId}.conflict`);
@@ -2454,6 +4771,8 @@ class SyncEngine {
   }
 
   async pushAtomicSignedOverwritePair(pending, summary) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     if (!this.requireAuthorization || !this.requireCurrentOutgoingAuthorization
       || typeof this.currentDeviceAuthorization !== "function"
       || typeof this.adapter.pushBatch !== "function"
@@ -2494,6 +4813,13 @@ class SyncEngine {
       // envelopes and the synchronous owner-trusted policy in one no-await
       // window immediately before beginning the single remote batch POST.
       const dispatchIfBothStillFresh = () => {
+        // This call graph is still the legacy JavaScript publisher, NOT an
+        // independently rooted native RootSession. Even a caller that
+        // overrides assertOutgoingAuthorized on this instance must not
+        // turn its JS callback into authority for a destructive signed
+        // DELETE + MOVE. Historical read-only witness verification above
+        // remains permitted without attempting any new remote POST.
+        if (this.requireNativeRootRecovery && !hasNativeCustody(this)) denyUntrustedNativeSignedDelete();
         for (const member of [deleted, moved]) {
           try { protocol.validateFreshSignedOperation(member); }
           catch { fail("Atomic batch member expired before dispatch", "authorization_required"); }
@@ -2509,6 +4835,7 @@ class SyncEngine {
             fail("Atomic batch device grant changed before dispatch", "authorization_rejected");
           }
         }
+        markNativeRootMutationAttempt(this);
         return this.adapter.pushBatch([deleted, moved]);
       };
       // The final synchronous current-policy checks begin ONE network
@@ -2639,7 +4966,10 @@ class SyncEngine {
     const observed = [deleted, moved].map((entry, index) =>
       this.localAdmissionDigestIfFresh(entry) === digests[index] ? digests[index] : null);
     for (let index = 0; index < pending.length; index++) {
-      if (observed[index]) await this.journal.observeAdmission(pending[index].operationId, observed[index]);
+      if (observed[index]) {
+        await withNativeDurableMutationIntent(this,
+          () => this.journal.observeAdmission(pending[index].operationId, observed[index]));
+      }
     }
     this.rememberOperation(deleted);
     this.rememberOperation(moved, moveHash);
@@ -2650,14 +4980,24 @@ class SyncEngine {
       this.snapshot.files[moved.metadata.path].hash = null;
     }
     await this.persistSnapshot();
-    await this.journal.markSeenMany(pending.map((entry, index) => ({
-      operationId: entry.operationId, admittedDigest: observed[index],
-    })));
+    await withNativeDurableMutationIntent(this, () =>
+      this.journal.markSeenMany(pending.map((entry, index) => ({
+        operationId: entry.operationId, admittedDigest: observed[index],
+      }))));
     summary.pushed += 2;
   }
 
   async _pushPending(summary, indeterminate = null) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const recovered = await this.journal.recover();
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && recovered.some((operation) =>
+      !this.journal.hasSeen(operation.operationId)
+      && (operation.operation === "delete" || operation.tombstone))) {
+      // Pre-existing outboxes must not bypass current native custody rules.
+      denyUntrustedNativeSignedDelete();
+    }
     // The journal's durable group manifest—not adjacency—is the local
     // evidence that the DELETE and MOVE entered the outbox together.
     // enqueueMany can leave unrelated records between two group members.
@@ -2752,11 +5092,13 @@ class SyncEngine {
         if (!this.translateWebDavOperation) continue;
         const translated = await this.translateWebDavOperation(pending);
         if (!translated) continue;
-        if (this.journal.replace) await this.journal.replace(pending.operationId, translated);
-        else await this.journal.update(pending.operationId, translated);
+        await withNativeDurableMutationIntent(this, () => this.journal.replace
+          ? this.journal.replace(pending.operationId, translated)
+          : this.journal.update(pending.operationId, translated));
         pending = translated;
       }
       let operation;
+      let pendingDispatch = null;
       try {
         operation = protocol.validateOperation(pending);
         if (!this.operationIsSelected(operation)) continue;
@@ -2836,7 +5178,8 @@ class SyncEngine {
           }
         }
         const outboundFreshDigest = this.localAdmissionDigestIfFresh(operation);
-        const result = await this.retryPush(operation);
+        pendingDispatch = this.retryPush(operation);
+        const result = await pendingDispatch;
         if (result?.status >= 400) {
           if (result.status === 409 && (result.code === "remote_path_collision"
             || result.payload?.code === "remote_path_collision")) {
@@ -2850,7 +5193,10 @@ class SyncEngine {
         // impossible to authenticate after authorization expires.
         const acknowledgedDigest = outboundFreshDigest && result?.operationId === operation.operationId
           && signedEnvelopeDigest(result) === outboundFreshDigest ? outboundFreshDigest : null;
-        if (acknowledgedDigest) await this.journal.observeAdmission(operation.operationId, acknowledgedDigest);
+        if (acknowledgedDigest) {
+          await withNativeDurableMutationIntent(this,
+            () => this.journal.observeAdmission(operation.operationId, acknowledgedDigest));
+        }
         if (operation.operation === "move" || operation.operation === "delete") {
           const hash = operation.operation === "move" ? await this.hashPendingPayload(operation) : undefined;
           this.rememberOperation(operation, hash);
@@ -2863,7 +5209,8 @@ class SyncEngine {
         // HTTP 2xx is not an independently signed admission receipt. Pin only
         // our locally signed exact envelope if the response echoes every byte.
         // Unknown ACKs and conflict results remain seen-only.
-        await this.journal.markSeen(operation.operationId, acknowledgedDigest);
+        await withNativeDurableMutationIntent(this,
+          () => this.journal.markSeen(operation.operationId, acknowledgedDigest));
         summary.pushed += 1;
       } catch (error) {
         if (error?.code === "remote_path_collision"
@@ -2917,14 +5264,11 @@ class SyncEngine {
               }
             }
           }
-          // ALL 409 `current` envelopes are attacker-controlled until Ed25519
-          // device/roster verification, including destinations inside selected
-          // paths. In particular, recoverConflict writes decrypted pending
-          // plaintext under .rootark-conflicts and must never run for B.
-          // No durable admission is created until after pin preflight.
-          await this.verifyIncomingOperation(current, { preObserve: false });
-          if (!this.operationDestinationIsSelected(current)) {
-            this.preflightOutOfScopeMove(current);
+          if (current) {
+            await this.verifyIncomingOperation(current, { preObserve: false });
+            if (!this.operationDestinationIsSelected(current)) {
+              preflightOutOfScopeMoveBuiltIn.call(this, current);
+            }
           }
           // A device signature alone cannot certify that the remote server
           // actually committed CURRENT. A malicious 409 may echo our OWN
@@ -2972,13 +5316,24 @@ class SyncEngine {
             // A verified remote winner is not the local pending operation.
             // Its separately signed envelope needs its own durable admission
             // pin after the remote snapshot/materialization is persisted.
-            await this.journal.markSeen(current.operationId, verifiedFreshDigest);
+            await withNativeDurableMutationIntent(this,
+              () => this.journal.markSeen(current.operationId, verifiedFreshDigest));
           }
-          await this.journal.markSeen(operation.operationId);
+          await withNativeDurableMutationIntent(this,
+            () => this.journal.markSeen(operation.operationId));
           summary.pushed += 1;
+          acknowledgeHandledNativeMutationPromise(this, pendingDispatch, error);
           continue;
         }
-        if (transient(error)) { summary.offline = true; continue; }
+        if (transient(error)) {
+          // A timeout/offline code from an already-invoked adapter is NOT a
+          // cryptographic no-write receipt. retryPush has recorded an active
+          // outbound write attempt, so an unconfirmed remote COMMIT must
+          // quarantine the physical lock even if the summary says offline.
+          // Trusted pre-dispatch failures never set the per-ticket hazard.
+          summary.offline = true;
+          continue;
+        }
         throw error;
       }
     }
@@ -2994,13 +5349,34 @@ class SyncEngine {
   }
 
   async stageExisting(target, customTrashTarget = null) {
-    if (!(await exists(target))) return null;
+    // No Files On-Demand caller may move cached bytes into legacy pathname
+    // trash until an independently rooted native mutation session exists.
+    // Deny BEFORE the mode-fence helper can itself write an ever-FOD marker
+    // under a foreign process lock. This is a negative fence, not custody.
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this)) denyUntrustedNativeEviction();
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
+    // A public caller may pass an absolute source. Never stage a file from
+    // outside this root, even when the trash destination itself is contained.
+    // This rejects static escapes, NOT concurrent same-SID ancestor swaps.
+    const safeTarget = await containedAbsolute(this.rootDir, target, true);
+    if (!(await exists(safeTarget))) return null;
+    if (hasNativeCustody(this)) {
+      const session = NATIVE_ROOT_SESSIONS.get(this);
+      session.openChildDirectory(".rootark-trash");
+      const trashTarget = customTrashTarget || path.join(this.rootDir, ".rootark-trash", `${Date.now()}-${crypto.randomUUID()}-${path.basename(safeTarget)}`);
+      await containedAbsolute(this.rootDir, trashTarget, true);
+      const relSrc = path.relative(this.rootDir, safeTarget).split(path.sep).join("/");
+      const relDst = path.relative(this.rootDir, trashTarget).split(path.sep).join("/");
+      session.renameNoReplace(relSrc, relDst);
+      session.syncDirectory(".rootark-trash");
+      return trashTarget;
+    }
     const trashDir = path.join(this.rootDir, ".rootark-trash");
     await fsp.mkdir(trashDir, { recursive: true });
     await containedAbsolute(this.rootDir, trashDir, false);
-    const trashTarget = customTrashTarget || path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(target)}`);
+    const trashTarget = customTrashTarget || path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(safeTarget)}`);
     await containedAbsolute(this.rootDir, trashTarget, true);
-    await fsp.rename(target, trashTarget);
+    await fsp.rename(safeTarget, trashTarget);
     return trashTarget;
   }
 
@@ -3083,16 +5459,11 @@ class SyncEngine {
     if (!staged) fail("Tracked local source disappeared during staging", "local_changes_pending");
     try {
       await containedAbsolute(this.rootDir, staged, false);
-      const stagedStats = await fsp.lstat(staged, { bigint: true });
-      if (!stagedStats.isFile() || stagedStats.isSymbolicLink() || stagedStats.nlink !== 1n
-        || !sameFileIdentity(before, stagedStats)) {
-        fail("Tracked local source changed during staging", "local_changes_pending");
-      }
       const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
       const handle = await fsp.open(staged, flags);
       try {
         const opened = await handle.stat({ bigint: true });
-        if (!sameFileVersion(stagedStats, opened)) {
+        if (!opened.isFile() || opened.nlink !== 1n || !sameFileIdentity(before, opened)) {
           fail("Tracked local source changed during staging", "local_changes_pending");
         }
         const stagedBytes = await handle.readFile();
@@ -3100,6 +5471,7 @@ class SyncEngine {
         const stagedAfterRead = await fsp.lstat(staged, { bigint: true });
         if (!sameFileVersion(opened, openedAfterRead)
           || !sameFileVersion(openedAfterRead, stagedAfterRead)
+          || stagedAfterRead.isSymbolicLink()
           || crypto.createHash("sha256").update(stagedBytes).digest("hex") !== tracked.hash) {
           fail("Tracked local source changed during staging", "local_changes_pending");
         }
@@ -3133,7 +5505,16 @@ class SyncEngine {
   }
 
   async _apply(operation, summary = null, beforeHydrationWrite = null, tombstoneSourceOverride = null, historicalRestoreHash = undefined) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     operation = envelopeCopy(operation);
+    // Incoming authenticated DELETE/tombstone is not independent authority
+    // to stage or unlink cached bytes when the native root is unavailable.
+    // This also protects direct _apply() callers, not just public apply().
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && (operation.operation === "delete" || operation.tombstone)) {
+      denyUntrustedNativeSignedDelete();
+    }
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     const key = await this.keyFor(operation);
     const plaintext = protocol.decryptPayload(operation, key);
@@ -3161,7 +5542,37 @@ class SyncEngine {
       ...(canonicalSourcePath ? { sourcePath: canonicalSourcePath } : {}),
     };
     operation = { ...operation, metadata };
+    const configuredMetadata = internalRootMetadata(
+      this.rootDir, this.snapshotPath, this.journal?.filePath);
+    if (isReservedHistoricalControlTempInMetadata(metadata.path, configuredMetadata)
+      || isReservedHistoricalControlTempInMetadata(metadata.sourcePath, configuredMetadata)) {
+      fail("Remote operation targets reserved local sync metadata", "unsafe_path");
+    }
     const target = await contained(this.rootDir, metadata.path, true);
+    // A cached-source MOVE or occupied destination would invoke legacy
+    // pathname rename/staging. Deny before journal admission, even when the
+    // source bytes are clean. An absent-source MOVE is also denied by the
+    // unconditional native-required inbound fence below, even if signed;
+    // no branch here authorizes RootSession custody.
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && operation.operation === "move") {
+      if (await exists(target)) denyUntrustedNativeEviction();
+      const trackedSource = activeFileIdentityPath(this.snapshot.files, operation, metadata.path);
+      for (const sourcePath of new Set([metadata.sourcePath, trackedSource].filter(Boolean))) {
+        if (await exists(await contained(this.rootDir, sourcePath, true))) denyUntrustedNativeEviction();
+      }
+    }
+    // A directory's path may also change through a signed UPDATE, not just a
+    // MOVE. The legacy UPDATE branch may physically rename the entire cached
+    // subtree based on the mutable snapshot AFTER multiple awaits. Checking
+    // source absence now would be a new TOCTOU: a same-SID/UID writer could
+    // create the tracked source later and turn this into a destructive rename.
+    // Deny ALL native-required directory UPDATEs until a real trusted native
+    // RootSession implements this operation. Even signed CREATE of an absent
+    // directory is denied by the native-required inbound fence below.
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && operation.operation === "update"
+      && metadata.contentType === "inode/directory") {
+      denyUntrustedNativeEviction();
+    }
     // A signed operation may target a directory which contains a device-local
     // pinned file. stageExisting() moves whole directory trees, so check every
     // path it could remove or relocate BEFORE recording admission or touching
@@ -3231,16 +5642,39 @@ class SyncEngine {
       // when Files-On-Demand is disabled on the reopened client.
       fail("A pinned file owns the destination path", "file_pinned");
     }
+    // A native-required inbound mutation must not reach journal admission,
+    // recursive parent creation, stageExisting or replace-capable JS rename.
+    // Browsing and full signed reads remain possible; the positive publish
+    // path requires independent native root custody and no-replace semantics.
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this)) denyUntrustedNativeInboundPublish();
     // Credential/key/AEAD/path preflight is complete. Fsync the exact verified
     // envelope before the first filesystem or snapshot mutation; failure here
     // must not leave an applied object with no restart-safe observation.
-    if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+    if (verifiedFreshDigest) {
+      markNativeRootMutationAttempt(this);
+      await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+      markNativeRootMutationCompleted(this);
+    }
     let cleanupPath = null;
-    // FOD publishes with an exclusive hardlink. Keep the private alias (nlink=2)
-    // until the signed remote identity is durably in the snapshot: after a
-    // crash, readContainedFile then fails closed instead of treating a nlink=1
-    // orphan as a new local CREATE.
+    // A directory CREATE (or a newly created parent) can be just as unsafe
+    // as a file rename when the later snapshot checkpoint fails. Keep this
+    // local to the trusted mutation pass; it cannot grant replay authority.
+    let inboundCacheChanged = false;
     let privatePublishedTemp = null;
+    const ensureInboundParent = async () => {
+      try {
+        const created = await fsp.mkdir(path.dirname(target), { recursive: true });
+        if (created !== undefined) inboundCacheChanged = true;
+      } catch (error) {
+        // Recursive mkdir may create one or more intermediate ancestors and
+        // then reject before returning the first created path. We cannot
+        // safely prove non-mutation from that rejection, so quarantine even
+        // when EIO occurs before the final child directory exists.
+        inboundCacheChanged = true;
+        throw error;
+      }
+    };
+    try {
     if (operation.operation === "delete" || operation.tombstone) {
       const priorAtTarget = this.snapshot.files[metadata.path];
       const targetMatchesIdentity = priorAtTarget && !priorAtTarget.deleted
@@ -3288,7 +5722,7 @@ class SyncEngine {
       const sourceExists = source ? await exists(source) : false;
       const movePayload = protocol.decodeMovePayload(plaintext, key);
       if (!sourceExists && movePayload === null) fail("Moved file is unavailable and the operation has no recovery payload", "move_source_missing");
-      await fsp.mkdir(path.dirname(target), { recursive: true });
+      await ensureInboundParent();
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       let hash;
@@ -3333,82 +5767,29 @@ class SyncEngine {
         if (source !== target) {
           const sameWindowsPath = process.platform === "win32"
             && path.resolve(source).toLowerCase() === path.resolve(target).toLowerCase();
-          if (!sameWindowsPath && await exists(target)) await this.stageExisting(target);
+          if (!sameWindowsPath && await exists(target)) {
+            inboundCacheChanged = true;
+            await this.stageExisting(target);
+          }
+          // The OS rename may succeed and still surface an EIO to the caller.
+          // Once it is attempted, a rejection cannot prove no disk mutation.
+          inboundCacheChanged = true;
           await fsp.rename(source, target);
         }
         const movedStats = await fsp.lstat(target, { bigint: true });
         if (movedStats.isFile()) hash = crypto.createHash("sha256").update(await readContainedFile(this.rootDir, metadata.path, movedStats)).digest("hex");
       } else {
-        let stagedTarget = null;
-        try {
-          if (beforeHydrationWrite) {
-            const trackedTarget = this.snapshot.files[metadata.path];
-            if (trackedTarget && !trackedTarget.deleted && !trackedTarget.directory
-              && trackedTarget.objectId === operation.objectId
-              && trackedTarget.fileId === operation.fileId) {
-              // A remote MOVE can return to an already-cached, clean path.
-              // Recheck the old local revision at the final staging boundary;
-              // it need not equal the newer authenticated MOVE payload.
-              stagedTarget = await this.stageCleanTrackedFile(metadata.path, trackedTarget);
-            } else if (await exists(target)) {
-              fail("Untracked destination appeared during hydration", "local_changes_pending");
-            }
-          } else if (await exists(target)) {
-            await this.stageExisting(target);
-          }
-          const moveTempDir = beforeHydrationWrite
-            ? path.join(this.rootDir, ".rootark-trash") : null;
-          if (moveTempDir) {
-            await fsp.mkdir(moveTempDir, { recursive: true, mode: 0o700 });
-            await containedAbsolute(this.rootDir, moveTempDir, false);
-          }
-          const temporary = beforeHydrationWrite
-            ? path.join(moveTempDir, `.rootark-move-${crypto.randomUUID()}`)
-            : `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-          try {
-            await fsp.writeFile(temporary, movePayload, { mode: 0o600, flag: "wx" });
-            if (beforeHydrationWrite) {
-              try {
-                await fsp.link(temporary, target);
-                privatePublishedTemp = temporary;
-              }
-              catch (error) {
-                if (await exists(target)) fail("Local destination appeared before MOVE publication", "local_changes_pending");
-                throw error;
-              }
-            } else {
-              await fsp.rename(temporary, target);
-            }
-          } finally {
-            if (beforeHydrationWrite) {
-              if (privatePublishedTemp !== temporary) await fsp.rm(temporary, { force: true });
-            } else {
-              await fsp.rm(temporary, { force: true }).catch(() => {});
-            }
-          }
-        } catch (error) {
-          if (stagedTarget) await this.restoreStagedTrackedFile(metadata.path, stagedTarget);
-          throw error;
-        }
+        // Preserve the original denial-before-write ordering when a MOVE
+        // would replace existing FOD bytes: native custody must refuse it
+        // without first creating a speculative payload temporary.
+        if (await exists(target)) await this.stageExisting(target);
+        await publishInboundPayload(target, movePayload, null,
+          () => { inboundCacheChanged = true; });
         hash = crypto.createHash("sha256").update(movePayload).digest("hex");
       }
       this.rememberOperation(operation, hash, sourcePath);
     } else {
-      if (beforeHydrationWrite) {
-        const segments = metadata.path.split("/").slice(0, -1);
-        let prefix = "";
-        for (const segment of segments) {
-          prefix = prefix ? `${prefix}/${segment}` : segment;
-          const dirTarget = await contained(this.rootDir, prefix, true);
-          if (!(await exists(dirTarget)) && !this.snapshot.files[prefix]?.directory) {
-            this.snapshot.hydrationParents = this.snapshot.hydrationParents || [];
-            if (!this.snapshot.hydrationParents.some((p) => pathsEqual(p, prefix))) {
-              this.snapshot.hydrationParents.push(prefix);
-            }
-          }
-        }
-      }
-      await fsp.mkdir(path.dirname(target), { recursive: true });
+      await ensureInboundParent();
       await containedAbsolute(this.rootDir, path.dirname(target), false);
       if (beforeHydrationWrite) await beforeHydrationWrite();
       if (metadata.contentType === "inode/directory") {
@@ -3425,7 +5806,11 @@ class SyncEngine {
           if (await exists(source)) {
             if (!(await fsp.lstat(source)).isDirectory()) fail("Tracked directory identity points to a non-directory", "unsafe_path");
             if (source !== target) {
-              if (await exists(target)) await this.stageExisting(target);
+              if (await exists(target)) {
+                inboundCacheChanged = true;
+                await this.stageExisting(target);
+              }
+              inboundCacheChanged = true;
               await fsp.rename(source, target);
             }
             relocated = true;
@@ -3434,235 +5819,147 @@ class SyncEngine {
         if (!relocated && !existingAncestorCreate) {
           try {
             await fsp.mkdir(target, { recursive: false });
+            inboundCacheChanged = true;
           } catch (error) {
-            if (error.code !== "EEXIST") throw error;
+            if (error.code !== "EEXIST") {
+              // An injected/physical I/O failure may follow a successful
+              // mkdir syscall but precede its reported completion.
+              inboundCacheChanged = true;
+              throw error;
+            }
             if (!(await fsp.lstat(target)).isDirectory()) {
+              inboundCacheChanged = true;
               await this.stageExisting(target);
               await fsp.mkdir(target, { recursive: false });
             }
           }
         }
-      } else {
-        if (historicalRestoreHash !== undefined) {
-          const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-          const tempHandle = await fsp.open(temporary, "wx", 0o600);
-          let tempStat;
-          try {
-            await tempHandle.writeFile(plaintext);
-            await tempHandle.sync();
-            tempStat = await tempHandle.stat({ bigint: true });
-          } finally {
-            await tempHandle.close();
-          }
-          try {
-            if (this.options?.requireNativeRootSession) {
-              fail("Native root session required for historical restore", "restore_local_conflict");
-            }
-            const staged = await this.stageHistoricalRestore(target, metadata.path, historicalRestoreHash);
-            try {
-              // Atomic no-replace materialization; do not clobber files
-              // created by another process after the last restore preflight.
-              await fsp.link(temporary, target);
-            } catch (error) {
-              // Never publish a possibly substituted staged pathname as a
-              // rollback. Preserve its current inode for manual recovery.
-              if (error?.code === "EEXIST") fail("Historical restore path was recreated", "restore_local_conflict");
-              throw error;
-            }
-            let targetHandle;
-            let verified = false;
-            let openedStat = null;
-            let pathStat = null;
-            try {
-              targetHandle = await fsp.open(target, fs.constants.O_RDONLY
-                | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
-              try {
-                openedStat = await targetHandle.stat({ bigint: true });
-                pathStat = await fsp.lstat(target, { bigint: true });
-                if (openedStat.isFile() && !openedStat.isSymbolicLink()
-                  && pathStat.isFile() && !pathStat.isSymbolicLink()
-                  && openedStat.nlink >= 2n
-                  && sameFileVersion(openedStat, pathStat)
-                  && sameFileIdentity(tempStat, openedStat)
-                  && openedStat.size === BigInt(plaintext.length)) {
-                  const materializedBytes = await targetHandle.readFile();
-                  try {
-                    const endStat = await targetHandle.stat({ bigint: true });
-                    const pathAfterRead = await fsp.lstat(target, { bigint: true });
-                    if (sameFileVersion(openedStat, endStat)
-                      && sameFileVersion(endStat, pathAfterRead)
-                      && crypto.createHash("sha256").update(materializedBytes).digest("hex")
-                        === crypto.createHash("sha256").update(plaintext).digest("hex")) {
-                      verified = true;
-                    }
-                  } finally {
-                    materializedBytes.fill(0);
-                  }
-                }
-              } finally {
-                await targetHandle.close();
-              }
-            } catch {
-              /* Reject on descriptor open, stat, or read failure */
-            }
-            if (!verified) {
-              // No portable Node API can unlink or rename only if a pathname
-              // still names a previously observed inode. Even stageExisting()
-              // could move a different writer's replacement after our last
-              // lstat. The pre-restore bytes are already staged in .rootark-trash;
-              // leave the current target occupant exactly where it is.
-              fail("Historical restore materialization identity mismatch", "restore_local_conflict");
-            }
-          } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
-        } else {
-        if (beforeHydrationWrite && operation.operation === "create") {
-          // Reopening the SAME signed CREATE is an idempotent read, not a
-          // request to overwrite its clean, already-hydrated local cache.
-          // Check both the pinned snapshot and current on-disk bytes before
-          // returning; a racing user edit or a different signed revision may
-          // not be treated as a successful refresh.
-          const cached = this.snapshot.files[metadata.path];
-          if (cached && !cached.deleted && !cached.directory
-            && cached.objectId === operation.objectId && cached.fileId === operation.fileId
-            && cached.versionId === operation.versionId
-            && protocol.compareRevisions(cached.revision, operation.revision) === 0) {
-            const signedHash = crypto.createHash("sha256").update(plaintext).digest("hex");
-            const current = await readContainedFile(this.rootDir, metadata.path);
-            try {
-              if (cached.hash !== signedHash
-                || crypto.createHash("sha256").update(current).digest("hex") !== signedHash) {
-                fail("Cached CREATE no longer matches authenticated local bytes", "local_changes_pending");
-              }
-            } finally { current.fill(0); }
-            return verifiedFreshDigest;
-          }
-        }
-        // For an explicitly verified on-demand UPDATE, the same file identity
-        // may still be cached at the pathname preceding a remote MOVE.
-        const relocatedSource = beforeHydrationWrite && operation.operation === "update"
-          ? activeFileIdentityPath(this.snapshot.files, operation, metadata.path) : null;
-        // An interrupted verified hydration must never leave plaintext as a
-        // syncable sibling that the next reconcile can enqueue as CREATE.
-        // Only FOD materialization uses this private staging directory.
-        const hydrationTempDir = beforeHydrationWrite
-          ? path.join(this.rootDir, ".rootark-trash") : null;
-        if (hydrationTempDir) {
-          await fsp.mkdir(hydrationTempDir, { recursive: true, mode: 0o700 });
-          await containedAbsolute(this.rootDir, hydrationTempDir, false);
-        }
-        const hydrationTempName = hydrationTempDir ? `hydrate-${crypto.randomUUID()}.tmp` : null;
-        const temporary = hydrationTempDir
-          ? path.join(hydrationTempDir, hydrationTempName)
-          : `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
-        if (hydrationTempDir) await containedAbsolute(this.rootDir, temporary, true);
-        let stagedSource = null;
-        let stagedTarget = null;
+        // Even when an existing directory was legitimately reused, the
+        // durable snapshot must authenticate the new remote identity first.
+        // A later failed checkpoint leaves ambiguous cache ancestry.
+        inboundCacheChanged = true;
+      } else if (historicalRestoreHash !== undefined) {
+        const temporary = `${target}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        const tempHandle = await fsp.open(temporary, "wx", 0o600);
+        let tempStat;
         try {
-          await fsp.writeFile(temporary, plaintext, { mode: 0o600, flag: "wx" });
-          const plannedStages = [];
-          const trackedTarget = beforeHydrationWrite && operation.operation === "update"
-            ? this.snapshot.files[metadata.path] : null;
-          const stageRelocated = Boolean(relocatedSource && !pathsEqual(relocatedSource, metadata.path));
-          const stageTarget = Boolean(
-            beforeHydrationWrite && operation.operation === "update"
-            && trackedTarget && !trackedTarget.deleted && !trackedTarget.directory
-            && trackedTarget.objectId === operation.objectId
-            && trackedTarget.fileId === operation.fileId,
-          );
-          let stagedSourceDest = null;
-          let stagedTargetDest = null;
-          if (hydrationTempDir && (stageRelocated || stageTarget)) {
-            const payloadHash = crypto.createHash("sha256").update(plaintext).digest("hex");
-            if (stageRelocated) {
-              const stagedName = `stage-${crypto.randomUUID()}.tmp`;
-              stagedSourceDest = path.join(hydrationTempDir, stagedName);
-              plannedStages.push({
-                path: relocatedSource,
-                stagedName,
-                hash: this.snapshot.files[relocatedSource]?.hash || "",
-                payloadHash,
-                tempName: hydrationTempName,
-                targetPath: metadata.path,
-              });
-            }
-            if (stageTarget) {
-              const stagedName = `stage-${crypto.randomUUID()}.tmp`;
-              stagedTargetDest = path.join(hydrationTempDir, stagedName);
-              plannedStages.push({
-                path: metadata.path,
-                stagedName,
-                hash: trackedTarget.hash || "",
-                payloadHash,
-                tempName: hydrationTempName,
-                targetPath: metadata.path,
-              });
-            }
-            this.snapshot.pendingHydrations = plannedStages;
-            await this.writeSnapshotDurable();
-          }
-          // Stage AND verify the old identity before publishing the new path.
-          // A racing local edit/removal must never leave a destination orphan.
-          if (stageRelocated) {
-            stagedSource = await this.stageCleanTrackedFile(
-              relocatedSource, this.snapshot.files[relocatedSource], stagedSourceDest);
-          }
-          if (beforeHydrationWrite && operation.operation === "update") {
-            if (stageTarget) {
-              // Do not condition this on exists(target): a local deletion
-              // between preflight and stage is an unsent change too.
-              stagedTarget = await this.stageCleanTrackedFile(metadata.path, trackedTarget, stagedTargetDest);
-            } else if (await exists(target)) {
-              fail("Untracked local destination cannot be replaced", "local_changes_pending");
-            }
-          } else if (beforeHydrationWrite) {
-            // A verified on-demand CREATE never has permission to stage or
-            // replace a newly appearing user-owned destination.
-            if (await exists(target)) {
-              fail("Untracked local destination cannot be replaced", "local_changes_pending");
-            }
-          } else if (await exists(target)) {
-            await this.stageExisting(target);
-          }
-          if (beforeHydrationWrite) {
-            // For both CREATE and UPDATE, publish by exclusive hardlink and
-            // unlink only after a durable snapshot. Rename would consume the
-            // temp and make a crash leave an untracked nlink=1 file.
-            try {
-              await fsp.link(temporary, target);
-              privatePublishedTemp = temporary;
-            } catch (error) {
-              if (await exists(target)) fail("Local destination was recreated before publication", "local_changes_pending");
-              throw error;
-            }
-          } else {
-            await fsp.rename(temporary, target);
-          }
-          if (stagedSource) cleanupPath = relocatedSource;
-        } catch (error) {
-          // Attempt both recoveries even when a concurrently recreated path
-          // prevents one restore. The un-restored bytes remain in trash.
-          if (stagedSource) {
-            try { await this.restoreStagedTrackedFile(relocatedSource, stagedSource); }
-            catch (restoreError) { error = restoreError; }
-          }
-          if (stagedTarget) {
-            try { await this.restoreStagedTrackedFile(metadata.path, stagedTarget); }
-            catch (restoreError) { error = restoreError; }
-          }
-          if (this.snapshot.pendingHydrations) {
-            delete this.snapshot.pendingHydrations;
-            await this.writeSnapshotDurable().catch(() => {});
-          }
-          throw error;
+          await tempHandle.writeFile(plaintext);
+          await tempHandle.sync();
+          tempStat = await tempHandle.stat({ bigint: true });
         } finally {
-          // Until persistSnapshot() succeeds, retaining nlink=2 is the only
-          // durable guard against restart reconciliation minting a local CREATE.
-            if (hydrationTempDir && privatePublishedTemp !== temporary) {
-              await fsp.rm(temporary, { force: true });
-            } else if (!hydrationTempDir) {
-              await fsp.rm(temporary, { force: true }).catch(() => {});
-            }
+          await tempHandle.close();
+        }
+        try {
+          if (this.options?.requireNativeRootSession) {
+            fail("Native root session required for historical restore", "restore_local_conflict");
           }
+          await this.stageHistoricalRestore(target, metadata.path, historicalRestoreHash);
+          try {
+            // Atomic no-replace materialization; do not clobber files
+            // created by another process after the last restore preflight.
+            await fsp.link(temporary, target);
+          } catch (error) {
+            // Never publish a possibly substituted staged pathname as a
+            // rollback. Preserve its current inode for manual recovery.
+            if (error?.code === "EEXIST") fail("Historical restore path was recreated", "restore_local_conflict");
+            throw error;
+          }
+          let targetHandle;
+          let verified = false;
+          try {
+            targetHandle = await fsp.open(target, fs.constants.O_RDONLY
+              | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+            try {
+              const openedStat = await targetHandle.stat({ bigint: true });
+              const pathStat = await fsp.lstat(target, { bigint: true });
+              if (openedStat.isFile() && !openedStat.isSymbolicLink()
+                && pathStat.isFile() && !pathStat.isSymbolicLink()
+                && openedStat.nlink >= 2n
+                && sameFileVersion(openedStat, pathStat)
+                && sameFileIdentity(tempStat, openedStat)
+                && openedStat.size === BigInt(plaintext.length)) {
+                const materializedBytes = await targetHandle.readFile();
+                try {
+                  const endStat = await targetHandle.stat({ bigint: true });
+                  const pathAfterRead = await fsp.lstat(target, { bigint: true });
+                  if (sameFileVersion(openedStat, endStat)
+                    && sameFileVersion(endStat, pathAfterRead)
+                    && crypto.createHash("sha256").update(materializedBytes).digest("hex")
+                      === crypto.createHash("sha256").update(plaintext).digest("hex")) {
+                    verified = true;
+                  }
+                } finally {
+                  materializedBytes.fill(0);
+                }
+              }
+            } finally {
+              await targetHandle.close();
+            }
+          } catch {
+            /* Reject on descriptor open, stat, or read failure */
+          }
+          if (!verified) {
+            // No portable Node API can unlink or rename only if a pathname
+            // still names a previously observed inode. Even stageExisting()
+            // could move a different writer's replacement after our last
+            // lstat. The pre-restore bytes are already staged in .rootark-trash;
+            // leave the current target occupant exactly where it is.
+            fail("Historical restore materialization identity mismatch", "restore_local_conflict");
+          }
+        } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
+      } else {
+        // A failed target preflight must not quarantine a clean existing
+        // parent merely because an inert reserved temporary was created.
+        // Conversely, an actual rename may complete before reporting EIO:
+        // the target-publication callback flips the negative latch BEFORE
+        // entering the potentially mutating syscall, not after its result.
+        let customTrashTarget = null;
+        const trackedTarget = beforeHydrationWrite && operation.operation === "update"
+          ? this.snapshot.files[metadata.path] : null;
+        if (!this.requireNativeRootRecovery && trackedTarget && !trackedTarget.deleted && !trackedTarget.directory
+          && trackedTarget.objectId === operation.objectId && trackedTarget.fileId === operation.fileId) {
+          const trashDir = path.join(this.rootDir, ".rootark-trash");
+          await fsp.mkdir(trashDir, { recursive: true });
+          await containedAbsolute(this.rootDir, trashDir, false);
+          const stagedName = `stage-${crypto.randomUUID()}.tmp`;
+          customTrashTarget = path.join(trashDir, stagedName);
+          this.snapshot.pendingHydrations = [{
+            path: metadata.path,
+            stagedName,
+            hash: trackedTarget.hash || "",
+            tempName: null,
+            targetPath: metadata.path,
+          }];
+          await this.persistSnapshot();
+        }
+        if (hasNativeCustody(this)) {
+          const session = NATIVE_ROOT_SESSIONS.get(this);
+          const parentRel = path.posix.dirname(metadata.path);
+          if (parentRel && parentRel !== ".") session.openChildDirectory(parentRel);
+          const tmpName = `${INBOUND_PAYLOAD_TEMP_PREFIX}${process.pid}-${crypto.randomUUID()}`;
+          const tmpRel = parentRel && parentRel !== "." ? `${parentRel}/${tmpName}` : tmpName;
+          session.createExclusiveFile(tmpRel, Buffer.from(plaintext));
+          try {
+            if (await exists(target)) await this.stageExisting(target, customTrashTarget);
+            inboundCacheChanged = true;
+            session.renameNoReplace(tmpRel, metadata.path);
+            session.syncDirectory(parentRel === "." ? "" : parentRel);
+          } catch (error) {
+            try { session.removeEntry(tmpRel); } catch { /* best-effort cleanup */ }
+            throw error;
+          }
+        } else {
+          await publishInboundPayload(target, plaintext,
+            async () => { if (await exists(target)) await this.stageExisting(target, customTrashTarget); },
+            () => { inboundCacheChanged = true; });
+        }
+      }
+      if (operation.operation === "update" && metadata.contentType !== "inode/directory") {
+        const relocated = activeFileIdentityPath(this.snapshot.files, operation, metadata.path);
+        if (relocated && !pathsEqual(relocated, metadata.path)) {
+          cleanupPath = relocated;
+          const src = await contained(this.rootDir, relocated, true);
+          if (await exists(src)) await this.stageExisting(src);
         }
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"),
@@ -3682,16 +5979,134 @@ class SyncEngine {
     if (privatePublishedTemp) await fsp.rm(privatePublishedTemp, { force: true });
     if (summary) summary.applied = (summary.applied || 0) + 1;
     return verifiedFreshDigest;
+    } catch (error) {
+      // A successful rename, directory CREATE or newly created ancestor
+      // followed by any failed local checkpoint is indeterminate. Retain
+      // .rootark-sync.lock: a subsequent sync pass must not mistake incoming
+      // cache bytes or directories for a signed local CREATE.
+      // This does NOT cure the earlier target-overwrite race or allow a cold
+      // operator to trust the same-SID root without native custody.
+      if (this.requireNativeRootRecovery && inboundCacheChanged) {
+        INDETERMINATE_FOD_INBOUND.add(this);
+      }
+      throw error;
+    }
+  }
+
+  // Only for a required-v2, zero-PREPARE genesis under the exclusive root
+  // mutation lock. Unlike scanFiles(), this walks every physical cache path
+  // without isSelected()/needsTraversal() and rejects untracked entries.
+  // The extra conservative checks never grant a server-side DELETE.
+  async scanPhysicalCacheForEvictionRecovery() {
+    const root = this.rootDir;
+    const internal = internalRootMetadata(root, this.snapshotPath, this.journal?.filePath);
+    const expected = new Set();
+    const parents = new Set();
+    for (const [relative, item] of Object.entries(this.snapshot.files)) {
+      if (!item || item.deleted) continue;
+      protocol.safeRelativePath(relative, "path");
+      expected.add(relative);
+      let ancestor = path.posix.dirname(relative);
+      while (ancestor !== ".") {
+        parents.add(ancestor);
+        ancestor = path.posix.dirname(ancestor);
+      }
+    }
+    const scanned = Object.create(null);
+    const emptyHash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
+    let visited = 0;
+    const walk = async (directory, prefix = "") => {
+      const before = await fsp.lstat(directory, { bigint: true });
+      if (!before.isDirectory() || before.isSymbolicLink() || before.ino === 0n) {
+        fail("Unsafe physical cache directory during eviction recovery", "invalid_snapshot");
+      }
+      const names = new Set();
+      let directoryCount = 0;
+      for await (const entry of await fsp.opendir(directory)) {
+        if (++directoryCount > 16384) {
+          fail("Physical recovery directory capacity exceeded", "invalid_snapshot");
+        }
+        if (++visited > EVICTION_LEDGER_MAX * 2) {
+          fail("Physical recovery traversal capacity exceeded", "invalid_snapshot");
+        }
+        const folded = entry.name.toLowerCase();
+        if (names.has(folded)) fail("Ambiguous physical casefold alias in cache", "invalid_snapshot");
+        names.add(folded);
+        // Failed same-volume inbound publishes may leave a leaf below a
+        // selected directory. This pre-existing reserved control prefix is
+        // not user content or signed recovery authority, but other untracked
+        // entries must still fail closed. Do not follow a link or skip a
+        // directory under the reserved prefix.
+        if (folded.startsWith(INBOUND_PAYLOAD_TEMP_PREFIX)) {
+          if (!entry.name.startsWith(INBOUND_PAYLOAD_TEMP_PREFIX)) {
+            fail("Ambiguous inbound temporary cache prefix", "invalid_snapshot");
+          }
+          const inert = await fsp.lstat(path.join(directory, entry.name), { bigint: true });
+          if (!inert.isFile() || inert.isSymbolicLink() || inert.ino === 0n
+            || inert.nlink !== 1n) {
+            fail("Unsafe inbound temporary during physical recovery", "invalid_snapshot");
+          }
+          continue;
+        }
+        if (!prefix) {
+          const internalName = internal.names.find((name) => name.toLowerCase() === folded);
+          if (internalName) {
+            if (entry.name !== internalName) fail("Ambiguous internal cache entry", "invalid_snapshot");
+            continue;
+          }
+          if (internal.prefixes.some((name) => folded.startsWith(name.toLowerCase()))) {
+            if (!internal.prefixes.some((name) => entry.name.startsWith(name))) {
+              fail("Ambiguous internal cache prefix", "invalid_snapshot");
+            }
+            continue;
+          }
+        }
+        const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+        protocol.safeRelativePath(relative, "path");
+        if (!expected.has(relative) && !parents.has(relative)) {
+          fail("Untracked physical path during eviction recovery", "invalid_snapshot");
+        }
+        const target = path.join(directory, entry.name);
+        await containedAbsolute(root, target, false);
+        const stats = await fsp.lstat(target, { bigint: true });
+        if (stats.isSymbolicLink() || stats.ino === 0n) {
+          fail("Unsafe cache link during eviction recovery", "invalid_snapshot");
+        }
+        if (stats.isDirectory()) {
+          await walk(target, relative);
+          if (expected.has(relative)) {
+            scanned[relative] = { directory: true, hash: emptyHash };
+          }
+        } else if (stats.isFile()) {
+          if (!expected.has(relative)) {
+            fail("Untracked physical file during eviction recovery", "invalid_snapshot");
+          }
+          const bytes = await readContainedFile(root, relative, stats);
+          scanned[relative] = { directory: false,
+            hash: crypto.createHash("sha256").update(bytes).digest("hex") };
+        } else {
+          fail("Unsupported physical cache entry during eviction recovery", "invalid_snapshot");
+        }
+      }
+      const after = await fsp.lstat(directory, { bigint: true });
+      if (!sameFileVersion(before, after)) {
+        fail("Physical cache directory changed during recovery", "invalid_snapshot");
+      }
+    };
+    await walk(root);
+    return scanned;
   }
 
   async scanFiles() {
     const result = {};
+    const internal = internalRootMetadata(
+      this.rootDir, this.snapshotPath, this.journal?.filePath);
     const emptyHash = crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex");
     const walk = async (directory, prefix = "") => {
       let hasSyncEntries = false;
       for (const entry of await fsp.readdir(directory, { withFileTypes: true })) {
-        if (prefix === "" && ([...INTERNAL_NAMES].some((name) => name.toLowerCase() === entry.name.toLowerCase())
-          || INTERNAL_NAME_PREFIXES.some((name) => entry.name.toLowerCase().startsWith(name)))) continue;
+        if (prefix === "" && (internal.names.some((name) => name.toLowerCase() === entry.name.toLowerCase())
+          || internal.prefixes.some((name) => entry.name.toLowerCase().startsWith(name.toLowerCase())))) continue;
         if (entry.name.startsWith(".rootark-put-") || entry.name.startsWith(".rootark-move-")) continue;
         const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
         try { protocol.safeRelativePath(relative, "path"); } catch { continue; }
@@ -3720,6 +6135,13 @@ class SyncEngine {
   }
 
   async pruneEmptyUntrackedParents(directory) {
+    // Public/direct callers must not delete an ancestor created by an
+    // uncheckpointed inbound FOD operation while the root is quarantined.
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    // A previously opened legacy instance must not prune physical cache paths
+    // after another instance has durably marked this root as Files On-Demand.
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const root = path.resolve(this.rootDir);
     let current = path.resolve(directory);
     while (current !== root && current.startsWith(`${root}${path.sep}`)) {
@@ -3728,6 +6150,7 @@ class SyncEngine {
       const prior = this.snapshot.files[relative];
       if (prior && !prior.deleted && prior.directory) break;
       try {
+        markNativeRootMutationAttempt(this);
         await fsp.rmdir(current);
       } catch (error) {
         if (error.code === "ENOENT") {
@@ -3792,7 +6215,11 @@ class SyncEngine {
   }
 
   async _reconcileLocal() {
-    await this.assertPinnedLocalTree();
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
+    denyHistoricallyTrackedControlTemp(this.snapshot,
+      internalRootMetadata(this.rootDir, this.snapshotPath, this.journal?.filePath));
     const scanned = await this.scanFiles();
     // Keep every scanned spelling when checking pinned regular files. A Map
     // built directly from lowercased entries can let docs/a.txt overwrite a
@@ -3889,9 +6316,14 @@ class SyncEngine {
         delete this.snapshot.files[relative];
         continue;
       }
+      if (this.requireNativeRootRecovery) denyUntrustedNativeSignedDelete();
       const key = await this.fileKeyResolver(prior);
       const operation = await this.buildOperation({ operation: "delete", objectId: prior.objectId, fileId: prior.fileId, versionId: crypto.randomUUID(), baseRevision: prior.revision, revision: { counter: (prior.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata: { path: relative }, fileKey: key });
-      await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
+      await this.assertOutgoingAuthorized(operation, () => {
+        markNativeRootMutationAttempt(this);
+        return this.journal.enqueue(operation);
+      });
+      markNativeRootMutationCompleted(this);
       this.rememberOperation(operation);
     }
     for (const [relative, file] of Object.entries(current)) {
@@ -3923,7 +6355,11 @@ class SyncEngine {
       const key = await this.fileKeyResolver({ objectId, fileId, path: relative, keyEpoch: this.keyEpoch });
       const metadata = { path: relative, name: path.basename(relative), size: data.length, ...(isDirectory ? { contentType: "inode/directory" } : {}) };
       const operation = await this.buildOperation({ operation: isUpdate ? "update" : "create", objectId, fileId, versionId: crypto.randomUUID(), baseRevision: isUpdate ? prior.revision : null, revision: { counter: (prior?.revision?.counter || 0) + 1, deviceId: this.deviceId }, metadata, plaintext: data, fileKey: key });
-      await this.assertOutgoingAuthorized(operation, () => this.journal.enqueue(operation));
+      await this.assertOutgoingAuthorized(operation, () => {
+        markNativeRootMutationAttempt(this);
+        return this.journal.enqueue(operation);
+      });
+      markNativeRootMutationCompleted(this);
       this.rememberOperation(operation, contentHash);
     }
     await this.persistSnapshot();
@@ -3972,6 +6408,8 @@ class SyncEngine {
   }
 
   async _pinLocal(relativePath) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
     if (!this.requireAuthorization || typeof this.verifyIncoming !== "function") {
       // Ordinary non-strict sync is allowed to use a caller-supplied AEAD
@@ -4035,6 +6473,8 @@ class SyncEngine {
   }
 
   async _unpinLocal(relativePath) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     if (!this.filesOnDemand) fail("Files On-Demand is not enabled", "files_on_demand_disabled");
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
     const previous = this.snapshot.pinnedFiles || {};
@@ -4093,17 +6533,39 @@ class SyncEngine {
     });
   }
 
-  async _evictLocal(relativePath) {
-    if (!this.opened) await this._open();
-    const safePath = await canonicalRelativePath(this.rootDir, relativePath);
-    if (!this.isInScope(safePath)) fail("Only selected paths can be evicted", "path_not_selected");
-    const prior = this.snapshot.files[safePath];
+  async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null, batchDurable = false) {
+    denyIndeterminateInbound(this);
+    if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
+    if (!this.opened) await openEngineBuiltIn.call(this);
+    // The internal exclusion path was already case-resolved with a bounded
+    // directory index; do not enumerate the same Windows parent 640 times.
+    const safePath = excludedTrackedPath === null
+      ? await canonicalRelativePath(this.rootDir, relativePath)
+      : protocol.safeRelativePath(relativePath, "path");
+    const snapshotPath = excludedTrackedPath === null
+      ? safePath : protocol.safeRelativePath(excludedTrackedPath, "trackedPath");
+    if (!this.isInScope(safePath) || !this.isInScope(snapshotPath)) {
+      fail("Only selected paths can be evicted", "path_not_selected");
+    }
+    if (excludedTrackedPath !== null) {
+      if (!this.isExcluded(safePath) || !this.isExcluded(snapshotPath)
+        || snapshotPath.toLowerCase() !== safePath.toLowerCase()
+        || (trustedCasefoldIndex
+          ? trustedCasefoldIndex.get(snapshotPath.toLowerCase()) !== snapshotPath
+          : Object.keys(this.snapshot.files).filter((candidate) =>
+            candidate.toLowerCase() === snapshotPath.toLowerCase()).length !== 1)) {
+        fail("Excluded tracked path does not uniquely match the physical alias", "unsafe_path");
+      }
+    }
+    const prior = this.snapshot.files[snapshotPath];
     if (!prior || prior.deleted || prior.directory || !/^[a-f0-9]{64}$/.test(prior.hash || "")) fail("Only a tracked file can be evicted", "cache_entry_unavailable");
     if (this.snapshot.pinnedFiles?.[pinnedKey(prior.objectId)]?.fileId === prior.fileId) {
       fail("Pinned file cannot be evicted before unpin", "file_pinned");
     }
     const pending = await this.journal.recover();
     if (pending.some((operation) => operation.objectId === prior.objectId
+      || operation.metadata?.path === snapshotPath || operation.metadata?.sourcePath === snapshotPath
       || operation.metadata?.path === safePath || operation.metadata?.sourcePath === safePath)) {
       fail("A pending sync operation prevents cache eviction", "sync_operation_pending");
     }
@@ -4120,10 +6582,16 @@ class SyncEngine {
       : Array.isArray(remoteResult?.objects) ? remoteResult.objects : remoteResult ? [remoteResult] : [];
     if (remoteRecords.length !== 1) fail("Current remote object is unavailable", "remote_object_missing");
     const remote = protocol.validateStoredOperation(remoteRecords[0]);
-    if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId || !pathsEqual(remote.metadata.path, safePath)) {
+    if (remote.objectId !== prior.objectId || remote.fileId !== prior.fileId
+      || (excludedTrackedPath !== null ? remote.metadata.path !== snapshotPath
+        : !pathsEqual(remote.metadata.path, safePath))) {
       fail("Current remote object no longer matches the local cache", "remote_object_changed");
     }
-    await this.verifyIncomingOperation(remote);
+    // Eviction verifies an existing signed remote object but does not APPLY
+    // that envelope. Its exact digest is separately persisted in PREPARE,
+    // so a per-file observed[] journal fsync would be redundant and turn a
+    // signed exclusion batch quadratic again.
+    await this.verifyIncomingOperation(remote, { preObserve: false });
     if (remote.tombstone || remote.operation === "delete") fail("Current remote object has been deleted", "remote_object_deleted");
     const remoteKey = await this.keyFor(remote);
     const remotePlaintext = protocol.decryptPayload(remote, remoteKey);
@@ -4152,6 +6620,10 @@ class SyncEngine {
     // next reconcile resolves (the file is local and the stale marker is dropped) without a remote delete.
     const rollbackEviction = async (cause) => {
       restoreMemoryMarker();
+      // In a batch the small PREPARE already protects the crash window. The
+      // previous full snapshot is still on disk, so no large rollback write
+      // is needed before restoring the same physically present local file.
+      if (batchDurable) throw cause;
       try {
         await this.persistSnapshot();
       } catch (persistError) {
@@ -4162,12 +6634,71 @@ class SyncEngine {
 
     // The marker is committed before the file leaves its path, so the file is never outside its path
     // without a durable record that the remote object is the only copy.
-    this.snapshot.remoteOnly[prior.objectId] = {
+    const evictedMarker = {
       objectId: remote.objectId, fileId: remote.fileId, versionId: remote.versionId,
-      revision: remote.revision, path: safePath, directory: false, deleted: false, reason: "evicted", hash,
+      revision: remote.revision, path: snapshotPath, directory: false, deleted: false, reason: "evicted", hash,
     };
+    const prepare = batchDurable ? {
+      version: EVICTION_LEDGER_VERSION, tx: crypto.randomUUID(),
+      objectId: prior.objectId, fileId: prior.fileId,
+      path: snapshotPath, physical: safePath, hash, record: evictedMarker,
+      remoteDigest: signedEnvelopeDigest(remote),
+    } : null;
+    if (prepare) {
+      if (!this.evictionLedgerHead) {
+        // Stage the genesis under v1-recognized .rootark-trash. Old v1
+        // clients must NEVER see a new .rootark-sync-evictions name before
+        // the incompatible v2 snapshot is durable.
+        const { entries: pendingEntries, head: priorHead } =
+          await readEvictionLedger(this.rootDir);
+        if (pendingEntries.size || (priorHead
+          && (priorHead.sequence !== 0 || priorHead.digest !== EVICTION_LEDGER_ZERO))) {
+          fail("Unreconciled eviction ledger before snapshot upgrade", "invalid_snapshot");
+        }
+        // A prior zero-head is usable only when its old staged genesis has
+        // actually disappeared. Concurrent/stale copies cannot be silently
+        // combined with a fresh PREPARE: doing so would brick cold replay.
+        if (priorHead && await stagedEvictionGenesis(this.rootDir)) {
+          fail("Conflicting staged and active eviction genesis", "invalid_snapshot");
+        }
+        const staged = priorHead ? null : await createStagedEvictionGenesis(this.rootDir);
+        const genesis = priorHead || staged.head;
+        const priorVersion = this.snapshot.version;
+        const priorEpoch = this.snapshot.evictionLedgerEpoch;
+        const priorRequired = this.snapshot.evictionLedgerRequired;
+        this.snapshot.version = EVICTION_LEDGER_SNAPSHOT_VERSION;
+        this.snapshot.evictionLedgerEpoch = genesis.epoch;
+        this.snapshot.evictionLedgerRequired = true;
+        try { await this.persistSnapshot(); }
+        catch (error) {
+          this.snapshot.version = priorVersion;
+          if (priorEpoch === undefined) delete this.snapshot.evictionLedgerEpoch;
+          else this.snapshot.evictionLedgerEpoch = priorEpoch;
+          if (priorRequired === undefined) delete this.snapshot.evictionLedgerRequired;
+          else this.snapshot.evictionLedgerRequired = priorRequired;
+          throw error;
+        }
+        if (staged) await promoteStagedEvictionGenesis(this.rootDir, staged);
+        this.evictionLedgerHead = genesis;
+      }
+      if (this.snapshot.version !== EVICTION_LEDGER_SNAPSHOT_VERSION
+        || this.snapshot.evictionLedgerEpoch !== this.evictionLedgerHead.epoch
+        || this.snapshot.evictionLedgerRequired !== true) {
+        fail("Eviction journal is not anchored to its durable snapshot", "invalid_snapshot");
+      }
+      prepare.epoch = this.evictionLedgerHead.epoch;
+      prepare.sequence = this.evictionLedgerHead.sequence + 1;
+      prepare.previousDigest = this.evictionLedgerHead.digest;
+      try {
+        this.evictionLedgerHead = await writeEvictionPrepare(this.rootDir,
+          prepare, this.evictionLedgerHead);
+      } catch (error) {
+        throw evictionError("invalid_snapshot", "Eviction PREPARE durability is indeterminate", error);
+      }
+    }
+    this.snapshot.remoteOnly[prior.objectId] = evictedMarker;
     try {
-      await this.persistSnapshot();
+      if (!batchDurable) await this.persistSnapshot();
     } catch (error) {
       await rollbackEviction(error);
     }
@@ -4177,6 +6708,13 @@ class SyncEngine {
       staged = await this.stageExisting(target);
       if (!staged) fail("Local cache entry disappeared during eviction", "cache_entry_unavailable");
     } catch (error) {
+      // A stage helper can move the file and then fail. A durable PREPARE is
+      // now the only restart-safe evidence that a missing local cache is not
+      // a user-requested deletion. Never roll it back or compact it away.
+      if (!(await exists(target))) {
+        throw evictionError("eviction_restore_failed",
+          "Eviction stage returned an error after the cache path disappeared; recover the durable PREPARE", error);
+      }
       await rollbackEviction(error);
     }
     // Renames the staged copy back only if nothing now occupies the path. Never deletes the staged copy.
@@ -4205,8 +6743,9 @@ class SyncEngine {
     }
     // The eviction is committed and the file is out of its path, so a failed cleanup only leaves the staged copy in the trash folder.
     await fsp.unlink(staged).catch(() => {});
-    if (this.snapshot.files[safePath]?.objectId === prior.objectId) delete this.snapshot.files[safePath];
-    await this.persistSnapshot();
+    if (this.snapshot.files[snapshotPath]?.objectId === prior.objectId) delete this.snapshot.files[snapshotPath];
+    if (prepare) await writeEvictionCommit(this.rootDir, prepare);
+    else await this.persistSnapshot();
     return true;
   }
 
@@ -4229,7 +6768,10 @@ class SyncEngine {
   }
 
   async _materializeRemote(relativePath) {
-    if (!this.opened) await this._open();
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
+    if (!this.opened) await openEngineBuiltIn.call(this);
     const safePath = await canonicalRelativePath(this.rootDir, relativePath);
     if (!this.isSelected(safePath)) fail("Remote-only path is outside the selected scope", "path_not_selected");
     if (this.filesOnDemand) return this._materializeOnDemand(safePath);
@@ -4248,17 +6790,23 @@ class SyncEngine {
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
     await this.assertPendingMaterializationDisjoint(operation);
     if (operation.tombstone) {
-      if (verifiedFreshDigest) await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+      if (verifiedFreshDigest) {
+        await withNativeDurableMutationIntent(this,
+          () => this.journal.observeAdmission(operation.operationId, verifiedFreshDigest));
+      }
       this.rememberRemoteOnly(operation, entry.reason);
       await this.persistSnapshot();
       return false;
     }
     const appliedDigest = await this._apply(operation);
-    await this.journal.markSeen(operation.operationId, verifiedFreshDigest || appliedDigest);
+    await withNativeDurableMutationIntent(this,
+      () => this.journal.markSeen(operation.operationId, verifiedFreshDigest || appliedDigest));
     return true;
   }
 
   async _materializeOnDemand(safePath) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
     if (Object.keys(this.journal.atomicSignedGroups?.() || {}).length) {
       fail("Cannot hydrate while a signed atomic sync batch is pending", "sync_atomic_batch_indeterminate");
     }
@@ -4409,7 +6957,9 @@ class SyncEngine {
     };
     await checkBeforeWrite();
     const verifiedFreshDigest = await this._apply(operation, null, checkBeforeWrite);
+    markNativeRootMutationAttempt(this);
     await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
+    markNativeRootMutationCompleted(this);
     return true;
   }
 
@@ -4469,6 +7019,9 @@ class SyncEngine {
   }
 
   async _pullRemote(summary, indeterminate = []) {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // A remotely visible single side of a just-committed/lost-ACK pair must
     // NOT consume that local pending ID via _apply, markSeen or the excluded-
     // path reconciliation path. Recover the atomic pair through its outbound
@@ -4527,7 +7080,8 @@ class SyncEngine {
       // Fsync the current snapshot before converting any pin to applied.
       await this.persistSnapshot();
       for (const { operation, verifiedFreshDigest } of observedRemoteOnly) {
-        await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
+        await withNativeDurableMutationIntent(this,
+          () => this.journal.markSeen(operation.operationId, verifiedFreshDigest));
       }
       observedRemoteOnly.length = 0;
     };
@@ -4538,17 +7092,14 @@ class SyncEngine {
         continue;
       }
       if (!this.operationDestinationIsSelected(operation)) {
-        // Authenticity must precede even a side-effect-free local pin oracle:
-        // an untrusted LIST entry cannot force file_pinned before its Ed25519
-        // device/roster proof is checked. Defer durable observation until the
-        // pin preflight accepts this exact verified envelope, so a genuine
-        // refused MOVE cannot exhaust the finite observed[] window either.
-        const verifiedFreshDigest = await this.verifyIncomingOperation(operation,
-          { preObserve: false });
-        this.preflightOutOfScopeMove(operation);
-        if (verifiedFreshDigest) {
-          await this.journal.observeAdmission(operation.operationId, verifiedFreshDigest);
+        // A refused pinned origin must not consume the finite, durable
+        // observed[] window before reconciliation rejects its signed MOVE.
+        if (this.requireNativeRootRecovery && !hasNativeCustody(this)) {
+          preflightOutOfScopeMoveBuiltIn.call(this, operation);
         }
+        await this.verifyIncomingOperation(operation, { preObserve: false });
+        preflightOutOfScopeMoveBuiltIn.call(this, operation);
+        const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
         await this.reconcileOutOfScopeMove(operation, summary);
         this.rememberRemoteOnly(operation, "excluded");
         observedRemoteOnly.push({ operation, verifiedFreshDigest });
@@ -4573,7 +7124,8 @@ class SyncEngine {
         continue;
       }
       const verifiedFreshDigest = await this._apply(operation, summary);
-      await this.journal.markSeen(operation.operationId, verifiedFreshDigest);
+      await withNativeDurableMutationIntent(this,
+        () => this.journal.markSeen(operation.operationId, verifiedFreshDigest));
       summary.pulled += 1;
     }
     await flushRemoteOnly();
@@ -4583,20 +7135,54 @@ class SyncEngine {
   // through the guarded _evictLocal path; excluded files with no local copy become remote-only
   // records so that no remote delete can ever be pushed for them. Remote objects are never deleted.
   async _applyExcludedPaths() {
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const applied = this.snapshot.excludedPaths || [];
     const listChanged = JSON.stringify(applied) !== JSON.stringify(this.excludedPaths);
+    // A pre-upgrade snapshot may claim that ["private"] was already applied
+    // while retaining tracked "PRIVATE/secret.txt" bytes on POSIX. Revisit
+    // those entries once even if the configured list has not changed.
+    const needsCasefoldMigration = this.excludedPaths.length > 0
+      && this.snapshot.excludedPathsCasefoldVersion !== EXCLUDED_PATHS_CASEFOLD_VERSION;
+    // Exclusion-policy changes can cause automatic destructive eviction,
+    // but the old path-based helper cannot establish native root custody.
+    // Deny BEFORE creating retry state, inspecting mutable names, or
+    // persisting exclusion policy / remote-only markers. A harmless no-op
+    // with the same already-applied policy remains permitted.
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && (listChanged || needsCasefoldMigration
+      || Object.keys(this.snapshot.pendingEvictions || {}).length)) {
+      denyUntrustedNativeEviction();
+    }
     this.snapshot.pendingEvictions = this.snapshot.pendingEvictions || {};
     const pendingEvictions = this.snapshot.pendingEvictions;
-    if (!listChanged && !Object.keys(pendingEvictions).length) return null;
+    if (!listChanged && !needsCasefoldMigration && !Object.keys(pendingEvictions).length) return null;
     const report = { evicted: 0, released: 0, kept: [], failed: [] };
+    let needsPersistence = listChanged || needsCasefoldMigration;
     const pending = await this.journal.recover();
     const excludedObjectIds = new Set();
+    const directoryCache = new Map(); // never persist stale filesystem names across syncs
+    // Never begin a ledger-backed destructive batch that cannot be fully
+    // recovered within the bounded ledger reader's object limit.
+    const candidateCount = Object.entries(this.snapshot.files).filter(([relative, prior]) =>
+      !prior.deleted && !prior.directory && this.isExcluded(relative)
+      && (listChanged || needsCasefoldMigration || pendingEvictions[prior.objectId])).length;
+    if (candidateCount > EVICTION_LEDGER_MAX) {
+      fail("Excluded cache migration exceeds durable ledger capacity", "eviction_capacity_exceeded");
+    }
+    const snapshotCasefoldIndex = new Map();
+    for (const relative of Object.keys(this.snapshot.files)) {
+      const folded = relative.toLowerCase();
+      if (snapshotCasefoldIndex.has(folded)) snapshotCasefoldIndex.set(folded, null);
+      else snapshotCasefoldIndex.set(folded, relative);
+    }
     for (const [relative, prior] of Object.entries(this.snapshot.files)) {
       if (prior.deleted || prior.directory || !this.isExcluded(relative)) continue;
       const retry = pendingEvictions[prior.objectId];
-      if (!listChanged && !retry) continue;
+      if (!listChanged && !needsCasefoldMigration && !retry) continue;
       excludedObjectIds.add(prior.objectId);
       if (this.snapshot.pinnedFiles?.[pinnedKey(prior.objectId)]?.fileId === prior.fileId) {
+        if (retry) needsPersistence = true;
         delete pendingEvictions[prior.objectId];
         report.kept.push({ path: relative, code: "file_pinned" });
         continue;
@@ -4605,14 +7191,38 @@ class SyncEngine {
         report.failed.push({ path: relative, code: retry.code });
         continue;
       }
-      delete pendingEvictions[prior.objectId];
+      // A path may be renamed only by case after the migration watch was
+      // stored. A missing old-cased path on POSIX is not proof of no local
+      // bytes; on Windows the filesystem may canonicalize to a different key.
+      const physicalPath = await uniqueExcludedPhysicalPath(this.rootDir, relative, directoryCache);
+      const target = physicalPath === null ? null : await contained(this.rootDir, physicalPath, false);
+      // A dirty legacy alias is kept until its local file metadata changes.
+      // With no change, do not hash potentially large private bytes repeatedly.
+      // The final eviction still compares complete remote and local content.
+      // A failed metadata probe provides NO safe version evidence. Abort this
+      // pass (preserving the durable dirty watch / pending migration marker)
+      // rather than converting an EIO into terminal local_changes_pending.
+      const localVersionStamp = target === null ? null
+        : evictionFileVersionStamp(await fsp.lstat(target, { bigint: true }));
+      if (retry?.code === "local_changes_pending" && localVersionStamp
+        && localVersionStamp === retry.localVersionStamp
+        && physicalPath === retry.localPath) continue;
       if (pending.some((operation) => operation.objectId === prior.objectId
         || operation.metadata?.path === relative || operation.metadata?.sourcePath === relative)) {
+        // The pending operation must settle first. Preserve a dirty-file watch
+        // so an alias that became clean during that operation is not stranded.
+        if (!retry) {
+          pendingEvictions[prior.objectId] = {
+            path: relative, code: "sync_operation_pending", attempts: 0,
+          };
+          needsPersistence = true;
+        }
         report.kept.push({ path: relative, code: "sync_operation_pending" });
         continue;
       }
-      const target = await contained(this.rootDir, relative, true);
-      if (!(await exists(target))) {
+      needsPersistence = true;
+      delete pendingEvictions[prior.objectId];
+      if (target === null || !(await exists(target))) {
         this.snapshot.remoteOnly[prior.objectId] = {
           objectId: prior.objectId, fileId: prior.fileId, versionId: prior.versionId, revision: prior.revision,
           path: relative, directory: false, deleted: false, reason: "excluded", ...(prior.hash ? { hash: prior.hash } : {}),
@@ -4622,32 +7232,90 @@ class SyncEngine {
         continue;
       }
       try {
-        await this._evictLocal(relative);
+        await this._evictLocal(physicalPath, relative, snapshotCasefoldIndex, true);
+        await observeVerifiedExcludedEviction(this.rootDir, physicalPath, directoryCache);
         report.evicted += 1;
       } catch (error) {
+        if (["invalid_snapshot", "eviction_restore_failed", "eviction_rollback_failed"].includes(error?.code)) {
+          // The file may be out of its former path while the durable
+          // PREPARE is the only crash-recovery witness. Never compact away
+          // that witness after a failed physical restore/ledger mutation.
+          throw error;
+        }
+        await refreshExcludedInternalRoot(this.rootDir, directoryCache);
         const code = error?.code || "unknown";
         // Transient failures (for example a file held open on Windows) are retried on later cycles, up to a bound.
-        // Other failures, including local edits, are reported once and never retried.
-        if (TRANSIENT_EVICTION_CODES.has(code)) {
+        // Dirty local edits are retained, and rechecked only after an observed
+        // local metadata change; other nontransient failures are durably quarantined.
+        if (TRANSIENT_EVICTION_CODES.has(code) || code === "cache_entry_unavailable") {
           const attempts = (retry?.attempts || 0) + 1;
           pendingEvictions[prior.objectId] = { path: relative, code, attempts };
           if (attempts >= MAX_EVICTION_ATTEMPTS) report.failed.push({ path: relative, code });
           else report.kept.push({ path: relative, code });
-        } else {
+        } else if (code === "local_changes_pending" && localVersionStamp) {
+          pendingEvictions[prior.objectId] = {
+            path: relative, code, attempts: 0, localVersionStamp, localPath: physicalPath,
+          };
           report.kept.push({ path: relative, code });
+        } else if (code === "sync_operation_pending") {
+          // An operation can arrive after the initial journal check. Retain
+          // its retry intent until the operation settles, as above.
+          pendingEvictions[prior.objectId] = { path: relative, code, attempts: 0 };
+          report.kept.push({ path: relative, code });
+        } else {
+          // A rejected physical alias must never be considered migrated. A
+          // bounded durable failure remains visible across restarts without
+          // retrying an unsafe unlink or scanning the tree indefinitely.
+          pendingEvictions[prior.objectId] = {
+            path: relative, code, attempts: MAX_EVICTION_ATTEMPTS,
+          };
+          report.failed.push({ path: relative, code });
         }
       }
     }
     // Drop retry records for objects that are no longer tracked as excluded local files.
     for (const objectId of Object.keys(pendingEvictions)) {
-      if (!excludedObjectIds.has(objectId)) delete pendingEvictions[objectId];
+      if (!excludedObjectIds.has(objectId)) {
+        delete pendingEvictions[objectId];
+        needsPersistence = true;
+      }
     }
+    await verifyExcludedDirectoryIndexes(directoryCache);
+    if (!needsPersistence) return report.failed.length || report.kept.length ? report : null;
     if (Object.keys(pendingEvictions).length) this.snapshot.pendingEvictions = pendingEvictions;
     else delete this.snapshot.pendingEvictions;
     // The applied list is stored only when exclusions are configured, so snapshots of devices that never use them keep their existing shape.
-    if (this.excludedPaths.length) this.snapshot.excludedPaths = [...this.excludedPaths];
-    else delete this.snapshot.excludedPaths;
-    await this.persistSnapshot();
+    if (this.excludedPaths.length) {
+      this.snapshot.excludedPaths = [...this.excludedPaths];
+      // Every tracked entry has been checked. Locally dirty legacy aliases
+      // retain a durable version watch until safely evicted, while pinned
+      // entries remain under explicit retention and unpin retry semantics.
+      this.snapshot.excludedPathsCasefoldVersion = EXCLUDED_PATHS_CASEFOLD_VERSION;
+    } else {
+      delete this.snapshot.excludedPaths;
+      delete this.snapshot.excludedPathsCasefoldVersion;
+    }
+    const compacting = this.evictionLedgerHead !== null;
+    if (compacting) {
+      // Verify that the on-disk chain still contains every PREPARE produced
+      // in this batch before retiring the active flag. The full checkpoint
+      // is already populated with remote-only markers for staged files.
+      const { head } = await readEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch);
+      if (!head || this.snapshot.evictionLedgerRequired !== true
+        || head.epoch !== this.evictionLedgerHead.epoch
+        || head.sequence !== this.evictionLedgerHead.sequence
+        || head.digest !== this.evictionLedgerHead.digest) {
+        fail("Active eviction ledger changed before durable checkpoint", "invalid_snapshot");
+      }
+      this.snapshot.evictionLedgerRequired = false;
+    }
+    try { await this.persistSnapshot(); }
+    catch (error) {
+      if (compacting) this.snapshot.evictionLedgerRequired = true;
+      throw error;
+    }
+    await clearEvictionLedger(this.rootDir, this.snapshot.evictionLedgerEpoch || null);
+    this.evictionLedgerHead = null;
     return report;
   }
 
@@ -4656,9 +7324,22 @@ class SyncEngine {
   }
 
   async _syncOnce() {
-    if (!this.opened) await this._open();
+    denyIndeterminateInbound(this);
+    requireNativeRootMutationContext(this);
+    await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
+    if (!this.opened) await openEngineBuiltIn.call(this);
     const summary = { pushed: 0, pulled: 0, applied: 0, conflicts: [], offline: false };
-    const excluded = await this._applyExcludedPaths();
+    let excluded;
+    try { excluded = await this._applyExcludedPaths(); }
+    catch (error) {
+      // A partial batch may have durable PREPARE records but no compacted
+      // snapshot yet. Reopen from disk and replay them under the next lock,
+      // rather than retaining a speculative in-memory snapshot after EIO.
+      this.opened = false;
+      this.snapshotDiskRevision = null;
+      this.evictionLedgerHead = null;
+      throw error;
+    }
     if (excluded) summary.excluded = excluded;
     await this._reconcileLocal();
     const indeterminate = [];
@@ -4689,6 +7370,72 @@ class SyncEngine {
     }
     return summary;
   }
+}
+
+// Captured once while loading the trusted module. A caller or callback may
+// override an engine method, but cannot authorize an unverified native replay
+// by replacing this local binding. This is not OS-level writer custody.
+const replayEvictionLedgerBuiltIn = SyncEngine.prototype.replayEvictionLedger;
+const openEngineBuiltIn = SyncEngine.prototype._open;
+// A caller can shadow public instance methods. Always use this module-captured
+// preflight for out-of-scope origin custody checks, including direct reconcile.
+const preflightOutOfScopeMoveBuiltIn = SyncEngine.prototype.preflightOutOfScopeMove;
+
+// Capture each trusted implementation once. Track the entire async lifetime,
+// not merely its entry, even if a caller forgets to await a private method.
+// These are cooperative process-lock leases ONLY; no JS wrapper can grant
+// native RootSession, independent ancestry custody or same-SID isolation.
+for (const name of [
+  "_open", "persistSnapshot", "replayEvictionLedger", "_translateWebDavMutation", "_apply",
+  "reconcileOutOfScopeMove", "pushAtomicSignedOverwritePair",
+  "_reconcileLocal", "_materializeOnDemand",
+  "_materializeRemote", "_enqueueChange",
+  "retryPush", "recoverConflict", "_pushPending", "pruneEmptyUntrackedParents",
+  "_pinLocal", "_unpinLocal", "_pullRemote", "_applyExcludedPaths", "_syncOnce",
+]) {
+  const implementation = SyncEngine.prototype[name];
+  Object.defineProperty(SyncEngine.prototype, name, {
+    configurable: true,
+    writable: true,
+    value: function (...args) {
+      // Attach the non-swallowing error observer to the EXACT promise
+      // returned to the caller. A detached rejection must not terminate
+      // Node before the root lease can record and quarantine its failure.
+      let retained;
+      const operation = (async () => {
+        denyIndeterminateInbound(this);
+        // A directly invoked out-of-scope MOVE/DELETE affecting cached FOD
+        // bytes must retain its ORIGINAL negative native-custody error,
+        // even without an acquired root lock. This immutable module-captured
+        // preflight has no filesystem/network I/O or state mutation.
+        if (name === "reconcileOutOfScopeMove" && this.requireNativeRootRecovery) {
+          preflightOutOfScopeMoveBuiltIn.call(this, args[0]);
+        }
+        if (name === "_open" && args[0]?.readOnly === true) {
+          return await implementation.apply(this, args);
+        }
+        retained = retainNativeRootMutation(this);
+        try {
+          return await ROOT_MUTATION_OPERATION_CONTEXT.run(retained.ticket || null, async () => {
+            // These private paths may perform destructive or remote actions
+            // before they return. Read-only hydration and signed preflight
+            // remain unmarked until their first real mutating syscall.
+            return await implementation.apply(this, args);
+          });
+        } catch (error) {
+          retained.fail(error);
+          throw error;
+        } finally {
+          retained.finish();
+        }
+      })();
+      if (retained?.ticket) ROOT_MUTATION_PROMISE_TICKETS.set(operation, retained.ticket);
+      // Only a started native-required lease uses this internal rejection
+      // observer. Preserve legacy/non-strict Promise rejection semantics.
+      if (retained?.ticket) operation.catch(() => {});
+      return operation;
+    },
+  });
 }
 
 module.exports = { SyncEngine, contained, containedAbsolute, normalizeExcludedPaths,
