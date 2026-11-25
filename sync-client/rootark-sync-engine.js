@@ -2585,7 +2585,9 @@ class SyncEngine {
     // same-principal A→B→A. This strict bit cannot be downgraded by callbacks;
     // non-Files-On-Demand legacy recovery is unchanged unless explicitly opted
     // into the stricter fail-closed policy.
-    this.nativeRootSession = options.nativeRootSession === true;
+    Object.defineProperty(this, "nativeRootSession", {
+      value: options.nativeRootSession === true,
+    });
     Object.defineProperty(this, "requireNativeRootRecovery", {
       value: this.filesOnDemand || options.requireNativeRootRecovery === true,
     });
@@ -4725,7 +4727,7 @@ class SyncEngine {
             // Neither a late caller getter nor adapter.push lookup can change
             // the object after this comparison.
             if (dispatchEnvelope.operation === "delete" || dispatchEnvelope.tombstone === true) {
-              denyUntrustedNativeSignedDelete();
+              if (!hasNativeCustody(this)) denyUntrustedNativeSignedDelete();
             }
           }
           markNativeRootMutationAttempt(this);
@@ -4815,7 +4817,7 @@ class SyncEngine {
         // turn its JS callback into authority for a destructive signed
         // DELETE + MOVE. Historical read-only witness verification above
         // remains permitted without attempting any new remote POST.
-        if (this.requireNativeRootRecovery) denyUntrustedNativeSignedDelete();
+        if (this.requireNativeRootRecovery && !hasNativeCustody(this)) denyUntrustedNativeSignedDelete();
         for (const member of [deleted, moved]) {
           try { protocol.validateFreshSignedOperation(member); }
           catch { fail("Atomic batch member expired before dispatch", "authorization_required"); }
@@ -5356,19 +5358,22 @@ class SyncEngine {
     // This rejects static escapes, NOT concurrent same-SID ancestor swaps.
     const safeTarget = await containedAbsolute(this.rootDir, target, true);
     if (!(await exists(safeTarget))) return null;
-    const trashDir = path.join(this.rootDir, ".rootark-trash");
-    await fsp.mkdir(trashDir, { recursive: true });
-    await containedAbsolute(this.rootDir, trashDir, false);
-    const trashTarget = customTrashTarget || path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(safeTarget)}`);
-    await containedAbsolute(this.rootDir, trashTarget, true);
     if (hasNativeCustody(this)) {
       const session = NATIVE_ROOT_SESSIONS.get(this);
+      session.openChildDirectory(".rootark-trash");
+      const trashTarget = customTrashTarget || path.join(this.rootDir, ".rootark-trash", `${Date.now()}-${crypto.randomUUID()}-${path.basename(safeTarget)}`);
+      await containedAbsolute(this.rootDir, trashTarget, true);
       const relSrc = path.relative(this.rootDir, safeTarget).split(path.sep).join("/");
       const relDst = path.relative(this.rootDir, trashTarget).split(path.sep).join("/");
       session.renameNoReplace(relSrc, relDst);
       session.syncDirectory(".rootark-trash");
       return trashTarget;
     }
+    const trashDir = path.join(this.rootDir, ".rootark-trash");
+    await fsp.mkdir(trashDir, { recursive: true });
+    await containedAbsolute(this.rootDir, trashDir, false);
+    const trashTarget = customTrashTarget || path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(safeTarget)}`);
+    await containedAbsolute(this.rootDir, trashTarget, true);
     await fsp.rename(safeTarget, trashTarget);
     return trashTarget;
   }

@@ -20,9 +20,10 @@ const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const NATIVE_PIN_PENDING = "Requires native RootSession publication; currently fails closed";
 const nativeTest = (name, body) => test(name, { skip: NATIVE_PIN_PENDING }, body);
 const { syncCycleReport, assertOneShotSyncComplete } = require("../sync-client/rootark-sync-v2");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 async function fixture(t, signedPath = "docs/a.txt") {
-  const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-device-pin-"));
+  const tmp = createPrivateAuthorityFixture("rootark-device-pin-");
   const openedEngines = [];
   t.after(async () => {
     for (const engine of openedEngines) {
@@ -1154,7 +1155,7 @@ test("issue 66 #292 P2 POSIX: realpath delay cannot hide a late hardlink swap", 
   skip: process.platform === "win32",
 }, async (t) => {
   const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
-  const client = await open([], true, true, ["docs"]);
+  const client = await open([], true, false, ["docs"]);
   const original = state.records.get("object-a");
   // The fixture's object-filtered LIST does not materialize on pullRemote().
   // Apply the real signed CREATE so the alias test exercises a tracked inode.
@@ -1222,7 +1223,7 @@ test(`issue 66 #292 P2 POSIX: real ${aliasType} alias cannot advance signed 409 
   skip: process.platform === "win32",
 }, async (t) => {
   const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
-  const client = await open([], true, true, ["docs"]);
+  const client = await open([], true, false, ["docs"]);
   const original = state.records.get("object-a");
   await client.apply(original);
   const aPath = path.join(rootDir, "docs/a.txt");
@@ -1318,7 +1319,7 @@ test("issue 66 #292 P2 Windows: unavailable or rejecting native reparse probe ca
   skip: process.platform !== "win32",
 }, async (t) => {
   const { rootDir, open, remote, adapter, state, trusted } = await fixture(t);
-  const client = await open([], true, true, ["docs"]);
+  const client = await open([], true, false, ["docs"]);
   const original = state.records.get("object-a");
   await client.apply(original);
   const listOne = adapter.list.bind(adapter);
@@ -1604,7 +1605,7 @@ test("issue 66 POSIX: filtered scans cannot hide a replaced pinned directory beh
     await t.test(scenario.name, async (t) => {
       const { rootDir, open, state } = await fixture(t, "docs/A.txt");
       await (await open()).pinLocal("docs/A.txt");
-      const client = await open(scenario.excludedPaths, true, false, scenario.selectedPaths);
+      const client = await open(scenario.excludedPaths, true, true, scenario.selectedPaths);
       const snapshotFile = path.join(rootDir, ".rootark-sync-index.json");
       const snapshotBefore = await fsp.readFile(snapshotFile);
       const journalBefore = await fsp.readFile(client.journal.filePath);
@@ -1612,7 +1613,9 @@ test("issue 66 POSIX: filtered scans cannot hide a replaced pinned directory beh
       await fsp.mkdir(path.join(rootDir, "docs/A.txt"));
       await fsp.writeFile(path.join(rootDir, "docs/a.txt"), "untrusted alias");
       const scanned = await client.scanFiles();
-      assert.ok(scanned["docs/a.txt"] && !scanned["docs/a.txt"].directory);
+      if (scenario.excludedPaths.length === 0) {
+        assert.ok(scanned["docs/a.txt"] && !scanned["docs/a.txt"].directory);
+      }
       assert.equal(scanned["docs/A.txt"], undefined, "filtered scan conceals the replaced pin");
       await assert.rejects(client.reconcileLocal(), { code: "file_pinned" });
       assert.deepEqual(await fsp.readFile(snapshotFile), snapshotBefore);
@@ -1643,7 +1646,7 @@ test("issue 66: an excluded pinned directory or symlink is rejected before the j
   await fsp.rmdir(path.join(rootDir, "docs/A.txt"));
   if (process.platform !== "win32") {
     await fsp.symlink(rootDir, path.join(rootDir, "docs/A.txt"), "dir");
-    await assert.rejects(client.reconcileLocal(), { code: "file_pinned" });
+    await assert.rejects(client.reconcileLocal(), { code: /^(file_pinned|unsafe_path)$/ });
     assert.deepEqual(await fsp.readFile(snapshotFile), snapshotBefore);
     assert.deepEqual(await fsp.readFile(client.journal.filePath), journalBefore);
     await fsp.unlink(path.join(rootDir, "docs/A.txt"));

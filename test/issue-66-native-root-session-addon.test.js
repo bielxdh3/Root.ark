@@ -18,9 +18,10 @@ const { SyncEngine } = require("../sync-client/rootark-sync-engine");
 const protocol = require("../sync-client/rootark-sync-protocol");
 const { createAuthorizationProof, verifyAuthorizationProof } =
   require("../sync-client/rootark-sync-authorization");
+const { createPrivateAuthorityFixture } = require("./support/issue-65-private-authority-fixture");
 
 test("issue 66 native addon: implements all 13 REQUIRED_OPERATIONS and rejects JS forgery", async (t) => {
-  const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-native-addon-"));
+  const scratch = createPrivateAuthorityFixture("rootark-native-addon-");
   const rootDir = path.join(scratch, "vault");
   await fsp.mkdir(rootDir, { recursive: true });
   t.after(() => fsp.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
@@ -66,7 +67,7 @@ test("issue 66 native addon: implements all 13 REQUIRED_OPERATIONS and rejects J
 });
 
 test("issue 66 native SyncEngine: hydrates with nativeRootSession while default FOD stays fail-closed", async (t) => {
-  const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), "rootark-native-engine-"));
+  const scratch = createPrivateAuthorityFixture("rootark-native-engine-");
   const rootDir = path.join(scratch, "root");
   t.after(() => fsp.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
 
