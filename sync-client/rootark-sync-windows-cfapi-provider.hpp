@@ -28,8 +28,10 @@ struct Context {
   const NativeOriginalEnrollment* enrollment = nullptr;
   const wchar_t* path = nullptr;
 private:
-  // A revoke/reissue, even to the same physical inode, must invalidate an
-  // in-flight FETCH_DATA authorization rather than lending it a new pin.
+  // Native pin state can be withdrawn while a callback is authorizing a
+  // transfer. Keep the mutation surface private: every new pin or revocation
+  // advances one monotonically increasing admission generation, including a
+  // revoke/re-pin of the SAME physical NTFS inode.
   std::atomic<ULONGLONG> placeholderFileId{0};
   std::atomic<bool> placeholderPinned{false};
   std::atomic<std::uint64_t> placeholderGeneration{0};
@@ -60,6 +62,10 @@ public:
   ~Context() { if (!payload.empty()) SecureZeroMemory(payload.data(), payload.size()); }
 };
 
+// Pure callback-time identity predicate. Payload and FileIdentity MUST remain
+// immutable for the lifetime of an admitted Context; only the pin and file-ID
+// atomics may change while an authorization callback is in progress.
+// This check is necessary, never sufficient, for a positive kernel transfer.
 bool matchesPinnedPlaceholder(const Context& ctx, const CF_CALLBACK_INFO* info) noexcept {
   return info && info->FileIdentity
     && !ctx.identity.empty() && ctx.identity.size() <= 256
@@ -109,8 +115,13 @@ void CALLBACK onFetch(const CF_CALLBACK_INFO* info, const CF_CALLBACK_PARAMETERS
   const bool independentlyAdmitted = identityMatches && rangeMatches
     && !ctx.cancellations.canceled(info) && retainsNativeCustody(ctx) && ctx.authorize
     && ctx.authorize(info, ctx.authorityContext);
-  // Recheck after callback-time authorization, which may race CANCEL,
-  // revocation, ABA pin reissue, or a physical root replacement.
+  // Authorization may yield to CANCEL_FETCH_DATA, pin withdrawal or physical
+  // path replacement. Recheck all three predicates after the authority call,
+  // before offering data to the kernel. This narrows (does not eliminate) the
+  // final check -> CfExecute window: already-submitted bytes are irreversible.
+  // The local monotonic generation blocks same-inode pin ABA across the
+  // authorizer. Independent owner-signed/root custody is still required; a
+  // mock's positive callback alone cannot confer that authority.
   if (independentlyAdmitted && !ctx.cancellations.canceled(info)
       && ctx.pinGeneration() == admittedPinGeneration
       && matchesPinnedPlaceholder(ctx, info) && retainsNativeCustody(ctx)) {

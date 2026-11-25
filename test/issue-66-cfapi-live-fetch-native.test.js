@@ -64,7 +64,7 @@ test("#66 live Windows CFAPI kernel FETCH_DATA completes and unregisters the dis
     assert.equal(evidence.positiveReadVerified, true);
     assert.equal(evidence.nativePayloadMatch, true);
     assert.equal(evidence.successfulCallbackSettled, true,
-      "exact plaintext is insufficient without completed native callback");
+      "exact bytes do not suffice until the same kernel callback has completed successfully");
   });
 
 test("#66 signed Ed25519/AES-GCM Sync v2 bytes hydrate through a real native CFAPI kernel callback",
@@ -353,11 +353,11 @@ test("#66 native FETCH_DATA denies pin revoked and reissued for the same NTFS in
     const outcome = runCompiledFixture(receipt,
       ["--disposable-repin-during-authority", root], 20000);
     assert.equal(outcome.status, 0,
-      `old callback may not inherit reissued pin: ${outcome.stdout}\n${outcome.stderr}`);
+      `reissued pin must not authorize an in-flight native transfer: ${outcome.stdout}\n${outcome.stderr}`);
     const evidence = JSON.parse(outcome.stdout.trim());
-    assert.ok(evidence.liveKernelCallbackCount >= 1);
+    assert.ok(evidence.liveKernelCallbackCount >= 1, "real kernel FETCH_DATA must be exercised");
     assert.ok(evidence.rejectedTransfers >= 1);
-    assert.equal(evidence.successfulTransfers, 0);
+    assert.equal(evidence.successfulTransfers, 0, "reissued native pin cannot resurrect the old callback");
     assert.equal(evidence.positiveReadVerified, false);
     assert.equal(evidence.nativeRelativeOpen, true);
     assert.equal(evidence.unregistered, true);

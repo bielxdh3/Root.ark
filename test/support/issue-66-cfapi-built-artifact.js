@@ -59,6 +59,8 @@ function unchangedDirectory(scratch, prefix) {
   assert.ok(path.isAbsolute(scratch), FAIL);
   assert.match(path.basename(scratch), new RegExp(`^${prefix}[A-Za-z0-9_-]{6,}$`), FAIL);
   assert.equal(comparable(path.dirname(scratch)), comparable(os.tmpdir()), FAIL);
+  // NTFS 8.3 temp ancestors may expand (RUNNER~1 -> runneradmin). Only
+  // accept the unchanged named child under the SAME canonical temp parent.
   const temp = fs.realpathSync.native(os.tmpdir());
   const tempStat = fs.lstatSync(os.tmpdir(), { bigint: true });
   assert.ok(tempStat.isDirectory() && !tempStat.isSymbolicLink(), FAIL);
@@ -149,6 +151,8 @@ function buildCompiledFixture(scratch, name, vcvars, timeout = 40000) {
     assert.doesNotMatch(filename, /[\r\n\x00-\x1f\x7f"%!^&|<>]/, FAIL);
   }
   for (const filename of [vcvars, source, ...dependencies]) {
+    // The generated inherit-only C++ fixture is the only input under the
+    // short-path TEMP root. Do not loosen the real toolchain's path checks.
     const expected = name === "inherit-only-fixture.exe" && filename === source
       ? path.join(fs.realpathSync.native(scratch), path.basename(filename))
       : filename;

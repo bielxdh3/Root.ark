@@ -61,8 +61,9 @@ bool disposableLabAuthorize(const CF_CALLBACK_INFO* info, void* opaque) noexcept
     static_cast<const Context*>(opaque)->root != nullptr;
 }
 
-// Test-only ABA adversary: a revoked then reissued pin on the SAME inode
-// cannot inherit authorization from the preceding generation.
+// Disposable race injector: the owner withdraws the physical pin and then
+// publishes the SAME NTFS inode while FETCH_DATA awaits its authority result.
+// The in-flight callback must never borrow the newly issued pin.
 bool disposableRePinAuthorize(const CF_CALLBACK_INFO* info, void* opaque) noexcept {
   if (!info || !opaque) return false;
   auto& ctx = *static_cast<Context*>(opaque);
@@ -185,6 +186,9 @@ int wmain(int argc, wchar_t** argv) {
   unsigned unsafeNameDenials = 0;
   bool nativeRelativeOpen = false;
   bool positiveReadVerified = false;
+  // A successful CfExecute callback only acknowledges the provider handoff.
+  // It does NOT prove ReadFile returned exact authenticated bytes on the
+  // consumer HANDLE. Surface non-secret diagnostics when a runner differs.
   bool nativeReadSuccess = false;
   bool nativePayloadMatch = false;
   DWORD nativeReadError = 0;
@@ -276,6 +280,14 @@ int wmain(int argc, wchar_t** argv) {
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         &owner, nullptr, &dacl, nullptr, &descriptor.value) == ERROR_SUCCESS
       && trustedDacl(descriptor.value, dacl, owner, sid);
+    // The kernel may release this consumer ReadFile after CfExecute has
+    // supplied all authenticated bytes but BEFORE onFetch increments its
+    // callback-success counter. The Windows hosted runner exposed this exact
+    // scheduling race: byte-for-byte match with successful==0 at this check,
+    // then successful==1 by final JSON output. Wait only for that already
+    // submitted callback to settle. This cannot authorize an absent callback
+    // or repair a wrong/partial read: the byte match and native custody
+    // checks remain mandatory and the deadline fails closed.
     successfulAtConsumerRead = context.successful.load(std::memory_order_acquire);
     if (nativePayloadMatch && context.callbacks.load(std::memory_order_acquire) != 0) {
       const ULONGLONG deadline = GetTickCount64() + 2000;

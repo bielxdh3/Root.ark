@@ -7,6 +7,7 @@ on:
       - agent/pr300-fetch-positive-w190-20261122
       - agent/pr300-native-fixes-w190-20261122-r3
       - cdx/issue66-cfapi-native-w8-20261107
+      - agent/rootark-pr322-merge-pr300-prime-20261122
     paths:
       - '.github/workflows/issue66-cfapi-cancel-fence-w181.yml'
       - 'sync-client/rootark-sync-windows-cfapi-cancel-fence.hpp'
