@@ -9,10 +9,70 @@ import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
+import java.io.InputStream
 import java.math.BigDecimal
 import java.math.BigInteger
+import java.nio.charset.StandardCharsets
+import java.security.cert.Certificate
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import javax.net.ssl.HttpsURLConnection
+import dev.rootark.core.auth.ServerOrigin
 
 class AuthHttpTransportTest {
+
+    @Test
+    fun `adversarial slow-drip sync listing exhausts total response budget before EOF`() {
+        val origin = ServerOrigin.parse("https://sync.example.test")
+        val expected = """{"protocolVersion":2,"view":"metadata","objects":[],"nextCursor":null}""".toByteArray(StandardCharsets.UTF_8)
+        val elapsed = AtomicLong(0L)
+        val reads = AtomicInteger(0)
+        var offset = 0
+        var disconnected = false
+        // Each successful socket read supplies data in under its 10-second
+        // per-read timeout. Without a cumulative BODY deadline this stream
+        // can keep the authenticated listing worker alive indefinitely.
+        val dripper = object : InputStream() {
+            override fun read(): Int = if (offset < expected.size) {
+                reads.incrementAndGet()
+                elapsed.addAndGet(4_000_000_000L)
+                expected[offset++].toInt() and 0xff
+            } else -1
+
+            override fun read(buffer: ByteArray, start: Int, length: Int): Int {
+                if (length == 0) return 0
+                val next = read()
+                if (next < 0) return -1
+                buffer[start] = next.toByte()
+                return 1
+            }
+        }
+        val connection = object : HttpsURLConnection(origin.syncInventoryUrl()) {
+            override fun connect() = Unit
+            override fun disconnect() { disconnected = true }
+            override fun usingProxy() = false
+            override fun getResponseCode() = 200
+            override fun getInputStream() = dripper
+            override fun getContentType() = "application/json"
+            override fun getCipherSuite() = "TLS_AES_128_GCM_SHA256"
+            override fun getLocalCertificates(): Array<Certificate>? = null
+            override fun getServerCertificates(): Array<Certificate> = emptyArray()
+        }
+        val transport = AuthHttpTransport(
+            openInventoryConnection = { requested ->
+                assertEquals(origin.syncInventoryUrl().toString(), requested.toString())
+                connection
+            },
+            monotonicNanos = elapsed::get,
+        )
+        val failure = assertThrows(SyncListingLimitException::class.java) {
+            transport.listInventoryPage(origin, "independent-bearer")
+        }
+        assertTrue(failure.message?.contains("deadline") == true)
+        assertEquals("the third short read crosses the body budget", 3, reads.get())
+        assertEquals("Bearer independent-bearer", connection.getRequestProperty("Authorization"))
+        assertTrue("failed listing must release the authenticated connection", disconnected)
+    }
 
     private fun createValidSyncListing(): JSONObject {
         val json = JSONObject()
