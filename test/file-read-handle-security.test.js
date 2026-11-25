@@ -76,6 +76,28 @@ test("opening pins the descriptor before checking path identity", () => {
   }
 });
 
+test("share opened handle refuses a multiply linked local inode", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-share-hardlink-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const target = path.join(directory, "private.txt");
+  const alias = path.join(directory, "alias.txt");
+  fs.writeFileSync(target, "privately owned original contents");
+  try { fs.linkSync(target, alias); }
+  catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP"].includes(error.code)) {
+      t.skip("filesystem does not permit creating a disposable hardlink");
+      return;
+    }
+    throw error;
+  }
+  assert.equal(fs.statSync(target).nlink, 2,
+    "exercise a real hardlink alias, not a second independent copy");
+  assert.throws(() => openReadHandle(target), { code: "FILE_HANDLE_CHANGED" },
+    "an alternate filename may not serve as an independent authorization path");
+  assert.deepEqual(fs.readFileSync(alias, "utf8"), "privately owned original contents",
+    "denial must not mutate either hardlink");
+});
+
 test("opening rejects an in-place rewrite after the descriptor is pinned", () => {
   const directory = fs.mkdtempSync(path.join(testTempDirectoryRoot(), "rootark-open-file-in-place-race-"));
   const filePath = path.join(directory, "file.txt");
