@@ -12,6 +12,16 @@ function invalidInternalFile(message) {
   return fileReadError("INVALID_INTERNAL_FILE", message);
 }
 
+function replacedInternalFile(message) {
+  const error = invalidInternalFile(message);
+  error.reason = "PATH_REPLACED";
+  return error;
+}
+
+function differentFile(left, right) {
+  return left.dev !== right.dev || left.ino !== right.ino;
+}
+
 function sameSnapshot(left, right) {
   return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode
     && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
@@ -64,9 +74,11 @@ function readBoundedRegularFile(filePath, maxBytes) {
       throw invalidInternalFile("Internal file must be a bounded regular file");
     }
     const openedPath = fs.lstatSync(filePath, { bigint: true });
-    if (!openedPath.isFile() || openedPath.isSymbolicLink() || !sameSnapshot(opened, openedPath)) {
+    if (!openedPath.isFile() || openedPath.isSymbolicLink() || openedPath.size > BigInt(maxBytes)) {
       throw invalidInternalFile("Internal file changed while opening");
     }
+    if (differentFile(opened, openedPath)) throw replacedInternalFile("Internal file changed while opening");
+    if (!sameSnapshot(opened, openedPath)) throw invalidInternalFile("Internal file changed while opening");
 
     const chunks = [];
     const buffer = Buffer.alloc(Math.min(64 * 1024, maxBytes + 1));
@@ -83,8 +95,11 @@ function readBoundedRegularFile(filePath, maxBytes) {
     const afterRead = fs.fstatSync(descriptor, { bigint: true });
     const afterReadPath = fs.lstatSync(filePath, { bigint: true });
     if (!afterRead.isFile() || afterRead.size > BigInt(maxBytes)
-      || !afterReadPath.isFile() || afterReadPath.isSymbolicLink()
-      || !sameSnapshot(opened, afterRead) || !sameSnapshot(afterRead, afterReadPath)) {
+      || !afterReadPath.isFile() || afterReadPath.isSymbolicLink() || afterReadPath.size > BigInt(maxBytes)) {
+      throw invalidInternalFile("Internal file changed while reading");
+    }
+    if (differentFile(opened, afterReadPath)) throw replacedInternalFile("Internal file changed while reading");
+    if (!sameSnapshot(opened, afterRead) || !sameSnapshot(afterRead, afterReadPath)) {
       throw invalidInternalFile("Internal file changed while reading");
     }
 
