@@ -15,7 +15,7 @@ const { encryptSecret, generateSecret } = require("../src/services/totp");
 test("SQLite increments a deleted username generation on every recreation", (t) => {
   t.after(() => {
     closeDb();
-    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
   runMigrations({ backup: false });
 
