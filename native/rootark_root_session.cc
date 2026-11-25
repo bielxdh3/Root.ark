@@ -159,7 +159,7 @@ bool verify_root_owner_dacl(HANDLE h) {
   PACL dacl = nullptr;
   if (GetSecurityInfo(h, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
       &owner, nullptr, &dacl, nullptr, &sd) != ERROR_SUCCESS) return false;
-  bool ok = owner && (EqualSid(owner, cur_sid) || IsWellKnownSid(owner, WinBuiltinAdministratorsSid));
+  bool ok = dacl != nullptr && owner && (EqualSid(owner, cur_sid) || IsWellKnownSid(owner, WinBuiltinAdministratorsSid));
   if (ok && dacl) {
     ACL_SIZE_INFORMATION asi{};
     if (!GetAclInformation(dacl, &asi, sizeof(asi), AclSizeInformation)) ok = false;
@@ -372,7 +372,13 @@ struct NativeSession {
       if (fstat(a->fd, &ast) != 0 || !S_ISDIR(ast.st_mode) || ast.st_nlink == 0) return false;
       if (ast.st_dev != a->dev || ast.st_ino != a->ino) return false;
     }
-    return true;
+    int cur_fd = sys_openat2(AT_FDCWD, root_path.c_str(), O_RDONLY | O_DIRECTORY, 0, RESOLVE_NO_SYMLINKS);
+    if (cur_fd < 0) return false;
+    struct stat cur_st{};
+    bool same = fstat(cur_fd, &cur_st) == 0 && S_ISDIR(cur_st.st_mode) && cur_st.st_nlink > 0
+      && cur_st.st_dev == root_dev && cur_st.st_ino == root_ino;
+    close(cur_fd);
+    return same;
   }
 
   bool open_root(const std::string& path) {
@@ -833,13 +839,15 @@ napi_value fn_sync_file_or_dir(napi_env env, napi_callback_info info) {
     std::vector<std::string> dirs(parts.begin(), parts.end() - 1);
     HANDLE ph = s->open_dir_chain(dirs, false);
     if (ph == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
-    HANDLE h = open_step_relative(ph, utf8_to_wide(parts.back()), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-      FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, 0);
+    HANDLE h = open_step_relative(ph, utf8_to_wide(parts.back()), FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN, 0);
     CloseHandle(ph);
-    if (h != INVALID_HANDLE_VALUE) {
-      FlushFileBuffers(h);
-      CloseHandle(h);
-    }
+    if (h == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_durability_indeterminate", "Sync open failed");
+    bool flushed = FlushFileBuffers(h) != 0;
+    CloseHandle(h);
+    if (!flushed) return throw_err(env, "root_session_durability_indeterminate", "FlushFileBuffers failed");
+  } else {
+    if (!FlushFileBuffers(s->root_handle)) return throw_err(env, "root_session_durability_indeterminate", "Root FlushFileBuffers failed");
   }
 #else
   if (!rel.empty()) {
@@ -877,7 +885,9 @@ napi_value fn_commit_durable_recovery(napi_env env, napi_callback_info info) {
   NativeSession* s = unwrap_session(env, self);
   if (!s) return nullptr;
   if (!s->verify_custody()) return throw_err(env, "root_session_durability_indeterminate", "Custody lost");
-#ifndef _WIN32
+#ifdef _WIN32
+  if (!FlushFileBuffers(s->root_handle)) return throw_err(env, "root_session_durability_indeterminate", "Root FlushFileBuffers failed");
+#else
   if (fsync(s->root_fd) != 0) return throw_err(env, "root_session_durability_indeterminate", "root fsync failed");
 #endif
   napi_value out; napi_get_boolean(env, true, &out); return out;
