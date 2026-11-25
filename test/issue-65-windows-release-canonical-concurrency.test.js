@@ -17,7 +17,7 @@ function npmTestArgs(file, variable) {
 
 test("Windows mandatory release gate runs the same full canonical test suite with bounded file concurrency", () => {
   const expected = ["test", "--", "--test-reporter=tap", "--test-concurrency=2"];
-  assert.deepEqual(npmTestArgs("run-windows-canonical-tests.js", "invocation"), expected,
+  assert.deepEqual(require("../scripts/run-windows-canonical-tests").canonicalTestArgs([]), expected,
     "existing canonical Windows runner must retain its complete two-worker suite");
   assert.deepEqual(npmTestArgs("validate-release-gate.js", "npmTest"), expected,
     "release gate must not use unbounded parallel files and destabilize restore fixtures");
