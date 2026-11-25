@@ -124,7 +124,13 @@ async function stop(child, secrets) {
 }
 
 function createSandbox() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-startup-"));
+  // On Windows the production staging ACL verifier validates *all* ancestors.
+  // A shared TEMP ancestor can legitimately fail that trust boundary before
+  // this fixture reaches the independent seed-import admission check.
+  // Use the same per-user protected root as the WebDAV startup fixture.
+  const base = process.platform === "win32" && process.env.USERPROFILE
+    ? process.env.USERPROFILE : os.tmpdir();
+  const dir = fs.mkdtempSync(path.join(base, "rootark-startup-"));
   fs.symlinkSync(PUBLIC, path.join(dir, "public"), "junction");
   return dir;
 }

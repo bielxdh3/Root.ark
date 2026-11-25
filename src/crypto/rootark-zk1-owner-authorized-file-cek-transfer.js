@@ -11,6 +11,12 @@ const committedApproval = require("../../public/client/rootark-zk1-v2-committed-
 const browserPop = require("../../public/client/rootark-zk1-v2-browser-pop");
 const fileContent = require("../../public/client/rootark-zk1-file-content");
 const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
+// Snapshot the release clock and lease intrinsics before caller-controlled
+// cryptographic callbacks can replace globals. A forged callback must neither
+// extend a signed owner-approved CEK lease nor force premature CEK release.
+const nativeReleaseNow = Date.now;
+const nativeReleaseFloor = Math.floor;
+const nativeReleaseMin = Math.min;
 const DOMAIN = Buffer.from("Root.ark/zk-1/owner-authorized-file-cek-transfer/v1\0");
 const INFO = Buffer.from("Root.ark/zk-1/owner-authorized-file-cek-info/v1\0");
 const AAD = Buffer.from("Root.ark/zk-1/owner-authorized-file-cek-aad/v1\0");
@@ -115,7 +121,7 @@ function compare(a, b) { return a.length === b.length && crypto.timingSafeEqual(
 function positive(v) { if (!Number.isSafeInteger(v) || v < 1) deny(); return v; }
 function requireUnexpiredAtRelease(expiresAt) {
   if (!Number.isSafeInteger(expiresAt)
-    || Math.floor(Date.now() / 1000) > expiresAt) deny();
+    || nativeReleaseFloor(nativeReleaseNow() / 1000) >= expiresAt) deny();
 }
 function metadataCopy(meta) {
   exact(meta, META);
@@ -291,7 +297,7 @@ async function sealOwnerAuthorizedFileCek(input) {
       metadata: stable.metadata, revision: stable.objectRevision,
       ciphertext: stable.ciphertext, ciphertextRoot: stable.ciphertextRoot, authority: trusted }),
       nonce: b64(crypto.randomBytes(16)),
-      expires_at: Math.min(trusted.expiresAt, a.approval.expires_at) };
+      expires_at: nativeReleaseMin(trusted.expiresAt, a.approval.expires_at) };
     exact(core, CORE);
     if (!compare(from64(core.hpke_public_key, 32), ownerApprovedHpkePublicKey)) deny();
     const context = Buffer.from(await z.encodeDeterministic(core));
@@ -360,12 +366,12 @@ async function openOwnerAuthorizedFileCek(input) {
     if (cek.length !== 32) deny();
     // Last use: reject a now-expired owner approval/receipt before returning
     // plaintext-equivalent CEK bytes to B, even if HPKE was valid at entry.
-    // Release the minimum expiration from the exact owner-approved envelope,
-    // committed approval and independently verified witness snapshot, rather
-    // than forcing a later caller to reread mutable untrusted authority.
-    const verifiedReleaseExpiresAt = Math.min(core.expires_at,
+    const verifiedReleaseExpiresAt = nativeReleaseMin(core.expires_at,
       a.approval.expires_at, a.committedReceipt.expires_at);
     requireUnexpiredAtRelease(verifiedReleaseExpiresAt);
+    // The caller must use this EXACT expiration from the independently
+    // verified, detached authority snapshot, not a pre-await read of the
+    // mutable original approval/receipt supplied by an untrusted caller.
     return Object.freeze({ cek: Buffer.from(cek), verifiedReleaseExpiresAt,
       authorizesProductionRestore: false,
       externalCustodyProven: false });

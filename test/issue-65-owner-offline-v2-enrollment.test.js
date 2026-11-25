@@ -17,6 +17,27 @@ const cekTransfer = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
 })();
+// A fresh instance pins a controllable *native-release* clock before it loads.
+// Restore Date.now and the module cache immediately, so the real entry-time
+// approval, witness, signature and <=30-second skew checks still run against
+// real time. Only the final post-HPKE release boundary sees elapsed time.
+function releaseClockTransfer() {
+  const moduleId = require.resolve("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer");
+  const previousModule = require.cache[moduleId];
+  const actualNow = Date.now;
+  let nowMs = actualNow();
+  let transfer;
+  try {
+    Date.now = () => nowMs;
+    delete require.cache[moduleId];
+    transfer = require(moduleId);
+  } finally {
+    Date.now = actualNow;
+    if (previousModule) require.cache[moduleId] = previousModule;
+    else delete require.cache[moduleId];
+  }
+  return { transfer, advanceTo(ms) { nowMs = ms; } };
+}
 const cekBatch = (() => {
   try { return require("../src/crypto/rootark-zk1-owner-authorized-versioned-cek-batch"); }
   catch (error) { if (error.code === "MODULE_NOT_FOUND") return {}; throw error; }
@@ -671,8 +692,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       assert.equal(safe.core.owner_digest, committed.digest,
         `${label}: signed owner head pinned before await`);
     }
-    // The owner also must not create a fresh CEK grant after the signed
-    // approval expires while the real file AEAD open is pending.
+    // A hostile callback must not replace the module's wall clock after the
+    // real AEAD await. The signed owner lease remains authoritative.
     const originalWallClock = Date.now;
     let ownerDecryptFinished = false;
     subtle.decrypt = async function (...args) {
@@ -682,18 +703,40 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       return result;
     };
     try {
-      await assert.rejects(cekTransfer.sealOwnerAuthorizedFileCek({
+      const clockPinnedEnvelope = await cekTransfer.sealOwnerAuthorizedFileCek({
         ownerPrivateKey: owner.privateKey, ownerHeldCek,
         metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
         authority: publicAuthority,
-      }), /ZK_OWNER_FILE_CEK_DENIED/,
-      "A must refuse CEK rewrap after authorization expires during real file AEAD open");
+      });
+      assert.equal(clockPinnedEnvelope.core.expires_at, envelope.core.expires_at,
+        "an AEAD callback may not spoof a later wall clock or extend the signed owner lease");
     } finally {
       Date.now = originalWallClock;
       delete subtle.decrypt;
     }
     assert.equal(ownerDecryptFinished, true,
-      "test must reach the genuine file AEAD before expiring the grant");
+      "test must reach genuine file AEAD before rebinding the global clock");
+    const sealClock = releaseClockTransfer();
+    const validSealInput = { ownerPrivateKey: owner.privateKey, ownerHeldCek,
+      metadata, objectRevision: 1, ciphertext: sealed, ciphertextRoot: root,
+      authority: publicAuthority };
+    const baselineSeal = await sealClock.transfer.sealOwnerAuthorizedFileCek(validSealInput);
+    assert.equal(baselineSeal.core.expires_at, envelope.core.expires_at,
+      "the same signed authority must pass every entry-time gate before expiry");
+    const nativeSeal = z.hpkeSeal;
+    let realSealCompleted = false;
+    z.hpkeSeal = async (...args) => {
+      const value = await nativeSeal(...args);
+      realSealCompleted = true;
+      sealClock.advanceTo((envelope.core.expires_at + 1) * 1000);
+      return value;
+    };
+    try {
+      await assert.rejects(sealClock.transfer.sealOwnerAuthorizedFileCek(validSealInput),
+        /ZK_OWNER_FILE_CEK_DENIED/,
+        "an actually elapsed signed CEK lease must deny at the final post-HPKE seal fence");
+    } finally { z.hpkeSeal = nativeSeal; }
+    assert.equal(realSealCompleted, true, "real HPKE sealing must finish before the clock expires");
     for (const label of ["request", "metadata", "head", "opened envelope"]) {
       let accessed = 0;
       const accessor = { enumerable: true, configurable: true,
@@ -740,8 +783,8 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       ciphertextRoot: root, deviceHpkePrivateKey: bRecipient,
       nowSeconds: now + 9, ...overrides,
     });
-    // Expire the real signed authorization at the last awaited HPKE operation.
-    // A previously approved CEK must not escape after the time-bound grant dies.
+    // Rebind the mutable global clock after real HPKE; the pinned clock must
+    // not treat an attacker-supplied timestamp as wall-clock passage.
     const realHpkeOpen = z.hpkeOpen;
     const realDateNow = Date.now;
     let hpkeFinishedBeforeExpiry = false;
@@ -752,14 +795,45 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       return result;
     };
     try {
-      await assert.rejects(open(), /ZK_OWNER_FILE_CEK_DENIED/,
-        "B cannot release a CEK after expiry during real HPKE open");
+      const clockPinnedCek = await open();
+      assert.equal(clockPinnedCek.verifiedReleaseExpiresAt,
+        Math.min(envelope.core.expires_at, issued.approval.expires_at,
+          signedCommittedHead.expires_at),
+      "B returns exactly the original signed lease despite a forged Date.now callback");
+      clockPinnedCek.cek.fill(0);
     } finally {
       z.hpkeOpen = realHpkeOpen;
       Date.now = realDateNow;
     }
     assert.equal(hpkeFinishedBeforeExpiry, true,
-      "test must reach actual HPKE decrypt before the clock changes");
+      "test must reach actual HPKE decrypt before the forged clock changes");
+    const openClock = releaseClockTransfer();
+    const validOpenInput = {
+      envelope, authority: { ...linked, nowSeconds: now + 9 },
+      operatorMinimumSequence: signedCommittedHead.sequence,
+      metadata, objectRevision: 1, ciphertext: recoveredCiphertext,
+      ciphertextRoot: root, deviceHpkePrivateKey: bRecipient,
+      nowSeconds: now + 9,
+    };
+    const baselineOpen = await openClock.transfer.openOwnerAuthorizedFileCek(validOpenInput);
+    assert.equal(baselineOpen.verifiedReleaseExpiresAt,
+      Math.min(envelope.core.expires_at, issued.approval.expires_at,
+        signedCommittedHead.expires_at));
+    baselineOpen.cek.fill(0);
+    const originalHpkeOpen = z.hpkeOpen;
+    let realOpenCompleted = false;
+    z.hpkeOpen = async (...args) => {
+      const value = await originalHpkeOpen(...args);
+      realOpenCompleted = true;
+      openClock.advanceTo((baselineOpen.verifiedReleaseExpiresAt + 1) * 1000);
+      return value;
+    };
+    try {
+      await assert.rejects(openClock.transfer.openOwnerAuthorizedFileCek(validOpenInput),
+        /ZK_OWNER_FILE_CEK_DENIED/,
+        "an actually elapsed signed CEK lease must deny at the final post-HPKE open fence");
+    } finally { z.hpkeOpen = originalHpkeOpen; }
+    assert.equal(realOpenCompleted, true, "real HPKE opening must finish before the clock expires");
     const bCek = await open();
     assert.equal(bCek.authorizesProductionRestore, false);
     assert.equal(bCek.verifiedReleaseExpiresAt, Math.min(
@@ -1281,55 +1355,90 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.deepEqual(Buffer.from(shared.data), bytes);
     assert.equal(shared.authorizesProductionIo, false);
     shared.data.fill(0);
-    {
-    // P2 regression: a genuinely signed share grant can outlive the owner
-    // HPKE approval and witness. Expiration during real file AEAD must deny.
-    const longGrantInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
-      expiresAt: Math.max(envelope.core.expires_at,
-        issued.approval.expires_at, signedCommittedHead.expires_at) + 120 };
-    const longMessage = await shareGrantMessageV1(longGrantInput);
-    const longGrant = { grantId: longGrantInput.grantId,
-      expiresAt: longGrantInput.expiresAt,
-      shareStatementBase64: b64(longMessage.subarray(Buffer.byteLength(
+    const encodedFile = JSON.parse(recoveredCiphertext.toString("utf8"));
+    const fileAeadCipherLength = Buffer.from(encodedFile.ciphertext, "base64url").length;
+    assert.notEqual(fileAeadCipherLength, 48,
+      "genuine file AEAD must be distinguishable from the 48-byte owner HPKE CEK ciphertext");
+    // Sign a NEW short-lived share with the real Ed25519 owner device key.
+    // Allow its real expiration to pass ONLY after the genuine HPKE/file AEAD
+    // path has completed; the third independent-authority callback then rolls
+    // Date.now backwards. Merely mocking Date.now forwards here would not
+    // prove the pinned release clock rejects an actually expired share.
+    const physicalNow = Date.now;
+    const shortIssuedAt = Math.floor(physicalNow() / 1000) - 1;
+    const shortExpiresAt = shortIssuedAt + 15;
+    const shortInput = { ...grantInput, grantId: b64(crypto.randomBytes(32)),
+      authorization: { ...shareAuthorization, issued_at: shortIssuedAt },
+      expiresAt: shortExpiresAt };
+    const shortMessage = await shareGrantMessageV1(shortInput);
+    const shortGrant = { grantId: shortInput.grantId, expiresAt: shortExpiresAt,
+      shareStatementBase64: b64(shortMessage.subarray(Buffer.byteLength(
         "Root.ark/zk-1/protected-ciphertext-share/v1\0"))),
-      shareSignatureBase64: b64(crypto.sign(null, longMessage, originalActor)) };
-    const longShareInput = { ...recipientShareInput, grant: longGrant,
+      shareSignatureBase64: b64(crypto.sign(null, shortMessage, originalActor)) };
+    const shortNowSeconds = shortIssuedAt + 1;
+    const shortShareInput = { ...recipientShareInput, grant: shortGrant,
+      nowSeconds: () => shortNowSeconds,
       fetchImpl: async () => new Response(JSON.stringify({
         id: metadata.object_id, revision: 1, epoch: metadata.epoch,
         ciphertextBase64: b64(recoveredCiphertext),
-        shareStatementBase64: longGrant.shareStatementBase64,
-        shareSignatureBase64: longGrant.shareSignatureBase64,
+        shareStatementBase64: shortGrant.shareStatementBase64,
+        shareSignatureBase64: shortGrant.shareSignatureBase64,
       }), { status: 200, headers: { "content-type": "application/json" } }) };
-    const firstExpiry = Math.min(envelope.core.expires_at,
-      issued.approval.expires_at, signedCommittedHead.expires_at);
-    assert.ok(longGrant.expiresAt > firstExpiry + 2,
-      "genuine signed share remains live after owner approval/witness expiration");
-    const encodedFile = JSON.parse(recoveredCiphertext.toString("utf8"));
-    const fileAeadCipherLength = Buffer.from(encodedFile.ciphertext, "base64url").length;
-    assert.notEqual(fileAeadCipherLength, 48, "genuine file AEAD differs from HPKE CEK");
-    const originalFinalDecrypt = subtle.decrypt;
-    const originalFinalNow = Date.now;
-    let finalAeadCompleted = false;
+    const shortBridge = { ...bridgeArgs, nowSeconds: shortNowSeconds,
+      authority: { ...linked, nowSeconds: shortNowSeconds } };
+    const originalSome = Array.prototype.some;
+    const originalReadNow = Date.now;
+    const realFinalDecrypt = subtle.decrypt;
+    let poisonInstalled = false;
+    let authorityReadsWithPoison = 0, genuineAeadBeforePoison = false;
+    let realExpiryObserved = false;
     subtle.decrypt = async function (...args) {
-      const openedFile = await originalFinalDecrypt.apply(this, args);
+      const result = await realFinalDecrypt.apply(this, args);
       if (args[0]?.name === "AES-GCM"
         && args[2]?.byteLength === fileAeadCipherLength) {
-        finalAeadCompleted = true;
-        Date.now = () => (firstExpiry + 2) * 1000;
+        genuineAeadBeforePoison = true;
       }
-      return openedFile;
+      return result;
     };
+    let expiryOutcome;
     try {
-      await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
-        redeemInput: longShareInput }), /ZK_SHARE_FILE_OPEN_DENIED/,
-      "do not release plaintext after owner approval/witness expires during file AEAD");
+      expiryOutcome = await openProtectedRecipientShareFile({ ...shortBridge,
+        redeemInput: { ...shortShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++authorityReadsWithPoison === 3) {
+            assert.equal(genuineAeadBeforePoison, true,
+              "the real file AEAD must complete before the malicious third read");
+            assert.ok(physicalNow() < shortExpiresAt * 1000,
+              "genuine file AEAD must finish while the short signed share is still live");
+            const remaining = shortExpiresAt * 1000 - physicalNow();
+            if (remaining > 0) await new Promise((resolve) =>
+              setTimeout(resolve, remaining + 30));
+            realExpiryObserved = physicalNow() >= shortExpiresAt * 1000;
+            assert.equal(realExpiryObserved, true,
+              "the genuine native clock, not a patched Date.now, crossed signed expiry");
+            poisonInstalled = true;
+            Array.prototype.some = () => false;
+            Date.now = () => shortIssuedAt * 1000;
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
     } finally {
+      Array.prototype.some = originalSome;
+      Date.now = originalReadNow;
       delete subtle.decrypt;
-      Date.now = originalFinalNow;
     }
-    assert.equal(finalAeadCompleted, true,
-      "oracle must complete genuine file AEAD before expiring owner authority");
-    }
+    if (expiryOutcome?.data instanceof Uint8Array) expiryOutcome.data.fill(0);
+    assert.equal(genuineAeadBeforePoison, true,
+      "the real encrypted file was opened before the callback poisoned Array.some");
+    assert.equal(authorityReadsWithPoison, 3,
+      "the malicious method replacement occurred on the final independent authority read");
+    assert.equal(poisonInstalled, true);
+    assert.equal(realExpiryObserved, true,
+      "a real deadline must pass after AES-GCM, before Date.now rolls backwards");
+    assert.ok(expiryOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(expiryOutcome.message),
+    "a real expired Ed25519 share must deny despite Date.now rollback and forged Array.some");
     await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
       redeemInput: { ...recipientShareInput, grant: { ...grant,
         shareSignatureBase64: b64(crypto.randomBytes(64)) } },
@@ -1368,6 +1477,741 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     "issuer revoked during HPKE/file AEAD awaits cannot yield plaintext");
     assert.equal(authorityReads, 3,
       "additional current authority check must occur after owner CEK and file AEAD");
+    // P2: an independently signed reader is entrusted at entry, but its OWN
+    // callback can replace the caller-owned function property during the
+    // second awaited read. The actual original reader detects revocation
+    // after file AEAD on its third call; a replacement returns stale authority.
+    const readerAttack = { ...recipientShareInput };
+    const realDecryptForReader = subtle.decrypt;
+    let readerAeadFinished = false, realReaderCalls = 0, staleReaderCalls = 0;
+    let issuerRevokedOnThirdReader = false;
+    subtle.decrypt = async function (...args) {
+      const openedFile = await realDecryptForReader.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) readerAeadFinished = true;
+      return openedFile;
+    };
+    readerAttack.readIndependentAuthority = async function () {
+      const current = await readIndependentAuthority();
+      realReaderCalls++;
+      if (realReaderCalls === 2) {
+        readerAttack.readIndependentAuthority = async function () {
+          staleReaderCalls++;
+          // This stale callback still returns a valid-looking previously
+          // active owner-signed roster; only the original would see revocation.
+          return readIndependentAuthority();
+        };
+      }
+      if (realReaderCalls === 3) {
+        assert.equal(readerAeadFinished, true,
+          "third real authority read must be after genuine file AES-GCM");
+        const issuer = current.devices.find((entry) =>
+          entry.deviceId === originalDevice.device_id);
+        assert.ok(issuer);
+        issuer.revokedAtEpoch = metadata.epoch;
+        issuerRevokedOnThirdReader = true;
+      }
+      return current;
+    };
+    let swappedReaderOutcome;
+    try {
+      swappedReaderOutcome = await openProtectedRecipientShareFile({
+        ...bridgeArgs, redeemInput: readerAttack,
+      }).then((result) => result, (error) => error);
+    } finally { delete subtle.decrypt; }
+    if (swappedReaderOutcome?.data instanceof Uint8Array) swappedReaderOutcome.data.fill(0);
+    assert.equal(realReaderCalls, 3,
+      "the originally trusted independent reader must run at final release");
+    assert.equal(readerAeadFinished, true,
+      "attack must traverse real owner HPKE and local file AES");
+    assert.equal(issuerRevokedOnThirdReader, true,
+      "genuine third authority reading must contain revoked issuer");
+    assert.equal(staleReaderCalls, 0,
+      "an awaited read may not substitute a stale authority implementation");
+    assert.ok(swappedReaderOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(swappedReaderOutcome.message),
+    "a newly revoked issuer cannot release plaintext via callback reference swap");
+    // P2 RED-on-parent: a callback returns a genuinely REVOKED current issuer
+    // after genuine share signatures, HTTP/SQLite-reopened ciphertext,
+    // recipient HPKE and file AES-GCM have all succeeded. A poisoned filter must not let
+    // currentAuthority() replace that roster with an attacker-chosen old view.
+    const nativeFilter = Array.prototype.filter;
+    const nativeDecrypt = subtle.decrypt;
+    let finalAeadBeforeRevocation = false;
+    let readsWithRevocation = 0;
+    let revocationReturned = false;
+    let attackerFilterCalls = 0;
+    let revokedRoster;
+    let falselyActiveRoster;
+    subtle.decrypt = async function (...args) {
+      const result = await nativeDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) {
+        finalAeadBeforeRevocation = true;
+      }
+      return result;
+    };
+    let filterAttackOutcome;
+    try {
+      filterAttackOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++readsWithRevocation === 3) {
+            assert.equal(finalAeadBeforeRevocation, true,
+              "the real file AEAD must finish before the third authority read");
+            const issuer = current.devices.find((device) =>
+              device.deviceId === originalDevice.device_id);
+            assert.ok(issuer, "the independently verified current roster contains the real issuer");
+            issuer.revokedAtEpoch = metadata.epoch;
+            revocationReturned = true;
+            revokedRoster = current.devices;
+            falselyActiveRoster = current.devices.map((device) => ({
+              ...device, revokedAtEpoch: null,
+            }));
+            Array.prototype.filter = function (predicate, thisArg) {
+              if (this === revokedRoster) {
+                attackerFilterCalls++;
+                return Reflect.apply(nativeFilter, falselyActiveRoster,
+                  [predicate, thisArg]);
+              }
+              return Reflect.apply(nativeFilter, this, [predicate, thisArg]);
+            };
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally {
+      Array.prototype.filter = nativeFilter;
+      delete subtle.decrypt;
+    }
+    if (filterAttackOutcome?.data instanceof Uint8Array) filterAttackOutcome.data.fill(0);
+    assert.equal(finalAeadBeforeRevocation, true,
+      "P2 fixture must run signed share and real HPKE+file AES-GCM before poisoning");
+    assert.equal(readsWithRevocation, 3,
+      "the bad native filter is installed only for the final independent read");
+    assert.equal(revocationReturned, true,
+      "the final callback must return a genuinely revoked issuer, not a fake active snapshot");
+    assert.equal(revokedRoster?.find((device) =>
+      device.deviceId === originalDevice.device_id)?.revokedAtEpoch, metadata.epoch,
+    "the final authority result really contains the revoked issuer epoch");
+    assert.equal(attackerFilterCalls, 0,
+      "the release fence may not call a rebound Array.prototype.filter");
+    assert.ok(filterAttackOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(filterAttackOutcome.message),
+    "a revoked issuer may not release plaintext by swapping the roster filter");
+    // Native Array#filter is NOT a sufficient fix. On the returned current
+    // authority roster it consults constructor[Symbol.species], which can
+    // manufacture a Proxy output and replace the genuinely revoked issuer
+    // with an active clone. This bypasses even a captured native filter.
+    let speciesAuthorityReads = 0, speciesInvocations = 0, forgedHits = 0;
+    let speciesAeadCompleted = false, signedRosterRevoked = false;
+    const speciesDecrypt = subtle.decrypt;
+    subtle.decrypt = async function (...args) {
+      const openedFile = await speciesDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) speciesAeadCompleted = true;
+      return openedFile;
+    };
+    let speciesOutcome;
+    try {
+      speciesOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++speciesAuthorityReads === 3) {
+            assert.equal(speciesAeadCompleted, true,
+              "real AES-GCM must finish before the hostile final roster");
+            const issuer = current.devices.find((entry) =>
+              entry.deviceId === originalDevice.device_id);
+            assert.ok(issuer);
+            issuer.revokedAtEpoch = metadata.epoch;
+            signedRosterRevoked = true;
+            Object.defineProperty(current.devices, "constructor", { value: {
+              [Symbol.species]: function ForgedFilteredRoster() {
+                speciesInvocations++;
+                return new Proxy([], { defineProperty(target, prop, descriptor) {
+                  if (typeof prop === "string" && /^\d+$/.test(prop)
+                    && Object.hasOwn(descriptor, "value")) {
+                    forgedHits++;
+                    return Reflect.defineProperty(target, prop, { ...descriptor,
+                      value: { ...descriptor.value, revokedAtEpoch: null } });
+                  }
+                  return Reflect.defineProperty(target, prop, descriptor);
+                } });
+              },
+            } });
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally { delete subtle.decrypt; }
+    if (speciesOutcome?.data instanceof Uint8Array) speciesOutcome.data.fill(0);
+    assert.equal(speciesAeadCompleted, true,
+      "species adversary must reach real owner HPKE and file AES-GCM");
+    assert.equal(speciesAuthorityReads, 3,
+      "species poison applies exclusively after the last authority await");
+    assert.equal(signedRosterRevoked, true,
+      "the actual returned authority list still contains a revoked issuer");
+    assert.equal(speciesInvocations, 0,
+      "final revocation fence cannot construct attacker-defined filter species");
+    assert.equal(forgedHits, 0,
+      "no malicious species result may turn a revoked issuer into active");
+    assert.ok(speciesOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(speciesOutcome.message),
+    "a revoked issuer must deny plaintext even with a forged filter species");
+    // P2 RED on the previous descriptor-only patch: the REAL Uint8Array key
+    // of the recipient owns a malicious `length` getter and iterator. Reading
+    // either while checking B runs attacker JS that revives the genuinely
+    // revoked issuer A before A's independent signature check. A native
+    // typed-array byte copy must never dispatch either property.
+    let poisonedKeyReads = 0, poisonedIteratorRuns = 0;
+    let typedKeyAuthorityReads = 0, typedKeyAeadCompleted = false;
+    let revokedIssuerReturned = false, finalIssuer;
+    const typedKeyDecrypt = subtle.decrypt;
+    subtle.decrypt = async function (...args) {
+      const openedFile = await typedKeyDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) typedKeyAeadCompleted = true;
+      return openedFile;
+    };
+    const actualUint8Iterator = Uint8Array.prototype[Symbol.iterator];
+    let typedKeyOutcome;
+    try {
+      typedKeyOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++typedKeyAuthorityReads === 3) {
+            assert.equal(typedKeyAeadCompleted, true,
+              "genuine file AES-GCM completes before the third roster is read");
+            finalIssuer = current.devices.find((entry) =>
+              entry.deviceId === originalDevice.device_id);
+            const recipient = current.devices.find((entry) =>
+              entry.deviceId === fresh.request.device_id);
+            assert.ok(finalIssuer && recipient);
+            finalIssuer.revokedAtEpoch = metadata.epoch;
+            revokedIssuerReturned = true;
+            assert.ok(recipient.authorizationPublicKey instanceof Uint8Array);
+            assert.equal(recipient.authorizationPublicKey.byteLength, 32);
+            Object.defineProperty(recipient.authorizationPublicKey, "length", { get() {
+              poisonedKeyReads++;
+              finalIssuer.revokedAtEpoch = null;
+              return 32;
+            } });
+            Object.defineProperty(recipient.authorizationPublicKey, Symbol.iterator, {
+              value: function () {
+                poisonedIteratorRuns++;
+                finalIssuer.revokedAtEpoch = null;
+                return Reflect.apply(actualUint8Iterator, this, []);
+              },
+            });
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally { delete subtle.decrypt; }
+    if (typedKeyOutcome?.data instanceof Uint8Array) typedKeyOutcome.data.fill(0);
+    assert.equal(typedKeyAeadCompleted, true,
+      "the getter adversary must pass real signed share, HPKE and AES-GCM");
+    assert.equal(typedKeyAuthorityReads, 3,
+      "malicious typed key is installed only for the final authority check");
+    assert.equal(revokedIssuerReturned, true,
+      "the independent authority must return an actually revoked issuer");
+    assert.equal(poisonedKeyReads, 0,
+      "native key snapshot must not execute attacker-owned typed-array length getter");
+    assert.equal(poisonedIteratorRuns, 0,
+      "native key snapshot must not run attacker-owned Symbol.iterator");
+    assert.equal(finalIssuer?.revokedAtEpoch, metadata.epoch,
+      "issuer must remain revoked after the final local key check");
+    assert.ok(typedKeyOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(typedKeyOutcome.message),
+    "recipient's malicious real Uint8Array cannot revive the issuer and release plaintext");
+    // P2 RED-on-previous-patch: final head.digest is ALSO a caller-supplied
+    // real Uint8Array. Buffer.from(digest) consults a hostile own valueOf
+    // before active(recipient) / active(issuer), reviving the signed issuer
+    // even though the third independent authority read returned it revoked.
+    let headDigestAuthorityReads = 0, headDigestAeadCompleted = false;
+    let headDigestValueOfReads = 0, headDigestLengthReads = 0;
+    let headDigestIssuerRevoked = false, headDigestIssuer;
+    const headDigestDecrypt = subtle.decrypt;
+    subtle.decrypt = async function (...args) {
+      const openedFile = await headDigestDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) headDigestAeadCompleted = true;
+      return openedFile;
+    };
+    let headDigestOutcome;
+    try {
+      headDigestOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++headDigestAuthorityReads === 3) {
+            assert.equal(headDigestAeadCompleted, true,
+              "file AES-GCM must complete before the malicious final head digest");
+            headDigestIssuer = current.devices.find((entry) =>
+              entry.deviceId === originalDevice.device_id);
+            assert.ok(headDigestIssuer, "current independent roster contains real issuer");
+            headDigestIssuer.revokedAtEpoch = metadata.epoch;
+            headDigestIssuerRevoked = true;
+            const trueDigest = Uint8Array.from(current.head.digest);
+            assert.equal(trueDigest.byteLength, 32);
+            assert.ok(current.head.digest instanceof Uint8Array,
+              "head digest must be a genuine native Uint8Array, not a fake dictionary");
+            Object.defineProperty(current.head.digest, "valueOf", { value() {
+              headDigestValueOfReads++;
+              headDigestIssuer.revokedAtEpoch = null;
+              return trueDigest;
+            } });
+            Object.defineProperty(current.head.digest, "length", { get() {
+              headDigestLengthReads++;
+              headDigestIssuer.revokedAtEpoch = null;
+              return 32;
+            } });
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally { delete subtle.decrypt; }
+    if (headDigestOutcome?.data instanceof Uint8Array) headDigestOutcome.data.fill(0);
+    assert.equal(headDigestAeadCompleted, true,
+      "head-digest attack must reach real Ed25519 share, HPKE and AES-GCM");
+    assert.equal(headDigestAuthorityReads, 3,
+      "head digest is poisoned only for the final independent authority read");
+    assert.equal(headDigestIssuerRevoked, true,
+      "final authority must return a genuinely revoked signed issuer");
+    assert.equal(headDigestValueOfReads, 0,
+      "native head-digest copy may not dispatch an attacker-owned valueOf");
+    assert.equal(headDigestLengthReads, 0,
+      "native head-digest copy may not run an attacker-owned length getter");
+    assert.equal(headDigestIssuer?.revokedAtEpoch, metadata.epoch,
+      "head digest conversion cannot revive the final signed issuer");
+    assert.ok(headDigestOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(headDigestOutcome.message),
+    "revoked issuer must block local plaintext despite malicious head digest");
+    // P2 RED on the preceding native-copy fix: Buffer#equals is still looked
+    // up after the third (revoked) independent roster read. Calling the real
+    // equality operation does not make a malicious method side-effect-free.
+    const originalBufferEquals = Buffer.prototype.equals;
+    const bufferEqualsDecrypt = subtle.decrypt;
+    let equalsAuthorityReads = 0, equalsFileAeadCompleted = false;
+    let equalsIssuerRevoked = false, equalsIssuer, interceptedEqualsCalls = 0;
+    subtle.decrypt = async function (...args) {
+      const result = await bufferEqualsDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) equalsFileAeadCompleted = true;
+      return result;
+    };
+    let equalsOutcome;
+    try {
+      equalsOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++equalsAuthorityReads === 3) {
+            assert.equal(equalsFileAeadCompleted, true,
+              "real AES-GCM must finish before overriding Buffer#equals");
+            equalsIssuer = current.devices.find((entry) =>
+              entry.deviceId === originalDevice.device_id);
+            assert.ok(equalsIssuer, "the genuine current roster contains the issuer");
+            equalsIssuer.revokedAtEpoch = metadata.epoch;
+            equalsIssuerRevoked = true;
+            Buffer.prototype.equals = function (other) {
+              interceptedEqualsCalls++;
+              equalsIssuer.revokedAtEpoch = null;
+              // Honest equality and authentic signed head stay intact; only
+              // the revocation side effect makes the old release unsafe.
+              return Reflect.apply(originalBufferEquals, this, [other]);
+            };
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally {
+      Buffer.prototype.equals = originalBufferEquals;
+      delete subtle.decrypt;
+    }
+    if (equalsOutcome?.data instanceof Uint8Array) equalsOutcome.data.fill(0);
+    assert.equal(equalsFileAeadCompleted, true,
+      "equals adversary must reach the real signed Ed25519+HPKE+file AES-GCM path");
+    assert.equal(equalsAuthorityReads, 3,
+      "the hostile equality method applies only after the third independent read");
+    assert.equal(equalsIssuerRevoked, true,
+      "independent authority must actually report a revoked signed issuer");
+    assert.equal(interceptedEqualsCalls, 0,
+      "final authority must not dispatch rebound Buffer.prototype.equals");
+    assert.equal(equalsIssuer?.revokedAtEpoch, metadata.epoch,
+      "mutable Buffer equality must not revive the issuer");
+    assert.ok(equalsOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(equalsOutcome.message),
+    "revoked issuer must deny plaintext despite malicious Buffer#equals");
+    // One adjacent reachable P2: scope checks run AFTER the hostile third
+    // callback too. The old b64() dynamically dispatched Buffer.from and
+    // Buffer#toString before active(issuer); both can revive a revoked signer
+    // while returning the completely honest signed scope bytes.
+    const originalBufferFrom = Buffer.from;
+    const originalBufferToString = Buffer.prototype.toString;
+    const scopeB64Decrypt = subtle.decrypt;
+    let scopeB64AuthorityReads = 0, scopeB64FileAeadCompleted = false;
+    let scopeB64IssuerRevoked = false, scopeB64Issuer;
+    let spoofedFromCalls = 0, spoofedToStringCalls = 0;
+    subtle.decrypt = async function (...args) {
+      const result = await scopeB64Decrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) scopeB64FileAeadCompleted = true;
+      return result;
+    };
+    let scopeB64Outcome;
+    try {
+      scopeB64Outcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++scopeB64AuthorityReads === 3) {
+            assert.equal(scopeB64FileAeadCompleted, true,
+              "real AES-GCM must finish before poisoning scope encoding");
+            scopeB64Issuer = current.devices.find((entry) =>
+              entry.deviceId === originalDevice.device_id);
+            assert.ok(scopeB64Issuer);
+            scopeB64Issuer.revokedAtEpoch = metadata.epoch;
+            scopeB64IssuerRevoked = true;
+            Buffer.from = function (...args) {
+              spoofedFromCalls++;
+              scopeB64Issuer.revokedAtEpoch = null;
+              return Reflect.apply(originalBufferFrom, Buffer, args);
+            };
+            Buffer.prototype.toString = function (...args) {
+              spoofedToStringCalls++;
+              scopeB64Issuer.revokedAtEpoch = null;
+              return Reflect.apply(originalBufferToString, this, args);
+            };
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally {
+      Buffer.from = originalBufferFrom;
+      Buffer.prototype.toString = originalBufferToString;
+      delete subtle.decrypt;
+    }
+    if (scopeB64Outcome?.data instanceof Uint8Array) scopeB64Outcome.data.fill(0);
+    assert.equal(scopeB64FileAeadCompleted, true,
+      "scope-b64 adversary must reach real signed share, HPKE, file AES-GCM");
+    assert.equal(scopeB64AuthorityReads, 3,
+      "scope globals are poisoned only on the third independent read");
+    assert.equal(scopeB64IssuerRevoked, true,
+      "the final independent roster must contain a revoked issuer");
+    assert.equal(spoofedFromCalls, 0,
+      "final scope check must not call a rebound global Buffer.from");
+    assert.equal(spoofedToStringCalls, 0,
+      "final scope check must not call a rebound Buffer.prototype.toString");
+    assert.equal(scopeB64Issuer?.revokedAtEpoch, metadata.epoch,
+      "scope normalization must not un-revoke the issuer");
+    assert.ok(scopeB64Outcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(scopeB64Outcome.message),
+    "a revoked issuer must deny plaintext despite poisoned scope encoding");
+    // Final issuer signature verification is also on the same post-await
+    // release path. A callback can substitute a DIFFERENT valid Ed25519 key
+    // in the third roster and monkeypatch crypto.verify() to return true.
+    // Its signed share remains authentic only under the ORIGINAL issuer key.
+    const substitutedIssuer = crypto.generateKeyPairSync("ed25519");
+    const substitutedIssuerRaw = Uint8Array.from(pub(substitutedIssuer.publicKey));
+    assert.equal(crypto.verify(null, message, substitutedIssuer.publicKey,
+      Buffer.from(grant.shareSignatureBase64, "base64url")), false,
+    "control: genuine signed share must NOT verify under substituted issuer key");
+    const originalCreatePublicKey = crypto.createPublicKey;
+    const originalVerify = crypto.verify;
+    const originalBufferConcat = Buffer.concat;
+    const signatureDecrypt = subtle.decrypt;
+    let signatureAuthorityReads = 0, signatureAeadCompleted = false;
+    let signerSubstituted = false, spoofedVerifyCalls = 0;
+    let spoofedCreateKeyCalls = 0, spoofedConcatCalls = 0;
+    subtle.decrypt = async function (...args) {
+      const result = await signatureDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) signatureAeadCompleted = true;
+      return result;
+    };
+    let signatureOutcome;
+    try {
+      signatureOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++signatureAuthorityReads === 3) {
+            assert.equal(signatureAeadCompleted, true,
+              "real AES-GCM must finish before the forged signature boundary");
+            const currentIssuer = current.devices.find((entry) =>
+              entry.deviceId === originalDevice.device_id);
+            assert.ok(currentIssuer && currentIssuer.revokedAtEpoch === null);
+            currentIssuer.authorizationPublicKey = substitutedIssuerRaw;
+            signerSubstituted = true;
+            crypto.createPublicKey = function (...args) {
+              spoofedCreateKeyCalls++;
+              return Reflect.apply(originalCreatePublicKey, crypto, args);
+            };
+            Buffer.concat = function (...args) {
+              spoofedConcatCalls++;
+              return Reflect.apply(originalBufferConcat, Buffer, args);
+            };
+            crypto.verify = function () {
+              spoofedVerifyCalls++;
+              return true;
+            };
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally {
+      crypto.createPublicKey = originalCreatePublicKey;
+      Buffer.concat = originalBufferConcat;
+      crypto.verify = originalVerify;
+      delete subtle.decrypt;
+    }
+    if (signatureOutcome?.data instanceof Uint8Array) signatureOutcome.data.fill(0);
+    assert.equal(signatureAeadCompleted, true,
+      "signature spoof must traverse real signed share, owner HPKE, file AEAD");
+    assert.equal(signatureAuthorityReads, 3,
+      "signature monkeypatch must occur only after third independent read");
+    assert.equal(signerSubstituted, true,
+      "third authority must really contain a different native Ed25519 key");
+    assert.equal(spoofedVerifyCalls, 0,
+      "final signature check must not call rebound crypto.verify");
+    assert.equal(spoofedCreateKeyCalls, 0,
+      "final signature check must not call rebound crypto.createPublicKey");
+    assert.equal(spoofedConcatCalls, 0,
+      "final signature check must not call rebound Buffer.concat");
+    assert.ok(signatureOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(signatureOutcome.message),
+    "a replaced issuer key must not authenticate an old genuine share");
+    // The final native-byte and enrollment validators must not re-read a
+    // callback-rebound Number.isSafeInteger before testing issuer revocation.
+    const originalIsSafeInteger = Number.isSafeInteger;
+    const numericDecrypt = subtle.decrypt;
+    let numericAuthorityReads = 0, numericAeadCompleted = false;
+    let numericIssuerRevoked = false, numericIssuer, numericSpoofCalls = 0;
+    subtle.decrypt = async function (...args) {
+      const result = await numericDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) numericAeadCompleted = true;
+      return result;
+    };
+    let numericOutcome;
+    try {
+      numericOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++numericAuthorityReads === 3) {
+            assert.equal(numericAeadCompleted, true);
+            numericIssuer = current.devices.find((entry) =>
+              entry.deviceId === originalDevice.device_id);
+            assert.ok(numericIssuer);
+            numericIssuer.revokedAtEpoch = metadata.epoch;
+            numericIssuerRevoked = true;
+            Number.isSafeInteger = function (value) {
+              numericSpoofCalls++;
+              numericIssuer.revokedAtEpoch = null;
+              return Reflect.apply(originalIsSafeInteger, Number, [value]);
+            };
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally {
+      Number.isSafeInteger = originalIsSafeInteger;
+      delete subtle.decrypt;
+    }
+    if (numericOutcome?.data instanceof Uint8Array) numericOutcome.data.fill(0);
+    assert.equal(numericAeadCompleted, true,
+      "numeric spoof must reach real signed share, HPKE and file AEAD");
+    assert.equal(numericAuthorityReads, 3);
+    assert.equal(numericIssuerRevoked, true,
+      "final independent authority must report a genuinely revoked issuer");
+    assert.equal(numericSpoofCalls, 0,
+      "final roster check must not call rebound Number.isSafeInteger");
+    assert.equal(numericIssuer?.revokedAtEpoch, metadata.epoch);
+    assert.ok(numericOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(numericOutcome.message),
+    "numeric intrinsic spoof must not reauthorize the revoked issuer");
+    // P2: the final authority callback may also rebind Object.freeze.
+    // It must not be allowed to forge DEV-OFF policy flags on a VALID,
+    // otherwise successful plaintext result after the real file AEAD.
+    const originalFreeze = Object.freeze;
+    const freezeDecrypt = subtle.decrypt;
+    let freezeAuthorityReads = 0, freezeAeadCompleted = false, forgedReleaseCalls = 0;
+    subtle.decrypt = async function (...args) {
+      const openedFile = await freezeDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) freezeAeadCompleted = true;
+      return openedFile;
+    };
+    let freezeOutcome;
+    try {
+      freezeOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++freezeAuthorityReads === 3) {
+            assert.equal(freezeAeadCompleted, true,
+              "real HPKE and file AES must finish before final release");
+            const issuer = current.devices.find((entry) =>
+              entry.deviceId === originalDevice.device_id);
+            assert.ok(issuer && issuer.revokedAtEpoch === null,
+              "positive control uses a genuinely active signed issuer");
+            Object.freeze = function (value) {
+              if (value?.schema === "rootark-zk1-recipient-share-file-dev/v1") {
+                forgedReleaseCalls++;
+                return { ...value, serverRevocationProofVerified: true,
+                  externalCustodyProven: true, authorizesProductionIo: true };
+              }
+              return Reflect.apply(originalFreeze, Object, [value]);
+            };
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally {
+      Object.freeze = originalFreeze;
+      delete subtle.decrypt;
+    }
+    assert.equal(freezeAuthorityReads, 3,
+      "policy flag attack must occur on final independent authority read");
+    assert.equal(freezeAeadCompleted, true,
+      "policy flag test must reach real signed share and AES file decrypt");
+    assert.ok(freezeOutcome && !(freezeOutcome instanceof Error)
+      && freezeOutcome.data instanceof Uint8Array && freezeOutcome.data.length > 0,
+    "positive control must actually release a nonempty decrypted file");
+    assert.equal(forgedReleaseCalls, 0,
+      "the release boundary may not dispatch callback-rebound Object.freeze");
+    assert.equal(freezeOutcome.serverRevocationProofVerified, false);
+    assert.equal(freezeOutcome.externalCustodyProven, false);
+    assert.equal(freezeOutcome.authorizesProductionIo, false);
+    freezeOutcome.data.fill(0);
+    // P2: even a PINNED Buffer.from(view) dispatches the raw Uint8Array's
+    // inherited valueOf in Node22. The signed CBOR scope bytes are genuine,
+    // but a poisoned Uint8Array.prototype.valueOf can un-revoke a real issuer
+    // before active(issuer) if the final scope b64 reads that raw view.
+    const priorTypedValueOf = Object.getOwnPropertyDescriptor(Uint8Array.prototype, "valueOf");
+    const scopeBytesDecrypt = subtle.decrypt;
+    let scopeBytesReads = 0, scopeBytesAead = false, scopeBytesIssuer;
+    let scopeBytesSpoofCalls = 0;
+    subtle.decrypt = async function (...args) {
+      const result = await scopeBytesDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) scopeBytesAead = true;
+      return result;
+    };
+    let scopeBytesOutcome;
+    try {
+      scopeBytesOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++scopeBytesReads === 3) {
+            assert.equal(scopeBytesAead, true,
+              "scope byte poison must follow genuine HPKE and file AEAD");
+            scopeBytesIssuer = current.devices.find((entry) =>
+              entry.deviceId === originalDevice.device_id);
+            assert.ok(scopeBytesIssuer);
+            scopeBytesIssuer.revokedAtEpoch = metadata.epoch;
+            Uint8Array.prototype.valueOf = function () {
+              scopeBytesSpoofCalls++;
+              scopeBytesIssuer.revokedAtEpoch = null;
+              return this;
+            };
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally {
+      if (priorTypedValueOf) Object.defineProperty(Uint8Array.prototype, "valueOf", priorTypedValueOf);
+      else delete Uint8Array.prototype.valueOf;
+      delete subtle.decrypt;
+    }
+    if (scopeBytesOutcome?.data instanceof Uint8Array) scopeBytesOutcome.data.fill(0);
+    assert.equal(scopeBytesReads, 3,
+      "scope poisoning must occur only at the last independent authority read");
+    assert.equal(scopeBytesAead, true);
+    assert.equal(scopeBytesSpoofCalls, 0,
+      "final scope serialization may not call callback-poisoned Uint8Array.valueOf");
+    assert.equal(scopeBytesIssuer?.revokedAtEpoch, metadata.epoch,
+      "authentic revoked issuer must remain revoked throughout scope encoding");
+    assert.ok(scopeBytesOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(scopeBytesOutcome.message),
+    "real revoked issuer must deny plaintext despite poisoned typed-array prototypes");
+    // P2: an adverse last authority read that DENIES plaintext must still
+    // wipe the real intermediate CEK and decrypted bytes. Rebound .fill
+    // methods must never be able to turn that cleanup into a no-op.
+    const previousOwnerFreeze = Object.freeze;
+    const previousUint8From = Uint8Array.from;
+    const previousBufferFill = Buffer.prototype.fill;
+    const previousTypedFill = Uint8Array.prototype.fill;
+    const cleanupDecrypt = subtle.decrypt;
+    let capturedCek, capturedPlaintext, cleanupReads = 0;
+    let cleanupAeadCompleted = false, cleanupRevoked = false;
+    let spoofedBufferFill = 0, spoofedTypedFill = 0;
+    // The file-content export is frozen. Observe genuine internal allocations
+    // at their existing native construction boundaries instead of replacing
+    // the module's read-only methods or fabricating plaintext.
+    Object.freeze = function (value) {
+      if (value?.cek instanceof Uint8Array
+        && value.authorizesProductionRestore === false
+        && Number.isSafeInteger(value.verifiedReleaseExpiresAt)) {
+        capturedCek = value.cek;
+      }
+      return Reflect.apply(previousOwnerFreeze, Object, [value]);
+    };
+    Uint8Array.from = function (...args) {
+      const nativeResult = Reflect.apply(previousUint8From, Uint8Array, args);
+      if (nativeResult.length === bytes.length
+        && nativeResult.every((byte, index) => byte === bytes[index])) {
+        capturedPlaintext = nativeResult;
+      }
+      return nativeResult;
+    };
+    subtle.decrypt = async function (...args) {
+      const openedFile = await cleanupDecrypt.apply(this, args);
+      if (args[0]?.name === "AES-GCM"
+        && args[2]?.byteLength === fileAeadCipherLength) cleanupAeadCompleted = true;
+      return openedFile;
+    };
+    let cleanupOutcome;
+    try {
+      cleanupOutcome = await openProtectedRecipientShareFile({ ...bridgeArgs,
+        redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
+          const current = await readIndependentAuthority();
+          if (++cleanupReads === 3) {
+            assert.equal(cleanupAeadCompleted, true,
+              "a genuine file AEAD must finish before denied cleanup");
+            assert.ok(capturedCek instanceof Uint8Array
+              && capturedCek.some((byte) => byte !== 0),
+            "real opened CEK must contain nonzero secret before denial");
+            assert.ok(capturedPlaintext instanceof Uint8Array
+              && capturedPlaintext.some((byte) => byte !== 0),
+            "real decrypted file must contain bytes before denial");
+            const issuer = current.devices.find((entry) =>
+              entry.deviceId === originalDevice.device_id);
+            assert.ok(issuer);
+            issuer.revokedAtEpoch = metadata.epoch;
+            cleanupRevoked = true;
+            Buffer.prototype.fill = function () { spoofedBufferFill++; return this; };
+            Uint8Array.prototype.fill = function () { spoofedTypedFill++; return this; };
+          }
+          return current;
+        } },
+      }).then((value) => value, (error) => error);
+    } finally {
+      Buffer.prototype.fill = previousBufferFill;
+      Uint8Array.prototype.fill = previousTypedFill;
+      Object.freeze = previousOwnerFreeze;
+      Uint8Array.from = previousUint8From;
+      delete subtle.decrypt;
+    }
+    assert.equal(cleanupReads, 3);
+    assert.equal(cleanupRevoked, true);
+    assert.ok(cleanupOutcome instanceof Error
+      && /ZK_SHARE_FILE_OPEN_DENIED/.test(cleanupOutcome.message),
+    "a genuinely revoked issuer must deny the final plaintext release");
+    assert.equal(spoofedBufferFill, 0);
+    assert.equal(spoofedTypedFill, 0);
+    assert.ok(capturedCek instanceof Uint8Array
+      && capturedCek.every((byte) => byte === 0),
+    "denied share must wipe the opened native CEK even after fill rebinding");
+    assert.ok(capturedPlaintext instanceof Uint8Array
+      && capturedPlaintext.every((byte) => byte === 0),
+    "denied share must wipe the actual decrypted buffer even after fill rebinding");
     // This proof covers the three explicitly owner-selected versions, never
     // unknown historical versions or externally held backup copies.
     assert.equal(typeof cekBatch.sealOwnerAuthorizedVersionedCeks, "function",
