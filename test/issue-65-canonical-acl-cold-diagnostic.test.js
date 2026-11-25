@@ -55,9 +55,13 @@ test("canonical TAP recorder reveals bounded cold-ACL categories but no raw titl
     const tracker = createTapProgressRecorder((message) => printed.push(message));
     const lines = [
       `not ok 1079 - ${name}`,
+      // Match real Node 22 TAP: structural failure metadata belongs inside
+      // the opened YAML block. Stage breadcrumbs may follow it separately.
+      "  ---",
       String.raw`  location: 'D:\a\Root.ark\Root.ark\test\issue-65-sync-webdav-windows-junction-acl.test.js:169:1'`,
       "  failureType: 'testCodeFailure'",
       "  code: 'ERR_ASSERTION'",
+      "  ...",
       line(stage),
     ];
     for (const sample of lines) tracker.accept(sample);

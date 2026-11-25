@@ -146,7 +146,7 @@ test("new admissions refuse IDs that would make their own durable journal unreop
     await assert.rejects(journal.enqueueMany([
       { operationId: "safe-candidate" },
       { operationId, phase: "prepared" },
-    ]), /valid operationId/i);
+    ]), /valid (?:unique )?operationId/i);
   }
   assert.deepEqual(await readPinnedJournal(filename, bytes), bytes,
     "rejected malformed admissions must not persist poison or partial batches");
