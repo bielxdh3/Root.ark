@@ -1,5 +1,6 @@
 "use strict";
 const test = require("node:test");
+const { reportEdgeFailure } = require("../scripts/edge-test-failure-diagnostic");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -537,6 +538,8 @@ test("UMD browser-only modules mint signed inventory authority and restore genui
 test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure fencing", {
   timeout: 120000,
 }, async (t) => {
+  let edgeStage = "initial";
+  try {
   const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
   if (!fs.existsSync(EDGE)) return t.skip("Microsoft Edge unavailable");
   const f = await fixture(Math.floor(Date.now() / 1000), 12);
@@ -599,6 +602,7 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
   });
   t.after(() => { server.closeAllConnections(); server.close(); server.unref(); });
   const origin = "http://127.0.0.1:" + server.address().port;
+  edgeStage = "launch-edge";
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-v2-edge-archive-"));
   const child = spawn(EDGE, ["--headless=new", "--disable-gpu", "--no-first-run",
     "--disable-extensions", "--remote-debugging-port=0",
@@ -626,14 +630,56 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     }
     throw Error("EDGE_V2_TIMEOUT_" + label);
   };
-  const port = await wait(() => {
-    return readReadyEdgeDevToolsPort(profile);
-  }, "debug-port");
-  const page = await wait(() => fetchReadyEdgeDevToolsPage(port), "debug-page");
-  socket = new WebSocket(page.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    socket.addEventListener("open", resolve, { once: true });
-    socket.addEventListener("error", reject, { once: true });
+  const cdpDeadline = Date.now() + 10_000;
+  const retryCdp = async (label, attempt) => {
+    while (Date.now() < cdpDeadline) {
+      const remaining = cdpDeadline - Date.now();
+      try {
+        const result = await attempt(Math.max(1, Math.min(750, remaining)));
+        if (result) {
+          if (Date.now() < cdpDeadline) return result;
+          if (typeof result.close === "function") result.close();
+        }
+      } catch (_) {}
+      const delay = Math.min(75, Math.max(0, cdpDeadline - Date.now()));
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    throw Error("EDGE_V2_TIMEOUT_" + label);
+  };
+  // Keep the parent's strict/partial-port and loopback target validation,
+  // plus this PR's bounded, retrying CDP connection and cleanup semantics.
+  const port = await retryCdp("debug-port",
+    async () => readReadyEdgeDevToolsPort(profile));
+  const page = await retryCdp("page-target",
+    async () => fetchReadyEdgeDevToolsPage(port));
+  const debuggerUrl = page.webSocketDebuggerUrl;
+  socket = await retryCdp("websocket-open", async (attemptTimeout) => {
+    const candidate = new WebSocket(debuggerUrl);
+    try {
+      await new Promise((resolve, reject) => {
+        const finish = (error) => {
+          clearTimeout(timer);
+          candidate.removeEventListener("open", onOpen);
+          candidate.removeEventListener("error", onError);
+          candidate.removeEventListener("close", onClose);
+          if (error) reject(error);
+          else resolve();
+        };
+        const onOpen = () => finish();
+        const onError = () => finish(Error("EDGE_V2_WEBSOCKET_OPEN_FAILED"));
+        const onClose = () => finish(Error("EDGE_V2_WEBSOCKET_CLOSED_BEFORE_OPEN"));
+        const timer = setTimeout(() => finish(Error("EDGE_V2_WEBSOCKET_OPEN_TIMEOUT")),
+          attemptTimeout);
+        candidate.addEventListener("open", onOpen, { once: true });
+        candidate.addEventListener("error", onError, { once: true });
+        candidate.addEventListener("close", onClose, { once: true });
+        if (candidate.readyState === WebSocket.OPEN) onOpen();
+      });
+      return candidate;
+    } catch (error) {
+      try { candidate.close(); } catch (_) {}
+      throw error;
+    }
   });
   let serial = 0;
   const pending = new Map();
@@ -662,6 +708,7 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     if (result.exceptionDetails) throw Error("EDGE_EXCEPTION: " + result.exceptionDetails.text);
     return result.result?.value;
   };
+  edgeStage = "edge-ui";
   await send("Page.navigate", { url: origin + "/edge-workspace" });
   await wait(() => evaluate("document.readyState==='complete'"), "load");
   await evaluate("window.dispatchEvent(new Event('rootark:workspace-rendered'))");
@@ -730,6 +777,7 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     return value?.includes(needle) ? value : null;
   }, needle);
   const downloads = () => evaluate("(async()=>{await Promise.all(__pending);return __versionsDownloads})()");
+  edgeStage = "owner-provision";
   await fill();
   await click("provision");
   await wait(async () => /Âncora offline|Piso local verificado/.test(await status()), "provision");
@@ -745,6 +793,7 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     "Edge must fail closed without an opt-in, independent native pin and owner approval");
   await fill();
   await evaluate("document.querySelector('[data-zk1-field=v2-opt-in]').checked=true");
+  edgeStage = "archive-export";
   await click("versioned-create");
   const created = await untilStatus("V2:");
   assert.match(created, /todas as versões verificadas/);
@@ -757,6 +806,7 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
   assert.equal(JSON.parse(archiveText).format, "rootark-zk1-keyring-portable-archive/v2");
   await fill({ ...files, "archive-json": b64(archiveText) }, {
     ...values, "archive-sha": archiveHash });
+  edgeStage = "archive-import";
   await click("versioned-recover");
   const restored = await untilStatus("V2:");
   assert.match(restored, /versões autenticadas/);
@@ -775,6 +825,7 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
   assert.equal(requests > 0, true);
   assert.equal(sensitiveWire, false);
   assert.equal(unexpectedRequests, 0, "archive export/import leaked data to an HTTP route");
+  edgeStage = "negative-proofs";
   const previous = all.length;
   // Omitted owner-authenticated revision MUST fail before any artifact release.
   const altered = { schema: "rootark-zk1-version-selection/v1",
@@ -817,6 +868,7 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
   // Real owner-signed later head. Re-endorse the *archive bundle roots*,
   // retain the original inventory checkpoint, and use the NEW device key
   // for the browser-generated one-shot historical PoP.
+  edgeStage = "historical-recovery";
   const [first, second] = f.authorityInput.ownerHistoryChain;
   const predecessor = await history.verifyOwnerCheckpoint({
     checkpoint: second, scope: f.archiveInput.scope,
@@ -920,6 +972,7 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
     };
     window.__heldWiped=()=>window.__heldOpened?.files.every(file=>
       file.ciphertext.every(v=>v===0)&&file.cek.every(v=>v===0));`);
+  edgeStage = "session-revocation";
   for (const interruptedBy of ["csrf", "logout"]) {
     const before = (await downloads()).length;
     await fill({ ...nextFiles, private: b64(devicePrivate) }, nextValues);
@@ -940,6 +993,11 @@ test("REAL Edge: authenticated signed CBOR v2 archive export/import and failure 
       "pending plaintext-equivalent CEK and ciphertext were not zeroized");
     if (interruptedBy === "csrf") await evaluate(
       "document.cookie='rootark_csrf=edge-session; path=/'");
+  }
+  } catch (error) {
+    // Hosted logs receive only a fixed stage enum, never browser details.
+    reportEdgeFailure(t, "V2_ARCHIVE", edgeStage, error);
+    throw error;
   }
 });
 
