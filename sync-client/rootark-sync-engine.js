@@ -2769,7 +2769,7 @@ class SyncEngine {
 
   async _open({ readOnly = false } = {}) {
     denyIndeterminateInbound(this);
-    requireNativeRootMutationContext(this);
+    if (!readOnly) requireNativeRootMutationContext(this);
     const configuredMetadata = internalRootMetadata(
       this.rootDir, this.snapshotPath, this.journal?.filePath);
     noteColdAdmissionWrite(this.rootDir, true);
@@ -2953,8 +2953,10 @@ class SyncEngine {
     }
     // Run the module-captured implementation, never a caller-replaced
     // instance or prototype hook which could silently disarm required-v2.
-    await replayEvictionLedgerBuiltIn.call(this);
-    if (!this.requireNativeRootRecovery) await this.recoverPendingHydrations();
+    if (!readOnly) {
+      await replayEvictionLedgerBuiltIn.call(this);
+      if (!this.requireNativeRootRecovery) await this.recoverPendingHydrations();
+    }
     this.opened = true;
     return this;
   }
@@ -6533,7 +6535,7 @@ class SyncEngine {
 
   async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null, batchDurable = false) {
     denyIndeterminateInbound(this);
-    if (this.requireNativeRootRecovery && !hasNativeCustody(this)) denyUntrustedNativeEviction();
+    if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     // The internal exclusion path was already case-resolved with a bounded
@@ -7408,6 +7410,9 @@ for (const name of [
         // preflight has no filesystem/network I/O or state mutation.
         if (name === "reconcileOutOfScopeMove" && this.requireNativeRootRecovery) {
           preflightOutOfScopeMoveBuiltIn.call(this, args[0]);
+        }
+        if (name === "_open" && args[0]?.readOnly === true) {
+          return await implementation.apply(this, args);
         }
         retained = retainNativeRootMutation(this);
         try {

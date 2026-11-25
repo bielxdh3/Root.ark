@@ -111,7 +111,32 @@ test("issue 66 native SyncEngine: hydrates with nativeRootSession while default 
   try {
     assert.equal(await nativeEngine.materializeRemote("docs/native.txt"), true);
     assert.deepEqual(await fsp.readFile(path.join(rootDir, "docs", "native.txt")), plaintext);
+    await assert.rejects(nativeEngine.evictLocal("docs/native.txt"), { code: "root_session_native_unavailable" });
+    const roEngine = await new SyncEngine({ ...baseOpts, nativeRootSession: true }).open({ readOnly: true });
+    await roEngine.close();
   } finally {
     await nativeEngine.close();
   }
+});
+
+test("issue 66 native addon: rejects displaced root namespace on POSIX and validates durability barriers", async (t) => {
+  const scratch = createPrivateAuthorityFixture("rootark-native-custody-");
+  const rootDir = path.join(scratch, "vault");
+  const movedDir = path.join(scratch, "vault-moved");
+  await fsp.mkdir(rootDir, { recursive: true });
+  t.after(() => fsp.rm(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
+
+  const session = openCompiledNativeRootSession(rootDir);
+  t.after(() => { try { session.close(); } catch { /* already closed */ } });
+  assert.equal(session.syncDirectory(""), true);
+  assert.equal(session.commitDurableRecovery(), true);
+
+  if (process.platform !== "win32") {
+    await fsp.rename(rootDir, movedDir);
+    await fsp.mkdir(rootDir, { recursive: true });
+    assert.throws(() => session.reacquireRoot(), { code: "root_session_cold_reopen_unverified" });
+    assert.throws(() => session.createExclusiveFile("docs/evil.txt", Buffer.from("x")),
+      { code: /^(root_session_root_identity_changed|root_session_unsafe_traversal)$/ });
+  }
+  session.close();
 });
