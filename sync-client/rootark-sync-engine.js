@@ -14,7 +14,16 @@ const { validatePortableRelativePath } = require("./rootark-sync-paths");
 const { SyncJournal, renameWithRetry } = require("./rootark-sync-journal");
 const { readExactOpenedControlBytes } = require("./rootark-sync-held-control-read");
 const { SyncConflictError, assertInventoryEntry } = require("../public/client/rootark-sync-adapter");
-const { openNativeRootSession } = require("./rootark-sync-native-root-session-contract");
+const {
+  openNativeRootSession,
+  openCompiledNativeRootSession,
+  isVerifiedNativeRootSession,
+} = require("./rootark-sync-native-root-session-contract");
+const NATIVE_ROOT_SESSIONS = new WeakMap();
+function hasNativeCustody(engine) {
+  const session = NATIVE_ROOT_SESSIONS.get(engine);
+  return Boolean(session && isVerifiedNativeRootSession(session));
+}
 
 const SNAPSHOT_VERSION = 1;
 // A v2 snapshot fences old clients that do not know how to replay the
@@ -2576,6 +2585,7 @@ class SyncEngine {
     // same-principal A→B→A. This strict bit cannot be downgraded by callbacks;
     // non-Files-On-Demand legacy recovery is unchanged unless explicitly opted
     // into the stricter fail-closed policy.
+    this.nativeRootSession = options.nativeRootSession === true;
     Object.defineProperty(this, "requireNativeRootRecovery", {
       value: this.filesOnDemand || options.requireNativeRootRecovery === true,
     });
@@ -2711,6 +2721,15 @@ class SyncEngine {
       releaseQueue();
       if (ROOT_MUTATION_QUEUES.get(queueKey) === queueGate) ROOT_MUTATION_QUEUES.delete(queueKey);
     });
+  }
+
+  async close() {
+    const session = NATIVE_ROOT_SESSIONS.get(this);
+    if (session) {
+      try { session.close(); } catch { /* best-effort close */ }
+      NATIVE_ROOT_SESSIONS.delete(this);
+    }
+    this.opened = false;
   }
 
   async open({ readOnly = false } = {}) {
@@ -2918,7 +2937,16 @@ class SyncEngine {
     // checkpoint must be recovered BEFORE local reconciliation or outbound
     // sync. Replay never unlinks anything or authorizes a remote operation.
     this.evictionLedgerHead = null;
-    if (this.requireNativeRootRecovery && this.snapshot.evictionLedgerRequired) {
+    if (this.nativeRootSession && this.filesOnDemand) {
+      await fsp.mkdir(this.rootDir, { recursive: true });
+      const existingSession = NATIVE_ROOT_SESSIONS.get(this);
+      if (existingSession && isVerifiedNativeRootSession(existingSession)) {
+        existingSession.reacquireRoot();
+      } else {
+        NATIVE_ROOT_SESSIONS.set(this, openCompiledNativeRootSession(this.rootDir));
+      }
+    }
+    if (this.requireNativeRootRecovery && this.snapshot.evictionLedgerRequired && !hasNativeCustody(this)) {
       denyLegacyNativeRootReplay();
     }
     // Run the module-captured implementation, never a caller-replaced
@@ -2930,7 +2958,7 @@ class SyncEngine {
   }
 
   async replayEvictionLedger() {
-    if (this.requireNativeRootRecovery && this.snapshot.evictionLedgerRequired) {
+    if (this.requireNativeRootRecovery && this.snapshot.evictionLedgerRequired && !hasNativeCustody(this)) {
       // The only currently available RootSession contract rejects activation.
       // Do not read legacy path-based staging/ledger trees, clear the required
       // marker, emit operations, or accept a caller-supplied fake native object.
@@ -2940,7 +2968,7 @@ class SyncEngine {
     await assertNoOrphanedEvictionArchive(this.rootDir);
     const { entries, head } = await readEvictionLedger(this.rootDir,
       this.snapshot.evictionLedgerRequired ? this.snapshot.evictionLedgerEpoch : null);
-    if (this.requireNativeRootRecovery && entries.size) {
+    if (this.requireNativeRootRecovery && entries.size && !hasNativeCustody(this)) {
       // Even if a future native backend can be opened, legacy JS path replay
       // must never be selected for an unfinished ledger transaction.
       denyLegacyNativeRootReplay();
@@ -4077,7 +4105,7 @@ class SyncEngine {
     // inside it. Reconciliation can stage/rename/unlink that local origin via
     // paths without passing through _apply(). Deny BEFORE remote verification
     // side effects or any local reads, for direct and pull callers alike.
-    if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this)) denyUntrustedNativeEviction();
 
     // Reconciliation can stage/rename the origin and then discard its tracked
     // snapshot entry. A signed MOVE/DELETE outside selectedPaths must never
@@ -4239,7 +4267,7 @@ class SyncEngine {
 
   async assertOutgoingAuthorized(operation, authorizedAction = null) {
     denyIndeterminateInbound(this);
-    if (this.requireNativeRootRecovery && (operation.operation === "delete" || operation.tombstone)) {
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && (operation.operation === "delete" || operation.tombstone)) {
       denyUntrustedNativeSignedDelete();
     }
     let locallyAuthorized;
@@ -4654,7 +4682,7 @@ class SyncEngine {
     // destructive signed DELETE while required-v2 native root custody is
     // unavailable. This negative guard is module-owned, runs before mode
     // I/O or any adapter callback and cannot be waived by an object flag.
-    if (this.requireNativeRootRecovery
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this)
       && (operation?.operation === "delete" || operation?.tombstone === true)) {
       denyUntrustedNativeSignedDelete();
     }
@@ -5321,7 +5349,7 @@ class SyncEngine {
     // trash until an independently rooted native mutation session exists.
     // Deny BEFORE the mode-fence helper can itself write an ever-FOD marker
     // under a foreign process lock. This is a negative fence, not custody.
-    if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this)) denyUntrustedNativeEviction();
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     // A public caller may pass an absolute source. Never stage a file from
     // outside this root, even when the trash destination itself is contained.
@@ -5333,6 +5361,14 @@ class SyncEngine {
     await containedAbsolute(this.rootDir, trashDir, false);
     const trashTarget = customTrashTarget || path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(safeTarget)}`);
     await containedAbsolute(this.rootDir, trashTarget, true);
+    if (hasNativeCustody(this)) {
+      const session = NATIVE_ROOT_SESSIONS.get(this);
+      const relSrc = path.relative(this.rootDir, safeTarget).split(path.sep).join("/");
+      const relDst = path.relative(this.rootDir, trashTarget).split(path.sep).join("/");
+      session.renameNoReplace(relSrc, relDst);
+      session.syncDirectory(".rootark-trash");
+      return trashTarget;
+    }
     await fsp.rename(safeTarget, trashTarget);
     return trashTarget;
   }
@@ -5469,7 +5505,7 @@ class SyncEngine {
     // Incoming authenticated DELETE/tombstone is not independent authority
     // to stage or unlink cached bytes when the native root is unavailable.
     // This also protects direct _apply() callers, not just public apply().
-    if (this.requireNativeRootRecovery && (operation.operation === "delete" || operation.tombstone)) {
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && (operation.operation === "delete" || operation.tombstone)) {
       denyUntrustedNativeSignedDelete();
     }
     const verifiedFreshDigest = await this.verifyIncomingOperation(operation, { preObserve: false });
@@ -5511,7 +5547,7 @@ class SyncEngine {
     // source bytes are clean. An absent-source MOVE is also denied by the
     // unconditional native-required inbound fence below, even if signed;
     // no branch here authorizes RootSession custody.
-    if (this.requireNativeRootRecovery && operation.operation === "move") {
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && operation.operation === "move") {
       if (await exists(target)) denyUntrustedNativeEviction();
       const trackedSource = activeFileIdentityPath(this.snapshot.files, operation, metadata.path);
       for (const sourcePath of new Set([metadata.sourcePath, trackedSource].filter(Boolean))) {
@@ -5526,7 +5562,7 @@ class SyncEngine {
     // Deny ALL native-required directory UPDATEs until a real trusted native
     // RootSession implements this operation. Even signed CREATE of an absent
     // directory is denied by the native-required inbound fence below.
-    if (this.requireNativeRootRecovery && operation.operation === "update"
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && operation.operation === "update"
       && metadata.contentType === "inode/directory") {
       denyUntrustedNativeEviction();
     }
@@ -5603,7 +5639,7 @@ class SyncEngine {
     // recursive parent creation, stageExisting or replace-capable JS rename.
     // Browsing and full signed reads remain possible; the positive publish
     // path requires independent native root custody and no-replace semantics.
-    if (this.requireNativeRootRecovery) denyUntrustedNativeInboundPublish();
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this)) denyUntrustedNativeInboundPublish();
     // Credential/key/AEAD/path preflight is complete. Fsync the exact verified
     // envelope before the first filesystem or snapshot mutation; failure here
     // must not leave an applied object with no restart-safe observation.
@@ -5889,9 +5925,27 @@ class SyncEngine {
           }];
           await this.persistSnapshot();
         }
-        await publishInboundPayload(target, plaintext,
-          async () => { if (await exists(target)) await this.stageExisting(target, customTrashTarget); },
-          () => { inboundCacheChanged = true; });
+        if (hasNativeCustody(this)) {
+          const session = NATIVE_ROOT_SESSIONS.get(this);
+          const parentRel = path.posix.dirname(metadata.path);
+          if (parentRel && parentRel !== ".") session.openChildDirectory(parentRel);
+          const tmpName = `${INBOUND_PAYLOAD_TEMP_PREFIX}${process.pid}-${crypto.randomUUID()}`;
+          const tmpRel = parentRel && parentRel !== "." ? `${parentRel}/${tmpName}` : tmpName;
+          session.createExclusiveFile(tmpRel, Buffer.from(plaintext));
+          try {
+            if (await exists(target)) await this.stageExisting(target, customTrashTarget);
+            inboundCacheChanged = true;
+            session.renameNoReplace(tmpRel, metadata.path);
+            session.syncDirectory(parentRel === "." ? "" : parentRel);
+          } catch (error) {
+            try { session.removeEntry(tmpRel); } catch { /* best-effort cleanup */ }
+            throw error;
+          }
+        } else {
+          await publishInboundPayload(target, plaintext,
+            async () => { if (await exists(target)) await this.stageExisting(target, customTrashTarget); },
+            () => { inboundCacheChanged = true; });
+        }
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"),
         cleanupPath || undefined);
@@ -6466,7 +6520,7 @@ class SyncEngine {
 
   async _evictLocal(relativePath, excludedTrackedPath = null, trustedCasefoldIndex = null, batchDurable = false) {
     denyIndeterminateInbound(this);
-    if (this.requireNativeRootRecovery) denyUntrustedNativeEviction();
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this)) denyUntrustedNativeEviction();
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     if (!this.opened) await openEngineBuiltIn.call(this);
     // The internal exclusion path was already case-resolved with a bounded
@@ -7077,7 +7131,7 @@ class SyncEngine {
     // Deny BEFORE creating retry state, inspecting mutable names, or
     // persisting exclusion policy / remote-only markers. A harmless no-op
     // with the same already-applied policy remains permitted.
-    if (this.requireNativeRootRecovery && (listChanged || needsCasefoldMigration
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && (listChanged || needsCasefoldMigration
       || Object.keys(this.snapshot.pendingEvictions || {}).length)) {
       denyUntrustedNativeEviction();
     }
