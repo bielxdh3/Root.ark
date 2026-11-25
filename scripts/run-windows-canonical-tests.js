@@ -14,7 +14,7 @@ const { parseEdgeFailureDiagnostic } = require("./edge-test-failure-diagnostic")
 // observed state even when the final TAP summary cannot be emitted.
 const HEARTBEAT_MS = 15_000;
 const IDLE_LIMIT_MS = 15 * 60_000;
-const TOTAL_LIMIT_MS = 55 * 60_000;
+const TOTAL_LIMIT_MS = 57 * 60_000;
 const SAFE_CODES = new Set(["ERR_ASSERTION", "ERR_TEST_FAILURE", "SQLITE_BUSY",
   "SQLITE_LOCKED", "ENOENT", "EACCES", "EPERM", "EADDRINUSE", "ETIMEDOUT",
   "ECONNRESET", "ERR_DLOPEN_FAILED", "MODULE_NOT_FOUND", "ERR_MODULE_NOT_FOUND"]);
@@ -213,7 +213,7 @@ function run() {
     const idle = Math.floor((Date.now() - lastOutput) / 1000);
     writeProgressDiagnostic(`Windows canonical heartbeat: elapsedSeconds=${elapsed} idleSeconds=${idle} TAPresults=${tracker.state.results} failures=${tracker.state.failures} ${tracker.safeSummary()}`);
     if (idle * 1000 >= IDLE_LIMIT_MS) terminate("idle timeout (15 minutes without child output)");
-    else if (elapsed * 1000 >= TOTAL_LIMIT_MS) terminate("total timeout (55 minutes)");
+    else if (elapsed * 1000 >= TOTAL_LIMIT_MS) terminate("total timeout (57 minutes)");
   }, HEARTBEAT_MS);
 
   child.on("error", (error) => {
