@@ -8,6 +8,7 @@ on:
       - '.github/workflows/zk65-provider-android-focused.yml'
       - 'src/services/zk1MultiproviderCiphertextRestore.js'
       - 'src/services/zk1WebdavCiphertextAdapter.js'
+      - 'src/services/zk1ContentInventoryHttpsClient.js'
       - 'sync-client/rootark-sync-protocol.js'
       - 'sync-client/rootark-sync-paths.js'
       - 'sync-client/rootark-sync-authorization.js'
@@ -17,6 +18,7 @@ on:
       - 'src/routes/auth.js'
       - 'scripts/issue-64-android-fixtures.js'
       - 'test/issue-65-full-multiprovider-http-restore.test.js'
+      - 'test/issue-65-content-inventory-mtls.test.js'
       - 'test/issue-64-android-contract.test.js'
       - 'test/issue-64-android-entry.test.js'
       - 'test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js'
@@ -76,6 +78,9 @@ jobs:
         run: npm ci
       - name: Real signed remote-provider TLS, Android routes and atomic CAS floor negatives
         run: node --test --test-reporter=tap test/issue-65-full-multiprovider-http-restore.test.js test/issue-64-android-contract.test.js test/issue-64-android-entry.test.js test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js test/issue-65-sync-atomic-cas-floor-ledger-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-mtls-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-operator-dev-off.test.js test/issue-65-sync-atomic-pg-physical-fence-dev-off.test.js test/issue-65-sync-atomic-signed-owner-bindings-dev-off.test.js test/issue-65-private-fifo-open-nonblock.test.js
+      - name: Reject pre-verification inventory TLS input hooks (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: node --test --test-reporter=tap test/issue-65-content-inventory-mtls.test.js
       - name: Verify tests did not change repository files
         run: git diff --exit-code
       - name: Verify tests did not create untracked files

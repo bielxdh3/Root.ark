@@ -4,11 +4,102 @@
 // PostgreSQL attestor AFTER it has verified bytes and a WAL flush barrier.
 // Neither this signature nor an mTLS ACK proves external/cloud durability.
 const crypto = require("node:crypto");
+const { types: { isProxy: NATIVE_IS_PROXY, isPromise: NATIVE_IS_PROMISE,
+  isUint8Array: NATIVE_IS_UINT8_ARRAY,
+  isSharedArrayBuffer: NATIVE_IS_SHARED_ARRAY_BUFFER } } = require("node:util");
 const { freeze: NATIVE_FREEZE, verify: NATIVE_VERIFY, mathAbs: NATIVE_MATH_ABS,
   sign: NATIVE_SIGN, timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL, bufferConcat: NATIVE_BUFFER_CONCAT, bufferFrom: NATIVE_BUFFER_FROM, ownKeys: NATIVE_OWN_KEYS, ownDescriptor: NATIVE_DESCRIPTOR,
-  getPrototype: NATIVE_GET_PROTOTYPE, hasOwn: NATIVE_HAS_OWN, arrayIsArray: NATIVE_IS_ARRAY } =
+  getPrototype: NATIVE_GET_PROTOTYPE, hasOwn: NATIVE_HAS_OWN, arrayIsArray: NATIVE_IS_ARRAY,
+  objectCreate: NATIVE_OBJECT_CREATE, defineProperty: NATIVE_DEFINE_PROPERTY,
+  apply: NATIVE_APPLY } =
   require("./rootark-zk10-native-intrinsics-v1");
+const { pinNativeEd25519PublicKey } = require("./rootark-zk1-native-ed25519-public-key");
 const z = require("./rootark-zk-1");
+// A caller-owned KeyObject getter may run during key() and mutate exports.
+// Keep the real codec entry points used for the signed bytes fixed from load.
+const NATIVE_ENCODE_DETERMINISTIC = z.encodeDeterministic.bind(z);
+const NATIVE_DECODE_DETERMINISTIC = z.decodeDeterministic.bind(z);
+const PG_PROMISE = Promise;
+// TypedArray.prototype intrinsic accessors read the actual view slots. An
+// object may inherit Uint8Array.prototype without being a view, and a genuine
+// view may shadow .buffer/.length after a hostile KeyObject getter runs.
+const NATIVE_TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
+const NATIVE_VIEW_BUFFER = Object.getOwnPropertyDescriptor(
+  NATIVE_TYPED_ARRAY_PROTOTYPE, "buffer").get;
+const NATIVE_VIEW_OFFSET = Object.getOwnPropertyDescriptor(
+  NATIVE_TYPED_ARRAY_PROTOTYPE, "byteOffset").get;
+const NATIVE_VIEW_LENGTH = Object.getOwnPropertyDescriptor(
+  NATIVE_TYPED_ARRAY_PROTOTYPE, "length").get;
+
+function pgPromiseThen(onFulfilled, onRejected) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (fulfilled) return typeof onFulfilled === "function" ? onFulfilled(value) : value;
+    if (typeof onRejected !== "function") throw value;
+    return onRejected(value);
+  }
+  return pinnedPgPromise(settle());
+}
+
+function pgPromiseFinally(onFinally) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (typeof onFinally === "function") {
+      const cleanup = onFinally();
+      if (NATIVE_IS_PROXY(cleanup)) deny();
+      if (NATIVE_IS_PROMISE(cleanup)) await pinnedPgPromise(cleanup);
+      else if (cleanup !== null && (typeof cleanup === "object" || typeof cleanup === "function")) {
+        // Unknown thenables may inherit a forged Object.prototype.then.
+        deny();
+      }
+    }
+    if (!fulfilled) throw value;
+    return value;
+  }
+  return pinnedPgPromise(settle());
+}
+
+function pinnedPgPromise(pending) {
+  if (NATIVE_IS_PROXY(pending) || !NATIVE_IS_PROMISE(pending)) deny();
+  NATIVE_DEFINE_PROPERTY(pending, "constructor", {
+    value: PG_PROMISE, configurable: false, writable: false,
+  });
+  const existing = NATIVE_DESCRIPTOR(pending, "then");
+  if (existing) {
+    if (existing.configurable !== false || existing.writable !== false
+      || typeof existing.value !== "function") deny();
+    return pending;
+  }
+  NATIVE_DEFINE_PROPERTY(pending, "then", { value: pgPromiseThen,
+    configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(pending, "catch", { value(onRejected) {
+    return NATIVE_APPLY(pgPromiseThen, this, [undefined, onRejected]);
+  }, configurable: false, writable: false });
+  NATIVE_DEFINE_PROPERTY(pending, "finally", { value: pgPromiseFinally,
+    configurable: false, writable: false });
+  return pending;
+}
+
+function signedResult(fields) {
+  // A hostile signer KeyObject getter may install Object.prototype.then;
+  // resolving an async verifier with ordinary `{}` would then assimilate a
+  // forged proof AFTER genuine Ed25519 verification completed.
+  const result = NATIVE_OBJECT_CREATE(null);
+  const keys = NATIVE_OWN_KEYS(fields);
+  for (let i = 0; i < keys.length; i += 1) {
+    const descriptor = NATIVE_DESCRIPTOR(fields, keys[i]);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    NATIVE_DEFINE_PROPERTY(result, keys[i], { value: descriptor.value,
+      writable: false, enumerable: true, configurable: false });
+  }
+  return NATIVE_FREEZE(result);
+}
 
 const DOMAIN = NATIVE_BUFFER_FROM("Root.ark/zk-1/physical-pg-readback-attestation/v1\0");
 const TYPE = "rootark-zk1-physical-pg-readback-attestation/v1";
@@ -45,10 +136,20 @@ function hasSignedFields(unsigned) {
     if (!NATIVE_HAS_OWN(unsigned, FIELDS[i])) return false;
   }
   return true;
-}function bytes(v, length) {
-  if ((!Buffer.isBuffer(v) && !(v instanceof Uint8Array)) || v.length !== length
-    || (typeof SharedArrayBuffer !== "undefined" && v.buffer instanceof SharedArrayBuffer)) deny();
-  return NATIVE_BUFFER_FROM(v);
+}
+function boundedBytes(v, minimum, maximum) {
+  if (!NATIVE_IS_UINT8_ARRAY(v)) deny();
+  const length = NATIVE_APPLY(NATIVE_VIEW_LENGTH, v, []);
+  if (length < minimum || length > maximum) deny();
+  const backing = NATIVE_APPLY(NATIVE_VIEW_BUFFER, v, []);
+  if (NATIVE_IS_SHARED_ARRAY_BUFFER(backing)) deny();
+  const offset = NATIVE_APPLY(NATIVE_VIEW_OFFSET, v, []);
+  // Buffer.from(ArrayBuffer) makes a view; copy it once more so subsequent
+  // asynchronous verification cannot observe changes to the caller's bytes.
+  return NATIVE_BUFFER_FROM(NATIVE_BUFFER_FROM(backing, offset, length));
+}
+function bytes(v, length) {
+  return boundedBytes(v, length, length);
 }
 function count(n, minimum) {
   if (!Number.isSafeInteger(n) || n < minimum) deny();
@@ -64,11 +165,9 @@ function key(value, kind) {
 }
 function scopeOf(scope) {
   exact(scope, ["account_id", "compartment_id", "keyring_id"]);
-  const compartment = scope.compartment_id;
-  if ((!Buffer.isBuffer(compartment) && !(compartment instanceof Uint8Array))
-    || compartment.length < 1 || compartment.length > 128) deny();
   return { account_id: bytes(scope.account_id, 16),
-    compartment_id: NATIVE_BUFFER_FROM(compartment), keyring_id: bytes(scope.keyring_id, 16) };
+    compartment_id: boundedBytes(scope.compartment_id, 1, 128),
+    keyring_id: bytes(scope.keyring_id, 16) };
 }
 function operationOf(op) {
   exact(op, ["operation_id", "expected_sequence", "expected_root", "object_id",
@@ -108,13 +207,13 @@ async function signCommittedPhysicalReadback(request, attestorPrivateKey) {
     key(attestorPrivateKey, "private");
     exact(request, ["scope", "operation", "readback", "nonce", "issuedAt"]);
     const unsigned = claimsOf(request);
-    const encoded = NATIVE_BUFFER_FROM(await z.encodeDeterministic(unsigned));
+    const encoded = NATIVE_BUFFER_FROM(await NATIVE_ENCODE_DETERMINISTIC(unsigned));
     const signature = NATIVE_SIGN(null, NATIVE_BUFFER_CONCAT([DOMAIN, encoded]), attestorPrivateKey);
-    return NATIVE_BUFFER_FROM(await z.encodeDeterministic({ ...unsigned, signature }));
+    return NATIVE_BUFFER_FROM(await NATIVE_ENCODE_DETERMINISTIC({ ...unsigned, signature }));
   } catch (_) { deny(); }
 }
 
-async function verifyCommittedPhysicalReadback(raw, options = {}) {
+async function verifyCommittedPhysicalReadbackInternal(raw, options = {}) {
   try {
     exact(options, ["scope", "operation", "expected", "nonce", "pinnedPublicKey", "nowSeconds"]);
     const expected = options.expected;
@@ -132,18 +231,17 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
     // Validate the untrusted transport value *before* any Buffer.from coercion.
     // A foreign object may have an attacker-supplied iterator/valueOf; an
     // enormous typed array must never be copied merely to measure its size.
-    if ((!Buffer.isBuffer(raw) && !(raw instanceof Uint8Array))
-      || raw.length < 1 || raw.length > 2048
-      || (typeof SharedArrayBuffer !== "undefined"
-        && raw.buffer instanceof SharedArrayBuffer)) deny();
-    const serialized = NATIVE_BUFFER_FROM(raw);
-    const pin = key(options.pinnedPublicKey, "public");
-    const proof = await z.decodeDeterministic(serialized);
+    const serialized = boundedBytes(raw, 1, 2048);
+    // Never use the caller-owned KeyObject across an await. Its inherited
+    // kHandle getter can switch from pinned key B to signing key A after
+    // validation while keeping a genuine Ed25519 signature on A.
+    const pin = pinNativeEd25519PublicKey(options.pinnedPublicKey);
+    const proof = await NATIVE_DECODE_DETERMINISTIC(serialized);
     exact(proof, ALL_FIELDS);
     const { signature, ...unsigned } = proof;
-    const canonical = NATIVE_BUFFER_FROM(await z.encodeDeterministic({ ...unsigned, signature }));
+    const canonical = NATIVE_BUFFER_FROM(await NATIVE_ENCODE_DETERMINISTIC({ ...unsigned, signature }));
     if (!same(canonical, serialized)) deny();
-    const encoded = NATIVE_BUFFER_FROM(await z.encodeDeterministic(unsigned));
+    const encoded = NATIVE_BUFFER_FROM(await NATIVE_ENCODE_DETERMINISTIC(unsigned));
     if (!NATIVE_VERIFY(null, NATIVE_BUFFER_CONCAT([DOMAIN, encoded]), pin, bytes(signature, 64))) deny();
     if (unsigned.type !== TYPE || !hasSignedFields(unsigned)
       || !matchSignedBytes(unsigned, scope, ["account_id", "compartment_id", "keyring_id"])
@@ -163,7 +261,7 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
     const chunkRoot = bytes(unsigned.chunk_root, 32);
     const chunkCount = count(unsigned.chunk_count, 1);
     bytes(unsigned.admission_id, 16);
-    return NATIVE_FREEZE({ status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
+    return signedResult({ status: "PHYSICALLY_REREAD_PG_COMMITTED", verified: true,
       walFlushConfirmed: true, generation, admissionId: NATIVE_BUFFER_FROM(unsigned.admission_id),
       physicalDigest, chunkRoot, chunkCount,
       // Return the already-verified, signed issuance time so callers that
@@ -172,6 +270,12 @@ async function verifyCommittedPhysicalReadback(raw, options = {}) {
       operationId: NATIVE_BUFFER_FROM(op.operation_id), authorizesIo: false,
       provesIndependentOperator: false });
   } catch (_) { deny(); }
+}
+
+function verifyCommittedPhysicalReadback(raw, options) {
+  // The caller awaits only after its native pinned-key getter may have
+  // replaced Promise.prototype.constructor, .then, .catch and .finally.
+  return pinnedPgPromise(verifyCommittedPhysicalReadbackInternal(raw, options));
 }
 
 module.exports = { signCommittedPhysicalReadback, verifyCommittedPhysicalReadback,

@@ -37,8 +37,8 @@ test("P2 physical: same Ed25519 inventory and PG signer cannot be disguised by i
     };
     return real[symbol];
   } });
-  // Expected scope/operation must now be safely snapshotted BEFORE the key
-  // callback; valid detached fields keep the native role check reachable.
+  // Keep the expected scope/operation valid so the rejection demonstrates
+  // the key boundary rather than an unrelated malformed field.
   const expectedScope = { account_id: Buffer.alloc(16, 15),
     compartment_id: Buffer.from("private"), keyring_id: Buffer.alloc(16, 16) };
   const expectedOperation = { operation_id: Buffer.alloc(16, 17), expected_sequence: 0,
@@ -55,7 +55,8 @@ test("P2 physical: same Ed25519 inventory and PG signer cannot be disguised by i
       pinnedPhysicalAttestorPublicKey: real, nowSeconds: 1,
     }), /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/);
   } finally { Function.prototype.call = originalCall; z.decodeDeterministic = realDecode; }
-  assert.ok(getterReads > 0, "genuine native getter must have run");
+  assert.equal(getterReads, 0,
+    "the inherited KeyObject handle getter must be rejected before execution");
   assert.equal(equalityBypassAttempts, 0, "no mutable .call can suppress native signer equality");
   assert.equal(proofDecodeAttempts, 0, "equal real signers must reject before untrusted proof parsing");
 });

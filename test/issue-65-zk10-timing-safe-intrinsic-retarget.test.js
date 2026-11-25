@@ -41,18 +41,26 @@ function withNativeKeyGetterRebindingTimingSafeEqual(fixture, check) {
   const original = crypto.timingSafeEqual;
   let getterCalls = 0;
   let forgedComparisons = 0;
+  const poison = () => {
+    crypto.timingSafeEqual = () => { forgedComparisons += 1; return true; };
+  };
   Object.defineProperty(inherited, handle, { get() {
     getterCalls += 1;
-    crypto.timingSafeEqual = () => { forgedComparisons += 1; return true; };
+    poison();
     return owner.publicKey[handle];
   } });
   try {
-    // Real signature must be checked under the captured Ed25519 verifier,
-    // while the inherited caller KeyObject runs its hostile handle getter.
-    assert.equal(verifyOwnerCutover(signed, inherited).generation, 1);
-    assert.ok(getterCalls > 0, "hostile getter actually executed");
+    assert.throws(() => verifyOwnerCutover(signed, inherited),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "inherited native handle must fail closed before the hostile getter");
+    assert.equal(getterCalls, 0, "the untrusted native getter must not execute");
+    assert.equal(crypto.timingSafeEqual, original,
+      "rejection must not mutate the process comparator");
+    // Exercise the original comparator replacement with a genuine pinned key.
+    poison();
+    assert.equal(verifyOwnerCutover(signed, owner.publicKey).generation, 1);
     assert.notEqual(crypto.timingSafeEqual, original,
-      "same-realm attacker must actually rebind exported verifier");
+      "the fixture must install the same hostile comparator replacement");
     check();
     assert.equal(forgedComparisons, 0,
       "the verified Merkle root must never dispatch to attacker JS comparator");

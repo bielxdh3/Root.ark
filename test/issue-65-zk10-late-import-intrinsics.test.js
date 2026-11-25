@@ -57,8 +57,7 @@ test("P2: late issuer module must reuse native hash/sign methods pinned before h
   let hostileGetterReads = 0;
   let interceptedDigestCalls = 0;
   let interceptedSignCalls = 0;
-  Object.defineProperty(inherited, ownerHandleSymbol, { get() {
-    hostileGetterReads += 1;
+  const poison = () => {
     Object.defineProperty(prototype, "digest", {
       ...originalHashDigest, value: function forgedDigest(encoding) {
         const actual = originalHashDigest.value.call(this, encoding);
@@ -76,15 +75,25 @@ test("P2: late issuer module must reuse native hash/sign methods pinned before h
     // A late module that binds crypto.verify will be poisoned, too; the
     // genuine signature control below uses the saved original verifier.
     crypto.verify = () => true;
+  };
+  Object.defineProperty(inherited, ownerHandleSymbol, { get() {
+    hostileGetterReads += 1;
+    poison();
     return owner.publicKey[ownerHandleSymbol];
   } });
   try {
     const expectedOwnerSpki = spkiHash(owner.publicKey);
-    assert.equal(spkiHash(inherited), expectedOwnerSpki,
-      "early trusted module still binds the genuine Ed25519 public key");
-    assert.ok(hostileGetterReads > 0);
+    assert.throws(() => spkiHash(inherited),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "an inherited owner handle must be rejected before executing its getter");
+    assert.equal(hostileGetterReads, 0);
+    assert.equal(spkiHash(owner.publicKey), expectedOwnerSpki,
+      "the genuine early trusted module must remain usable");
     assert.equal(require.cache[issuerModulePath], undefined,
-      "the malicious getter must poison the realm before the issuer module loads");
+      "the issuer must remain unloaded before the post-key global mutation");
+    // Exercise the original late-import threat independently of the rejected
+    // inherited key: the same global mutations are installed before require().
+    poison();
     const late = require("../src/crypto/rootark-zk10-independent-issuer-bridge-v1");
     const observedDigest = late.digestIssuerProvisioning(wireA);
     assert.equal(observedDigest, digestA,

@@ -3,6 +3,16 @@
 const native = require("../src/crypto/rootark-zk10-native-intrinsics-v1");
 const { types: nodeUtilTypes } = require("node:util");
 const zk = require("../src/crypto/rootark-zk-1");
+const { types: { isProxy, isPromise } } = require("node:util");
+const NATIVE_DEFINE_PROPERTY = native.defineProperty;
+const NATIVE_PROMISE = Promise;
+function verifiedPromise(value) {
+  if (isProxy(value) || !isPromise(value)) fail("Non-native authorization Promise");
+  NATIVE_DEFINE_PROPERTY(value, "constructor", {
+    value: NATIVE_PROMISE, configurable: false, writable: false,
+  });
+  return value;
+}
 const nativeZkEncodeDeterministic = zk.encodeDeterministic;
 const nativeZkSuiteId = zk.SUITE_ID;
 const nativeZkAuthorizationDomain = zk.ASCII.AUTHORIZATION;
@@ -295,7 +305,7 @@ function proofCore(operation, options, requireFresh = true) {
 async function signedBytes(core) {
   const { signature: _signature, ...unsigned } = core;
   return nativeBufferConcat([nativeBufferFrom(nativeZkAuthorizationDomain, "ascii"),
-    nativeBufferFrom([0]), await nativeReflectApply(nativeZkEncodeDeterministic, undefined, [unsigned])]);
+    nativeBufferFrom([0]), await verifiedPromise(nativeReflectApply(nativeZkEncodeDeterministic, undefined, [unsigned]))]);
 }
 
 async function createAuthorizationProof(operation, options = {}) {
@@ -305,7 +315,7 @@ async function createAuthorizationProof(operation, options = {}) {
   const publicKey = ownDataValue(options, "publicKey");
   if (!privateKey || !publicKey) fail("Authorization key material is required");
   const core = proofCore(operation, options);
-  const signatureInput = await signedBytes(core);
+  const signatureInput = await verifiedPromise(signedBytes(core));
   core.signature = bufferToString(nativeSign(null, signatureInput, privateKey), "base64url");
   return core;
 }
@@ -378,7 +388,7 @@ async function verifyAuthorizationProofInternal(proof, operation, expected, requ
   assertAuthorizationEnvelopeBinding(normalized, operation);
   // CBOR encoding yields before verify(). Do not reuse a prior trust-policy
   // snapshot if the embedding authority revoked or replaced a pin mid-await.
-  const signedInput = await signedBytes(normalized);
+  const signedInput = await verifiedPromise(signedBytes(normalized));
   const liveRevocationsSource = ownDataValue(expected, "revokedDeviceIds");
   const liveRevocations = snapshotStringArray(liveRevocationsSource,
     "authorization_device_revoked");

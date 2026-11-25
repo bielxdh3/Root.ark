@@ -7,7 +7,20 @@ const https = require("node:https");
 const tls = require("node:tls");
 const net = require("node:net");
 const crypto = require("node:crypto");
-const inventory = require("../crypto/rootark-zk-content-inventory-v1");
+const { types: { isPromise, isProxy } } = require("node:util");
+const { defineProperty: NATIVE_DEFINE_PROPERTY, apply: NATIVE_APPLY,
+  ownDescriptor: NATIVE_OWN_DESCRIPTOR, ownKeys: NATIVE_OWN_KEYS,
+  objectCreate: NATIVE_OBJECT_CREATE, getPrototype: NATIVE_GET_PROTOTYPE,
+  hasOwn: NATIVE_HAS_OWN, bufferFrom: NATIVE_BUFFER_FROM,
+  timingSafeEqual: NATIVE_TIMING_SAFE_EQUAL,
+  dateNow: NATIVE_DATE_NOW, mathFloor: NATIVE_MATH_FLOOR,
+  randomBytes: NATIVE_RANDOM_BYTES } =
+  require("../crypto/rootark-zk10-native-intrinsics-v1");
+// A native caller-owned KeyObject getter may run during verification and
+// replace writable CommonJS exports. Capture the complete inventory facade
+// before the first such callback; never consult its mutable module.exports
+// again after beginning a security decision.
+const inventory = Object.freeze({ ...require("../crypto/rootark-zk-content-inventory-v1") });
 const { verifyAttestedInventoryCommit, derivePhysicalChainNonce,
   derivePhysicalChainPageNonce, MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS } =
   require("../crypto/rootark-zk1-attested-inventory-commit-v1");
@@ -31,6 +44,129 @@ const PENDING_REASONS = new Set([
   "EXPECTED_HEAD_CHANGED", "INVENTORY_LIMIT", "INVALID_CHRONOLOGY",
   "INVALID_CATALOG_TRANSITION", "UNRESOLVED_INTENT", "SEAL_UNCERTAIN",
 ]);
+const NATIVE_PROMISE = Promise;
+const NATIVE_OBJECT_PROTO = Object.prototype;
+function inertHttpResult(value) {
+  if (!value || typeof value !== "object"
+    || NATIVE_GET_PROTOTYPE(value) !== NATIVE_OBJECT_PROTO) return value;
+  const result = NATIVE_OBJECT_CREATE(null);
+  const keys = NATIVE_OWN_KEYS(value);
+  for (let i = 0; i < keys.length; i += 1) {
+    const descriptor = NATIVE_OWN_DESCRIPTOR(value, keys[i]);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) fail();
+    NATIVE_DEFINE_PROPERTY(result, keys[i], { value: descriptor.value,
+      enumerable: true, configurable: false, writable: false });
+  }
+  return result;
+}
+function appendVerifiedArrayItem(target, item) {
+  // The native Ed25519 KeyObject getter runs BEFORE the physical proof is
+  // appended. Array.prototype.push and Array.prototype[index] setters may now
+  // be attacker-controlled. Define a real own element by index instead.
+  NATIVE_DEFINE_PROPERTY(target, target.length, {
+    value: item, enumerable: true, configurable: true, writable: true,
+  });
+}
+function copyVerifiedBytes(items) {
+  const copied = [];
+  for (let index = 0; index < items.length; index += 1) {
+    appendVerifiedArrayItem(copied, NATIVE_BUFFER_FROM(items[index]));
+  }
+  return copied;
+}
+function nativeVerificationThen(onFulfilled, onRejected) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (fulfilled) return typeof onFulfilled === "function" ? onFulfilled(value) : value;
+    if (typeof onRejected !== "function") throw value;
+    return onRejected(value);
+  }
+  return pinnedVerification(settle());
+}
+
+function nativeVerificationFinally(onFinally) {
+  const pending = this;
+  async function settle() {
+    let fulfilled = false, value;
+    try { value = await pending; fulfilled = true; }
+    catch (error) { value = error; }
+    if (typeof onFinally === "function") {
+      const cleanup = onFinally();
+      if (isProxy(cleanup)) fail();
+      if (isPromise(cleanup)) await pinnedVerification(cleanup);
+      else if (cleanup !== null && (typeof cleanup === "object" || typeof cleanup === "function")) {
+        fail(); // Never assimilate an untrusted or inherited thenable.
+      }
+    }
+    if (!fulfilled) throw value;
+    return value;
+  }
+  return pinnedVerification(settle());
+}
+
+function pinnedVerification(pending) {
+  if (isProxy(pending) || !isPromise(pending)) fail();
+  NATIVE_DEFINE_PROPERTY(pending, "constructor", { value: NATIVE_PROMISE,
+    configurable: false, writable: false });
+  // Promise reaction assimilation also looks up .then directly even when an
+  // external `await` could use the native constructor fast path.
+  const alreadyPinnedThen = NATIVE_OWN_DESCRIPTOR(pending, "then");
+  if (alreadyPinnedThen) {
+    // The composite verifier already returns an immutable native-owned Promise
+    // with its own safe then/catch. Replacing it would throw and leave the
+    // actual verifier rejection unobserved.
+    const existingCatch = NATIVE_OWN_DESCRIPTOR(pending, "catch");
+    const existingFinally = NATIVE_OWN_DESCRIPTOR(pending, "finally");
+    if (typeof alreadyPinnedThen.value !== "function" || alreadyPinnedThen.writable !== false
+      || alreadyPinnedThen.configurable !== false || !existingCatch
+      || typeof existingCatch.value !== "function" || existingCatch.writable !== false
+      || existingCatch.configurable !== false || !existingFinally
+      || typeof existingFinally.value !== "function" || existingFinally.writable !== false
+      || existingFinally.configurable !== false) fail();
+  } else {
+    NATIVE_DEFINE_PROPERTY(pending, "then", { value: nativeVerificationThen,
+      configurable: false, writable: false });
+    NATIVE_DEFINE_PROPERTY(pending, "catch", { value(onRejected) {
+      return NATIVE_APPLY(nativeVerificationThen, pending, [undefined, onRejected]);
+    }, configurable: false, writable: false });
+    NATIVE_DEFINE_PROPERTY(pending, "finally", { value: nativeVerificationFinally,
+      configurable: false, writable: false });
+  }
+  return pending;
+}
+
+function thenVerified(pending, onVerified) {
+  // A genuine KeyObject getter can poison Promise.prototype.then before the
+  // HTTPS caller receives the verifier result. Use native await only on a
+  // Promise whose own immutable constructor matches the captured realm.
+  async function run() {
+    const verified = await pinnedVerification(pending);
+    const result = onVerified(verified);
+    return inertHttpResult(isPromise(result) ? await pinnedVerification(result) : result);
+  }
+  return pinnedVerification(run());
+}
+
+function bothVerified(first, second) {
+  const safeFirst = pinnedVerification(first);
+  const safeSecond = pinnedVerification(second);
+  // Attach BOTH genuine rejection reactions immediately. A sequential await
+  // alone leaves the second verification temporarily unobserved while a slow
+  // snapshot completes, producing an unhandled rejection on tampered receipts.
+  const observedSecond = safeSecond.then(
+    value => inertHttpResult({ ok: true, value }),
+    error => inertHttpResult({ ok: false, error }));
+  async function run() {
+    const a = await safeFirst;
+    const secondOutcome = await observedSecond;
+    if (!secondOutcome.ok) throw secondOutcome.error;
+    return inertHttpResult({ verification: a, checked: secondOutcome.value });
+  }
+  return pinnedVerification(run());
+}
 
 function fail() {
   const error = new Error("INVENTORY_HTTP_UNAVAILABLE");
@@ -39,34 +175,69 @@ function fail() {
 }
 
 function exact(value, required, optional = []) {
-  if (!value || typeof value !== "object" || Array.isArray(value)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail();
-  const keys = Reflect.ownKeys(value);
-  if (required.some((name) => !keys.includes(name))
-    || keys.some((name) => !required.includes(name) && !optional.includes(name))) fail();
-  const result = Object.create(null);
-  for (const name of [...required, ...optional]) {
-    if (!keys.includes(name)) {
+  // Caller-owned Proxies can run getPrototypeOf/ownKeys/descriptor traps before
+  // the first signed inventory verification and replace process-wide crypto
+  // hooks. Reject them before invoking ANY reflective operation. Once a native
+  // key getter has run, inherited Array methods may also be poisoned; inspect
+  // the bounded field schema through captured native intrinsics instead.
+  if (!value || typeof value !== "object" || isProxy(value) || Array.isArray(value)) fail();
+  const prototype = NATIVE_GET_PROTOTYPE(value);
+  if (prototype !== NATIVE_OBJECT_PROTO && prototype !== null) fail();
+  const keys = NATIVE_OWN_KEYS(value);
+  if (keys.length < required.length || keys.length > required.length + optional.length) fail();
+  for (let index = 0; index < keys.length; index += 1) {
+    const name = keys[index];
+    let allowed = false;
+    for (let cursor = 0; cursor < required.length; cursor += 1) {
+      if (name === required[cursor]) allowed = true;
+    }
+    for (let cursor = 0; cursor < optional.length; cursor += 1) {
+      if (name === optional[cursor]) allowed = true;
+    }
+    if (!allowed) fail();
+  }
+  const result = NATIVE_OBJECT_CREATE(null);
+  for (let index = 0; index < required.length + optional.length; index += 1) {
+    const name = index < required.length
+      ? required[index] : optional[index - required.length];
+    const descriptor = NATIVE_OWN_DESCRIPTOR(value, name);
+    if (!descriptor) {
+      if (index < required.length) fail();
       result[name] = undefined;
       continue;
     }
-    const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (!descriptor || !Object.hasOwn(descriptor, "value")) fail();
+    if (!NATIVE_HAS_OWN(descriptor, "value")) fail();
     result[name] = descriptor.value;
   }
   return result;
 }
 
+// A caller-owned nested Proxy can run getPrototypeOf/ownKeys traps inside the
+// otherwise strict inventory normalizers before any signer verification.
+// Reject it before reflection, just as we already do for the outer input.
+function normalizeScope(value) {
+  if (isProxy(value)) fail();
+  return inventory.normalizeScope(value);
+}
+function normalizeRequested(value) {
+  if (isProxy(value)) fail();
+  return inventory.normalizeRequested(value);
+}
+function normalizeMinimumHead(value) {
+  if (isProxy(value)) fail();
+  return inventory.normalizeMinimumHead(value);
+}
+
 function copyBytes(value, min, max = min) {
-  if ((!Buffer.isBuffer(value) && !(value instanceof Uint8Array))
+  if (isProxy(value) || (!Buffer.isBuffer(value) && !(value instanceof Uint8Array))
     || (typeof SharedArrayBuffer !== "undefined" && value.buffer instanceof SharedArrayBuffer)
     || value.byteLength < min || value.byteLength > max) fail();
-  return Buffer.from(value);
+  return NATIVE_BUFFER_FROM(value);
 }
 
 function decode(value, min, max) {
   if (typeof value !== "string" || !B64U.test(value) || value.length > max * 2 + 4) fail();
-  const bytes = Buffer.from(value, "base64url");
+  const bytes = NATIVE_BUFFER_FROM(value, "base64url");
   if (bytes.length < min || bytes.length > max || bytes.toString("base64url") !== value) fail();
   return bytes;
 }
@@ -85,10 +256,10 @@ function encodeOperation(operation) {
 
 function operationEntry(operation) {
   return {
-    object_id: Buffer.from(operation.object_id),
+    object_id: NATIVE_BUFFER_FROM(operation.object_id),
     revision: operation.revision,
     epoch: operation.epoch,
-    ciphertext_sha256: Buffer.from(operation.ciphertext_sha256),
+    ciphertext_sha256: NATIVE_BUFFER_FROM(operation.ciphertext_sha256),
   };
 }
 
@@ -250,7 +421,7 @@ function createZk1ContentInventoryHttpsClient({
     const raw = exact(response, ["status", "snapshotBase64"]);
     if (raw.status !== "snapshot") fail();
     const serialized = decode(raw.snapshotBase64, 1, inventory.MAX_SNAPSHOT_BYTES);
-    return inventory.verifySnapshot({
+    return thenVerified(inventory.verifySnapshot({
       serialized,
       pinnedPublicKey: inventoryPublicKey,
       pinnedSignerKeyId: signerKeyId,
@@ -260,9 +431,11 @@ function createZk1ContentInventoryHttpsClient({
       minimumSnapshot,
       committedProofChain,
       nonce,
-    }).then((verification) => ({
+    }), (verification) => ({
       ...verification,
-      serializedSnapshot: Buffer.from(serialized),
+      // The actual signed wire must survive a malicious Ed25519 KeyObject
+      // getter rewriting Buffer.from after signature verification.
+      serializedSnapshot: NATIVE_BUFFER_FROM(serialized),
       authorizesIo: false,
     }));
   }
@@ -272,28 +445,28 @@ function createZk1ContentInventoryHttpsClient({
     if (raw.status !== "not_committed_final"
       || !sameOperationId(raw.operationId, operation.operation_id)) fail();
     const proof = decode(raw.proofBase64, 1, inventory.MAX_TERMINAL_PROOF_BYTES);
-    return inventory.verifyTerminalProof({
+    return thenVerified(inventory.verifyTerminalProof({
       serialized: proof,
       pinnedPublicKey: inventoryPublicKey,
       pinnedSignerKeyId: signerKeyId,
       expectedScope: scope,
       operation,
-    }).then((verification) => {
+    }), (verification) => {
       if (verification.outcome !== "NOT_COMMITTED_FINAL") fail();
       return {
         status: "not_committed_final",
         reason: verification.reason,
         verified: true,
-        proof: Buffer.from(proof),
+        proof: NATIVE_BUFFER_FROM(proof),
         authorizesIo: false,
       };
     });
   }
 
   function call(route, requestBody, requestLimit, responseLimit) {
-    const body = Buffer.from(JSON.stringify(requestBody), "utf8");
+    const body = NATIVE_BUFFER_FROM(JSON.stringify(requestBody), "utf8");
     if (body.length < 1 || body.length > requestLimit) fail();
-    return requestJson({
+    const request = requestJson({
       url,
       secureContext,
       serverFingerprint,
@@ -302,13 +475,18 @@ function createZk1ContentInventoryHttpsClient({
       route,
       body,
       responseLimit,
-    }).catch(() => fail());
+    });
+    async function send() {
+      try { return await pinnedVerification(request); }
+      catch (_) { fail(); }
+    }
+    return pinnedVerification(send());
   }
 
   const client = Object.freeze({
     getProofPage(input) {
       const raw = exact(input, ["scope", "afterSequence", "limit"], ["pageNonce"]);
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       if (!Number.isSafeInteger(raw.afterSequence) || raw.afterSequence < 0
         || raw.afterSequence > inventory.MAX_ENTRIES
         || !Number.isSafeInteger(raw.limit) || raw.limit < 1
@@ -316,18 +494,18 @@ function createZk1ContentInventoryHttpsClient({
           ? MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS : MAX_CHAIN_PAGE_RECEIPTS)) fail();
       if (!physicalAttestorPublicKey && raw.pageNonce !== undefined) fail();
       const pageNonce = physicalAttestorPublicKey
-        ? (raw.pageNonce === undefined ? crypto.randomBytes(32)
+        ? (raw.pageNonce === undefined ? NATIVE_RANDOM_BYTES(32)
           : copyBytes(raw.pageNonce, 32)) : null;
-      return call("/v1/inventory/chain", {
+      return thenVerified(call("/v1/inventory/chain", {
         scope: Object.fromEntries(Object.entries(scope).map(([field, value]) =>
           [field, value.toString("base64url")])),
         afterSequence: raw.afterSequence, limit: raw.limit,
         ...(pageNonce ? { nonce: pageNonce.toString("base64url") } : {}),
-      }, MAX_METADATA_REQUEST_BYTES, MAX_CHAIN_RESPONSE_BYTES).then(async (result) => {
+      }, MAX_METADATA_REQUEST_BYTES, MAX_CHAIN_RESPONSE_BYTES), async (result) => {
         try {
           const pending = exact(result, ["status", "reason"]);
           if (pending.status === "pending" && pending.reason === "UNRESOLVED_INTENT") {
-            return { status: "pending", reason: "UNRESOLVED_INTENT", authorizesIo: false };
+            return inertHttpResult({ status: "pending", reason: "UNRESOLVED_INTENT", authorizesIo: false });
           }
         } catch (_) { /* next check requires the exact chain page shape */ }
         const page = exact(result, ["status", "afterSequence", "nextSequence",
@@ -350,30 +528,36 @@ function createZk1ContentInventoryHttpsClient({
           if (!Array.isArray(page.physicalAttestationsBase64)
             || page.physicalAttestationsBase64.length !== proofs.length) fail();
           for (let i = 0; i < proofs.length; i += 1) {
-            const operation = await inventory.readVerifiedCommittedOperation({
+            const operation = await pinnedVerification(inventory.readVerifiedCommittedOperation({
               serialized: proofs[i], pinnedPublicKey: inventoryPublicKey,
               pinnedSignerKeyId: signerKeyId, expectedScope: scope,
-            });
+            }));
             if (operation.expected_sequence !== raw.afterSequence + i) fail();
             const physicalAttestation = decode(page.physicalAttestationsBase64[i], 1, 2048);
             const nonce = derivePhysicalChainNonce(pageNonce,
               operation.expected_sequence + 1, operation.operation_id);
-            await verifyAttestedInventoryCommit({ receipt: proofs[i], physicalAttestation,
+            await pinnedVerification(verifyAttestedInventoryCommit({ receipt: proofs[i], physicalAttestation,
               scope, operation, nonce, pinnedInventoryPublicKey: inventoryPublicKey,
               pinnedInventorySignerKeyId: signerKeyId,
               pinnedPhysicalAttestorPublicKey: physicalAttestorPublicKey,
-              nowSeconds: Math.floor(Date.now() / 1000) });
-            physicalProofs.push(physicalAttestation);
+              // The inventory KeyObject getter already ran while checking
+              // this signed receipt. Do not trust a late-bound JS wall clock.
+              nowSeconds: NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000) }));
+            appendVerifiedArrayItem(physicalProofs, physicalAttestation);
           }
         }
         // Transport delivery is NOT a signed floor or a verified chain.
         // Only verifySnapshot with a pinned minimumHead and complete signed
         // minimumSnapshot can authenticate these bytes.
-        return {
+        // This is itself the return of an ASYNC callback. Its PromiseResolve
+        // runs before thenVerified can sanitize the resolved value. A hostile
+        // key getter can otherwise replace verified physicalProofs through
+        // Object.prototype.then after the PG signature was checked.
+        return inertHttpResult({
           status: "transport_unverified", afterSequence: raw.afterSequence,
           nextSequence: page.nextSequence, headSequenceReported: page.headSequence,
           proofs, physicalProofs, authorizesIo: false,
-        };
+        });
       }).catch(() => fail());
     },
 
@@ -384,10 +568,10 @@ function createZk1ContentInventoryHttpsClient({
         && raw.includeVerifiedProofChain !== true) fail();
       // Copy every user-controlled buffer before fetching the first page. The
       // network's reported head is never accepted as an authenticated floor.
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       const nonce = inventory.normalizeNonce(raw.nonce);
-      const requested = inventory.normalizeRequested(raw.requested);
-      const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
+      const requested = normalizeRequested(raw.requested);
+      const minimumHead = normalizeMinimumHead(raw.minimumHead);
       const minimumSnapshot = copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
       const committedProofChain = [];
       const physicalProofChain = [];
@@ -397,48 +581,52 @@ function createZk1ContentInventoryHttpsClient({
         const limit = Math.min(physicalAttestorPublicKey
           ? MAX_PHYSICAL_CHAIN_PAGE_RECEIPTS : MAX_CHAIN_PAGE_RECEIPTS,
           MAX_AUTO_CHAIN_RECEIPTS - committedProofChain.length);
-        const page = await client.getProofPage({ scope, afterSequence: cursor, limit,
+        const page = await publicClient.getProofPage({ scope, afterSequence: cursor, limit,
           ...(physicalAttestorPublicKey ? {
             pageNonce: derivePhysicalChainPageNonce(nonce, cursor),
           } : {}) });
         if (page.status === "pending") {
-          return { status: "pending", reason: "UNRESOLVED_INTENT", authorizesIo: false };
+          return inertHttpResult({ status: "pending", reason: "UNRESOLVED_INTENT", authorizesIo: false });
         }
         if (page.status !== "transport_unverified" || page.afterSequence !== cursor
           || page.nextSequence - cursor !== page.proofs.length
           || (page.nextSequence === cursor && page.headSequenceReported !== cursor)) fail();
-        committedProofChain.push(...page.proofs);
+        for (let i = 0; i < page.proofs.length; i += 1) {
+          appendVerifiedArrayItem(committedProofChain, page.proofs[i]);
+        }
         if (physicalAttestorPublicKey) {
           if (page.physicalProofs.length !== page.proofs.length) fail();
-          physicalProofChain.push(...page.physicalProofs);
+          for (let i = 0; i < page.physicalProofs.length; i += 1) {
+            appendVerifiedArrayItem(physicalProofChain, page.physicalProofs[i]);
+          }
         }
         cursor = page.nextSequence;
         if (page.headSequenceReported === cursor) break;
       }
       // A malicious or racing peer may give a stale/partial chain. The
       // separately pinned nonce-bound signed snapshot rejects it closed.
-      const verified = await client.getSnapshot({
+      const verified = await publicClient.getSnapshot({
         scope, nonce, requested, minimumHead, minimumSnapshot, committedProofChain,
       });
       if (verified.status !== "VERIFIED_NONAUTHORIZING") return verified;
-      return { ...verified,
+      return inertHttpResult({ ...verified,
         ...(physicalAttestorPublicKey ? { independentPhysicalChainVerified: true } : {}),
         ...(raw.includeVerifiedProofChain === true ? {
-          authenticatedProofChain: committedProofChain.map((proof) => Buffer.from(proof)),
+          authenticatedProofChain: copyVerifiedBytes(committedProofChain),
           ...(physicalAttestorPublicKey ? {
-            authenticatedPhysicalProofChain: physicalProofChain.map((proof) => Buffer.from(proof)),
+            authenticatedPhysicalProofChain: copyVerifiedBytes(physicalProofChain),
           } : {}),
         } : {}),
-      };
+      });
     },
 
     getSnapshot(input) {
       const raw = exact(input, ["scope", "nonce", "requested", "minimumHead"],
         ["minimumSnapshot", "committedProofChain"]);
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       const nonce = inventory.normalizeNonce(raw.nonce);
-      const entry = inventory.normalizeRequested(raw.requested);
-      const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
+      const entry = normalizeRequested(raw.requested);
+      const minimumHead = normalizeMinimumHead(raw.minimumHead);
       const minimumSnapshot = raw.minimumSnapshot === undefined || raw.minimumSnapshot === null
         ? undefined : copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
       // Snapshot all caller-controlled receipts before any TLS/network await.
@@ -449,7 +637,7 @@ function createZk1ContentInventoryHttpsClient({
           [field, value.toString("base64url")])),
         nonce: nonce.toString("base64url"),
       }, MAX_METADATA_REQUEST_BYTES, MAX_SNAPSHOT_RESPONSE_BYTES);
-      return response.then((result) => {
+      return thenVerified(response, (result) => {
         try {
           const pending = exact(result, ["status", "reason"]);
           if (pending.status === "pending" && pending.reason === "UNRESOLVED_INTENT") {
@@ -464,10 +652,10 @@ function createZk1ContentInventoryHttpsClient({
 
     append(input) {
       const raw = exact(input, ["scope", "operation", "nonce", "minimumHead"], ["minimumSnapshot"]);
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       const operation = normalizeOperation(raw.operation);
       const nonce = inventory.normalizeNonce(raw.nonce);
-      const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
+      const minimumHead = normalizeMinimumHead(raw.minimumHead);
       const minimumSnapshot = raw.minimumSnapshot === undefined || raw.minimumSnapshot === null
         ? undefined : copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
       const body = {
@@ -478,7 +666,7 @@ function createZk1ContentInventoryHttpsClient({
       };
       const response = call("/v1/inventory/append", body,
         MAX_APPEND_REQUEST_BYTES, MAX_SNAPSHOT_RESPONSE_BYTES);
-      return response.then((result) => {
+      return thenVerified(response, (result) => {
         try {
           const pending = exact(result, ["status", "reason", "operationId"]);
           if (pending.status === "pending" && PENDING_REASONS.has(pending.reason)
@@ -509,13 +697,13 @@ function createZk1ContentInventoryHttpsClient({
               pinnedInventoryPublicKey: inventoryPublicKey,
               pinnedInventorySignerKeyId: signerKeyId,
               pinnedPhysicalAttestorPublicKey: physicalAttestorPublicKey,
-              nowSeconds: Math.floor(Date.now() / 1000),
+              nowSeconds: NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000),
             })
             : inventory.verifyCommittedEntryProof({ serialized: receiptBytes,
               pinnedPublicKey: inventoryPublicKey,
               pinnedSignerKeyId: signerKeyId,
               expectedScope: scope, operation });
-          return Promise.all([inventory.verifySnapshot({
+          return thenVerified(bothVerified(inventory.verifySnapshot({
             serialized: snapshot,
             pinnedPublicKey: inventoryPublicKey,
             pinnedSignerKeyId: signerKeyId,
@@ -524,14 +712,14 @@ function createZk1ContentInventoryHttpsClient({
             minimumHead,
             minimumSnapshot,
             nonce,
-          }), receiptVerification]).then(([verification, checked]) => {
+          }), receiptVerification), ({ verification, checked }) => {
             const receipt = physicalAttestorPublicKey ? checked.inventoryReceipt : checked;
             if (verification.sequence !== committed.headSequence
-              || !crypto.timingSafeEqual(verification.root, headRoot)
+              || !NATIVE_TIMING_SAFE_EQUAL(verification.root, headRoot)
               || verification.outcome !== "PRESENT"
               || receipt.sequence > verification.sequence
               || (receipt.sequence === verification.sequence
-                && !crypto.timingSafeEqual(receipt.root, verification.root))) fail();
+                && !NATIVE_TIMING_SAFE_EQUAL(receipt.root, verification.root))) fail();
             // The entry proves the exact operation committed in this signed
             // inventory ledger. It does NOT attest physical ciphertext I/O,
             // independent operation, remote durability or release permission.
@@ -543,13 +731,13 @@ function createZk1ContentInventoryHttpsClient({
               verifiedReceipt: receipt,
               externalDurabilityProven: false,
               sequence: verification.sequence,
-              root: Buffer.from(verification.root),
+              root: NATIVE_BUFFER_FROM(verification.root),
               verification,
-              serializedSnapshot: Buffer.from(snapshot),
+              serializedSnapshot: NATIVE_BUFFER_FROM(snapshot),
               authorizesIo: false,
               ...(physicalAttestorPublicKey ? {
                 independentPhysicalAttestationVerified: true,
-                physicalAttestationReceiptDigest: Buffer.from(checked.receiptDigest),
+                physicalAttestationReceiptDigest: NATIVE_BUFFER_FROM(checked.receiptDigest),
               } : {}),
             };
           });
@@ -559,16 +747,16 @@ function createZk1ContentInventoryHttpsClient({
 
     getOperationStatus(input) {
       const raw = exact(input, ["scope", "operation"]);
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       const operation = normalizeOperation(raw.operation);
-      const nonce = physicalAttestorPublicKey ? crypto.randomBytes(32) : null;
+      const nonce = physicalAttestorPublicKey ? NATIVE_RANDOM_BYTES(32) : null;
       const response = call("/v1/inventory/operation", {
         scope: Object.fromEntries(Object.entries(scope).map(([field, value]) =>
           [field, value.toString("base64url")])),
         operation: encodeOperation(operation),
         ...(nonce ? { nonce: nonce.toString("base64url") } : {}),
       }, MAX_METADATA_REQUEST_BYTES, MAX_SMALL_RESPONSE_BYTES);
-      return response.then((result) => {
+      return thenVerified(response, (result) => {
         try {
           const rawStatus = exact(result, ["status", "operationId"]);
           if ((rawStatus.status === "unknown" || rawStatus.status === "pending")
@@ -598,20 +786,20 @@ function createZk1ContentInventoryHttpsClient({
               pinnedInventoryPublicKey: inventoryPublicKey,
               pinnedInventorySignerKeyId: signerKeyId,
               pinnedPhysicalAttestorPublicKey: physicalAttestorPublicKey,
-              nowSeconds: Math.floor(Date.now() / 1000),
+              nowSeconds: NATIVE_MATH_FLOOR(NATIVE_DATE_NOW() / 1000),
             })
             : inventory.verifyCommittedEntryProof({ serialized,
               pinnedPublicKey: inventoryPublicKey,
               pinnedSignerKeyId: signerKeyId,
               expectedScope: scope, operation });
-          return verifiedPromise.then((checked) => {
+          return thenVerified(verifiedPromise, (checked) => {
             const verified = physicalAttestorPublicKey ? checked.inventoryReceipt : checked;
             if (verified.sequence !== committed.sequence
-              || !crypto.timingSafeEqual(verified.root, expectedRoot)) fail();
+              || !NATIVE_TIMING_SAFE_EQUAL(verified.root, expectedRoot)) fail();
             return {
               status: "committed",
               sequence: verified.sequence,
-              root: Buffer.from(verified.root),
+              root: NATIVE_BUFFER_FROM(verified.root),
               verifiedReceipt: verified,
               signedLedgerOperationCommitted: true,
               transportReportedCommittedOnly: false,
@@ -619,7 +807,7 @@ function createZk1ContentInventoryHttpsClient({
               authorizesIo: false,
               ...(physicalAttestorPublicKey ? {
                 independentPhysicalAttestationVerified: true,
-                physicalAttestationReceiptDigest: Buffer.from(checked.receiptDigest),
+                physicalAttestationReceiptDigest: NATIVE_BUFFER_FROM(checked.receiptDigest),
               } : {}),
             };
           });
@@ -634,16 +822,16 @@ function createZk1ContentInventoryHttpsClient({
     async getOperationStatusWithVerifiedChain(input) {
       if (!physicalAttestorPublicKey) fail();
       const raw = exact(input, ["scope", "operation", "minimumHead", "minimumSnapshot"]);
-      const scope = inventory.normalizeScope(raw.scope);
+      const scope = normalizeScope(raw.scope);
       const operation = normalizeOperation(raw.operation);
-      const minimumHead = inventory.normalizeMinimumHead(raw.minimumHead);
+      const minimumHead = normalizeMinimumHead(raw.minimumHead);
       const minimumSnapshot = copyBytes(raw.minimumSnapshot, 1, inventory.MAX_SNAPSHOT_BYTES);
       try {
-        const before = await client.getOperationStatus({ scope, operation });
-        if (before.status !== "committed") return { ...before,
-          verifiedChainContinuation: false, independentlyAnchoredFloorProven: false };
-        const chain = await client.getVerifiedSnapshotWithChain({ scope,
-          nonce: crypto.randomBytes(32), requested: operationEntry(operation),
+        const before = await publicClient.getOperationStatus({ scope, operation });
+        if (before.status !== "committed") return inertHttpResult({ ...before,
+          verifiedChainContinuation: false, independentlyAnchoredFloorProven: false });
+        const chain = await publicClient.getVerifiedSnapshotWithChain({ scope,
+          nonce: NATIVE_RANDOM_BYTES(32), requested: operationEntry(operation),
           minimumHead, minimumSnapshot, includeVerifiedProofChain: true });
         if (chain.status !== "VERIFIED_NONAUTHORIZING" || chain.outcome !== "PRESENT"
           || chain.independentPhysicalChainVerified !== true
@@ -653,36 +841,47 @@ function createZk1ContentInventoryHttpsClient({
           || chain.sequence < before.sequence) fail();
         const offset = before.verifiedReceipt.sequence - minimumHead.sequence - 1;
         if (offset === -1) {
-          if (!crypto.timingSafeEqual(before.root, minimumHead.root)) fail();
+          if (!NATIVE_TIMING_SAFE_EQUAL(before.root, minimumHead.root)) fail();
         } else {
           if (!Number.isSafeInteger(offset) || offset < 0
             || offset >= chain.authenticatedProofChain.length) fail();
-          const member = await inventory.verifyCommittedEntryProof({
+          const member = await pinnedVerification(inventory.verifyCommittedEntryProof({
             serialized: chain.authenticatedProofChain[offset],
             pinnedPublicKey: inventoryPublicKey,
             pinnedSignerKeyId: signerKeyId, expectedScope: scope, operation,
-          });
+          }));
           if (member.sequence !== before.sequence
-            || !crypto.timingSafeEqual(member.root, before.root)) fail();
+            || !NATIVE_TIMING_SAFE_EQUAL(member.root, before.root)) fail();
         }
         // A later physical readback prevents a stale PG response from being
         // accepted merely because the ledger ancestry was checked afterward.
-        const after = await client.getOperationStatus({ scope, operation });
+        const after = await publicClient.getOperationStatus({ scope, operation });
         if (after.status !== "committed" || after.sequence !== before.sequence
-          || !crypto.timingSafeEqual(after.root, before.root)
+          || !NATIVE_TIMING_SAFE_EQUAL(after.root, before.root)
           || after.independentPhysicalAttestationVerified !== true) fail();
-        return { ...after, verifiedChainContinuation: true,
-          independentlyAnchoredFloorProven: false };
+        return inertHttpResult({ ...after, verifiedChainContinuation: true,
+          independentlyAnchoredFloorProven: false });
       } catch (_) { fail(); }
     },
   });
-  return client;
+  // An attacker-owned Ed25519 getter may execute after these methods have
+  // returned their network Promise. Freeze the ACTUAL public Promise boundary
+  // synchronously, before a later HTTP callback can poison inherited reactions.
+  const publicClient = Object.freeze({
+    getProofPage: (...args) => pinnedVerification(client.getProofPage(...args)),
+    getVerifiedSnapshotWithChain: (...args) => pinnedVerification(client.getVerifiedSnapshotWithChain(...args)),
+    getSnapshot: (...args) => pinnedVerification(client.getSnapshot(...args)),
+    append: (...args) => pinnedVerification(client.append(...args)),
+    getOperationStatus: (...args) => pinnedVerification(client.getOperationStatus(...args)),
+    getOperationStatusWithVerifiedChain: (...args) => pinnedVerification(client.getOperationStatusWithVerifiedChain(...args)),
+  });
+  return publicClient;
 }
 
 function sameOperationId(encoded, expected) {
   try {
     const decoded = decode(encoded, 16, 16);
-    return crypto.timingSafeEqual(decoded, expected);
+    return NATIVE_TIMING_SAFE_EQUAL(decoded, expected);
   } catch (_) { return false; }
 }
 

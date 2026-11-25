@@ -22,14 +22,16 @@ const {
 } = require("./rootark-zk10-native-intrinsics-v1");
 const { types: { isProxy } } = require("node:util");
 const NATIVE_IS_BUFFER = Buffer.isBuffer.bind(Buffer);
-// A prior caller-controlled native KeyObject getter may replace the ambient
-// Array constructor; checkpoint storage must use the original native Array.
 const NATIVE_ARRAY_CTOR = Array;
-const z = require("./rootark-zk-1");
+// This detached facade is created before any caller-owned KeyObject getter.
+// A live export lookup after the callback can substitute the valid decoded C
+// for raw B while the genuine offline owner checkpoint still hashes B.
+const codec = require("./rootark-zk-1");
+const z = NATIVE_FREEZE({
+  encodeDeterministic: codec.encodeDeterministic,
+  decodeDeterministic: codec.decodeDeterministic,
+});
 const inventory = require("./rootark-zk-content-inventory-v1");
-// Resolve the nested inventory signature verifier once, before any
-// caller-controlled owner KeyObject property can replace this export.
-// A valid owner checkpoint NEVER authorizes an unsigned inventory snapshot.
 const NATIVE_VERIFY_INVENTORY_SNAPSHOT = inventory.verifySnapshot.bind(inventory);
 const { nativeEd25519Spki } = require("./rootark-zk1-native-ed25519-public-key");
 
@@ -228,6 +230,11 @@ async function verifyOwnerInventoryEnrollment(input) {
       || now < previous.issuedAt || now > previous.expiresAt
       || digest(snapshot) !== previous.snapshotHash) fail();
     const decoded = await z.decodeDeterministic(snapshot);
+    // Even a genuine owner signature is not evidence that a separately
+    // decoded object C belongs to the owner's raw checkpointed bytes B.
+    const canonical = await z.encodeDeterministic(decoded);
+    if (canonical.length !== snapshot.length ||
+        NATIVE_BUFFER_COMPARE(canonical, snapshot) !== 0) fail();
     if (decoded.sequence !== previous.inventorySequence ||
         NATIVE_BUFFER_COMPARE(NATIVE_BUFFER_FROM(decoded.root),
           NATIVE_BUFFER_FROM(previous.root, "hex")) !== 0) fail();
@@ -240,6 +247,10 @@ async function verifyOwnerInventoryEnrollment(input) {
     await NATIVE_VERIFY_INVENTORY_SNAPSHOT({ serialized: snapshot, pinnedPublicKey: inventoryKey,
       pinnedSignerKeyId: keyId, expectedScope: pinnedScopeBytes, requested, minimumHead,
       nonce: decoded.nonce });
+    // No nested callback may change the raw bytes that the offline owner
+    // actually signed. Recheck the private snapshot before returning proof.
+    if (digest(snapshot) !== previous.snapshotHash
+      || NATIVE_BUFFER_COMPARE(snapshot, canonical) !== 0) fail();
     return NATIVE_FREEZE({ minimumHead, minimumSnapshot: NATIVE_BUFFER_FROM(snapshot),
       ownerSignatureVerified: true, externallyPinnedDigestMatched: true,
       signedCounter: previous.counter, ownerCheckpointDigest: previous.digest,

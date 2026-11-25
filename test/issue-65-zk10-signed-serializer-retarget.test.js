@@ -37,19 +37,23 @@ function inheritedOwnerWithPrototypePoison(publicKey, target, replacement) {
   const oldToJson = Object.getOwnPropertyDescriptor(target, "toJSON");
   let getterReads = 0;
   let toJsonCalls = 0;
-  Object.defineProperty(inherited, symbol, { get() {
-    getterReads += 1;
+  const installPoison = () => {
     Object.defineProperty(target, "toJSON", { configurable: true, writable: true,
       value: function attackerJson() {
         toJsonCalls += 1;
         return replacement(this);
       } });
+  };
+  Object.defineProperty(inherited, symbol, { get() {
+    getterReads += 1;
+    installPoison();
     return publicKey[symbol];
   } });
   return {
     inherited,
     get getterReads() { return getterReads; },
     get toJsonCalls() { return toJsonCalls; },
+    installPoison,
     restore() {
       if (oldToJson) Object.defineProperty(target, "toJSON", oldToJson);
       else delete target.toJSON;
@@ -69,7 +73,13 @@ test("P2: inherited Object.prototype.toJSON cannot make signed cutover B verify 
     assert.throws(() => verifyOwnerCutoverHistory([forgedB], [hostile.inherited], account),
       /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/,
       "the forged B inventory must not inherit signer A's canonical bytes");
-    assert.ok(hostile.getterReads > 0, "real native owner KeyObject getter ran");
+    assert.equal(hostile.getterReads, 0, "inherited native handle getter must not execute");
+    hostile.installPoison();
+    assert.throws(() => verifyOwnerCutoverHistory([forgedB], [f.owner.publicKey], account),
+      /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/,
+      "signed B must remain rejected even with a preinstalled prototype serializer");
+    assert.equal(verifyOwnerCutoverHistory([f.signed], [f.owner.publicKey], account).digest,
+      f.digest, "the real owner-signed statement must still verify under the hostile hook");
     assert.equal(hostile.toJsonCalls, 0,
       "canonical signed payload must never consult a patched prototype hook");
   } finally { hostile.restore(); }
@@ -87,7 +97,13 @@ test("P2: Array.prototype.toJSON cannot substitute A's compartment corpus while 
     assert.throws(() => verifyOwnerCutoverHistory([forgedB], [hostile.inherited], account),
       /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/,
       "an inherited array serializer must not change the signed corpus");
-    assert.ok(hostile.getterReads > 0);
+    assert.equal(hostile.getterReads, 0, "inherited native handle getter must not execute");
+    hostile.installPoison();
+    assert.throws(() => verifyOwnerCutoverHistory([forgedB], [f.owner.publicKey], account),
+      /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/,
+      "unsigned compartment replacement must be refused despite Array.toJSON");
+    assert.equal(verifyOwnerCutoverHistory([f.signed], [f.owner.publicKey], account).digest,
+      f.digest, "the real signed compartments must still verify under the hostile hook");
     assert.equal(hostile.toJsonCalls, 0,
       "array fields must be serialized as validated primitives, not via toJSON");
   } finally { hostile.restore(); }

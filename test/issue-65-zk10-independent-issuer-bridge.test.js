@@ -241,15 +241,24 @@ test("issuer verifier cannot be rebound by an inherited native-handle getter", (
     return issuer.publicKey[handleSymbol];
   } });
   try {
-    const verifier = createIssuerProvisionedObjectVerifier({
+    assert.throws(() => createIssuerProvisionedObjectVerifier({
       trustedIssuerPublicKey: hostileIssuer,
+      immutableAccountId: accountId,
+      independentlyRetainedProvisioningDigest: retainedDigest,
+    }), /ZK10_ISSUER_BRIDGE_UNVERIFIED/,
+    "an inherited native handle must be rejected before its getter can rebind the verifier");
+    assert.equal(handleReads, 0, "no inherited issuer native getter may execute");
+    // Also exercise the genuine issuer with a hostile global verifier already
+    // rebound, so early rejection does not replace the intrinsic-pinning test.
+    crypto.verify = () => { attackerVerifyCalls += 1; return true; };
+    const verifier = createIssuerProvisionedObjectVerifier({
+      trustedIssuerPublicKey: issuer.publicKey,
       immutableAccountId: accountId,
       independentlyRetainedProvisioningDigest: retainedDigest,
     });
     assert.throws(() => verifier({ ...f.input, issuerProvisioning: forgedIssuerWire }),
       /ZK10_ISSUER_BRIDGE_UNVERIFIED/,
       "a forged issuer signature must not be accepted by re-binding crypto.verify");
-    assert.ok(handleReads > 0, "actual hostile getter must execute");
     assert.equal(attackerVerifyCalls, 0,
       "no caller-supplied JS verifier may replace Ed25519 verification");
   } finally {

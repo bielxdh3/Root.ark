@@ -17,7 +17,7 @@ const { SyncObjectStore, registerSyncRoutes } = require("../src/routes/sync");
 const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 const { createSyncBurstGuard } = require("../src/services/syncBurstGuard");
 const { runMigrations } = require("../db/migrations");
-const { closeDb } = require("../db");
+const { closeDb, getDb } = require("../db");
 const usersRepository = require("../repositories/usersRepository");
 
 async function privateDirectory(prefix) {
@@ -79,6 +79,7 @@ async function fixture(t, options = {}) {
   app.use(express.json({ limit: "9mb" }));
   const routes = registerSyncRoutes({ app, storagePath, atomicDeviceRegistry: true,
     requireDeviceAuthorization: true,
+    legacyCutoverStrict: options.legacyCutoverStrict === true,
     burstGuard: options.burstGuard,
     auditLog: options.auditLog,
     authenticate: (req, _res, next) => {
@@ -115,11 +116,22 @@ async function fixture(t, options = {}) {
     fileKey: fileKeys[id],
   }));
   const send = (route, body) => request(server.address().port, route, body);
-  assert.equal((await send("/sync/v1/objects", await make("create", "a", 1, "seed"))).status, 201);
-  assert.equal((await send("/sync/v1/objects", await make("create", "b", 1, "seed"))).status, 201);
+  if (options.legacyCutoverStrict === true) {
+    // Only this disposable fixture seeds prior signed state directly. The six
+    // legacy HTTP routes must remain unavailable under the experimental gate.
+    await routes.store.put("alice", await make("create", "a", 1, "seed"));
+    await routes.store.put("alice", await make("create", "b", 1, "seed"));
+    assert.equal(routes.store.list("alice").length, 2);
+  } else {
+    assert.equal((await send("/sync/v1/objects", await make("create", "a", 1, "seed"))).status, 201);
+    assert.equal((await send("/sync/v1/objects", await make("create", "b", 1, "seed"))).status, 201);
+  }
   return { routes, storagePath, make, send, publicKey,
     batch: async (deleteOp, moveOp) => send("/sync/v1/objects/batch",
       { operations: [deleteOp, moveOp] }),
+    accountRow: () => getDb().prepare(
+      "SELECT role, permissions_json, session_version, disabled FROM users WHERE username = ?")
+      .get("alice"),
     onDisk: () => fs.readFile(storagePath, "utf8") };
 }
 
@@ -442,6 +454,45 @@ test("atomic registry refuses unsigned or expired batch admission before changin
   const expired = await f.batch(freshDelete, expiredMove);
   assert.ok([400, 403].includes(expired.status), "expired MOVE must be rejected");
   assert.equal(await f.onDisk(), before, "invalid second member cannot commit DELETE");
+});
+
+test("ZK10 strict legacy cutover leaves signed atomic Sync v2 on its separate SQLite/device authority", async (t) => {
+  const f = await fixture(t, { legacyCutoverStrict: true });
+  const before = await f.onDisk();
+  const accountBefore = f.accountRow();
+
+  // Both routes receive real signed Ed25519 envelopes over HTTP, but only the
+  // legacy endpoint is covered by the DEV-OFF external-cutover gate.
+  const legacy = await f.send("/sync/v1/objects",
+    await f.make("delete", "a", 2, "strict-legacy-denial"));
+  assert.equal(legacy.status, 503);
+  assert.equal(legacy.body.code, "ZK10_EXTERNAL_AUTHORITY_UNAVAILABLE");
+  assert.equal(await f.onDisk(), before, "denied legacy request changed the disk");
+  assert.deepEqual(f.accountRow(), accountBefore, "denied legacy request changed SQLite account");
+
+  const rejectedDelete = await f.make("delete", "a", 2, "unsigned-delete");
+  const rejectedMove = await f.make("move", "b", 2, "unsigned-move");
+  delete rejectedMove.authorization;
+  const rejected = await f.batch(rejectedDelete, rejectedMove);
+  assert.equal(rejected.status, 403);
+  assert.equal(await f.onDisk(), before, "invalid atomic batch changed the disk");
+  assert.deepEqual(f.accountRow(), accountBefore, "invalid batch changed SQLite account");
+
+  const deleted = await f.make("delete", "a", 2, "strict-signed-delete");
+  const moved = await f.make("move", "b", 2, "strict-signed-move");
+  const admitted = await f.batch(deleted, moved);
+  assert.equal(admitted.status, 200);
+  assert.deepEqual(admitted.body.objects.map((record) => record.operation),
+    ["delete", "move"]);
+  const after = JSON.parse(await f.onDisk());
+  assert.notEqual(JSON.stringify(after), before,
+    "signed atomic batch must persist under the separate scoped contract");
+  assert.equal(after.users.alice.objects["object-a"].tombstone, true);
+  assert.equal(after.users.alice.objects["object-b"].operation, "move");
+  assert.equal(after.users.alice.seen[deleted.operationId], true);
+  assert.equal(after.users.alice.seen[moved.operationId], true);
+  assert.deepEqual(f.accountRow(), accountBefore,
+    "the signed batch holds SQLite account authorization without changing its account row");
 });
 
 test("HTTP denied on missing atomic mode, upload-only permission or malformed order", async (t) => {

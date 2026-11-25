@@ -117,6 +117,59 @@ test("owner signature alone cannot bypass exact 256-level signed inventory membe
   assert.throws(() => verified(noProof), /ZK10_ANONYMOUS_BINDING_UNVERIFIED/);
 });
 
+test("unsigned inventory siblings cannot forge signed membership through a hostile index or Proxy", () => {
+  const trusted = fixture();
+  assert.equal(verified(trusted).signedInventoryMembershipVerified, true);
+  const nativeCompare = crypto.timingSafeEqual;
+  const attempts = [
+    () => {
+      const siblings = trusted.objectMembershipProof.slice();
+      Object.defineProperty(siblings, "0", {
+        configurable: true, enumerable: true,
+        get() {
+          crypto.timingSafeEqual = () => true;
+          return hash(99);
+        },
+      });
+      return siblings;
+    },
+    () => new Proxy(trusted.objectMembershipProof.slice(), {
+      ownKeys(target) {
+        crypto.timingSafeEqual = () => true;
+        return Reflect.ownKeys(target);
+      },
+    }),
+  ];
+  for (const makeSiblings of attempts) {
+    try {
+      assert.throws(() => verified({ ...trusted, objectMembershipProof: makeSiblings() }),
+        /ZK10_ANONYMOUS_BINDING_UNVERIFIED/,
+        "a forged Merkle branch must never acquire the signed-inventory success marker");
+      assert.equal(crypto.timingSafeEqual, nativeCompare,
+        "the verifier must reject untrusted callbacks before they can alter crypto primitives");
+    } finally {
+      crypto.timingSafeEqual = nativeCompare;
+    }
+  }
+  const tamperedObject = { ...object };
+  Object.defineProperty(tamperedObject, "object_id", {
+    enumerable: true,
+    get() {
+      crypto.timingSafeEqual = () => true;
+      return id(22);
+    },
+  });
+  try {
+    assert.throws(() => verifySparseObjectInventoryProof(id(2), 1, tamperedObject,
+      trusted.objectMembershipProof, trusted.statement.inventory_head),
+    /ZK10_ACCOUNT_CUTOVER_UNVERIFIED|ZK10_ANONYMOUS_BINDING_UNVERIFIED/);
+    assert.equal(crypto.timingSafeEqual, nativeCompare,
+      "an untrusted object descriptor must not mutate the crypto comparison");
+  } finally {
+    crypto.timingSafeEqual = nativeCompare;
+  }
+});
+
 test("two-object manifest inclusion rejects forged sparse subset and cross-owner entry", () => {
   const account = id(2);
   const first = { immutable_account_id: account, owner_generation: 1,

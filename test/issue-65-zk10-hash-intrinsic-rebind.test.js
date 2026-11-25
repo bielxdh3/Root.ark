@@ -77,7 +77,7 @@ test("P2 digest: a valid owner A signature cannot report signed owner B's digest
   let forgedDigests = 0;
   let armed = false;
   withHashPrototypeRebind((hashProto, nativeUpdate, nativeDigest) => {
-    const root = controlledNativeRoot(f.A.publicKey, () => {
+    const poison = () => {
       if (armed) return;
       armed = true;
       Object.defineProperty(hashProto, "digest", { ...Object.getOwnPropertyDescriptor(hashProto, "digest"),
@@ -89,10 +89,18 @@ test("P2 digest: a valid owner A signature cannot report signed owner B's digest
           }
           return result;
         } });
-    });
-    const verified = verifyOwnerCutoverHistory([f.signedA], [root.inherited], account);
-    assert.ok(root.reads > 0, "physical Symbol(kHandle) getter must execute");
-    assert.equal(armed, true, "the native getter must install the hostile Hash prototype");
+    };
+    const root = controlledNativeRoot(f.A.publicKey, poison);
+    assert.throws(() => verifyOwnerCutoverHistory([f.signedA], [root.inherited], account),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "inherited native handles must be refused before getter code runs");
+    assert.equal(root.reads, 0, "an inherited kHandle getter must never execute");
+    assert.equal(armed, false, "the rejected key cannot poison Hash.prototype.digest");
+    // Still exercise legitimate verification with the hostile prototype already
+    // installed; the early key rejection is not a substitute for that check.
+    poison();
+    const verified = verifyOwnerCutoverHistory([f.signedA], [f.A.publicKey], account);
+    assert.equal(armed, true, "the fixture must install the hostile Hash prototype");
     assert.equal(verified.statement.inventory_head, f.signedA.inventory_head);
     assert.equal(verified.digest, f.digestA, "verified owner A must never report B's digest");
     assert.equal(forgedDigests, 0, "the canonical digest must bypass hostile prototype dispatch");
@@ -110,7 +118,7 @@ test("P2 update: a valid owner A signature cannot hash signed owner B's bytes af
   let rewrites = 0;
   let armed = false;
   withHashPrototypeRebind((hashProto, nativeUpdate) => {
-    const root = controlledNativeRoot(f.A.publicKey, () => {
+    const poison = () => {
       if (armed) return;
       armed = true;
       Object.defineProperty(hashProto, "update", { ...Object.getOwnPropertyDescriptor(hashProto, "update"),
@@ -121,10 +129,16 @@ test("P2 update: a valid owner A signature cannot hash signed owner B's bytes af
           }
           return nativeUpdate.call(this, bytes, encoding);
         } });
-    });
-    const verified = verifyOwnerCutoverHistory([f.signedA], [root.inherited], account);
-    assert.ok(root.reads > 0, "physical Symbol(kHandle) getter must execute");
-    assert.equal(armed, true, "the native getter must install the hostile Hash prototype");
+    };
+    const root = controlledNativeRoot(f.A.publicKey, poison);
+    assert.throws(() => verifyOwnerCutoverHistory([f.signedA], [root.inherited], account),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "inherited native handles must be refused before getter code runs");
+    assert.equal(root.reads, 0, "an inherited kHandle getter must never execute");
+    assert.equal(armed, false, "the rejected key cannot poison Hash.prototype.update");
+    poison();
+    const verified = verifyOwnerCutoverHistory([f.signedA], [f.A.publicKey], account);
+    assert.equal(armed, true, "the fixture must install the hostile Hash prototype");
     assert.equal(verified.statement.inventory_head, f.signedA.inventory_head);
     assert.equal(verified.digest, f.digestA, "verified owner A must never hash signed B's bytes");
     assert.equal(rewrites, 0, "canonical hashing must bypass hostile update prototype dispatch");

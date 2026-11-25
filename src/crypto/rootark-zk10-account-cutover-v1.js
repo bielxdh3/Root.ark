@@ -34,6 +34,27 @@ const {
 } = require("./rootark-zk10-native-intrinsics-v1");
 const DOMAIN_OWNER = Buffer.from("Root.ark/zk10/owner-account-cutover/v1\0");
 const DOMAIN_ROTATION = Buffer.from("Root.ark/zk10/owner-rotation/v1\0");
+const PUBLIC_KEY_FIXTURE = crypto.createPublicKey({
+  key: Buffer.from("302a300506032b6570032100" + "00".repeat(32), "hex"),
+  format: "der", type: "spki",
+});
+const GET_PROTOTYPE = Object.getPrototypeOf.bind(Object);
+const OWN_DESCRIPTOR = Object.getOwnPropertyDescriptor.bind(Object);
+const HAS_OWN = Object.hasOwn.bind(Object);
+const NATIVE_APPLY = Reflect.apply.bind(Reflect);
+const PUBLIC_KEY_PROTOTYPE = GET_PROTOTYPE(PUBLIC_KEY_FIXTURE);
+const PRIVATE_KEY_PROTOTYPE = GET_PROTOTYPE(crypto.generateKeyPairSync("ed25519").privateKey);
+const NATIVE_HANDLE = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
+  .find((symbol) => symbol.description === "kHandle");
+const NATIVE_KEY_TYPE = Object.getOwnPropertySymbols(PUBLIC_KEY_FIXTURE)
+  .find((symbol) => symbol.description === "kKeyType");
+const NATIVE_HANDLE_PROTOTYPE = GET_PROTOTYPE(OWN_DESCRIPTOR(PUBLIC_KEY_FIXTURE, NATIVE_HANDLE).value);
+const NATIVE_HANDLE_ALGORITHM = OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType").value;
+const NATIVE_HANDLE_EXPORT = OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "export").value;
+const RAW_NATIVE_TYPE = OWN_DESCRIPTOR(crypto.KeyObject.prototype, "type").get;
+const RAW_NATIVE_ALGORITHM = OWN_DESCRIPTOR(
+  GET_PROTOTYPE(PUBLIC_KEY_PROTOTYPE), "asymmetricKeyType").get;
+const RAW_NATIVE_PUBLIC_EXPORT = OWN_DESCRIPTOR(PUBLIC_KEY_PROTOTYPE, "export").value;
 const OWNER_FIELDS = NATIVE_FREEZE(["type", "immutable_account_id", "zk_account_id",
   "generation", "previous_cutover_digest", "inventory_head", "complete_corpus",
   "covered_compartments", "legacy_egress_scope", "reference_disposition",
@@ -72,6 +93,21 @@ function exact(value, fields) {
   }
   return output;
 }
+function exactArray(value, minimum, maximum) {
+  // A plain Array can still contain an own accessor at an indexed position.
+  // Reading history[0], ownerKeys[0] or a signed compartment via an iterator
+  // would invoke that accessor before signature verification. Validate every
+  // bounded slot as an own DATA descriptor before consuming any element.
+  if (isProxy(value) || !Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Array.prototype
+    || value.length < minimum || value.length > maximum
+    || Reflect.ownKeys(value).length !== value.length + 1) deny();
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = OWN_DESCRIPTOR(value, index);
+    if (!descriptor || !HAS_OWN(descriptor, "value")) deny();
+  }
+  return value;
+}
 function decode(value, length) {
   if (typeof value !== "string" || !B64.test(value)) deny();
   const result = NATIVE_BUFFER_FROM(value, "base64url");
@@ -80,21 +116,40 @@ function decode(value, length) {
 }
 function hex(value) { if (typeof value !== "string" || !HEX.test(value)) deny(); return value; }
 function key(value, type) {
-  if (isProxy(value) || !(value instanceof crypto.KeyObject) || NATIVE_TYPE.call(value) !== type
-    || NATIVE_ALGORITHM.call(value) !== "ed25519") deny();
-  // A forged Object.create(realKey) may provide an own kHandle getter which
-  // returns SPKI B for export and signer A for crypto.verify. Never retain a
-  // caller-owned public KeyObject: snapshot its native DER once, reimport,
-  // and use ONLY the fresh native identity for both SPKI and verification.
-  if (type === "private") return value; // Never export private key material.
   try {
-    const der = NATIVE_PUBLIC_EXPORT.call(value, { format: "der", type: "spki" });
+    // Neither a fake DATA kHandle nor an accessor-backed kKeyType may reach
+    // native KeyObject accessors: both can execute caller-controlled JS.
+    if (type !== "public" && type !== "private") deny();
+    if (isProxy(value) || !(value instanceof crypto.KeyObject)
+      || GET_PROTOTYPE(value) !== (type === "public"
+        ? PUBLIC_KEY_PROTOTYPE : PRIVATE_KEY_PROTOTYPE)) deny();
+    const handle = NATIVE_HANDLE && OWN_DESCRIPTOR(value, NATIVE_HANDLE);
+    const keyType = NATIVE_KEY_TYPE && OWN_DESCRIPTOR(value, NATIVE_KEY_TYPE);
+    if (!handle || !HAS_OWN(handle, "value")
+      || !keyType || !HAS_OWN(keyType, "value") || keyType.value !== type
+      || !handle.value || typeof handle.value !== "object"
+      || isProxy(handle.value)
+      || GET_PROTOTYPE(handle.value) !== NATIVE_HANDLE_PROTOTYPE
+      || HAS_OWN(handle.value, "getAsymmetricKeyType")
+      || HAS_OWN(handle.value, "export")
+      || OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "getAsymmetricKeyType")?.value
+        !== NATIVE_HANDLE_ALGORITHM
+      || OWN_DESCRIPTOR(NATIVE_HANDLE_PROTOTYPE, "export")?.value
+        !== NATIVE_HANDLE_EXPORT
+      || NATIVE_APPLY(NATIVE_HANDLE_ALGORITHM, handle.value, []) !== "ed25519"
+      || NATIVE_APPLY(RAW_NATIVE_TYPE, value, []) !== type
+      || NATIVE_APPLY(RAW_NATIVE_ALGORITHM, value, []) !== "ed25519") deny();
+    if (type === "private") return value; // Never export private key material.
+    if (type !== "public") deny();
+    // Take one native SPKI snapshot, then discard the supplied reference.
+    // Subsequent hash and signature checks use only the fresh, native key.
+    const der = NATIVE_APPLY(RAW_NATIVE_PUBLIC_EXPORT, value, [{ format: "der", type: "spki" }]);
     if (!Buffer.isBuffer(der) || der.length !== 44) deny();
-    const pinned = NATIVE_CREATE_PUBLIC_KEY({ key: der, format: "der", type: "spki" });
-    if (NATIVE_TYPE.call(pinned) !== "public"
-      || NATIVE_ALGORITHM.call(pinned) !== "ed25519"
-      || !NATIVE_PUBLIC_EXPORT.call(pinned, { format: "der", type: "spki" }).equals(der)) deny();
-    return pinned;
+    const canonical = NATIVE_CREATE_PUBLIC_KEY({ key: Buffer.from(der),
+      format: "der", type: "spki" });
+    if (NATIVE_APPLY(RAW_NATIVE_TYPE, canonical, []) !== "public"
+      || NATIVE_APPLY(RAW_NATIVE_ALGORITHM, canonical, []) !== "ed25519") deny();
+    return canonical;
   } catch (_) { deny(); }
 }
 function pinnedSpkiHash(pinnedPublicKey) {
@@ -116,8 +171,7 @@ function ownerPayload(payload) {
     || p.migration_disposition !== "closed") deny();
   // Completed cutover cannot carry compatibility grants. Migration windows
   // require their own separately signed pre-cutover policy protocol.
-  if (!NATIVE_ARRAY_IS_ARRAY(p.grants) || p.grants.length !== 0
-    || NATIVE_OWN_KEYS(p.grants).length !== 1) deny();
+  exactArray(p.grants, 0, 0);
   decode(p.immutable_account_id, 16);
   decode(p.zk_account_id, 16);
   decode(p.nonce, 32);
@@ -126,9 +180,7 @@ function ownerPayload(payload) {
     || !Number.isSafeInteger(p.issued_at) || p.issued_at < 1) deny();
   if (p.previous_cutover_digest !== null) hex(p.previous_cutover_digest);
   if ((p.generation === 1) !== (p.previous_cutover_digest === null)) deny();
-  if (!NATIVE_ARRAY_IS_ARRAY(p.covered_compartments) || p.covered_compartments.length < 1
-    || p.covered_compartments.length > 128
-    || NATIVE_OWN_KEYS(p.covered_compartments).length !== p.covered_compartments.length + 1) deny();
+  exactArray(p.covered_compartments, 1, 128);
   let previous = "";
   const names = [];
   for (let index = 0; index < p.covered_compartments.length; index += 1) {
@@ -155,19 +207,25 @@ function signOwnerCutover(payload, privateKey) {
   return NATIVE_FREEZE({ ...p, signature: NATIVE_BUFFER_TO_STRING.call(NATIVE_SIGN(null,
     signatureBytes(DOMAIN_OWNER, p), key(privateKey, "private")), "base64url") });
 }
-function verifyOwnerCutover(wire, publicKey) {
+function snapshotOwnerCutover(wire) {
   const signed = exact(wire, OWNER_WIRE_FIELDS);
   const p = ownerPayload(NATIVE_PICK_SIGNED_FIELDS(signed, OWNER_FIELDS));
-  if (!NATIVE_VERIFY(null, signatureBytes(DOMAIN_OWNER, p), key(publicKey, "public"),
-    decode(signed.signature, 64))) deny();
-  return NATIVE_FREEZE(p);
+  // Keep the statement and its digest on the same byte snapshot. In particular,
+  // never re-read a Proxy wire after verifying its owner signature, and do not
+  // retain references to caller-controlled nested arrays.
+  const body = NATIVE_FREEZE({ ...p, grants: NATIVE_FREEZE([]),
+    covered_compartments: NATIVE_FREEZE(p.covered_compartments) });
+  return { body, bytes: signatureBytes(DOMAIN_OWNER, body),
+    signature: decode(signed.signature, 64) };
+}
+function verifyOwnerCutover(wire, publicKey) {
+  const { body, bytes, signature } = snapshotOwnerCutover(wire);
+  if (!NATIVE_VERIFY(null, bytes, key(publicKey, "public"), signature)) deny();
+  return body;
 }
 function digestOwnerCutover(wire) {
-  const record = exact(wire, OWNER_WIRE_FIELDS);
-  const p = ownerPayload(NATIVE_PICK_SIGNED_FIELDS(record, OWNER_FIELDS));
-  decode(record.signature, 64);
-  return NATIVE_BUFFER_TO_STRING.call(H(
-    signatureBytes(DOMAIN_OWNER, p), decode(record.signature, 64)), "hex");
+  const { bytes, signature } = snapshotOwnerCutover(wire);
+  return NATIVE_BUFFER_TO_STRING.call(H(bytes, signature), "hex");
 }
 function rotationPayload(p) {
   const v = exact(p, ROTATION_FIELDS);
@@ -198,8 +256,7 @@ function signOwnerRotation(payload, previousPrivateKey, nextPrivateKey) {
       NATIVE_SIGN(null, data, nextPrivateKey), "base64url") });
 }
 function verifyOwnerRotationKeys(rotations, pinnedRoot, immutableAccountId) {
-  if (!NATIVE_ARRAY_IS_ARRAY(rotations) || rotations.length > 8
-    || NATIVE_OWN_KEYS(rotations).length !== rotations.length + 1) deny();
+  exactArray(rotations, 0, 8);
   let current = key(pinnedRoot, "public");
   const accepted = [current];
   let previousDigest = null;
@@ -228,12 +285,8 @@ function verifyOwnerRotationChain(rotations, pinnedRoot, immutableAccountId) {
   return keys[keys.length - 1];
 }
 function verifyOwnerCutoverHistory(history, ownerKeys, immutableAccountId) {
-  if (!NATIVE_ARRAY_IS_ARRAY(history) || isProxy(history)
-    || history.length < 1 || history.length > 64
-    || NATIVE_OWN_KEYS(history).length !== history.length + 1
-    || !NATIVE_ARRAY_IS_ARRAY(ownerKeys) || isProxy(ownerKeys)
-    || !ownerKeys.length || ownerKeys.length > 9
-    || NATIVE_OWN_KEYS(ownerKeys).length !== ownerKeys.length + 1) deny();
+  exactArray(history, 1, 64);
+  exactArray(ownerKeys, 1, 9);
   // Pin every trusted key once, not again after attacker-controlled history
   // processing. Reject accessors, holes and Proxies instead of invoking them.
   const pinnedKeys = [];
@@ -295,8 +348,7 @@ function pathBits(accountId) {
     Buffer.from("Root.ark/zk10/smt-key/v1\0"), decode(accountId, 16)), "hex")}`);
 }
 function verifySparseEnrollmentProof(accountId, cutoverDigest, siblings, expectedRoot) {
-  if (!NATIVE_ARRAY_IS_ARRAY(siblings) || siblings.length !== 256
-    || NATIVE_OWN_KEYS(siblings).length !== 257) deny();
+  exactArray(siblings, 256, 256);
   let at = pathBits(accountId), current = leaf(accountId, cutoverDigest);
   for (const sibling of siblings) {
     const siblingHash = NATIVE_BUFFER_FROM(hex(sibling), "hex");
@@ -309,7 +361,7 @@ function verifySparseEnrollmentProof(accountId, cutoverDigest, siblings, expecte
 // Pure deterministic fixture/proof builder. The authority, not an app server,
 // must create and independently retain the committed head for a real deployment.
 function buildSparseEnrollmentProof(entries, accountId) {
-  if (!NATIVE_ARRAY_IS_ARRAY(entries) || entries.length > 1024) deny();
+  exactArray(entries, 0, 1024);
   let level = new Map();
   for (const record of entries) {
     const v = exact(record, ["accountId", "cutoverDigest"]);

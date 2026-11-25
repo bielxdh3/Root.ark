@@ -2,6 +2,8 @@
 
 Status: **native launcher with online login and 2FA implementation; Android build/device behavior pending hosted and device validation.** This is a bounded step toward the client in issue #64, not a protected-file or sync client. It implements no Keystore, device enrollment, recovery or sync engine, and is not an approved release. The design gates in `docs/architecture/android-client-architecture.md` remain open.
 
+The original Kotlin/JVM scaffold was compiled and tested in hosted Ubuntu CI before the native login screen was added. Those results do not validate the newer Android application or an installed APK. The app now includes an HTTPS authentication screen, but no protected-file access or synchronization implementation.
+
 ## Layout
 
 | Path | Purpose |

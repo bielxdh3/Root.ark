@@ -5,6 +5,7 @@
 // complete object corpus, or an independently retained owner/corpus head.
 // A valid owner signature therefore NEVER authorizes I/O or proves ownership.
 const crypto = require("node:crypto");
+const { types: { isProxy } } = require("node:util");
 const {
   createHash: NATIVE_CREATE_HASH,
   verify: NATIVE_VERIFY,
@@ -20,6 +21,10 @@ const {
   pickSignedFields: NATIVE_PICK_SIGNED_FIELDS,
   arrayIsArray: NATIVE_ARRAY_IS_ARRAY,
   ownKeys: NATIVE_OWN_KEYS,
+  ownDescriptor: NATIVE_OWN_DESCRIPTOR,
+  getPrototype: NATIVE_GET_PROTOTYPE,
+  hasOwn: NATIVE_HAS_OWN,
+  defineProperty: NATIVE_DEFINE_PROPERTY,
 } = require("./rootark-zk10-native-intrinsics-v1");
 const {
   exact, decode, hex, key, verifyOwnerRotationKeys, verifyOwnerCutoverHistory,
@@ -119,19 +124,29 @@ for (let depth = 0; depth < 256; depth += 1) {
   EMPTY.push(sha(INVENTORY_NODE, EMPTY[depth], EMPTY[depth]));
 }
 function verifySparseObjectInventoryProof(accountId, generation, object, siblings, root) {
+  // Public callers can supply a plain Array whose indexed getter runs before
+  // the final cryptographic comparison. A getter or Proxy trap can replace a
+  // mutable process-wide crypto primitive and forge membership in a signed
+  // inventory. Snapshot only native own data slots before hashing anything.
+  if (isProxy(siblings) || !NATIVE_ARRAY_IS_ARRAY(siblings)
+    || NATIVE_GET_PROTOTYPE(siblings) !== Array.prototype
+    || siblings.length !== 256 || NATIVE_OWN_KEYS(siblings).length !== 257) deny();
+  const branch = [];
+  for (let index = 0; index < 256; index += 1) {
+    const descriptor = NATIVE_OWN_DESCRIPTOR(siblings, index);
+    if (!descriptor || !NATIVE_HAS_OWN(descriptor, "value")) deny();
+    NATIVE_DEFINE_PROPERTY(branch, index, { value: hex(descriptor.value) });
+  }
+  const expectedObject = exact(object, OBJECT_FIELDS);
   const entry = normalizedInventoryEntry({
     immutable_account_id: accountId, owner_generation: generation,
-    object_id: object.object_id, revision: object.revision,
-    ciphertext_sha256: object.ciphertext_sha256,
+    object_id: expectedObject.object_id, revision: expectedObject.revision,
+    ciphertext_sha256: expectedObject.ciphertext_sha256,
   });
-  if (!NATIVE_ARRAY_IS_ARRAY(siblings) || siblings.length !== 256
-    || NATIVE_OWN_KEYS(siblings).length !== 257) deny();
   let position = inventoryPosition(entry);
   let current = inventoryLeaf(entry);
-  // Caller callbacks may poison Array.prototype[Symbol.iterator] before this
-  // read. Use the indexed 256 DATA slots, never an ambient iterator.
   for (let depth = 0; depth < 256; depth += 1) {
-    const bytes = NATIVE_BUFFER_FROM(hex(siblings[depth]), "hex");
+    const bytes = NATIVE_BUFFER_FROM(branch[depth], "hex");
     current = position & 1n
       ? sha(INVENTORY_NODE, bytes, current) : sha(INVENTORY_NODE, current, bytes);
     position >>= 1n;
