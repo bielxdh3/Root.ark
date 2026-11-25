@@ -4988,7 +4988,7 @@ class SyncEngine {
     requireNativeRootMutationContext(this);
     await enforceEverFodRootMode(this.rootDir, this.filesOnDemand);
     const recovered = await this.journal.recover();
-    if (this.requireNativeRootRecovery && recovered.some((operation) =>
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && recovered.some((operation) =>
       !this.journal.hasSeen(operation.operationId)
       && (operation.operation === "delete" || operation.tombstone))) {
       // Pre-existing outboxes must not bypass current native custody rules.
@@ -5945,6 +5945,14 @@ class SyncEngine {
           await publishInboundPayload(target, plaintext,
             async () => { if (await exists(target)) await this.stageExisting(target, customTrashTarget); },
             () => { inboundCacheChanged = true; });
+        }
+      }
+      if (operation.operation === "update" && metadata.contentType !== "inode/directory") {
+        const relocated = activeFileIdentityPath(this.snapshot.files, operation, metadata.path);
+        if (relocated && !pathsEqual(relocated, metadata.path)) {
+          cleanupPath = relocated;
+          const src = await contained(this.rootDir, relocated, true);
+          if (await exists(src)) await this.stageExisting(src);
         }
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"),
@@ -7079,6 +7087,10 @@ class SyncEngine {
       if (!this.operationDestinationIsSelected(operation)) {
         // A refused pinned origin must not consume the finite, durable
         // observed[] window before reconciliation rejects its signed MOVE.
+        if (this.requireNativeRootRecovery && !hasNativeCustody(this)) {
+          preflightOutOfScopeMoveBuiltIn.call(this, operation);
+        }
+        await this.verifyIncomingOperation(operation, { preObserve: false });
         preflightOutOfScopeMoveBuiltIn.call(this, operation);
         const verifiedFreshDigest = await this.verifyIncomingOperation(operation);
         await this.reconcileOutOfScopeMove(operation, summary);
