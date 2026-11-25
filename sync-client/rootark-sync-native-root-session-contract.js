@@ -123,9 +123,56 @@ function requireNativeRecoveryAuthority() {
   throw new RootSessionUnavailableError(ROOT_SESSION_ERROR.UNVERIFIED_AUTHORITY);
 }
 
+const path = require("node:path");
+const fs = require("node:fs");
+
+let cachedAddon = null;
+function loadNativeRootSessionAddon() {
+  if (cachedAddon) return cachedAddon;
+  const addonPath = path.resolve(__dirname, "..", "native", "build",
+    `rootark_root_session_${process.platform}_${process.arch}.node`);
+  if (!fs.existsSync(addonPath)) {
+    try {
+      const { buildAddon } = require("../scripts/build-root-session-addon");
+      buildAddon();
+    } catch {
+      throw new RootSessionUnavailableError(ROOT_SESSION_ERROR.NATIVE_UNAVAILABLE);
+    }
+  }
+  if (!fs.existsSync(addonPath)) {
+    throw new RootSessionUnavailableError(ROOT_SESSION_ERROR.NATIVE_UNAVAILABLE);
+  }
+  cachedAddon = require(addonPath);
+  return cachedAddon;
+}
+
+function isVerifiedNativeRootSession(session) {
+  if (!session || typeof session !== "object") return false;
+  try {
+    return loadNativeRootSessionAddon().isVerifiedSession(session) === true;
+  } catch {
+    return false;
+  }
+}
+
+function openCompiledNativeRootSession(rootDir) {
+  if (typeof rootDir !== "string" || !rootDir) {
+    throw new RootSessionUnavailableError(ROOT_SESSION_ERROR.UNTRUSTED_ROOT);
+  }
+  const addon = loadNativeRootSessionAddon();
+  const session = addon.openRootFromTrustedParent(rootDir);
+  if (addon.isVerifiedSession(session) !== true) {
+    throw new RootSessionUnavailableError(ROOT_SESSION_ERROR.UNVERIFIED_AUTHORITY);
+  }
+  return session;
+}
+
 module.exports = {
   ROOT_SESSION_CONTRACT,
   ROOT_SESSION_ERROR,
   openNativeRootSession,
   requireNativeRecoveryAuthority,
+  loadNativeRootSessionAddon,
+  openCompiledNativeRootSession,
+  isVerifiedNativeRootSession,
 };

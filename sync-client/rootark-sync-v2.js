@@ -346,6 +346,7 @@ async function start(options = {}) {
     selectedPaths: config.selectedPaths,
     excludedPaths: config.excludedPaths,
     filesOnDemand: config.filesOnDemand === true,
+    nativeRootSession: config.filesOnDemand === true,
     deviceId: config.deviceId,
     keyEpoch: config.keyEpoch,
     compartmentId: config.compartmentId || "private",
