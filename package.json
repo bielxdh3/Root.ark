@@ -9,6 +9,7 @@
     "validate:dependencies": "npm audit --package-lock-only --audit-level=high",
     "validate:artifacts": "node scripts/validate-runtime-artifacts.js",
     "validate:release-gate": "node scripts/validate-release-gate.js",
+    "build:native": "node scripts/build-root-session-addon.js",
     "validate": "npm run validate:syntax && npm test && npm run validate:dependencies",
     "db:migrate": "node db/migrations.js",
     "db:migrate-json": "node db/migrate-json-to-sqlite.js",

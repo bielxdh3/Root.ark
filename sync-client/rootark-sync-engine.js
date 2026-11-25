@@ -4426,7 +4426,7 @@ class SyncEngine {
     if (!event || typeof event.operationId !== "string" || !event.operationId) fail("WebDAV mutation id is required", "invalid_webdav_mutation");
     const kind = String(event.kind || "");
     if (!["put", "move", "delete"].includes(kind)) fail("Unsupported WebDAV mutation", "invalid_webdav_mutation");
-    if (this.requireNativeRootRecovery && (kind === "delete" || kind === "move")) {
+    if (this.requireNativeRootRecovery && !hasNativeCustody(this) && (kind === "delete" || kind === "move")) {
       // MOVE may also generate a destination tombstone in an overwrite pair.
       denyUntrustedNativeSignedDelete();
     }
