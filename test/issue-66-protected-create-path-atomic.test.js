@@ -182,7 +182,9 @@ test("issue 66 P1: even stored signed CREATE remains pending without independent
     currentDeviceAuthorization: () => true,
   }).open();
   const started = await open();
-  assert.equal((await started.syncOnce()).offline, true);
+  await assert.rejects(started.syncOnce(), { code: "offline" },
+    "FOD mode quarantines the root lock on indeterminate offline push failure");
+  assert.equal((await fsp.stat(path.join(rootDir, ".rootark-sync.lock"))).isDirectory(), true);
   assert.equal(calls, 1);
   assert.equal((await started.journal.recover()).length, 1);
   const authentic = second.list("alice")[0];
@@ -192,6 +194,7 @@ test("issue 66 P1: even stored signed CREATE remains pending without independent
   assert.equal(fullReads, 0,
     "the first attempt has not yet fetched the full remote ciphertext");
 
+  await fsp.rmdir(path.join(rootDir, ".rootark-sync.lock")).catch(() => {});
   const restarted = await open();
   await assert.rejects(restarted.syncOnce(), { code: "remote_admission_unproven" },
     "even genuine signed remote bytes do not constitute an independent physical CAS receipt");
@@ -247,7 +250,9 @@ test("issue 66 P1: malicious signed CREATE echo cannot prove physical admission"
     currentDeviceAuthorization: () => true,
   }).open();
   const interrupted = await open();
-  assert.equal((await interrupted.syncOnce()).offline, true);
+  await assert.rejects(interrupted.syncOnce(), { code: "offline" },
+    "FOD mode quarantines the root lock on indeterminate offline push failure");
+  assert.equal((await fsp.stat(path.join(rootDir, ".rootark-sync.lock"))).isDirectory(), true);
   const pending = await interrupted.journal.recover();
   assert.equal(pending.length, 1);
   assert.equal(pushCount, 1);
@@ -256,6 +261,7 @@ test("issue 66 P1: malicious signed CREATE echo cannot prove physical admission"
   assert.equal(pending[0].operationId, echoed.operationId);
   const originalSnapshot = JSON.stringify(interrupted.snapshot.files);
 
+  await fsp.rmdir(path.join(rootDir, ".rootark-sync.lock")).catch(() => {});
   const restarted = await open();
   await assert.rejects(restarted.syncOnce(), { code: "remote_admission_unproven" },
     "self-echoed signed CREATE cannot clear outbox without an independent physical CAS receipt");
@@ -324,8 +330,11 @@ test("crashing after staging tracked cache for hydration recovers staged identit
         requireAuthorization: false,
         adapter: { push: async () => [], list: async () => [] },
       }).open();
-      const origLink = fsp.link;
-      fsp.link = () => process.exit(42);
+      const origRename = fsp.rename;
+      fsp.rename = async (from, to, ...rest) => {
+        if (require("node:path").basename(to) === "notes.txt") process.exit(42);
+        return origRename.call(fsp, from, to, ...rest);
+      };
       await engine._apply(${JSON.stringify(updateOp)}, null, async () => {});
     })();
   `;

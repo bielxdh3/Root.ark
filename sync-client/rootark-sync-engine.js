@@ -2924,6 +2924,7 @@ class SyncEngine {
     // Run the module-captured implementation, never a caller-replaced
     // instance or prototype hook which could silently disarm required-v2.
     await replayEvictionLedgerBuiltIn.call(this);
+    if (!this.requireNativeRootRecovery) await this.recoverPendingHydrations();
     this.opened = true;
     return this;
   }
@@ -3178,6 +3179,38 @@ class SyncEngine {
       this.snapshot.evictionLedgerRequired = true;
       throw error;
     }
+  }
+
+  async recoverPendingHydrations() {
+    const entries = this.snapshot.pendingHydrations;
+    if (!Array.isArray(entries) || !entries.length) return;
+    const trashDir = path.join(this.rootDir, ".rootark-trash");
+    for (const entry of entries) {
+      if (entry.tempName && entry.targetPath) {
+        const tempPath = path.join(trashDir, entry.tempName);
+        const target = await contained(this.rootDir, entry.targetPath, true);
+        if (await exists(tempPath) && await exists(target)) {
+          const [tempStats, targetStats] = await Promise.all([
+            fsp.lstat(tempPath, { bigint: true }),
+            fsp.lstat(target, { bigint: true }),
+          ]);
+          if (sameFileIdentity(tempStats, targetStats)) {
+            await fsp.unlink(target);
+            await fsp.rm(tempPath, { force: true });
+          }
+        }
+      }
+      const stagedPath = path.join(trashDir, entry.stagedName);
+      await containedAbsolute(this.rootDir, stagedPath, true);
+      if (await exists(stagedPath)) {
+        const source = await contained(this.rootDir, entry.path, true);
+        if (!(await exists(source))) {
+          await this.restoreStagedTrackedFile(entry.path, stagedPath);
+        }
+      }
+    }
+    delete this.snapshot.pendingHydrations;
+    await this.persistSnapshot();
   }
 
   async persistSnapshot() {
@@ -5283,7 +5316,7 @@ class SyncEngine {
     return crypto.createHash("sha256").update(content).digest("hex");
   }
 
-  async stageExisting(target) {
+  async stageExisting(target, customTrashTarget = null) {
     // No Files On-Demand caller may move cached bytes into legacy pathname
     // trash until an independently rooted native mutation session exists.
     // Deny BEFORE the mode-fence helper can itself write an ever-FOD marker
@@ -5298,7 +5331,7 @@ class SyncEngine {
     const trashDir = path.join(this.rootDir, ".rootark-trash");
     await fsp.mkdir(trashDir, { recursive: true });
     await containedAbsolute(this.rootDir, trashDir, false);
-    const trashTarget = path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(safeTarget)}`);
+    const trashTarget = customTrashTarget || path.join(trashDir, `${Date.now()}-${crypto.randomUUID()}-${path.basename(safeTarget)}`);
     await containedAbsolute(this.rootDir, trashTarget, true);
     await fsp.rename(safeTarget, trashTarget);
     return trashTarget;
@@ -5837,8 +5870,27 @@ class SyncEngine {
         // Conversely, an actual rename may complete before reporting EIO:
         // the target-publication callback flips the negative latch BEFORE
         // entering the potentially mutating syscall, not after its result.
+        let customTrashTarget = null;
+        const trackedTarget = beforeHydrationWrite && operation.operation === "update"
+          ? this.snapshot.files[metadata.path] : null;
+        if (!this.requireNativeRootRecovery && trackedTarget && !trackedTarget.deleted && !trackedTarget.directory
+          && trackedTarget.objectId === operation.objectId && trackedTarget.fileId === operation.fileId) {
+          const trashDir = path.join(this.rootDir, ".rootark-trash");
+          await fsp.mkdir(trashDir, { recursive: true });
+          await containedAbsolute(this.rootDir, trashDir, false);
+          const stagedName = `stage-${crypto.randomUUID()}.tmp`;
+          customTrashTarget = path.join(trashDir, stagedName);
+          this.snapshot.pendingHydrations = [{
+            path: metadata.path,
+            stagedName,
+            hash: trackedTarget.hash || "",
+            tempName: null,
+            targetPath: metadata.path,
+          }];
+          await this.persistSnapshot();
+        }
         await publishInboundPayload(target, plaintext,
-          async () => { if (await exists(target)) await this.stageExisting(target); },
+          async () => { if (await exists(target)) await this.stageExisting(target, customTrashTarget); },
           () => { inboundCacheChanged = true; });
       }
       this.rememberOperation(operation, crypto.createHash("sha256").update(plaintext).digest("hex"),
