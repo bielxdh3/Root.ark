@@ -1,7 +1,8 @@
-// Issue #66: Native RootSession N-API addon (Windows NTFS+CFAPI / Linux openat2+renameat2).
+// Issue #66: Hardened Native RootSession N-API addon (Windows NTFS NtCreateFile+CFAPI / Linux openat2+renameat2).
 // Enforces opaque handle custody via napi_type_tag; JS objects/paths cannot forge authority.
 
 #include <node_api.h>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -55,6 +56,20 @@ bool get_utf8(napi_env env, napi_value val, std::string& out) {
   return true;
 }
 
+#ifdef _WIN32
+bool is_win_reserved_name(const std::string& seg) {
+  if (seg.empty()) return true;
+  if (seg.back() == '.' || seg.back() == ' ') return true;
+  size_t dot = seg.find('.');
+  std::string base = (dot == std::string::npos) ? seg : seg.substr(0, dot);
+  for (char& c : base) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  if (base == "CON" || base == "PRN" || base == "AUX" || base == "NUL") return true;
+  if (base.size() == 4 && (base.rfind("COM", 0) == 0 || base.rfind("LPT", 0) == 0)
+      && base[3] >= '1' && base[3] <= '9') return true;
+  return false;
+}
+#endif
+
 bool split_safe_rel(const std::string& rel, std::vector<std::string>& parts) {
   parts.clear();
   if (rel.empty() || rel.size() > 2048) return false;
@@ -68,6 +83,9 @@ bool split_safe_rel(const std::string& rel, std::vector<std::string>& parts) {
     size_t slash = rel.find('/', start);
     std::string seg = (slash == std::string::npos) ? rel.substr(start) : rel.substr(start, slash - start);
     if (seg.empty() || seg == "." || seg == "..") return false;
+#ifdef _WIN32
+    if (is_win_reserved_name(seg)) return false;
+#endif
     parts.push_back(seg);
     if (slash == std::string::npos) break;
     start = slash + 1;
@@ -76,6 +94,16 @@ bool split_safe_rel(const std::string& rel, std::vector<std::string>& parts) {
 }
 
 #ifdef _WIN32
+
+using NtCreateFileFn = NTSTATUS (NTAPI*)(
+  PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
+  PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
+
+NtCreateFileFn get_nt_create_file() {
+  static NtCreateFileFn fn = reinterpret_cast<NtCreateFileFn>(
+    GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile"));
+  return fn;
+}
 
 std::wstring utf8_to_wide(const std::string& s) {
   if (s.empty()) return L"";
@@ -95,8 +123,14 @@ std::string wide_to_utf8(const std::wstring& w) {
   return s;
 }
 
+std::wstring to_extended_path(const std::wstring& p) {
+  if (p.rfind(L"\\\\?\\", 0) == 0) return p;
+  if (p.size() >= 3 && p[1] == L':' && p[2] == L'\\') return L"\\\\?\\" + p;
+  return p;
+}
+
 bool verify_dir_handle(HANDLE h, FILE_ID_INFO& out_id) {
-  if (h == INVALID_HANDLE_VALUE) return false;
+  if (h == INVALID_HANDLE_VALUE || h == nullptr) return false;
   FILE_ATTRIBUTE_TAG_INFO attr{};
   if (!GetFileInformationByHandleEx(h, FileAttributeTagInfo, &attr, sizeof(attr))) return false;
   if (!(attr.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
@@ -107,6 +141,46 @@ bool verify_dir_handle(HANDLE h, FILE_ID_INFO& out_id) {
   wchar_t fsname[64]{};
   if (!GetVolumeInformationByHandleW(h, nullptr, 0, nullptr, nullptr, nullptr, fsname, 64)) return false;
   return _wcsicmp(fsname, L"NTFS") == 0;
+}
+
+bool verify_root_owner_dacl(HANDLE h) {
+  HANDLE tok = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+  DWORD needed = 0;
+  GetTokenInformation(tok, TokenUser, nullptr, 0, &needed);
+  std::vector<unsigned char> tbuf(needed);
+  bool tok_ok = needed > 0 && GetTokenInformation(tok, TokenUser, tbuf.data(), needed, &needed);
+  CloseHandle(tok);
+  if (!tok_ok) return false;
+  PSID cur_sid = reinterpret_cast<TOKEN_USER*>(tbuf.data())->User.Sid;
+
+  PSECURITY_DESCRIPTOR sd = nullptr;
+  PSID owner = nullptr;
+  PACL dacl = nullptr;
+  if (GetSecurityInfo(h, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+      &owner, nullptr, &dacl, nullptr, &sd) != ERROR_SUCCESS) return false;
+  bool ok = owner && (EqualSid(owner, cur_sid) || IsWellKnownSid(owner, WinBuiltinAdministratorsSid));
+  if (ok && dacl) {
+    ACL_SIZE_INFORMATION asi{};
+    if (!GetAclInformation(dacl, &asi, sizeof(asi), AclSizeInformation)) ok = false;
+    for (DWORD i = 0; ok && i < asi.AceCount; ++i) {
+      LPVOID ace = nullptr;
+      if (!GetAce(dacl, i, &ace)) { ok = false; break; }
+      auto* hdr = static_cast<PACE_HEADER>(ace);
+      if (hdr->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+        auto* aa = static_cast<PACCESS_ALLOWED_ACE>(ace);
+        PSID s = &aa->SidStart;
+        bool write_mask = (aa->Mask & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES
+          | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL)) != 0;
+        if (write_mask && !EqualSid(s, cur_sid) && !IsWellKnownSid(s, WinLocalSystemSid)
+            && !IsWellKnownSid(s, WinBuiltinAdministratorsSid)) {
+          ok = false;
+        }
+      }
+    }
+  }
+  LocalFree(sd);
+  return ok;
 }
 
 bool same_file_id(const FILE_ID_INFO& a, const FILE_ID_INFO& b) {
@@ -125,6 +199,29 @@ bool verify_same_path_id(const std::wstring& p, const FILE_ID_INFO& expected) {
   return ok;
 }
 
+// Open strictly relative to a held directory HANDLE via NtCreateFile (no intermediate pathname TOCTOU).
+HANDLE open_step_relative(HANDLE dir_h, const std::wstring& seg, ACCESS_MASK access,
+    DWORD share, ULONG disp, ULONG create_opts, NTSTATUS* out_status = nullptr) {
+  auto nt_create = get_nt_create_file();
+  if (!nt_create || dir_h == INVALID_HANDLE_VALUE || seg.empty() || seg.size() > 255) return INVALID_HANDLE_VALUE;
+  UNICODE_STRING ustr{};
+  ustr.Length = static_cast<USHORT>(seg.size() * sizeof(wchar_t));
+  ustr.MaximumLength = ustr.Length;
+  ustr.Buffer = const_cast<PWSTR>(seg.data());
+  OBJECT_ATTRIBUTES oa{};
+  oa.Length = sizeof(oa);
+  oa.RootDirectory = dir_h;
+  oa.ObjectName = &ustr;
+  oa.Attributes = OBJ_CASE_INSENSITIVE;
+  IO_STATUS_BLOCK iosb{};
+  HANDLE out = INVALID_HANDLE_VALUE;
+  NTSTATUS st = nt_create(&out, access, &oa, &iosb, nullptr, FILE_ATTRIBUTE_NORMAL,
+    share, disp, create_opts | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
+  if (out_status) *out_status = st;
+  if (!NT_SUCCESS(st)) return INVALID_HANDLE_VALUE;
+  return out;
+}
+
 struct AncestorHandle {
   HANDLE h = INVALID_HANDLE_VALUE;
   std::wstring path;
@@ -134,6 +231,7 @@ struct AncestorHandle {
 
 struct NativeSession {
   std::wstring root_path;
+  std::wstring root_ext_path;
   HANDLE root_handle = INVALID_HANDLE_VALUE;
   FILE_ID_INFO root_id{};
   std::vector<std::unique_ptr<AncestorHandle>> ancestors;
@@ -161,7 +259,7 @@ struct NativeSession {
 
   bool verify_custody() const {
     if (closed || root_handle == INVALID_HANDLE_VALUE) return false;
-    if (!verify_same_path_id(root_path, root_id)) return false;
+    if (!verify_same_path_id(root_ext_path, root_id)) return false;
     for (const auto& a : ancestors) {
       if (!verify_same_path_id(a->path, a->id)) return false;
     }
@@ -169,6 +267,7 @@ struct NativeSession {
   }
 
   bool open_root(const std::string& utf8_root) {
+    if (!get_nt_create_file()) return false;
     std::wstring w = utf8_to_wide(utf8_root);
     if (w.size() < 4 || w[1] != L':' || w[2] != L'\\') return false;
     wchar_t full[4096]{};
@@ -176,13 +275,13 @@ struct NativeSession {
     if (!flen || flen >= 4096) return false;
     root_path = full;
     while (root_path.size() > 3 && root_path.back() == L'\\') root_path.pop_back();
+    root_ext_path = to_extended_path(root_path);
 
-    // Pin ancestors from drive root (X:\) up to parent of root_path.
     std::wstring prefix = root_path.substr(0, 3);
     auto push_ancestor = [&](const std::wstring& seg) -> bool {
       auto a = std::make_unique<AncestorHandle>();
-      a->path = seg;
-      a->h = CreateFileW(seg.c_str(), FILE_READ_ATTRIBUTES,
+      a->path = to_extended_path(seg);
+      a->h = CreateFileW(a->path.c_str(), FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
       if (a->h == INVALID_HANDLE_VALUE) return false;
@@ -194,37 +293,36 @@ struct NativeSession {
     size_t pos = 3;
     while (pos < root_path.size()) {
       size_t next = root_path.find(L'\\', pos);
-      if (next == std::wstring::npos) break; // root_path itself is opened below
-      std::wstring sub = root_path.substr(0, next);
-      if (!push_ancestor(sub)) return false;
+      if (next == std::wstring::npos) break;
+      if (!push_ancestor(root_path.substr(0, next))) return false;
       pos = next + 1;
     }
 
-    root_handle = CreateFileW(root_path.c_str(),
-      FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | READ_CONTROL | FILE_ADD_FILE,
+    root_handle = CreateFileW(root_ext_path.c_str(),
+      FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | READ_CONTROL | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | SYNCHRONIZE,
       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    return verify_dir_handle(root_handle, root_id);
+    return verify_dir_handle(root_handle, root_id) && verify_root_owner_dacl(root_handle);
   }
 
-  std::wstring resolve_contained(const std::vector<std::string>& parts, bool ensure_parents) {
-    if (!verify_custody()) return L"";
-    std::wstring cur = root_path;
-    for (size_t i = 0; i < parts.size(); ++i) {
-      std::wstring seg = utf8_to_wide(parts[i]);
-      if (seg.empty()) return L"";
-      cur += L"\\";
-      cur += seg;
-      if (i + 1 < parts.size()) {
-        if (ensure_parents) CreateDirectoryW(cur.c_str(), nullptr);
-        HANDLE dh = CreateFileW(cur.c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
-          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-          FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-        FILE_ID_INFO did{};
-        bool ok = verify_dir_handle(dh, did);
-        if (dh != INVALID_HANDLE_VALUE) CloseHandle(dh);
-        if (!ok) return L"";
-      }
+  HANDLE open_dir_chain(const std::vector<std::string>& dir_parts, bool ensure_parents) {
+    if (!verify_custody()) return INVALID_HANDLE_VALUE;
+    HANDLE cur = INVALID_HANDLE_VALUE;
+    if (!DuplicateHandle(GetCurrentProcess(), root_handle, GetCurrentProcess(), &cur, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+      return INVALID_HANDLE_VALUE;
+    }
+    for (const auto& seg_utf8 : dir_parts) {
+      std::wstring seg = utf8_to_wide(seg_utf8);
+      if (seg.empty()) { CloseHandle(cur); return INVALID_HANDLE_VALUE; }
+      ULONG disp = ensure_parents ? FILE_OPEN_IF : FILE_OPEN;
+      HANDLE next = open_step_relative(cur, seg,
+        FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, disp, FILE_DIRECTORY_FILE);
+      CloseHandle(cur);
+      if (next == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+      FILE_ID_INFO did{};
+      if (!verify_dir_handle(next, did)) { CloseHandle(next); return INVALID_HANDLE_VALUE; }
+      cur = next;
     }
     return cur;
   }
@@ -267,14 +365,21 @@ struct NativeSession {
   bool verify_custody() const {
     if (closed || root_fd < 0) return false;
     struct stat st{};
-    if (fstat(root_fd, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
-    return st.st_dev == root_dev && st.st_ino == root_ino;
+    if (fstat(root_fd, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_nlink == 0) return false;
+    if (st.st_dev != root_dev || st.st_ino != root_ino) return false;
+    for (const auto& a : ancestors) {
+      struct stat ast{};
+      if (fstat(a->fd, &ast) != 0 || !S_ISDIR(ast.st_mode) || ast.st_nlink == 0) return false;
+      if (ast.st_dev != a->dev || ast.st_ino != a->ino) return false;
+    }
+    return true;
   }
 
   bool open_root(const std::string& path) {
     if (path.empty() || path[0] != '/') return false;
     root_path = path;
     while (root_path.size() > 1 && root_path.back() == '/') root_path.pop_back();
+    uid_t uid = geteuid();
 
     int slash_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (slash_fd < 0) return false;
@@ -296,11 +401,13 @@ struct NativeSession {
       struct stat cst{};
       if (fstat(next_fd, &cst) != 0 || !S_ISDIR(cst.st_mode)) { close(next_fd); return false; }
       if (next == std::string::npos) {
+        if (cst.st_uid != uid || (cst.st_mode & 0022) != 0) { close(next_fd); return false; }
         root_fd = next_fd;
         root_dev = cst.st_dev;
         root_ino = cst.st_ino;
         break;
       } else {
+        if ((cst.st_mode & 0022) != 0 && !(cst.st_mode & S_ISVTX)) { close(next_fd); return false; }
         auto a = std::make_unique<AncestorFd>();
         a->fd = next_fd; a->dev = cst.st_dev; a->ino = cst.st_ino;
         cur_fd = next_fd;
@@ -308,11 +415,7 @@ struct NativeSession {
       }
       pos = next + 1;
     }
-    if (root_fd < 0 && root_path == "/") {
-      root_fd = dup(slash_fd);
-      root_dev = st.st_dev;
-      root_ino = st.st_ino;
-    }
+    if (root_fd < 0 && root_path == "/") return false;
     return root_fd >= 0;
   }
 
@@ -363,8 +466,9 @@ napi_value fn_open_child_dir(napi_env env, napi_callback_info info) {
   std::vector<std::string> parts;
   if (!split_safe_rel(rel, parts)) return throw_err(env, "root_session_unsafe_traversal", "Unsafe relative directory");
 #ifdef _WIN32
-  std::vector<std::string> with_dummy = parts; with_dummy.push_back("_");
-  if (s->resolve_contained(with_dummy, true).empty()) return throw_err(env, "root_session_unsafe_traversal", "Directory custody failed");
+  HANDLE dh = s->open_dir_chain(parts, true);
+  if (dh == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_unsafe_traversal", "Directory custody failed");
+  CloseHandle(dh);
 #else
   std::vector<std::string> with_dummy = parts; with_dummy.push_back("_");
   std::string leaf;
@@ -388,25 +492,29 @@ napi_value fn_enumerate_dir(napi_env env, napi_callback_info info) {
   napi_value arr; napi_create_array(env, &arr);
   uint32_t idx = 0;
 #ifdef _WIN32
-  if (!s->verify_custody()) return throw_err(env, "root_session_root_identity_changed", "Root identity changed");
-  std::wstring dir = s->root_path;
-  if (!rel.empty()) {
-    std::vector<std::string> parts;
-    if (!split_safe_rel(rel, parts)) return throw_err(env, "root_session_unsafe_traversal", "Unsafe directory");
-    dir = s->resolve_contained(parts, false);
-    if (dir.empty()) return throw_err(env, "root_session_unsafe_traversal", "Directory missing");
+  std::vector<std::string> parts;
+  if (!rel.empty() && !split_safe_rel(rel, parts)) return throw_err(env, "root_session_unsafe_traversal", "Unsafe directory");
+  HANDLE dh = s->open_dir_chain(parts, false);
+  if (dh == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_unsafe_traversal", "Directory missing");
+  // Enumerate through the exact held directory HANDLE via GetFileInformationByHandleEx(FileFullDirectoryInfo).
+  std::vector<unsigned char> buf(65536);
+  FILE_INFO_BY_HANDLE_CLASS cls = FileFullDirectoryRestartInfo;
+  while (GetFileInformationByHandleEx(dh, cls, buf.data(), static_cast<DWORD>(buf.size()))) {
+    cls = FileFullDirectoryInfo;
+    size_t off = 0;
+    for (;;) {
+      auto* entry = reinterpret_cast<FILE_FULL_DIR_INFO*>(buf.data() + off);
+      std::wstring wname(entry->FileName, entry->FileNameLength / sizeof(wchar_t));
+      if (wname != L"." && wname != L"..") {
+        std::string name = wide_to_utf8(wname);
+        napi_value v; napi_create_string_utf8(env, name.c_str(), name.size(), &v);
+        napi_set_element(env, arr, idx++, v);
+      }
+      if (entry->NextEntryOffset == 0) break;
+      off += entry->NextEntryOffset;
+    }
   }
-  std::wstring pat = dir + L"\\*";
-  WIN32_FIND_DATAW fd{};
-  HANDLE f = FindFirstFileExW(pat.c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
-  if (f == INVALID_HANDLE_VALUE) return arr;
-  do {
-    if (std::wcscmp(fd.cFileName, L".") == 0 || std::wcscmp(fd.cFileName, L"..") == 0) continue;
-    std::string name = wide_to_utf8(fd.cFileName);
-    napi_value v; napi_create_string_utf8(env, name.c_str(), name.size(), &v);
-    napi_set_element(env, arr, idx++, v);
-  } while (FindNextFileW(f, &fd));
-  FindClose(f);
+  CloseHandle(dh);
 #else
   if (!s->verify_custody()) return throw_err(env, "root_session_root_identity_changed", "Root identity changed");
   int dfd = -1;
@@ -441,10 +549,12 @@ napi_value fn_open_contained_file(napi_env env, napi_callback_info info) {
   if (!split_safe_rel(rel, parts)) return throw_err(env, "root_session_unsafe_traversal", "Unsafe path");
   napi_value obj; napi_create_object(env, &obj);
 #ifdef _WIN32
-  std::wstring target = s->resolve_contained(parts, false);
-  if (target.empty()) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
-  HANDLE h = CreateFileW(target.c_str(), FILE_READ_ATTRIBUTES | GENERIC_READ,
-    FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  std::vector<std::string> dirs(parts.begin(), parts.end() - 1);
+  HANDLE ph = s->open_dir_chain(dirs, false);
+  if (ph == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
+  HANDLE h = open_step_relative(ph, utf8_to_wide(parts.back()), FILE_READ_ATTRIBUTES | FILE_READ_DATA | SYNCHRONIZE,
+    FILE_SHARE_READ, FILE_OPEN, FILE_NON_DIRECTORY_FILE);
+  CloseHandle(ph);
   if (h == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_native_unavailable", "Open failed");
   BY_HANDLE_FILE_INFORMATION info_b{};
   FILE_ATTRIBUTE_TAG_INFO tag{};
@@ -461,7 +571,7 @@ napi_value fn_open_contained_file(napi_env env, napi_callback_info info) {
   std::string leaf;
   int pfd = s->open_parent_dir(parts, false, leaf);
   if (pfd < 0) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
-  int ffd = sys_openat2(pfd, leaf.c_str(), O_RDONLY, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV);
+  int ffd = sys_openat2(pfd, leaf.c_str(), O_RDONLY | O_NONBLOCK, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV);
   close(pfd);
   if (ffd < 0) return throw_err(env, "root_session_native_unavailable", "Open failed");
   struct stat st{};
@@ -484,10 +594,12 @@ napi_value fn_read_opened_file(napi_env env, napi_callback_info info) {
   std::vector<std::string> parts;
   if (!split_safe_rel(rel, parts)) return throw_err(env, "root_session_unsafe_traversal", "Unsafe path");
 #ifdef _WIN32
-  std::wstring target = s->resolve_contained(parts, false);
-  if (target.empty()) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
-  HANDLE h = CreateFileW(target.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  std::vector<std::string> dirs(parts.begin(), parts.end() - 1);
+  HANDLE ph = s->open_dir_chain(dirs, false);
+  if (ph == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
+  HANDLE h = open_step_relative(ph, utf8_to_wide(parts.back()), FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+    FILE_SHARE_READ, FILE_OPEN, FILE_NON_DIRECTORY_FILE);
+  CloseHandle(ph);
   if (h == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_native_unavailable", "Open failed");
   BY_HANDLE_FILE_INFORMATION b{};
   if (!GetFileInformationByHandle(h, &b) || (b.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) || b.nNumberOfLinks != 1) {
@@ -506,7 +618,7 @@ napi_value fn_read_opened_file(napi_env env, napi_callback_info info) {
   std::string leaf;
   int pfd = s->open_parent_dir(parts, false, leaf);
   if (pfd < 0) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
-  int ffd = sys_openat2(pfd, leaf.c_str(), O_RDONLY, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV);
+  int ffd = sys_openat2(pfd, leaf.c_str(), O_RDONLY | O_NONBLOCK, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV);
   close(pfd);
   if (ffd < 0) return throw_err(env, "root_session_native_unavailable", "Open failed");
   struct stat st{};
@@ -540,13 +652,16 @@ napi_value fn_create_exclusive(napi_env env, napi_callback_info info) {
   std::vector<std::string> parts;
   if (!split_safe_rel(rel, parts)) return throw_err(env, "root_session_unsafe_traversal", "Unsafe path");
 #ifdef _WIN32
-  std::wstring target = s->resolve_contained(parts, true);
-  if (target.empty()) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
-  HANDLE h = CreateFileW(target.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES,
-    0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  std::vector<std::string> dirs(parts.begin(), parts.end() - 1);
+  HANDLE ph = s->open_dir_chain(dirs, true);
+  if (ph == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
+  NTSTATUS ntst = 0;
+  HANDLE h = open_step_relative(ph, utf8_to_wide(parts.back()), FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+    0, FILE_CREATE, FILE_NON_DIRECTORY_FILE, &ntst);
+  CloseHandle(ph);
   if (h == INVALID_HANDLE_VALUE) {
-    DWORD err = GetLastError();
-    return throw_err(env, err == ERROR_FILE_EXISTS ? "root_session_no_replace_conflict" : "root_session_native_unavailable", "Exclusive create failed");
+    bool collision = (ntst == static_cast<NTSTATUS>(0xC0000035L)); // STATUS_OBJECT_NAME_COLLISION
+    return throw_err(env, collision ? "root_session_no_replace_conflict" : "root_session_native_unavailable", "Exclusive create failed");
   }
   DWORD wrote = 0;
   bool ok = (len == 0) || (WriteFile(h, data, static_cast<DWORD>(len), &wrote, nullptr) && wrote == len);
@@ -590,23 +705,42 @@ napi_value fn_rename_no_replace(napi_env env, napi_callback_info info) {
   if (!split_safe_rel(src_rel, src_p) || !split_safe_rel(dst_rel, dst_p))
     return throw_err(env, "root_session_unsafe_traversal", "Unsafe paths");
 #ifdef _WIN32
-  std::wstring src = s->resolve_contained(src_p, false);
-  std::wstring dst = s->resolve_contained(dst_p, true);
-  if (src.empty() || dst.empty()) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
-  HANDLE h = CreateFileW(src.c_str(), DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-  if (h == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_native_unavailable", "Source open failed");
-  std::vector<unsigned char> buf(sizeof(FILE_RENAME_INFO) + dst.size() * sizeof(wchar_t));
+  std::vector<std::string> sdirs(src_p.begin(), src_p.end() - 1);
+  std::vector<std::string> ddirs(dst_p.begin(), dst_p.end() - 1);
+  HANDLE sph = s->open_dir_chain(sdirs, false);
+  HANDLE dph = s->open_dir_chain(ddirs, true);
+  if (sph == INVALID_HANDLE_VALUE || dph == INVALID_HANDLE_VALUE) {
+    if (sph != INVALID_HANDLE_VALUE) CloseHandle(sph);
+    if (dph != INVALID_HANDLE_VALUE) CloseHandle(dph);
+    return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
+  }
+  HANDLE h = open_step_relative(sph, utf8_to_wide(src_p.back()), DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, 0);
+  CloseHandle(sph);
+  if (h == INVALID_HANDLE_VALUE) { CloseHandle(dph); return throw_err(env, "root_session_native_unavailable", "Source open failed"); }
+  BY_HANDLE_FILE_INFORMATION b{};
+  if (!GetFileInformationByHandle(h, &b) || (b.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+      || (!(b.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && b.nNumberOfLinks != 1)) {
+    CloseHandle(h); CloseHandle(dph);
+    return throw_err(env, "root_session_unsafe_traversal", "Refusing untrusted rename source");
+  }
+  std::wstring dst_leaf = utf8_to_wide(dst_p.back());
+  std::vector<unsigned char> buf(sizeof(FILE_RENAME_INFO) + dst_leaf.size() * sizeof(wchar_t));
   auto* ri = reinterpret_cast<FILE_RENAME_INFO*>(buf.data());
   ri->ReplaceIfExists = FALSE;
-  ri->RootDirectory = nullptr;
-  ri->FileNameLength = static_cast<DWORD>(dst.size() * sizeof(wchar_t));
-  std::memcpy(ri->FileName, dst.data(), ri->FileNameLength);
-  bool ok = SetFileInformationByHandle(h, FileRenameInfo, ri, static_cast<DWORD>(buf.size())) != 0;
-  DWORD err = ok ? 0 : GetLastError();
-  CloseHandle(h);
-  if (!ok) {
-    return throw_err(env, (err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS)
+  ri->RootDirectory = dph;
+  ri->FileNameLength = static_cast<DWORD>(dst_leaf.size() * sizeof(wchar_t));
+  std::memcpy(ri->FileName, dst_leaf.data(), ri->FileNameLength);
+  using NtSetInfoFn = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+  static NtSetInfoFn nt_set_info = reinterpret_cast<NtSetInfoFn>(
+    GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationFile"));
+  IO_STATUS_BLOCK iosb{};
+  NTSTATUS st = nt_set_info
+    ? nt_set_info(h, &iosb, ri, static_cast<ULONG>(buf.size()), 10 /* FileRenameInformation */)
+    : static_cast<NTSTATUS>(0xC0000001L);
+  CloseHandle(h); CloseHandle(dph);
+  if (!NT_SUCCESS(st)) {
+    return throw_err(env, (st == static_cast<NTSTATUS>(0xC0000035L)) /* STATUS_OBJECT_NAME_COLLISION */
       ? "root_session_no_replace_conflict" : "root_session_native_unavailable", "No-replace rename failed");
   }
 #else
@@ -616,6 +750,12 @@ napi_value fn_rename_no_replace(napi_env env, napi_callback_info info) {
   if (sp < 0 || dp < 0) {
     if (sp >= 0) close(sp); if (dp >= 0) close(dp);
     return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
+  }
+  struct stat sst{};
+  if (fstatat(sp, sl.c_str(), &sst, AT_SYMLINK_NOFOLLOW) != 0 || S_ISLNK(sst.st_mode)
+      || (S_ISREG(sst.st_mode) && sst.st_nlink != 1)) {
+    close(sp); close(dp);
+    return throw_err(env, "root_session_unsafe_traversal", "Refusing untrusted rename source");
   }
   long rc = syscall(SYS_renameat2, sp, sl.c_str(), dp, dl.c_str(), RENAME_NOREPLACE);
   int e = errno;
@@ -639,10 +779,12 @@ napi_value fn_remove_entry(napi_env env, napi_callback_info info) {
   std::vector<std::string> parts;
   if (!split_safe_rel(rel, parts)) return throw_err(env, "root_session_unsafe_traversal", "Unsafe path");
 #ifdef _WIN32
-  std::wstring target = s->resolve_contained(parts, false);
-  if (target.empty()) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
-  HANDLE h = CreateFileW(target.c_str(), DELETE | FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  std::vector<std::string> dirs(parts.begin(), parts.end() - 1);
+  HANDLE ph = s->open_dir_chain(dirs, false);
+  if (ph == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
+  HANDLE h = open_step_relative(ph, utf8_to_wide(parts.back()), DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, 0);
+  CloseHandle(ph);
   if (h == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_native_unavailable", "Open for delete failed");
   FILE_ATTRIBUTE_TAG_INFO tag{};
   BY_HANDLE_FILE_INFORMATION b{};
@@ -660,8 +802,12 @@ napi_value fn_remove_entry(napi_env env, napi_callback_info info) {
   std::string leaf;
   int pfd = s->open_parent_dir(parts, false, leaf);
   if (pfd < 0) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
-  int rc = unlinkat(pfd, leaf.c_str(), 0);
-  if (rc != 0 && errno == EISDIR) rc = unlinkat(pfd, leaf.c_str(), AT_REMOVEDIR);
+  struct stat st{};
+  if (fstatat(pfd, leaf.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0 || S_ISLNK(st.st_mode)
+      || (S_ISREG(st.st_mode) && st.st_nlink != 1)) {
+    close(pfd); return throw_err(env, "root_session_unsafe_traversal", "Refusing unsafe remove");
+  }
+  int rc = unlinkat(pfd, leaf.c_str(), S_ISDIR(st.st_mode) ? AT_REMOVEDIR : 0);
   if (rc == 0) (void)fsync(pfd);
   close(pfd);
   if (rc != 0) return throw_err(env, "root_session_native_unavailable", "unlinkat failed");
@@ -675,6 +821,44 @@ napi_value fn_sync_file_or_dir(napi_env env, napi_callback_info info) {
   NativeSession* s = unwrap_session(env, self);
   if (!s) return nullptr;
   if (!s->verify_custody()) return throw_err(env, "root_session_root_identity_changed", "Root identity changed");
+  std::string rel;
+  if (argc >= 1) {
+    napi_valuetype t; napi_typeof(env, argv[0], &t);
+    if (t == napi_string && !get_utf8(env, argv[0], rel)) return throw_err(env, "root_session_unsafe_traversal", "Invalid path");
+  }
+#ifdef _WIN32
+  if (!rel.empty()) {
+    std::vector<std::string> parts;
+    if (!split_safe_rel(rel, parts)) return throw_err(env, "root_session_unsafe_traversal", "Unsafe path");
+    std::vector<std::string> dirs(parts.begin(), parts.end() - 1);
+    HANDLE ph = s->open_dir_chain(dirs, false);
+    if (ph == INVALID_HANDLE_VALUE) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
+    HANDLE h = open_step_relative(ph, utf8_to_wide(parts.back()), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, 0);
+    CloseHandle(ph);
+    if (h != INVALID_HANDLE_VALUE) {
+      FlushFileBuffers(h);
+      CloseHandle(h);
+    }
+  }
+#else
+  if (!rel.empty()) {
+    std::vector<std::string> parts;
+    if (!split_safe_rel(rel, parts)) return throw_err(env, "root_session_unsafe_traversal", "Unsafe path");
+    std::string leaf;
+    int pfd = s->open_parent_dir(parts, false, leaf);
+    if (pfd < 0) return throw_err(env, "root_session_unsafe_traversal", "Untrusted parent");
+    int ffd = sys_openat2(pfd, leaf.c_str(), O_RDONLY | O_NONBLOCK, 0, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV);
+    if (ffd >= 0) {
+      if (fsync(ffd) != 0) { close(ffd); close(pfd); return throw_err(env, "root_session_durability_indeterminate", "fsync failed"); }
+      close(ffd);
+    }
+    if (fsync(pfd) != 0) { close(pfd); return throw_err(env, "root_session_durability_indeterminate", "dir fsync failed"); }
+    close(pfd);
+  } else {
+    if (fsync(s->root_fd) != 0) return throw_err(env, "root_session_durability_indeterminate", "root fsync failed");
+  }
+#endif
   napi_value out; napi_get_boolean(env, true, &out); return out;
 }
 
@@ -693,6 +877,9 @@ napi_value fn_commit_durable_recovery(napi_env env, napi_callback_info info) {
   NativeSession* s = unwrap_session(env, self);
   if (!s) return nullptr;
   if (!s->verify_custody()) return throw_err(env, "root_session_durability_indeterminate", "Custody lost");
+#ifndef _WIN32
+  if (fsync(s->root_fd) != 0) return throw_err(env, "root_session_durability_indeterminate", "root fsync failed");
+#endif
   napi_value out; napi_get_boolean(env, true, &out); return out;
 }
 
@@ -713,6 +900,7 @@ napi_value fn_cfapi_connect(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   NativeSession* s = unwrap_session(env, self);
   if (!s) return nullptr;
+  if (!s->verify_custody()) return throw_err(env, "root_session_root_identity_changed", "Custody lost");
 #ifdef _WIN32
   if (s->cf_connected) { napi_value out; napi_get_boolean(env, true, &out); return out; }
   CF_SYNC_REGISTRATION reg{};
