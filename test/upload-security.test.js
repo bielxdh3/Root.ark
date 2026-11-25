@@ -1684,3 +1684,14 @@ test("chunk metadata failure leaves a previously absent part uncommitted", { tim
   assert.deepEqual(fs.readdirSync(sessionDir).filter((name) => name.startsWith(".metadata-scrub-")), []);
 });
 
+
+test("kernel-assigned HTTP fixture port is announced by its own server", { timeout: 60_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    kernelAssignedPort: true,
+    preloadSource: 'if (process.env.PORT !== "0") throw new Error("expected a kernel-assigned fixture port");',
+  });
+  assert.ok(Number.isInteger(harness.port) && harness.port > 0 && harness.port <= 65535);
+  assert.equal((await request(harness.port, "/login.html")).status, 200);
+  assert.equal(harness.child.exitCode, null);
+});
+
