@@ -145,7 +145,7 @@ for (const [name, files] of [
   ["Phase 16 opaque group sharing", ["test/phase16-group-sharing.test.js"]],
   ["Phase 16 final correction boundary", ["test/phase16-final-corrections.test.js"]],
   ["Realtime transport boundary", ["test/realtime-transport-boundaries.test.js"]],
-  ["Upload security boundary", ["test/upload-security.test.js"]],
+  ["Upload security boundary", ["test/upload-security.test.js", "test/upload-security-part2.test.js", "test/upload-security-part3.test.js"]],
   ["Cloud inventory containment", ["test/cloud-storage.test.js"]],
   ["Phase 14 readiness/attestation", ["test/phase14-deployment-resilience.test.js"]],
   ["Phase 14 backup/restore evidence", ["test/backup-restore-security.test.js"]],
