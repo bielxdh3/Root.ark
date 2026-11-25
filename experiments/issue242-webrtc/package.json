@@ -1,0 +1,16 @@
+{
+  "name": "rootark-issue242-disposable-webrtc",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Isolated loopback-only WebRTC room proof of concept, not Root.ark production code",
+  "scripts": {
+    "start": "node server.cjs",
+    "test": "node --test tests/signal.test.cjs tests/session.test.cjs tests/transfer.test.cjs tests/client-races.test.cjs tests/send-window.test.cjs tests/stale-room-vm.test.cjs tests/client-room-races.test.cjs tests/create-room-capacity.test.cjs tests/create-room-http-disconnect.test.cjs tests/turn-config-policy.test.cjs tests/broker-review-p2.test.cjs tests/bound-pretrust-gate.test.cjs tests/immutable-version-authority.test.cjs tests/test-script-coverage.test.cjs",
+    "test:browser": "node tests/browser.cjs",
+    "test:app-browser": "node tests/app-browser.cjs"
+  },
+  "dependencies": {
+    "jsonwebtoken": "9.0.3",
+    "ws": "^8.22.0"
+  }
+}

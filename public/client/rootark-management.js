@@ -460,7 +460,7 @@
           <div class="section-heading"><div><h2>Filtros</h2><p>Filtre eventos pelo usuário, tipo, resultado ou período.</p></div></div>
           <div class="form-grid audit-filter-grid">
             <div class="field-row"><label for="audit-username">Usuário</label><input class="field" id="audit-username" name="username" type="text" autocomplete="off" /></div>
-            <div class="field-row"><label for="audit-event-type">Evento</label><select class="field" id="audit-event-type" name="eventType"><option value="">Todos os eventos</option><option value="auth.login.success">Login bem-sucedido</option><option value="auth.login.failed">Login falho</option><option value="file.upload">Envio de arquivo</option><option value="file.download">Download</option><option value="file.delete">Exclusão de arquivo</option><option value="file.approve">Aprovação</option><option value="user.permission.changed">Permissão alterada</option><option value="user.deleted">Conta excluída</option><option value="system.anomaly.detected">Anomalia</option></select></div>
+            <div class="field-row"><label for="audit-event-type">Evento</label><select class="field" id="audit-event-type" name="eventType"><option value="">Todos os eventos</option><option value="auth.login.success">Login bem-sucedido</option><option value="auth.login.failed">Login falho</option><option value="file.upload">Envio de arquivo</option><option value="file.download">Download</option><option value="file.delete">Exclusão de arquivo</option><option value="file.approve">Aprovação</option><option value="user.permission.changed">Permissão alterada</option><option value="user.deleted">Conta excluída</option><option value="system.anomaly.detected">Anomalia</option><optgroup label="Backup e restauração"><option value="backup.created">Backup criado</option><option value="backup.failed">Falha no backup</option><option value="backup.deleted">Backup excluído</option><option value="backup.downloaded">Backup baixado</option><option value="backup.restore.started">Restauração iniciada</option><option value="backup.restore.completed">Restauração concluída</option><option value="backup.restore.failed">Falha na restauração</option></optgroup></select></div>
             <div class="field-row"><label for="audit-severity">Severidade</label><select class="field" id="audit-severity" name="severity"><option value="">Todas</option><option value="info">Informação</option><option value="warning">Aviso</option><option value="error">Erro</option><option value="critical">Crítica</option></select></div>
             <div class="field-row"><label for="audit-result">Resultado</label><select class="field" id="audit-result" name="result"><option value="">Todos</option><option value="success">Sucesso</option><option value="failure">Falha</option><option value="partial">Parcial</option></select></div>
             <div class="field-row"><label for="audit-start-date">De</label><input class="field" id="audit-start-date" name="startDate" type="date" /></div>
@@ -482,6 +482,7 @@
     if (!canView) { noAccess(target, "A auditoria exige a permissão viewAuditLogs."); return; }
     target.innerHTML = auditMarkup();
     let currentPage = 1, totalPages = 1, currentFilters = {}, currentLogs = [];
+    let logsGeneration = 0, summaryGeneration = 0;
     const body = document.getElementById("audit-body"), prev = target.querySelector('[data-action="audit-previous"]');
     const next = target.querySelector('[data-action="audit-next"]'), pageInfo = document.getElementById("audit-page-info");
     function updatePagination(page, pages) {
@@ -504,21 +505,34 @@
       }).join("");
     }
     async function loadSummary() {
+      const generation = ++summaryGeneration;
       try {
         const summary = await api.get("/audit/summary");
+        if (generation !== summaryGeneration) return;
         document.getElementById("audit-total").textContent = count(summary.totalLogs);
         document.getElementById("audit-critical").textContent = count(summary.bySeverity && summary.bySeverity.critical);
         document.getElementById("audit-failed-logins").textContent = count(summary.failedLogins);
-      } catch (error) { const message = publicError(error, "Não foi possível carregar o resumo da auditoria."); if (message) setFeedback(document.getElementById("audit-filter-feedback"), message, "error"); }
+      } catch (error) {
+        if (generation !== summaryGeneration) return;
+        const message = publicError(error, "Não foi possível carregar o resumo da auditoria.");
+        if (message) setFeedback(document.getElementById("audit-filter-feedback"), message, "error");
+      }
     }
     async function loadLogs() {
+      const generation = ++logsGeneration, requestedPage = currentPage;
+      currentLogs = [];
+      prev.disabled = true;
+      next.disabled = true;
+      pageInfo.textContent = "Carregando registros…";
       body.innerHTML = tableState(8, "Carregando registros…", "loading");
       try {
-        const data = await api.get(api.query("/audit/logs", Object.assign({ page: currentPage, limit: 50 }, currentFilters)));
+        const data = await api.get(api.query("/audit/logs", Object.assign({ page: requestedPage, limit: 50 }, currentFilters)));
+        if (generation !== logsGeneration) return;
         const pages = Math.max(1, Math.ceil(numeric(data.total) / Math.max(1, numeric(data.limit) || 50)));
-        updatePagination(numeric(data.page) || currentPage, pages); renderLogs(data.logs);
+        updatePagination(numeric(data.page) || requestedPage, pages); renderLogs(data.logs);
       } catch (error) {
         const message = publicError(error, "Não foi possível carregar os registros de auditoria.");
+        if (generation !== logsGeneration) return;
         body.innerHTML = tableState(8, message || "Não foi possível carregar os registros.", "error"); pageInfo.textContent = "Registros indisponíveis";
       }
     }
@@ -538,8 +552,8 @@
     });
     target.addEventListener("click", (event) => {
       const button = event.target.closest("button[data-action]"); if (!button) return;
-      if (button.dataset.action === "audit-previous" && currentPage > 1) { currentPage -= 1; loadLogs(); }
-      else if (button.dataset.action === "audit-next" && currentPage < totalPages) { currentPage += 1; loadLogs(); }
+      if (button.dataset.action === "audit-previous" && !prev.disabled && currentPage > 1) { currentPage -= 1; loadLogs(); }
+      else if (button.dataset.action === "audit-next" && !next.disabled && currentPage < totalPages) { currentPage += 1; loadLogs(); }
       else if (button.dataset.action === "refresh-audit") {
         button.disabled = true; Promise.all([loadSummary(), loadLogs()]).finally(() => { button.disabled = false; });
       } else if (button.dataset.action === "audit-details") {
@@ -569,6 +583,7 @@
     let recoveryBlocked = false;
     const body = document.getElementById("backups-body"), warning = document.getElementById("backup-warning");
     const manifestPanel = document.getElementById("manifest-panel"), manifestContent = document.getElementById("manifest-content");
+    let manifestGeneration = 0;
     function blockForRestoreRecovery(message) {
       recoveryBlocked = true;
       warning.textContent = message;
@@ -590,7 +605,7 @@
         const status = Object.prototype.hasOwnProperty.call(labels, backup.status) ? backup.status : "unknown";
         const badge = status === "success" || status === "completed" ? "badge-success" : status === "failed" ? "badge-danger" : status === "creating" || status === "running" ? "badge-warning" : "";
         const actions = `<div class="row-actions"><button type="button" class="button button-quiet button-small" data-action="download-backup" data-backup-index="${index}">Baixar</button><button type="button" class="button button-quiet button-small" data-action="show-manifest" data-backup-index="${index}">Manifesto</button><button type="button" class="button button-primary button-small" data-action="restore-backup" data-backup-index="${index}">Restaurar</button><button type="button" class="button button-danger button-small" data-action="delete-backup" data-backup-index="${index}">Excluir</button></div>`;
-        return `<tr><td><time datetime="${esc(backup.createdAt || "")}">${esc(ui.formatDate(backup.createdAt))}</time></td><td>${esc(backup.type || "—")}</td><td><span class="badge ${badge}">${esc(labels[backup.status] || backup.status || "Desconhecido")}</span></td><td>${esc(ui.formatBytes(backup.sizeBytes))}</td><td>${actions}</td></tr>`;
+        return `<tr><td data-label="Criado em"><time datetime="${esc(backup.createdAt || "")}">${esc(ui.formatDate(backup.createdAt))}</time></td><td data-label="Tipo">${esc(backup.type || "—")}</td><td data-label="Estado"><span class="badge ${badge}">${esc(labels[backup.status] || backup.status || "Desconhecido")}</span></td><td data-label="Tamanho">${esc(ui.formatBytes(backup.sizeBytes))}</td><td data-label="Ações">${actions}</td></tr>`;
       }).join("");
     }
     async function loadLatestStatus() {
@@ -640,7 +655,12 @@
       const button = event.target.closest("button[data-action]"); if (!button) return;
       const action = button.dataset.action;
       if (action === "refresh-backups") { button.disabled = true; await loadBackups(); button.disabled = recoveryBlocked; return; }
-      if (action === "close-manifest") { manifestPanel.hidden = true; manifestContent.textContent = ""; return; }
+      if (action === "close-manifest") {
+        ++manifestGeneration;
+        manifestPanel.hidden = true;
+        manifestContent.textContent = "";
+        return;
+      }
       const backup = backups[Number(button.dataset.backupIndex)]; if (!backup) return;
       if (action === "download-backup") {
         button.disabled = true;
@@ -654,14 +674,18 @@
         return;
       }
       if (action === "show-manifest") {
+        const generation = ++manifestGeneration;
         manifestPanel.hidden = false; manifestContent.textContent = "Carregando manifesto…";
-        try { manifestContent.textContent = JSON.stringify(await api.get(`/backups/${encodeURIComponent(backup.id)}/manifest`), null, 2); }
+        manifestPanel.scrollIntoView({ block: "nearest" });
+        try {
+          const result = await api.get(`/backups/${encodeURIComponent(backup.id)}/manifest`);
+          if (generation === manifestGeneration) manifestContent.textContent = JSON.stringify(result, null, 2);
+        }
         catch (error) {
           const message = publicError(error, "Não foi possível carregar o manifesto.");
-          manifestContent.textContent = message;
+          if (generation === manifestGeneration) manifestContent.textContent = message;
           blockOnRestoreRecovery(error, message);
         }
-        manifestPanel.scrollIntoView({ block: "nearest" });
         return;
       }
       if (action === "restore-backup") {

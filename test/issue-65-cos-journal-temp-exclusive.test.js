@@ -4,7 +4,6 @@
 // collision must NEVER truncate an unrelated preexisting journal temp file.
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const crypto = require("node:crypto");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
@@ -31,22 +30,30 @@ test("durable journal uses exclusive creation and preserves a real planted colli
   fs.writeFileSync(planted, plantedBytes, { flag: "wx", mode: 0o600 });
   const plantedStat = fs.lstatSync(planted, { bigint: true });
 
-  // Constrain only the random-name provider for this journal commit; all
-  // physical open(O_EXCL), rename and fd.sync calls remain actual filesystem
-  // operations. This causally forces the otherwise astronomically unlikely
-  // collision without faking an EEXIST error.
-  const randomUUID = crypto.randomUUID;
-  let draws = 0;
+  // The journal pins crypto.randomUUID at module load, so patching the public
+  // crypto export would not force a collision. Redirect only the one journal
+  // temporary-path open to a preexisting real inode; the actual filesystem
+  // still enforces O_EXCL, and no EEXIST error is fabricated by this test.
+  const realOpen = fsp.open;
+  let collisionOpens = 0;
   try {
-    crypto.randomUUID = () => { draws += 1; return id; };
+    fsp.open = (candidate, flags, mode) => {
+      if (typeof candidate === "string"
+        && candidate.startsWith(`${filename}.tmp-${process.pid}-`)) {
+        collisionOpens += 1;
+        assert.equal(flags, "wx", "journal must demand exclusive temp creation");
+        return realOpen(planted, flags, mode);
+      }
+      return realOpen(candidate, flags, mode);
+    };
     await assert.rejects(journal.update(original.operationId, {
       phase: "source-moved",
     }), (error) => error?.code === "EEXIST",
     "O_EXCL must reject, not truncate or overwrite, the planted inode");
   } finally {
-    crypto.randomUUID = randomUUID;
+    fsp.open = realOpen;
   }
-  assert.equal(draws, 1);
+  assert.equal(collisionOpens, 1);
   assert.deepEqual(await fsp.readFile(planted), plantedBytes);
   const after = await fsp.lstat(planted, { bigint: true });
   assert.equal(after.dev, plantedStat.dev);
