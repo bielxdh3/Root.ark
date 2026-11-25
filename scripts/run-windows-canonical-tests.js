@@ -4,7 +4,9 @@ const { spawn } = require("node:child_process");
 const { createHash } = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
+const path = require("node:path");
 const { StringDecoder } = require("node:string_decoder");
+const { ensureWindowsChunkUploadRoot } = require("../services/chunkUploadWindowsAcl");
 const { getNpmInvocation } = require("./release-gate-environment");
 const { parseAclFailureDiagnostic } = require("./acl-test-failure-diagnostic");
 const { parseEdgeFailureDiagnostic } = require("./edge-test-failure-diagnostic");
@@ -14,7 +16,7 @@ const { parseEdgeFailureDiagnostic } = require("./edge-test-failure-diagnostic")
 // observed state even when the final TAP summary cannot be emitted.
 const HEARTBEAT_MS = 15_000;
 const IDLE_LIMIT_MS = 15 * 60_000;
-const TOTAL_LIMIT_MS = 55 * 60_000;
+const TOTAL_LIMIT_MS = 57 * 60_000;
 const SAFE_CODES = new Set(["ERR_ASSERTION", "ERR_TEST_FAILURE", "SQLITE_BUSY",
   "SQLITE_LOCKED", "ENOENT", "EACCES", "EPERM", "EADDRINUSE", "ETIMEDOUT",
   "ECONNRESET", "ERR_DLOPEN_FAILED", "MODULE_NOT_FOUND", "ERR_MODULE_NOT_FOUND"]);
@@ -67,6 +69,9 @@ function createTapProgressRecorder(write) {
   let pending = null;
   let nestedPending = null;
   let detailed = 0;
+  // Preserve one bounded diagnostic per failed top-level test. A single
+  // cascading fixture failure can exceed the old twelve-detail limit.
+  const MAX_FAILURE_DETAILS = 64;
   let nestedDetailed = 0;
   let verifiedAclOverflowDetails = 0;
   const fileLocation = (location) => {
@@ -92,7 +97,7 @@ function createTapProgressRecorder(write) {
     if (pending.pathHash !== "none") {
       failurePaths.set(pending.pathHash, (failurePaths.get(pending.pathHash) || 0) + 1);
     }
-    if (detailed < 12) {
+    if (detailed < MAX_FAILURE_DETAILS) {
       const acl = pending.acl
         ? ` aclStage=${pending.acl.stage} aclError=${pending.acl.code} aclTrust=${pending.acl.trust}` : "";
       const edge = pending.edge
@@ -103,7 +108,11 @@ function createTapProgressRecorder(write) {
       const moduleExit = pending.fileProcessFailed && pending.failureType === "testCodeFailure"
         && pending.code === "ERR_TEST_FAILURE" && pending.moduleExitCode !== null
         ? ` moduleExitCode=${pending.moduleExitCode}` : "";
-      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${acl}${edge}`);
+      const location = pending.locationLine === null ? "" : ` locationLine=${pending.locationLine}`;
+      const assertion = pending.assertionLine === null ? "" : ` assertionLine=${pending.assertionLine}`;
+      const message = pending.messageHash ? ` errorSha256=${pending.messageHash}` : "";
+      const operator = pending.operator ? ` operator=${pending.operator}` : "";
+      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${location}${assertion}${message}${operator}${acl}${edge}`);
       detailed++;
     } else if (pending.acl && verifiedAclOverflowDetails < 4) {
       // Numerous unrelated failed tests must not suppress the bounded, strictly
@@ -175,7 +184,8 @@ function createTapProgressRecorder(write) {
             write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
             pending = { index: result[2], nameHash, pathHash: "none",
               failureType: "unknown", code: "unknown", moduleExitCode: null,
-              fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false };
+              fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false,
+              locationLine: null, assertionLine: null, messageHash: null, operator: null };
           }
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
@@ -209,11 +219,32 @@ function createTapProgressRecorder(write) {
         // apparent failed test-file process. Do not reopen a consumed block.
         if (pending.moduleYamlOpen) {
           const location = /^  location: ['"](.{1,2048})['"]$/.exec(line);
-          if (location) pending.pathHash = fileLocation(location[1]);
+          if (location) {
+            pending.pathHash = fileLocation(location[1]);
+            const match = /:(\d{1,7}):\d+$/.exec(location[1]);
+            if (pending.pathHash !== "none" && match) pending.locationLine = Number(match[1]);
+          }
           const kind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
           if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
           const code = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
           if (code && SAFE_CODES.has(code[1])) pending.code = code[1];
+          const error = /^  error: '(.{0,2048})'$/.exec(line);
+          if (error && pending.pathHash !== "none") pending.messageHash = hash(error[1]);
+          const operator = /^  operator: '([a-zA-Z]{1,40})'$/.exec(line);
+          if (operator && ["strictEqual", "deepStrictEqual", "throws", "rejects", "match", "ok", "notStrictEqual"].includes(operator[1])) pending.operator = operator[1];
+          // Never log or retain a stack trace. Only its first numeric line
+          // in the already verified test file is actionable and non-secret.
+          // The YAML `location:` field identifies the test declaration, not
+          // the assertion that failed. Only a verified stack frame may supply
+          // assertionLine; otherwise a genuine later frame is shadowed by
+          // the earlier location (and the hosted diagnostic points to the
+          // wrong statement).
+          if (pending.pathHash !== "none" && pending.assertionLine === null
+            && /^\s{2,}at\s/.test(line)) {
+            const frame = /(?:^|[\\/])test[\\/]([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}/.exec(line);
+            if (frame && hash(`test/${frame[1]}`) === pending.pathHash)
+              pending.assertionLine = Number(frame[2]);
+          }
           // Keep only bounded, allowlisted process evidence; never print
           // raw YAML, paths, stack traces, or failure text.
           if (line === "  error: 'test failed'") pending.fileProcessFailed = true;
@@ -298,11 +329,33 @@ function createCanonicalTapLineAcceptor(tracker, fromStderr) {
   };
 }
 
+function resolveWindowsTempRoot(environment = process.env, platform = process.platform) {
+  if (platform !== "win32") return { tempDir: os.tmpdir(), cleanup: () => {} };
+  const probeParent = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), "rootark-acl-probe-"));
+  let tempOk = false;
+  try {
+    ensureWindowsChunkUploadRoot(path.join(probeParent, "uploads"));
+    tempOk = true;
+  } catch {
+    tempOk = false;
+  } finally {
+    fs.rmSync(probeParent, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+  if (tempOk || !environment.LOCALAPPDATA) return { tempDir: os.tmpdir(), cleanup: () => {} };
+  const isolated = fs.mkdtempSync(path.join(fs.realpathSync.native(environment.LOCALAPPDATA), "rootark-canonical-tmp-"));
+  ensureWindowsChunkUploadRoot(isolated);
+  return {
+    tempDir: isolated,
+    cleanup: () => fs.rmSync(isolated, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
+  };
+}
+
 function run() {
   // The split branch does not export #228's canonicalTestArgs helper.
   // Preserve its exact Windows invocation without changing the release gate:
   // full npm test, TAP reporter, bounded file concurrency, NO test filters.
   const invocation = getNpmInvocation(["test", "--", "--test-reporter=tap", "--test-concurrency=2"]);
+  const tempRoot = resolveWindowsTempRoot();
   const started = Date.now();
   let lastOutput = started;
   let timedOut = false;
@@ -321,10 +374,10 @@ function run() {
     catch { console.error(message); }
   }
   const child = spawn(invocation.executable, invocation.args, {
-    cwd: require("node:path").resolve(__dirname, ".."),
+    cwd: path.resolve(__dirname, ".."),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
-    env: canonicalWindowsTestEnvironment(),
+    env: canonicalWindowsTestEnvironment(process.env, process.platform, tempRoot.tempDir),
   });
 
   function consume(stream, streamName) {
@@ -385,7 +438,7 @@ function run() {
     const idle = Math.floor((Date.now() - lastOutput) / 1000);
     writeProgressDiagnostic(`Windows canonical heartbeat: elapsedSeconds=${elapsed} idleSeconds=${idle} TAPresults=${tracker.state.results} failures=${tracker.state.failures} ${tracker.safeSummary()} ${childProgress.safeSummary()}`);
     if (idle * 1000 >= IDLE_LIMIT_MS) terminate("idle timeout (15 minutes without child output)");
-    else if (elapsed * 1000 >= TOTAL_LIMIT_MS) terminate("total timeout (55 minutes)");
+    else if (elapsed * 1000 >= TOTAL_LIMIT_MS) terminate("total timeout (57 minutes)");
   }, HEARTBEAT_MS);
 
   child.on("error", (error) => {
@@ -399,6 +452,7 @@ function run() {
   child.on("close", (code, signal) => {
     childProgress.finished(code, signal);
     clearInterval(heartbeat);
+    tempRoot.cleanup();
     tracker.finish();
     const { results, failures, plan, tests, reportedFailures, reportedPasses } = tracker.state;
     // A child that exits 0 with TAP "1..0 / # tests 0 / # fail 0", or only
