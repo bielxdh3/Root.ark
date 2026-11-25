@@ -20,8 +20,8 @@ const cekTransfer = (() => {
 // Capture an adjustable wall clock only in a fresh copy of the release module.
 // Restore the global Date.now and cache before invoking any crypto: real
 // signed approval, witness, and skew checks must remain unmodified at entry.
-function releaseClockTransfer({ hpkeOpen } = {}) {
-  const moduleId = require.resolve("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer");
+function releaseClockTransfer({ hpkeOpen, modulePath = "../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer" } = {}) {
+  const moduleId = require.resolve(modulePath);
   const previousModule = require.cache[moduleId];
   const actualNow = Date.now;
   const actualHpkeOpen = z.hpkeOpen;
@@ -2132,7 +2132,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(forgedMapCalls, 0,
       "independent roster snapshot must read array slots, not a supplied map method");
     // The authentic owner-approved HPKE envelope has a shorter lifetime than
-    // this independently owner-signed grant. Advance only the wall clock in
+    // this independently owner-signed grant. Advance the pinned release clock in
     // the SECOND authority read, after the real AEAD + HPKE sealing awaits.
     const longGrantInput = { ...grantInput,
       expiresAt: envelope.core.expires_at + 120 };
@@ -2144,21 +2144,19 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       shareSignatureBase64: b64(crypto.sign(null, longGrantBytes, originalActor)) };
     assert.ok(longGrant.expiresAt > envelope.core.expires_at,
       "signed grant remains current after the real CEK offer expires");
-    const expiryOriginalWallClock = Date.now;
+    const expiryClock = releaseClockTransfer({ modulePath: "../src/crypto/rootark-zk1-recipient-share-cek" });
     let expiryReads = 0;
-    try {
-      await assert.rejects(createProtectedRecipientShareOffer({
-        ...ownerOfferArgs, grant: longGrant,
-        readIndependentAuthority: async () => {
-          const current = await readIndependentAuthority();
-          if (++expiryReads === 2) {
-            Date.now = () => (envelope.core.expires_at + 1) * 1000;
-          }
-          return current;
-        },
-      }), /ZK_SHARE_OFFER_DENIED/,
-      "a valid grant cannot export a newly expired, owner-signed HPKE envelope");
-    } finally { Date.now = expiryOriginalWallClock; }
+    await assert.rejects(expiryClock.transfer.createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, grant: longGrant,
+      readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++expiryReads === 2) {
+          expiryClock.advanceTo((envelope.core.expires_at + 1) * 1000);
+        }
+        return current;
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "a valid grant cannot export a newly expired, owner-signed HPKE envelope");
     assert.equal(expiryReads, 2,
       "the test must expire the envelope only at the second independent authority read");
     const maliciousOffer = { ...ownerOfferArgs };
@@ -2452,27 +2450,24 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     assert.equal(rosterProxyTraps, 0,
       "native Proxy roster arrays must be rejected without invoking descriptor traps");
     // The authenticated share grant remains live after the shorter, genuinely
-    // owner-signed HPKE CEK envelope. Advance the wall clock only during the
+    // owner-signed HPKE CEK envelope. Advance the pinned release clock only during the
     // third independent authority read, after the real HTTP, HPKE and AEAD work.
     assert.ok(grant.expiresAt > envelope.core.expires_at + 1,
       "fixture requires the owner HPKE envelope to expire before the signed grant");
-    const recipientExpiryClock = Date.now;
+    const recipientExpiryClock = releaseClockTransfer({ modulePath: "../src/crypto/rootark-zk1-recipient-share-cek" });
     const recipientExpiryFloor = Math.floor;
     const recipientExpiryMin = Math.min;
     // The fully authenticated HPKE/AEAD sequence now uses an isolated V8
     // worker. Begin at the real current instant, not the subtest's stale
     // startup instant; otherwise this tests clock rollback, not the intended
     // final-third-authority-read expiry race.
-    let recipientExpiryMilliseconds = recipientExpiryClock();
-    const stableRecipientClock = () => recipientExpiryMilliseconds;
-    Date.now = stableRecipientClock;
     let recipientExpiryReads = 0;
     try {
-      await assert.rejects(openProtectedRecipientShareFile({ ...bridgeArgs,
+      await assert.rejects(recipientExpiryClock.transfer.openProtectedRecipientShareFile({ ...bridgeArgs,
         redeemInput: { ...recipientShareInput, readIndependentAuthority: async () => {
           const current = await readIndependentAuthority();
           if (++recipientExpiryReads === 3) {
-            recipientExpiryMilliseconds = (envelope.core.expires_at + 1) * 1000;
+            recipientExpiryClock.advanceTo((envelope.core.expires_at + 1) * 1000);
             Math.floor = () => 0;
             Math.min = () => Number.MAX_SAFE_INTEGER;
           }
@@ -2481,7 +2476,6 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       }), /ZK_SHARE_FILE_OPEN_DENIED/,
       "the final authority await cannot release plaintext after signed HPKE expiry");
     } finally {
-      Date.now = recipientExpiryClock;
       Math.floor = recipientExpiryFloor;
       Math.min = recipientExpiryMin;
     }
