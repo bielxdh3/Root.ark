@@ -111,7 +111,7 @@ test("P2 composite: signed inventory+PG scope A cannot satisfy expected scope B 
     scope: scopeB, pinnedInventoryPublicKey: pin,
   }), /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/,
   "expected scope B must be detached before native signer key callback");
-  assert.ok(reads > 0);
+  assert.equal(reads, 0, "inherited native handle getter must be refused before mutation");
   assert.equal((await verifyAttestedInventoryCommit(f.input)).authorizesIo, false);
 });
 
@@ -155,8 +155,7 @@ test("P2: native signer kHandle callback cannot turn authentic nonauthorizing co
   const trustedFreeze = Object.freeze;
   let getterReads = 0;
   let flipped = 0;
-  Object.defineProperty(nativePin, nativeHandle, { get() {
-    getterReads++;
+  const poison = () => {
     Object.freeze = function(value) {
       if (value?.status === "VERIFIED_COMPOSITE_NONAUTHORIZING") {
         flipped++;
@@ -165,14 +164,24 @@ test("P2: native signer kHandle callback cannot turn authentic nonauthorizing co
       }
       return trustedFreeze(value);
     };
+  };
+  Object.defineProperty(nativePin, nativeHandle, { get() {
+    getterReads++;
+    poison();
     return fixture.inventorySigner.publicKey[nativeHandle];
   } });
   let outcome;
   try {
-    outcome = await verifyAttestedInventoryCommit({ ...fixture.input,
-      pinnedInventoryPublicKey: nativePin });
+    await assert.rejects(verifyAttestedInventoryCommit({ ...fixture.input,
+      pinnedInventoryPublicKey: nativePin }),
+    /ZK_ATTESTED_INVENTORY_COMMIT_DENIED/,
+    "inherited native handle must be rejected before freezing a forged authorization");
+    assert.equal(getterReads, 0, "invalid inherited handle getter must not execute");
+    assert.equal(Object.freeze, trustedFreeze, "failed pin cannot mutate the native freezer");
+    poison();
+    outcome = await verifyAttestedInventoryCommit(fixture.input);
   } finally { Object.freeze = trustedFreeze; }
-  assert.ok(getterReads > 0, "a genuine native KeyObject getter must install the attack");
+  assert.equal(getterReads, 0, "inherited native getter must never execute");
   assert.equal(outcome.status, "VERIFIED_COMPOSITE_NONAUTHORIZING");
   assert.equal(outcome.inventoryReceipt.outcome, "COMMITTED_IN_SIGNED_LEDGER");
   assert.equal(outcome.physicalReadback.verified, true);
@@ -197,8 +206,7 @@ test("P2: a signed PG physical readback cannot elevate nonauthorizing fields thr
   let reads = 0;
   let flipped = 0;
   const oldFreeze = Object.freeze;
-  Object.defineProperty(keyWithCallback, handle, { get() {
-    reads++;
+  const poison = () => {
     Object.freeze = function(value) {
       if (value?.status === "PHYSICALLY_REREAD_PG_COMMITTED") {
         flipped++;
@@ -207,14 +215,25 @@ test("P2: a signed PG physical readback cannot elevate nonauthorizing fields thr
       }
       return oldFreeze(value);
     };
+  };
+  Object.defineProperty(keyWithCallback, handle, { get() {
+    reads++;
+    poison();
     return real[handle];
   } });
   let signedResult;
   try {
+    await assert.rejects(pg.verifyCommittedPhysicalReadback(fixture.physicalAttestation,
+      { ...fixture.readbackOptions, pinnedPublicKey: keyWithCallback }),
+    /ZK_PHYSICAL_ATTESTATION_DENIED/,
+    "inherited Ed25519 handle must be rejected before callback mutation");
+    assert.equal(reads, 0, "the invalid inherited key getter must not execute");
+    assert.equal(Object.freeze, oldFreeze, "early denial must not alter the native freezer");
+    poison();
     signedResult = await pg.verifyCommittedPhysicalReadback(fixture.physicalAttestation,
-      { ...fixture.readbackOptions, pinnedPublicKey: keyWithCallback });
+      fixture.readbackOptions);
   } finally { Object.freeze = oldFreeze; }
-  assert.ok(reads > 0, "native Ed25519 public-key getter must execute before returning");
+  assert.equal(reads, 0, "untrusted native handle getter must not execute");
   assert.equal(signedResult.verified, true);
   assert.equal(signedResult.authorizesIo, false,
     "a genuine PG Ed25519 signature never conveys product I/O authority");

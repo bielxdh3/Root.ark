@@ -51,9 +51,14 @@ test("P2: native signed JSON array serializer ignores hostile String(index) rema
     return A.publicKey[kHandle];
   } });
   try {
-    const ownerKeys = verifyOwnerRotationKeys([], rogueRoot, accountId);
+    assert.throws(() => verifyOwnerRotationKeys([], rogueRoot, accountId),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "inherited native key handle must be rejected before its callback");
+    assert.equal(getterReads, 0, "untrusted native getter must not execute");
+    assert.equal(global.String, originalString, "failed key pin must not change the ambient realm");
+    global.String = poisoned;
+    const ownerKeys = verifyOwnerRotationKeys([], A.publicKey, accountId);
     assert.equal(ownerKeys.length, 1);
-    assert.ok(getterReads > 0, "same-realm poison installed by actual KeyObject getter");
     assert.equal(global.String, poisoned);
     assert.equal(crypto.verify(null, signedBytesA, A.publicKey, signatureA), true);
     assert.equal(crypto.verify(null, signBytes(forged), A.publicKey, signatureA), false,
@@ -106,9 +111,14 @@ test("P2: poisoned String must not erase signed root from a verified owner rotat
     return A.publicKey[kHandle];
   } });
   try {
-    const keys = verifyOwnerRotationKeys([signedRotation], hostileRoot, accountId);
-    assert.ok(nativeGetterReads > 0, "genuine crypto KeyObject getter executed");
-    assert.equal(global.String, poisonedString, "the real KeyObject getter poisoned the ambient realm");
+    assert.throws(() => verifyOwnerRotationKeys([signedRotation], hostileRoot, accountId),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "the inherited native key must fail before the getter mutates String");
+    assert.equal(nativeGetterReads, 0, "the inherited key getter must never execute");
+    assert.equal(global.String, originalString, "early denial preserves the global String factory");
+    global.String = poisonedString;
+    const keys = verifyOwnerRotationKeys([signedRotation], A.publicKey, accountId);
+    assert.equal(global.String, poisonedString, "the explicit hostile String factory remains installed");
     assert.equal(keys.length, 2, "rotated signer must append after owner root");
     assert.equal(hasKey(keys, A.publicKey), true,
       "old owner A must remain in trusted key set for independent signer check");
@@ -140,8 +150,7 @@ test("P2: a native owner kHandle getter cannot rebind JSON.stringify to verify A
   const rogue = Object.create(A.publicKey);
   const original = JSON.stringify;
   let getterReads = 0, forgedSerializations = 0;
-  Object.defineProperty(rogue, kHandle, { get() {
-    getterReads++;
+  const poison = () => {
     JSON.stringify = (value, ...args) => {
       if (value && value.type === signedB.type && value.inventory_head === signedB.inventory_head) {
         forgedSerializations++;
@@ -149,15 +158,24 @@ test("P2: a native owner kHandle getter cannot rebind JSON.stringify to verify A
       }
       return original(value, ...args);
     };
+  };
+  Object.defineProperty(rogue, kHandle, { get() {
+    getterReads++;
+    poison();
     return A.publicKey[kHandle];
   } });
   try {
-    let outcome;
-    try { outcome = verifyOwnerCutoverHistory([forgedB], [rogue], accountId); }
-    catch (err) { assert.match(err.message, /ZK10_ACCOUNT_CUTOVER_UNVERIFIED/); }
-    assert.equal(getterReads > 0, true, "actual native kHandle getter must be exercised");
-    assert.equal(outcome, undefined,
-      "a legitimate signed A digest must never authenticate B's inventory_head");
+    assert.throws(() => verifyOwnerCutoverHistory([forgedB], [rogue], accountId),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "an inherited handle must be denied before any JS callback");
+    assert.equal(getterReads, 0, "the inherited native getter must never execute");
+    assert.equal(JSON.stringify, original, "early denial must not alter the JSON encoder");
+    poison();
+    assert.throws(() => verifyOwnerCutoverHistory([forgedB], [A.publicKey], accountId),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "signed A cannot authenticate B even under a late global stringify replacement");
+    assert.equal(verifyOwnerCutoverHistory([signedA], [A.publicKey], accountId).digest,
+      digestA, "legitimate A remains valid under the hostile JSON encoder");
     assert.equal(forgedSerializations, 0,
       "trusted wire encoder must not dispatch to JSON.stringify replaced after the getter");
   } finally { JSON.stringify = original; }

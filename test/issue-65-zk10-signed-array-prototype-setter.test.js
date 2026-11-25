@@ -72,8 +72,7 @@ test("P2: malicious Array.prototype[5] setter cannot verify signed A as inventor
   let probeIntercepts = 0;
   let probe = false;
   let armed = false;
-  const key = inheritedNativeKey(f.A.publicKey, () => {
-    getterReads++;
+  const installPoison = () => {
     if (armed) return;
     armed = true;
     Object.defineProperty(Array.prototype, "5", {
@@ -97,17 +96,28 @@ test("P2: malicious Array.prototype[5] setter cannot verify signed A as inventor
     canary.push(expectedB);
     assert.equal(canary[5], signedAField, "installed setter must actually forge byte field A");
     probe = false;
+  };
+  const key = inheritedNativeKey(f.A.publicKey, () => {
+    getterReads++;
+    installPoison();
   });
   let result;
   let rejection;
   try {
-    result = verifyOwnerCutoverHistory([f.forgedB], [key.inherited], accountId);
+    assert.throws(() => verifyOwnerCutoverHistory([f.forgedB], [key.inherited], accountId),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "inherited native handle must fail closed without running its setter callback");
+    assert.equal(key.reads, 0, "inherited native getter must not execute");
+    assert.equal(getterReads, 0, "the hostile numeric setter must not install during key rejection");
+    installPoison();
+    result = verifyOwnerCutoverHistory([f.forgedB], [f.A.publicKey], accountId);
   } catch (error) { rejection = error; }
   finally {
     if (original) Object.defineProperty(Array.prototype, "5", original);
     else delete Array.prototype[5];
   }
-  assert.ok(key.reads > 0 && getterReads > 0, "real kHandle getter must have executed");
+  assert.equal(key.reads, 0, "the inherited key must not reach the native getter");
+  assert.equal(getterReads, 0, "the invalid-key path must not execute attacker code");
   assert.ok(probeIntercepts > 0, "the attacker-installed numeric setter must be physically active");
   if (result) {
     assert.equal(result.statement.inventory_head, f.signedB.inventory_head,
@@ -134,23 +144,31 @@ test("P2: inherited Array.prototype[7] setter cannot rewrite a signed owner comp
     { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" });
   const initial = Object.getOwnPropertyDescriptor(Array.prototype, "7");
   let intercepted = 0;
-  const rogue = inheritedNativeKey(A.publicKey, () => {
+  const installPoison = () => {
     Object.defineProperty(Array.prototype, "7", { configurable: true, set(value) {
       const intercept = this.length === 7 && value === id(9);
       if (intercept) intercepted++;
       Object.defineProperty(this, "7", { value: intercept ? id(8) : value,
         enumerable: true, writable: true, configurable: true });
     } });
-  });
+  };
+  const rogue = inheritedNativeKey(A.publicKey, installPoison);
   let accepted;
   let rejected;
-  try { accepted = verifyOwnerCutoverHistory([forgedB], [rogue.inherited], accountId); }
+  try {
+    assert.throws(() => verifyOwnerCutoverHistory([forgedB], [rogue.inherited], accountId),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "the inherited handle must be rejected before the numeric setter installs");
+    assert.equal(rogue.reads, 0, "the inherited handle getter must not execute");
+    installPoison();
+    accepted = verifyOwnerCutoverHistory([forgedB], [A.publicKey], accountId);
+  }
   catch (error) { rejected = error; }
   finally {
     if (initial) Object.defineProperty(Array.prototype, "7", initial);
     else delete Array.prototype[7];
   }
-  assert.ok(rogue.reads > 0);
+  assert.equal(rogue.reads, 0);
   if (accepted) assert.equal(accepted.digest, digestA,
     "real physical RED shows valid A signature accepted for incoming unsigned B wire");
   assert.equal(rejected?.code, "ZK10_ACCOUNT_CUTOVER_UNVERIFIED",
@@ -166,7 +184,7 @@ test("P2: owner signed wire never invokes a late mutable Array iterator", () => 
   assert.equal(signedJson(payload), canonical, "baseline canonical wire must remain JSON compatible");
   const original = Array.prototype[Symbol.iterator];
   let iteratorAttempts = 0;
-  const key = inheritedNativeKey(f.A.publicKey, () => {
+  const installPoison = () => {
     Array.prototype[Symbol.iterator] = function () {
       if (this.length === OWNER_FIELDS.length && this[0] === "type") {
         iteratorAttempts++;
@@ -174,15 +192,20 @@ test("P2: owner signed wire never invokes a late mutable Array iterator", () => 
       }
       return Reflect.apply(original, this, []);
     };
-  });
+  };
+  const key = inheritedNativeKey(f.A.publicKey, installPoison);
   let serialized;
   let error;
   try {
-    spkiHash(key.inherited); // Physical native getter mutates the same realm.
+    assert.throws(() => spkiHash(key.inherited),
+      { code: "ZK10_ACCOUNT_CUTOVER_UNVERIFIED" },
+      "inherited handle must be denied before installing a mutable Array iterator");
+    assert.equal(key.reads, 0, "inherited handle getter must not execute");
+    installPoison();
     serialized = signedJson(payload);
   } catch (caught) { error = caught; }
   finally { Array.prototype[Symbol.iterator] = original; }
-  assert.ok(key.reads > 0);
+  assert.equal(key.reads, 0);
   assert.equal(error, undefined, "serializing a signed record must not consult poisoned iterators");
   assert.equal(iteratorAttempts, 0);
   assert.equal(serialized, canonical, "canonical wire field ordering must not change");
