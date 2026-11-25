@@ -24,24 +24,34 @@ function windowsJobs(yaml) {
 function assertDualGate(yaml) {
   const jobs = windowsJobs(yaml);
   const release = jobs.get("windows-release-gate")?.join("\n");
+  const shards = jobs.get("windows-canonical-shards")?.join("\n");
   const canonical = jobs.get("windows-canonical-suite")?.join("\n");
   const aggregate = jobs.get("windows-validation")?.join("\n");
-  assert.ok(release && canonical && aggregate, "both independent Windows jobs and aggregator required");
+  assert.ok(release && shards && canonical && aggregate, "release, both canonical shards and both aggregators required");
   assert.match(release, /runs-on:\s*windows-2022/);
-  assert.match(canonical, /runs-on:\s*windows-2022/);
-  for (const job of [release, canonical]) {
+  assert.match(shards, /runs-on:\s*windows-2022/);
+  for (const job of [release, shards]) {
     assert.match(job, /node-version:\s*22/);
     assert.match(job, /run:\s*npm ci/);
   }
   assert.match(release, /timeout-minutes:\s*90/,
     "the full mandatory release gate requires a bounded 90-minute budget");
-  assert.match(canonical, /timeout-minutes:\s*60/,
+  assert.match(shards, /timeout-minutes:\s*60/,
     "the separate complete canonical suite retains its original 60-minute bound");
   assert.match(release, /node scripts\/validate-edge-e2e\.js --probe/);
   assert.match(release, /node scripts\/validate-edge-e2e\.js --run/);
   assert.match(release, /run:\s*npm run validate:release-gate/);
-  assert.match(canonical, /run:\s*node scripts\/run-windows-canonical-tests\.js/);
-  assert.doesNotMatch(canonical, /--test-skip-pattern|--test-name-pattern/);
+  assert.match(shards, /fail-fast:\s*false/);
+  assert.match(shards, /shard:\s*\['1\/2', '2\/2'\]/);
+  assert.match(shards, /run:\s*node scripts\/run-windows-canonical-tests\.js --shard=\$\{\{ matrix\.shard \}\}/);
+  assert.doesNotMatch(shards, /--test-skip-pattern|--test-name-pattern|continue-on-error:/);
+  assert.doesNotMatch(shards, /(?:^|\n)\s*if:/);
+  assert.match(canonical, /name:\s*Windows Node 22 - complete canonical tests/);
+  assert.match(canonical, /needs:\s*\[windows-canonical-shards\]/);
+  assert.match(canonical, /if:\s*\$\{\{ always\(\) \}\}/);
+  assert.match(canonical, /SHARDS_RESULT:\s*\$\{\{ needs\.windows-canonical-shards\.result \}\}/);
+  assert.match(canonical, /run:\s*node scripts\/check-windows-ci-results\.js --canonical-shards/);
+  assert.doesNotMatch(canonical, /continue-on-error:/);
   assert.match(aggregate, /needs:\s*\[windows-release-gate, windows-canonical-suite\]/);
   assert.match(aggregate, /if:\s*\$\{\{ always\(\) \}\}/);
   assert.match(aggregate, /uses:\s*actions\/checkout@v7/);
@@ -67,6 +77,12 @@ test("configuration gate fails closed on single-needs and omitted Edge probe", (
     "needs: [windows-release-gate, windows-canonical-suite]", "needs: [windows-release-gate]")));
   assert.throws(() => assertDualGate(workflow.replace(
     "node scripts/validate-edge-e2e.js --probe", "echo no-edge-probe")));
+});
+
+test("configuration gate rejects a missing shard or fail-fast matrix", () => {
+  assert.throws(() => assertDualGate(workflow.replace("shard: ['1/2', '2/2']", "shard: ['1/2']")));
+  assert.throws(() => assertDualGate(workflow.replace("fail-fast: false", "fail-fast: true")));
+  assert.throws(() => assertDualGate(workflow.replace("SHARDS_RESULT: ${{ needs.windows-canonical-shards.result }}", "SHARDS_RESULT: success")));
 });
 
 module.exports = { assertDualGate };
