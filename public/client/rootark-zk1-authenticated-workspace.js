@@ -32,6 +32,8 @@
   let checking = false;
   let loadingScripts = null;
   let busy = false;
+  let protectedLocalSearchGeneration = 0;
+  let protectedLocalSearchTerm = "";
   let dialog = null;
   // A logout invalidates the operation even if an awaited crypto/file/network
   // promise later resolves. The CSRF cookie also fences session switches in
@@ -46,6 +48,8 @@
   // silently fetch/apply data in the generic workspace.
   let verifiedOpaqueDelta = null;
   let verifiedRevocationHead = null;
+  let previewGeneration = 0;
+  let activeTextBatch = null;
 
   function fail() { throw new Error("ZK_WORKSPACE_INPUT_DENIED"); }
   function supportsOwnerRootedV2(value) {
@@ -56,6 +60,23 @@
   function status(value) {
     const target = field("status");
     if (target) target.textContent = value;
+  }
+  function clearLocalPreview() {
+    previewGeneration++;
+    const target = field("catalog-delta-preview");
+    if (target) target.textContent = "";
+    const batch = field("catalog-delta-text-results");
+    if (batch) batch.textContent = "";
+    field("catalog-index-pages")?.replaceChildren();
+  }
+  function resetRevisionBatchConsent() {
+    // A new selection must never reuse a destructive replace opt-in. The
+    // offline pin assertion and persistence opt-in are also per operation.
+    for (const name of ["catalog-batch-confirm", "catalog-batch-persist",
+      "catalog-batch-replace"]) {
+      const control = field(name);
+      if (control) control.checked = false;
+    }
   }
   function from64(value) {
     if (typeof value !== "string" || !base64.test(value)) fail();
@@ -643,6 +664,26 @@
       document.head.append(script);
     });
   }
+  async function invalidateProtectedLocalSearch(grant, assertLive) {
+    // A failed local cache delete is never authority: every subsequent read
+    // still requires the newly pinned, independently signed catalog head.
+    try {
+      if (!window.RootarkZk1ProtectedLocalSearch?.clear)
+        await loadScript("rootark-zk1-protected-local-search");
+      assertLive();
+      await window.RootarkZk1ProtectedLocalSearch.clear({
+        grant, indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
+        assertLive,
+      });
+      if (window.RootarkZk1ProtectedRevisionIndex?.clear) {
+        await window.RootarkZk1ProtectedRevisionIndex.clear({
+          grant, indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
+          assertLive,
+        });
+      }
+    } catch (_) { /* signed head fencing still excludes stale records */ }
+    assertLive();
+  }
   async function ensureScripts() {
     if (!loadingScripts) loadingScripts = (async () => {
       for (const name of dependencyNames) await loadScript(name);
@@ -821,9 +862,36 @@
       + '<label>Chave historica de metadados do arquivo ANTES da rotacao (raw 32 bytes; importada somente para leitura local)<input type="file" data-zk1-field="catalog-restore-source-metadata-key"></label>'
       + '<label>CEK NOVA do epoch atual (raw 32 bytes; compromisso SHA-256 no grant)<input type="file" data-zk1-field="catalog-restore-current-cek"></label>'
       + '<label>Chave NOVA de metadados do epoch atual (raw 32 bytes; compromisso SHA-256 no grant)<input type="file" data-zk1-field="catalog-restore-current-metadata"></label>'
+      + '<label>Busca por nome (índice local AES-GCM; vazio lista todos)<input type="search" data-zk1-field="catalog-delta-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
+      + '<p class="muted">O catálogo assinado é revalidado a cada busca. O índice cifrado fica no armazenamento deste navegador, até uma mudança do catálogo ou limpeza dos dados do site. Nome e consulta não são enviados ao servidor.</p>'
+      + '<label>Revisão protegida selecionada para GET cifrado<input type="number" min="1" step="1" data-zk1-field="catalog-delta-read-revision" readonly></label>'
+      + '<p class="muted">Selecione um resultado e confirme o GET assinado. Para abrir texto localmente, importe os metadados exatos da versão e a CEK guardados pelo proprietário fora do servidor. O SHA-256 da CEK deve estar fixado em fonte independente; um hash fornecido pelo próprio servidor não prova custódia.</p>'
+      + '<label>Metadados canônicos da versão escolhida (.json, arquivo externo ao servidor)<input type="file" data-zk1-field="catalog-preview-metadata" accept=".json,application/json"></label>'
+      + '<label>CEK da versão escolhida (arquivo binário offline de 32 bytes)<input type="file" data-zk1-field="catalog-preview-cek" accept=".bin,application/octet-stream"></label>'
+      + '<label>SHA-256 da CEK fixado pelo proprietário separadamente (base64url, 32 bytes)<input data-zk1-field="catalog-preview-cek-sha" maxlength="43" autocomplete="off" spellcheck="false"></label>'
+      + '<p class="muted">Prévia efêmera de texto UTF-8, até 64 KiB. AES-GCM, IDs, epoch, revisão, grant ativo, CAS e GET assinado são conferidos antes de exibir. Fecha ao mudar seleção ou sessão. Não executa HTML ou scripts.</p>'
+      + '<fieldset><legend>Busca em conteúdo protegido (DEV, somente local)</legend>'
+      + '<p class="muted">Busque texto em 1–128 versões cifradas explicitamente selecionadas no catálogo assinado, em janelas sequenciais de até oito. Importe um manifesto local JSON rootark-zk1-local-text-batch/v1 com entries {objectId, revision, metadata, cekFile, cekSha256Pin} e as CEKs de 32 bytes nomeadas nele. O SHA-256 do manifesto e a origem de cada CEK/pin devem ser confirmados fora do servidor. Cada versão exige GET Ed25519/CAS fresco e AEAD; os resultados só aparecem após todas as verificações. A persistência de conteúdo é opcional e exclusivamente cifrada neste navegador; limite de 4 MiB serializados, cobertura parcial e nunca universal.</p>'
+      + '<label>Texto a buscar (UTF-8 NFC, até 120 caracteres)<input type="search" data-zk1-field="catalog-batch-query" maxlength="120" autocomplete="off" spellcheck="false"></label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-batch-all-terms"> Todas as palavras (AND): 2–4 termos literais distintos, até 40 caracteres cada; espaços separam termos. Desmarcado: frase literal exata.</label>'
+      + '<label>Manifesto de seleção do proprietário (.json, 1–128 entradas, até 64 KiB)<input type="file" data-zk1-field="catalog-batch-manifest" accept=".json,application/json"></label>'
+      + '<label>SHA-256 do manifesto fixado fora do servidor (base64url, 32 bytes)<input data-zk1-field="catalog-batch-manifest-pin" maxlength="43" autocomplete="off" spellcheck="false"></label>'
+      + '<label>CEKs locais das revisões selecionadas (até 128 arquivos binários de 32 bytes, abertos uma por vez)<input type="file" multiple data-zk1-field="catalog-batch-ceks" accept=".bin,application/octet-stream"></label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-batch-confirm"> Verifiquei offline o manifesto, cada pin de CEK e a autorização atual do proprietário.</label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-batch-persist"> Após concluir todo o lote, guardar até 128 revisões selecionadas no índice local AES-GCM/HKDF (até 4 MiB de JSON antes da cifragem). Requer a chave local de metadados acima. Não indexa automaticamente todo o histórico.</label>'
+      + '<label><input type="checkbox" data-zk1-field="catalog-batch-replace"> Substituir explicitamente o índice local anterior pelo lote verificado acima (1–128 revisões). A seleção antiga deixa de ser pesquisável; mantém o limite de 4 MiB. Requer guardar no índice.</label>'
+      + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-search">Buscar dentro das versões selecionadas</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-text-cancel" disabled>Cancelar busca</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-index-search">Buscar nas revisões já indexadas (sem CEKs)</button></div>'
+      + '<output data-zk1-field="catalog-batch-progress" role="status" aria-live="polite" aria-atomic="true"></output>'
+      + '<pre data-zk1-field="catalog-delta-text-results" role="region" aria-label="Correspondências protegidas verificadas localmente"></pre>'
+      + '<div data-zk1-field="catalog-index-pages" class="zk1-workspace-actions" role="navigation" aria-label="Páginas do índice local cifrado"></div>'
+      + '</fieldset>'
       + '<div class="zk1-workspace-actions"><button type="button" class="button button-quiet" data-zk1-action="catalog-delta-anchor">Ancorar CAS assinado atual</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-pull">Conferir e exportar delta cifrado</button>'
-      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Listar nomes localmente (AES-GCM)</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-list">Buscar / listar nomes localmente (AES-GCM)</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-get">GET assinado do ciphertext selecionado</button>'
+      + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-preview">GET assinado e prévia de texto com CEK offline</button>'
       + '<button type="button" class="button button-quiet" data-zk1-action="catalog-delta-trash-inspect">Conferir tombstone assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-import">Importar e comparar delta com GET assinado</button>'
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-publish">Publicar nova versão cifrada via journal → PUT → CAS</button>'
@@ -831,6 +899,7 @@
       + '<button type="button" class="button button-primary" data-zk1-action="catalog-delta-restore">Restaurar ciphertext histórico autenticado (sem delete)</button></div>'
       + '<p class="muted">Restore exige tombstone Ed25519 válido, GET histórico assinado, CEK original offline e piso CAS/witness atual. Entre epochs, o tombstone deve ter sido assinado pelo dispositivo atual após rotação, e a versão antiga deve ter seu conteúdo e CEK preservados; o grant de rekey atual e duas chaves novas produzem revisão AEAD sem reutilizar CEK antiga. Fixe e preserve as novas chaves fora do servidor para recuperação futura. Sem deleção física.</p>'
       + '<div data-zk1-field="catalog-delta-private-list" role="region" aria-label="Nomes locais abertos após CAS e witness assinados"></div>'
+      + '<pre data-zk1-field="catalog-delta-preview" role="region" aria-label="Prévia de texto protegida localmente"></pre>'
       + '<output data-zk1-field="catalog-delta-summary" role="status" aria-live="polite"></output>'
       + '</fieldset>'
       + '</fieldset>'
@@ -931,15 +1000,64 @@
       + '</form><p class="muted" data-zk1-field="status" role="status" aria-live="polite">Nenhuma autoridade foi importada.</p>';
     document.body.append(dialog);
     dialog.addEventListener("cancel", (event) => { if (busy) event.preventDefault(); });
+    // Native Escape closes <dialog> via cancel -> close without the explicit
+    // "close" action's form reset. Consume destructive consent on that path
+    // too. Some browsers emit a noncancelable native cancel during an active
+    // batch: explicitly cancel that batch before it can release any result.
+    dialog.addEventListener("close", () => {
+      if (activeTextBatch) activeTextBatch.cancelled = true;
+      resetRevisionBatchConsent();
+      clearLocalPreview();
+    });
+    const invalidateInput = (event) => {
+      clearLocalPreview();
+      const changed = event.target?.getAttribute?.("data-zk1-field");
+      if (changed === "catalog-delta-query") {
+        // Editing the query revokes both an in-flight result and previously
+        // rendered private names immediately, even while the Search button is
+        // disabled by the single-operation busy gate.
+        protectedLocalSearchGeneration += 1;
+        protectedLocalSearchTerm = event.target.value || "";
+        field("catalog-delta-private-list")?.replaceChildren();
+        const previousSummary = field("catalog-delta-summary");
+        if (previousSummary) previousSummary.textContent = "";
+      }
+      if (changed && !["catalog-batch-confirm", "catalog-batch-persist",
+        "catalog-batch-replace"].includes(changed)) resetRevisionBatchConsent();
+    };
+    dialog.addEventListener("input", invalidateInput);
+    dialog.addEventListener("change", invalidateInput);
     dialog.addEventListener("click", (event) => {
+      if (event.target.closest('[data-zk1-field="catalog-delta-private-list"] button'))
+        clearLocalPreview();
       const button = event.target.closest("[data-zk1-action]");
       if (button) void perform(button.dataset.zk1Action);
     });
     return dialog;
   }
   async function perform(action) {
+    if (action === "catalog-delta-text-cancel") {
+      resetRevisionBatchConsent();
+      if (activeTextBatch) {
+        activeTextBatch.cancelled = true;
+        clearLocalPreview();
+        field("catalog-batch-progress").textContent = "Cancelando; nenhuma correspondência será exibida.";
+        status("Cancelamento solicitado; a leitura em andamento será descartada.");
+      }
+      return;
+    }
     if (busy) return;
+    if (action === "catalog-delta-list") {
+      // Invalidate the previously displayed local result before any script,
+      // capability, key-import, or listing await can yield to the event loop.
+      const previousSummary = field("catalog-delta-summary");
+      if (previousSummary) previousSummary.textContent = "";
+      const previousPrivateList = field("catalog-delta-private-list");
+      if (previousPrivateList) previousPrivateList.replaceChildren();
+    }
     if (action === "close") {
+      resetRevisionBatchConsent();
+      clearLocalPreview();
       committedDeviceApproval = null;
       verifiedCatalog = null;
       verifiedOpaqueDelta = null;
@@ -963,11 +1081,35 @@
       "account-create", "account-recover", "versioned-create", "versioned-recover",
       "catalog-discover", "catalog-page", "catalog-get", "catalog-publish",
       "catalog-lifecycle", "catalog-v2-read", "catalog-v2-get",
-      "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
+      "catalog-delta-anchor", "catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-index-search", "catalog-delta-pull", "catalog-delta-import",
       "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
       "catalog-delta-restore"].includes(action)) return;
+    if (action === "catalog-delta-list") {
+      protectedLocalSearchGeneration += 1;
+      protectedLocalSearchTerm = field("catalog-delta-query")?.value || "";
+      // A failed refresh must never leave the previous query's local names or
+      // count visible while scripts, trust, or key material are being loaded.
+      field("catalog-delta-private-list")?.replaceChildren();
+      const summary = field("catalog-delta-summary");
+      if (summary) summary.textContent = "";
+    }
+    // Capture the owner's checkboxes synchronously at this click, and consume
+    // them before any asynchronous trust, network, file or IndexedDB work.
+    const batchConsent = action === "catalog-delta-text-search" ? {
+      confirmed: field("catalog-batch-confirm")?.checked === true,
+      persist: field("catalog-batch-persist")?.checked === true,
+      replace: field("catalog-batch-replace")?.checked === true,
+    } : null;
+    resetRevisionBatchConsent();
+    clearLocalPreview();
+    const operationPreviewGeneration = previewGeneration;
+    const textBatch = action === "catalog-delta-text-search"
+      ? { cancelled: false } : null;
+    activeTextBatch = textBatch;
     busy = true;
-    dialog.querySelectorAll("button").forEach((button) => { button.disabled = true; });
+    dialog.querySelectorAll("button").forEach((button) => {
+      button.disabled = !textBatch || button.dataset.zk1Action !== "catalog-delta-text-cancel";
+    });
     status("Validando pins externos, assinatura do proprietário e dispositivo…");
     let privateDer;
     let data;
@@ -980,7 +1122,8 @@
       const operationEpoch = sessionEpoch;
       const initialCsrf = currentCsrf();
       const assertLive = () => {
-        if (sessionEpoch !== operationEpoch || dialog?.open !== true
+        if (sessionEpoch !== operationEpoch || textBatch?.cancelled
+          || dialog?.open !== true
           || currentCsrf() !== initialCsrf) fail();
       };
       const guardedFetch = async (url, options) => {
@@ -1101,7 +1244,7 @@
       }
       const trust = await grantAndOwner();
       assertLive();
-      if (["catalog-delta-list", "catalog-delta-pull", "catalog-delta-import",
+      if (["catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-index-search", "catalog-delta-pull", "catalog-delta-import",
         "catalog-delta-publish", "catalog-delta-trash", "catalog-delta-trash-inspect",
         "catalog-delta-restore"].includes(action)) {
         if (available.opaqueCatalogV1 !== true
@@ -1128,7 +1271,35 @@
           previousOwnerHistoryProof: trust.previousOwnerHistoryProof,
         });
         assertLive();
-        if (action !== "catalog-delta-list")
+        const verifyCurrentIndexOwnerGrant = async (assertOperationLive) => {
+          assertOperationLive();
+          // Re-import owner/grant/history and independently check the device
+          // trust floor on EVERY index read, write and navigation page.
+          const current = await grantAndOwner();
+          assertOperationLive();
+          if (JSON.stringify(current.signedDeviceGrant)
+              !== JSON.stringify(trust.signedDeviceGrant)
+            || current.pinnedCurrentHead.revision !== trust.pinnedCurrentHead.revision
+            || current.pinnedCurrentHead.epoch !== trust.pinnedCurrentHead.epoch
+            || to64(current.pinnedCurrentHead.digest)
+              !== to64(trust.pinnedCurrentHead.digest)
+            || to64(current.independentOwnerSpkiSha256)
+              !== to64(trust.independentOwnerSpkiSha256)) fail();
+          await window.RootarkZk1NormalBrowserTrustFloor.assertCurrent({
+            ownerPublicKey: current.ownerPublicKey,
+            independentOwnerSpkiSha256: current.independentOwnerSpkiSha256,
+            pinnedCurrentHead: current.pinnedCurrentHead,
+            signedDeviceGrant: current.signedDeviceGrant,
+            ownerHistoryCheckpoint: current.ownerHistoryCheckpoint,
+            previousOwnerHistoryProof: current.previousOwnerHistoryProof,
+          });
+          assertOperationLive();
+          return { verifiedCurrent: true, grant: current.signedDeviceGrant,
+            ownerHead: { revision: current.pinnedCurrentHead.revision,
+              epoch: current.pinnedCurrentHead.epoch,
+              digest: to64(current.pinnedCurrentHead.digest) } };
+        };
+        if (!["catalog-delta-list", "catalog-delta-get", "catalog-delta-preview", "catalog-delta-text-search", "catalog-delta-index-search"].includes(action))
           field("catalog-delta-private-list")?.replaceChildren();
         if (["catalog-delta-trash", "catalog-delta-trash-inspect",
           "catalog-delta-restore"].includes(action)) {
@@ -1225,6 +1396,7 @@
               || result.serverPlaintextExposed !== false
               || result.physicalDeletionAuthorized !== false
               || result.journalClearedAfterSignedProof !== true) fail();
+            await invalidateProtectedLocalSearch(trust.signedDeviceGrant, assertLive);
             field("catalog-delta-summary").textContent = "Restore cifrado · CAS #"
               + result.sequence + " · revisão " + result.revision;
             status("Restore lógico" + (rekeySelected ? " com rekey do proprietário" : "")
@@ -1252,6 +1424,7 @@
             || result.originalHistoryPreserved !== true
             || result.serverPlaintextExposed !== false
             || result.journalClearedAfterSignedProof !== true) fail();
+          await invalidateProtectedLocalSearch(trust.signedDeviceGrant, assertLive);
           field("catalog-delta-summary").textContent = "Trash lógico · CAS #"
             + result.sequence + " · revisão " + result.revision;
           status("Tombstone AES-GCM/Ed25519 publicado em nova revisão: PUT uma vez, "
@@ -1259,39 +1432,395 @@
           return;
         }
         if (action === "catalog-delta-list") {
-          // The metadata key is imported for DECRYPT only and never exported
-          // or sent to the server. Render via textContent, never HTML.
-          const raw = await fileBytes("catalog-write-key", 32, 32);
-          let metadataKey;
-          try { metadataKey = await crypto.subtle.importKey("raw", raw,
-            { name: "AES-GCM", length: 256 }, false, ["decrypt"]); }
-          finally { raw.fill(0); }
-          const list = field("catalog-delta-private-list");
-          list.replaceChildren();
-          const opened = await held.client.readPrivateListing(held.baseline, metadataKey);
+          // Raw key material is used only locally to decrypt catalog metadata
+          // and derive the nonextractable HKDF-separated cached index key.
+          if (!window.RootarkZk1ProtectedLocalSearch?.search)
+            await loadScript("rootark-zk1-protected-local-search");
           assertLive();
+          if (!window.RootarkZk1ProtectedLocalSearch?.search) fail();
+          const searchGeneration = protectedLocalSearchGeneration;
+          const term = protectedLocalSearchTerm;
+          const assertSearchLive = () => {
+            assertLive();
+            if (searchGeneration !== protectedLocalSearchGeneration
+              || field("catalog-delta-query")?.value !== term) {
+              const error = new Error("Consulta local substituída");
+              error.code = "SEARCH_SUPERSEDED";
+              throw error;
+            }
+          };
+          const raw = await fileBytes("catalog-write-key", 32, 32);
+          const list = field("catalog-delta-private-list");
+          let opened;
+          try {
+            try {
+              assertSearchLive();
+              opened = await window.RootarkZk1ProtectedLocalSearch.search({
+                client: held.client, baseline: held.baseline,
+                grant: trust.signedDeviceGrant,
+                ownerRevision: trust.pinnedCurrentHead.revision,
+                ownerEpoch: trust.pinnedCurrentHead.epoch,
+                ownerDigest: to64(trust.pinnedCurrentHead.digest),
+                metadataRaw: raw, term, indexedDBImpl:
+                  typeof indexedDB === "object" ? indexedDB : null,
+                assertLive: assertSearchLive,
+              });
+              assertSearchLive();
+            } catch (error) {
+              if (error?.code === "SEARCH_SUPERSEDED") return;
+              throw error;
+            }
+          } finally { raw.fill(0); }
           if (opened.independentlySignedCatalog !== true
             || opened.plaintextSentToServer !== false
             || opened.authorizesMutation !== false
             || opened.head.sequence !== held.baseline.head.sequence
             || opened.head.digest !== held.baseline.head.digest
-            || !Array.isArray(opened.entries)) fail();
-          const content = document.createDocumentFragment();
-          for (const entry of opened.entries) {
-            if ((typeof entry.name !== "string" || !entry.name)
-              && !(entry.name === null && entry.logicalTrashCandidate === true)) fail();
-            const item = document.createElement("div");
-            item.textContent = (entry.logicalTrashCandidate === true
-              ? "Lixeira lógica (verifique o tombstone assinado)" : entry.name)
-              + " · revisão " + entry.revision;
-            content.appendChild(item);
-          }
+            || !Array.isArray(opened.entries)
+            || !Number.isSafeInteger(opened.totalMatches)
+            || opened.totalMatches < opened.entries.length) fail();
+          const listLive = () => {
+            try { assertSearchLive(); }
+            catch (error) {
+              if (error?.code === "SEARCH_SUPERSEDED") return false;
+              throw error;
+            }
+            return !busy && verifiedOpaqueDelta === held;
+          };
+          const updateListSummary = (page) => {
+            const first = page.entries.length ? page.offset + 1 : 0;
+            field("catalog-delta-summary").textContent = term.trim()
+              ? "Busca local: " + page.totalMatches + " correspondência(s), "
+                + first + "–" + (page.offset + page.entries.length)
+                + " exibidas · CAS #" + page.head.sequence
+              : "Listagem local: " + first + "–"
+                + (page.offset + page.entries.length) + " de "
+                + page.totalMatches + " versão(ões) · CAS #" + page.head.sequence;
+          };
+          // Selection only fills the opaque ID used by existing independent
+          // authorization gates; it never triggers protected I/O or a mutation.
+          window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+            list, opened.entries, field("catalog-write-id"), listLive,
+            field("catalog-delta-read-revision"), { ...opened,
+              onPage: updateListSummary,
+              onDenied: () => {
+                field("catalog-delta-summary").textContent = "";
+                status("Consulta local interrompida: confira o CAS e o grant atuais.");
+              },
+            });
+          updateListSummary(opened);
+          status("CAS/witness revalidados; " + (opened.persistedIndex
+            ? opened.reusedIndex ? "índice cifrado reutilizado." : "índice local cifrado atualizado."
+            : "listagem local sem armazenamento persistente.")
+            + " Nenhum nome, chave ou consulta enviado ao servidor.");
+          return;
+        }
+        if (action === "catalog-delta-get") {
+          const objectId = field("catalog-write-id")?.value.trim();
+          const revision = Number(field("catalog-delta-read-revision")?.value);
+          if (!/^[A-Za-z0-9_-]{22}$/.test(objectId)
+            || !Number.isSafeInteger(revision) || revision < 1) fail();
+          const selected = held.baseline.entries.filter((entry) =>
+            entry.objectId === objectId && entry.revision === revision);
+          if (selected.length !== 1 || !held.client.readSelectedCiphertext) fail();
+          const checked = await held.client.readSelectedCiphertext(
+            held.baseline, objectId, revision);
           assertLive();
-          list.replaceChildren(content);
-          field("catalog-delta-summary").textContent = "Listagem local de "
-            + opened.entries.length + " versão(ões) · CAS #" + opened.head.sequence;
-          status("Metadados autenticados via CAS/witness e abertos só neste navegador. "
-            + "Nenhum nome ou chave enviado ao servidor.");
+          if (checked.verifiedCiphertext !== true || checked.plaintextAvailable !== false
+            || checked.authorizesMutation !== false
+            || checked.objectId !== objectId || checked.revision !== revision
+            || checked.epoch !== selected[0].epoch
+            || checked.ciphertextDigestBase64 !== selected[0].ciphertextDigestBase64) fail();
+          const sealed = contentFrom64(checked.ciphertextBase64);
+          try {
+            downloadLocal("zk1-" + objectId + "-v" + revision + ".ciphertext",
+              sealed, "application/octet-stream", assertLive);
+          } finally { sealed.fill(0); }
+          status("GET Ed25519/CAS e SHA-256 conferidos: objeto " + objectId
+            + " · revisão " + revision + ". Ciphertext salvo localmente; "
+            + "prévia bloqueada sem CEK confiável. Nenhum plaintext saiu do dispositivo.");
+          return;
+        }
+        if (action === "catalog-delta-preview") {
+          const objectId = field("catalog-write-id")?.value.trim();
+          const revisionRaw = field("catalog-delta-read-revision")?.value;
+          const revision = Number(revisionRaw);
+          if (!/^[A-Za-z0-9_-]{22}$/.test(objectId)
+            || !Number.isSafeInteger(revision) || revision < 1) fail();
+          const selected = held.baseline.entries.filter((entry) =>
+            entry.objectId === objectId && entry.revision === revision);
+          if (selected.length !== 1 || !held.client.readSelectedCiphertext) fail();
+          const assertPreviewLive = () => {
+            assertLive();
+            if (previewGeneration !== operationPreviewGeneration
+              || verifiedOpaqueDelta !== held
+              || field("catalog-write-id")?.value.trim() !== objectId
+              || field("catalog-delta-read-revision")?.value !== revisionRaw) fail();
+          };
+          const metadataRaw = await fileBytes("catalog-preview-metadata", 2, 2048);
+          let metadata;
+          try { metadata = JSON.parse(decoder.decode(metadataRaw)); }
+          finally { metadataRaw.fill(0); }
+          const cekRaw = await fileBytes("catalog-preview-cek", 32, 32);
+          try {
+            assertPreviewLive();
+            if (!window.RootarkZk1SelectedLocalPreview?.open)
+              await loadScript("rootark-zk1-selected-local-preview");
+            assertPreviewLive();
+            if (!window.RootarkZk1SelectedLocalPreview?.open) fail();
+            const checked = await held.client.readSelectedCiphertext(
+              held.baseline, objectId, revision);
+            assertPreviewLive();
+            const preview = await window.RootarkZk1SelectedLocalPreview.open({
+              checked, selected: selected[0], metadata, rawCek: cekRaw,
+              cekSha256Pin: field("catalog-preview-cek-sha")?.value.trim(),
+              grant: trust.signedDeviceGrant,
+              ownerHead: { revision: trust.pinnedCurrentHead.revision,
+                epoch: trust.pinnedCurrentHead.epoch,
+                digest: to64(trust.pinnedCurrentHead.digest) },
+              baseline: held.baseline, assertLive: assertPreviewLive,
+            });
+            assertPreviewLive();
+            if (preview.plaintextSentToServer !== false
+              || preview.objectId !== objectId || preview.revision !== revision
+              || preview.epoch !== selected[0].epoch) fail();
+            field("catalog-delta-preview").textContent = preview.name
+              + " · revisão " + revision + "\n" + preview.text;
+            status("Prévia UTF-8 conferida localmente por AEAD, CAS e GET assinado. "
+              + "A autenticidade do pin SHA-256 da CEK depende da fonte offline do proprietário.");
+          } finally { cekRaw.fill(0); }
+          return;
+        }
+        if (action === "catalog-delta-index-search") {
+          const originalQuery = field("catalog-batch-query")?.value;
+          const originalMatchMode = field("catalog-batch-all-terms")?.checked;
+          const assertIndexLive = () => {
+            assertLive();
+            if (previewGeneration !== operationPreviewGeneration
+              || verifiedOpaqueDelta !== held
+              || field("catalog-batch-query")?.value !== originalQuery
+              || field("catalog-batch-all-terms")?.checked !== originalMatchMode) fail();
+          };
+          if (!window.RootarkZk1ProtectedRevisionIndex?.search)
+            await loadScript("rootark-zk1-protected-revision-index");
+          assertIndexLive();
+          if (!window.RootarkZk1ProtectedRevisionIndex?.search) fail();
+          const metadataRaw = await fileBytes("catalog-write-key", 32, 32);
+          let result;
+          try {
+            result = await window.RootarkZk1ProtectedRevisionIndex.search({
+              query: originalQuery,
+              matchMode: originalMatchMode ? "all-terms" : "phrase",
+              grant: trust.signedDeviceGrant,
+              ownerHead: { revision: trust.pinnedCurrentHead.revision,
+                epoch: trust.pinnedCurrentHead.epoch,
+                digest: to64(trust.pinnedCurrentHead.digest) },
+              baseline: held.baseline, client: held.client, metadataRaw,
+              verifyOwnerGrant: () => verifyCurrentIndexOwnerGrant(assertIndexLive),
+              indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
+              assertLive: assertIndexLive,
+            });
+          } finally { metadataRaw.fill(0); }
+          assertIndexLive();
+          const resultPane = field("catalog-delta-text-results");
+          const pages = field("catalog-index-pages");
+          if (!resultPane || !pages || typeof result.readPage !== "function") fail();
+          const validatePage = (page, offset) => {
+            if (page?.plaintextSentToServer !== false
+              || page.authorizesMutation !== false
+              || page.coverage !== "owner-selected-revisions-only"
+              || !Array.isArray(page.entries) || page.entries.length > 50
+              || page.totalMatches < page.entries.length
+              || page.indexedCount > 128 || page.indexedCount < page.totalMatches
+              || page.totalMatches !== result.totalMatches
+              || page.indexedCount !== result.indexedCount
+              || page.pageSize !== 50 || page.offset !== offset
+              || page.hasPrevious !== (offset > 0)
+              || page.hasNext !== (offset + page.entries.length < page.totalMatches)
+              || typeof page.readPage !== "function") fail();
+          };
+          let navigationGeneration = 0;
+          const renderPage = (page, offset) => {
+            validatePage(page, offset);
+            navigationGeneration++;
+            resultPane.textContent = page.entries.map((row) =>
+              row.name + " · revisão " + row.revision + "\n" + row.excerpt).join("\n\n")
+              || "Nenhuma correspondência nas revisões já indexadas.";
+            const navigation = document.createDocumentFragment();
+            const counter = document.createElement("span");
+            counter.textContent = "Resultados " + (page.entries.length ? offset + 1 : 0)
+              + "–" + (offset + page.entries.length) + " de " + page.totalMatches;
+            navigation.append(counter);
+            const addNav = (nextOffset, title) => {
+              const button = document.createElement("button");
+              button.type = "button";
+              button.className = "button button-quiet";
+              button.dataset.zk1IndexPage = title === "Anterior" ? "previous" : "next";
+              button.textContent = title;
+              button.addEventListener("click", async () => {
+                if (!pages.contains(button) || busy) return;
+                const generation = navigationGeneration;
+                try {
+                  assertIndexLive();
+                  button.disabled = true;
+                  const next = await result.readPage(nextOffset);
+                  if (generation !== navigationGeneration || !pages.contains(button)) return;
+                  assertIndexLive();
+                  if (busy) fail();
+                  renderPage(next, nextOffset);
+                } catch (_) {
+                  if (generation === navigationGeneration && pages.contains(button)) {
+                    clearLocalPreview();
+                    status("Página negada: CAS, grant, sessão ou consulta alterados.");
+                  }
+                } finally { button.disabled = false; }
+              });
+              navigation.append(button);
+            };
+            if (page.hasPrevious) addNav(offset - 50, "Anterior");
+            if (page.hasNext) addNav(offset + 50, "Próxima");
+            pages.replaceChildren(navigation);
+            status("Índice local cifrado: " + page.totalMatches + " correspondência(s), "
+              + (page.entries.length ? offset + 1 : 0) + "–"
+              + (offset + page.entries.length) + " exibidas, de " + page.indexedCount
+              + " revisões selecionadas previamente. Cobertura parcial; "
+              + "CAS/grant revalidados, sem CEK nem consulta enviada ao servidor.");
+          };
+          renderPage(result, 0);
+          return;
+        }
+        if (action === "catalog-delta-text-search") {
+          if (!batchConsent.confirmed
+            || !held.client.readSelectedCiphertext) fail();
+          const assertBatchLive = () => {
+            assertLive();
+            if (previewGeneration !== operationPreviewGeneration
+              || verifiedOpaqueDelta !== held) fail();
+          };
+          const rawManifest = await fileBytes("catalog-batch-manifest", 2, 64 * 1024);
+          let manifest;
+          try {
+            const expectedPin = field("catalog-batch-manifest-pin")?.value.trim();
+            if (!base64.test(expectedPin)) fail();
+            const calculated = to64(new Uint8Array(await crypto.subtle.digest(
+              "SHA-256", rawManifest)));
+            assertBatchLive();
+            if (calculated !== expectedPin) fail();
+            manifest = JSON.parse(decoder.decode(rawManifest));
+          } finally { rawManifest.fill(0); }
+          exactly(manifest, ["schema", "entries"]);
+          if (manifest.schema !== "rootark-zk1-local-text-batch/v1"
+            || !Array.isArray(manifest.entries)
+            || manifest.entries.length < 1 || manifest.entries.length > 128) fail();
+          const persistBatch = batchConsent.persist;
+          const replaceExisting = batchConsent.replace;
+          if (replaceExisting && !persistBatch) fail();
+          if (persistBatch) {
+            if (field("catalog-write-key")?.files?.length !== 1
+              || field("catalog-write-key").files[0].size !== 32) fail();
+            if (!window.RootarkZk1ProtectedRevisionIndex?.append)
+              await loadScript("rootark-zk1-protected-revision-index");
+            assertBatchLive();
+            if (!window.RootarkZk1ProtectedRevisionIndex?.append) fail();
+          }
+          field("catalog-batch-progress").textContent =
+            "0 / " + manifest.entries.length + " revisões conferidas";
+          const filesControl = field("catalog-batch-ceks")?.files;
+          if (!filesControl || filesControl.length !== manifest.entries.length) fail();
+          const files = new Map();
+          for (const file of filesControl) {
+            if (file.size !== 32 || files.has(localName(file.name))) fail();
+            files.set(file.name, file);
+          }
+          const usedFiles = new Set();
+          {
+            for (const record of manifest.entries) {
+              exactly(record, ["objectId", "revision", "metadata", "cekFile",
+                "cekSha256Pin"]);
+              if (!/^[A-Za-z0-9_-]{22}$/.test(record.objectId)
+                || !Number.isSafeInteger(record.revision) || record.revision < 1
+                || !base64.test(record.cekSha256Pin)
+                || !files.has(record.cekFile) || usedFiles.has(record.cekFile)) fail();
+              usedFiles.add(record.cekFile);
+              const match = held.baseline.entries.filter((row) =>
+                row.objectId === record.objectId && row.revision === record.revision);
+              if (match.length !== 1) fail();
+              assertBatchLive();
+              record.selected = match[0];
+            }
+            if (usedFiles.size !== files.size) fail();
+            assertBatchLive();
+            if (!window.RootarkZk1SelectedLocalPreview?.open)
+              await loadScript("rootark-zk1-selected-local-preview");
+            if (!window.RootarkZk1ProtectedTextBatch?.search)
+              await loadScript("rootark-zk1-protected-text-batch");
+            assertBatchLive();
+            if (!window.RootarkZk1ProtectedTextBatch?.search) fail();
+            const result = await window.RootarkZk1ProtectedTextBatch.search({
+              query: field("catalog-batch-query")?.value,
+              matchMode: field("catalog-batch-all-terms")?.checked ? "all-terms" : "phrase",
+              items: manifest.entries,
+              grant: trust.signedDeviceGrant,
+              ownerHead: { revision: trust.pinnedCurrentHead.revision,
+                epoch: trust.pinnedCurrentHead.epoch,
+                digest: to64(trust.pinnedCurrentHead.digest) },
+              baseline: held.baseline, assertLive: assertBatchLive,
+              getChecked: async (objectId, revision) =>
+                held.client.readSelectedCiphertext(held.baseline, objectId, revision),
+              readCek: async (fileName) => {
+                assertBatchLive();
+                const file = files.get(fileName);
+                if (!file || file.size !== 32) fail();
+                const rawCek = new Uint8Array(await file.arrayBuffer());
+                try { assertBatchLive(); return rawCek; }
+                catch (error) { rawCek.fill(0); throw error; }
+              },
+              isCancelled: () => textBatch.cancelled,
+              onProgress: ({ completed, total }) => {
+                assertBatchLive();
+                field("catalog-batch-progress").textContent =
+                  completed + " / " + total + " revisões conferidas";
+              },
+              ...(persistBatch ? { onVerifiedBatch: async (entries) => {
+                assertBatchLive();
+                const metadataRaw = await fileBytes("catalog-write-key", 32, 32);
+                try {
+                  const saved = await window.RootarkZk1ProtectedRevisionIndex.append({
+                    entries, replaceExisting, grant: trust.signedDeviceGrant,
+                    ownerHead: { revision: trust.pinnedCurrentHead.revision,
+                      epoch: trust.pinnedCurrentHead.epoch,
+                      digest: to64(trust.pinnedCurrentHead.digest) },
+                    baseline: held.baseline, client: held.client, metadataRaw,
+                    verifyOwnerGrant: () => verifyCurrentIndexOwnerGrant(assertBatchLive),
+                    indexedDBImpl: typeof indexedDB === "object" ? indexedDB : null,
+                    assertLive: assertBatchLive,
+                  });
+                  assertBatchLive();
+                  return saved;
+                } finally { metadataRaw.fill(0); }
+              } } : {}),
+            });
+            assertBatchLive();
+            if (result.plaintextSentToServer !== false
+              || result.authorizesMutation !== false
+              || result.totalSearched !== manifest.entries.length
+              || result.totalMatches !== result.matches.length) fail();
+            const text = result.matches.map((row) => row.name + " · revisão "
+              + row.revision + "\n" + row.excerpt).join("\n\n");
+            field("catalog-delta-text-results").textContent =
+              text || "Nenhum conteúdo correspondente nas versões verificadas.";
+            status("Busca protegida local: " + result.totalMatches + " de "
+              + result.totalSearched + " versões conferidas. "
+              + (replaceExisting ? "Índice local anterior substituído atomicamente pelo lote selecionado. "
+                : persistBatch ? "Lote completo acrescentado ao índice local cifrado. "
+                : "Conteúdo não persistido. ")
+              + (result.indexedDiscardedCount > 0
+                ? result.indexedDiscardedCount + " revisão(ões) anteriores removidas "
+                  + "por ausência ou digest diferente no novo catálogo assinado. " : "")
+              + (result.indexedReplacedIncompatible
+                ? "Índice anterior descartado por mudança de autoridade ou formato antigo. " : "")
+              + "Nenhum texto/consulta/CEK enviado.");
+          }
           return;
         }
         if (action === "catalog-delta-publish") {
@@ -1334,6 +1863,7 @@
           if (result.journalClearedAfterSignedProof !== true
             || result.plaintextMetadataExposed !== false
             || result.productionDurabilityProven !== false) fail();
+          await invalidateProtectedLocalSearch(trust.signedDeviceGrant, assertLive);
           field("catalog-delta-summary").textContent = "CAS assinado #" + result.sequence;
           status("Versão cifrada enviada uma única vez, GET exato e catálogo CAS assinados. "
             + "Fixe o novo head externamente e ancore novamente em ambos os dispositivos. "
@@ -1706,6 +2236,7 @@
         assertLive();
         verifiedCatalog = null;
         if (result.verifiedSignedReadback !== true || result.productionDurabilityProven !== false) fail();
+        await invalidateProtectedLocalSearch(trust.signedDeviceGrant, assertLive);
         status("Catálogo completo #" + result.sequence + " confirmado por GET assinado + CAS: "
           + result.digest + ". " + result.totalCount + " versão(ões). Object ID: " + objectId
           + (uncertainPut ? ". ACK do PUT incerto, GET conferido." : ".")
@@ -2525,8 +3056,16 @@
         }
       }
     } catch (_) {
-      status("Operação recusada: autoridade, permissão, sessão ou ciphertext não verificado.");
+      if (textBatch?.cancelled) {
+        field("catalog-batch-progress").textContent = "Busca cancelada; resultados descartados.";
+        status("Busca cancelada; nenhuma correspondência parcial foi exibida.");
+      } else {
+        if (textBatch) field("catalog-batch-progress").textContent =
+          "Verificação incompleta; resultados descartados.";
+        status("Operação recusada: autoridade, permissão, sessão ou ciphertext não verificado.");
+      }
     } finally {
+      resetRevisionBatchConsent();
       privateDer?.fill(0);
       data?.fill(0);
       secret?.fill(0);
@@ -2547,7 +3086,8 @@
         "catalog-cas-key", "catalog-signer-grant", "catalog-metadata-key",
         "catalog-lifecycle-history", "catalog-lifecycle-ceks",
         "catalog-write-ciphertext", "catalog-write-key", "catalog-witness-key",
-        "catalog-delta-package",
+        "catalog-delta-package", "catalog-preview-metadata", "catalog-preview-cek",
+        "catalog-batch-manifest", "catalog-batch-ceks",
         "migration-batch-descriptors", "migration-batch-ceks", "migration-batch-secret",
         "archive-files", "archive-owner-private", "archive-json", "archive-historical-proof",
         "account-descriptors", "account-holder-files", "account-local-files",
@@ -2559,7 +3099,10 @@
         if (control) control.value = "";
       }
       busy = false;
-      dialog.querySelectorAll("button").forEach((button) => { button.disabled = false; });
+      if (activeTextBatch === textBatch) activeTextBatch = null;
+      dialog.querySelectorAll("button").forEach((button) => {
+        button.disabled = button.dataset.zk1Action === "catalog-delta-text-cancel";
+      });
     }
   }
   function showEntry() {
@@ -2593,6 +3136,7 @@
   });
   window.addEventListener("rootark:logout", () => {
     sessionEpoch++;
+    clearLocalPreview();
     verifiedCatalog = null;
     verifiedOpaqueDelta = null;
     const deltaSummary = field("catalog-delta-summary");
@@ -2610,4 +3154,5 @@
     if (dialog?.open) dialog.close();
     dialog?.querySelector("form")?.reset();
   });
+  window.addEventListener("pagehide", clearLocalPreview);
 }());

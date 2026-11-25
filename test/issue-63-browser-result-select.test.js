@@ -1,0 +1,537 @@
+"use strict";
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const http = require("node:http");
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
+
+test("real Edge CSP: verified local results select an opaque object without HTML/network or stale session replay", {
+  timeout: 40_000,
+}, async (t) => {
+  const edge = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+  if (process.platform !== "win32" || !fs.existsSync(edge)) {
+    t.skip("Windows Edge unavailable");
+    return;
+  }
+  const root = path.join(__dirname, "../public/client");
+  const html = "<!doctype html><meta charset='utf-8'>"
+    + "<section class='protected-client-panel'><p id='protectedClientStatus'></p></section>"
+    + "<output id='edge-result'>PENDING</output>"
+    + "<script defer src='/bootstrap.js'></script>"
+    + "<script defer src='/client/rootark-zk1-authenticated-workspace.js'></script>"
+    + "<script defer src='/client/rootark-zk1-protected-local-search.js'></script>"
+    + "<script defer src='/client/rootark-zk1-file-content.js'></script>"
+    + "<script defer src='/client/rootark-zk1-selected-local-preview.js'></script>"
+    + "<script defer src='/client/rootark-zk1-protected-text-batch.js'></script>"
+    + "<script defer src='/client/rootark-zk1-protected-revision-index.js'></script>"
+    + "<script defer src='/probe.js'></script>";
+  const bootstrap = "window.RootarkApi={get:async()=>({enabled:true,"
+    + "securityVersion:2,signedHistoryRequired:true,opaqueCatalogV1:true})};";
+  const probe = `window.addEventListener("load",async()=>{
+    const out=document.getElementById("edge-result");
+    const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    try {
+      window.dispatchEvent(new Event("rootark:workspace-rendered"));
+      let opener;
+      for(let i=0;i<80;i++){
+        opener=document.getElementById("zk1-workspace-open");
+        if(opener)break;
+        await sleep(30);
+      }
+      if(!opener)throw Error("NO_WORKSPACE_ENTRY");
+      opener.click();
+      let dialog;
+      for(let i=0;i<80;i++){
+        dialog=document.querySelector("dialog.zk1-workspace-dialog");
+        if(dialog?.open)break;
+        await sleep(30);
+      }
+      if(!dialog?.open)throw Error("NO_AUTH_DIALOG");
+      const list=dialog.querySelector('[data-zk1-field="catalog-delta-private-list"]');
+      const target=dialog.querySelector('[data-zk1-field="catalog-write-id"]');
+      const revision=dialog.querySelector('[data-zk1-field="catalog-delta-read-revision"]');
+      const listButton=dialog.querySelector('[data-zk1-action="catalog-delta-list"]');
+      const summary=dialog.querySelector('[data-zk1-field="catalog-delta-summary"]');
+      const getButton=dialog.querySelector('[data-zk1-action="catalog-delta-get"]');
+      const batchButton=dialog.querySelector('[data-zk1-action="catalog-delta-text-search"]');
+      const allTermsToggle=dialog.querySelector('[data-zk1-field="catalog-batch-all-terms"]');
+      const persistToggle=dialog.querySelector('[data-zk1-field="catalog-batch-persist"]');
+      const replaceToggle=dialog.querySelector('[data-zk1-field="catalog-batch-replace"]');
+      const storedIndexButton=dialog.querySelector('[data-zk1-action="catalog-delta-index-search"]');
+      const indexPages=dialog.querySelector('[data-zk1-field="catalog-index-pages"]');
+      if(!list||!target||!revision||!listButton||listButton.type!=="button"
+        ||!summary||!getButton||getButton.type!=="button"
+        ||!batchButton||batchButton.type!=="button"
+        ||!allTermsToggle||allTermsToggle.type!=="checkbox"||allTermsToggle.checked
+        ||!persistToggle||persistToggle.type!=="checkbox"||persistToggle.checked
+        ||!replaceToggle||replaceToggle.type!=="checkbox"||replaceToggle.checked
+        ||!storedIndexButton||storedIndexButton.type!=="button"
+        ||storedIndexButton.disabled||!indexPages
+        ||indexPages.getAttribute("role")!=="navigation"
+        ||indexPages.children.length!==0)
+        throw Error("MISSING_EXPLICIT_PROTECTED_GET");
+      persistToggle.click();
+      if(!persistToggle.checked)throw Error("EXPLICIT_REVISION_INDEX_OPT_IN_DENIED");
+      persistToggle.click();
+      if(persistToggle.checked)throw Error("REVISION_INDEX_OPT_IN_STUCK");
+      replaceToggle.click();
+      if(!replaceToggle.checked)throw Error("EXPLICIT_REPLACEMENT_OPT_IN_DENIED");
+      replaceToggle.click();
+      if(replaceToggle.checked)throw Error("EXPLICIT_REPLACEMENT_OPT_IN_STUCK");
+      const progress=dialog.querySelector('[data-zk1-field="catalog-batch-progress"]');
+      const cancel=dialog.querySelector('[data-zk1-action="catalog-delta-text-cancel"]');
+      if(!progress||progress.getAttribute("role")!=="status"
+        ||!cancel||cancel.textContent!=="Cancelar busca"||!cancel.disabled)
+        throw Error("MISSING_ACCESSIBLE_CANCEL_PROGRESS");
+      document.cookie="rootark_csrf=disposable-browser-session; SameSite=Strict";
+      if(batchButton.disabled)throw Error("BATCH_BUTTON_INITIAL_DISABLED");
+      batchButton.click();
+      if(cancel.disabled)throw Error("CANCEL_NOT_AVAILABLE_DURING_BUSY");
+      cancel.click();
+      if(!progress.textContent.includes("Cancelando"))
+        throw Error("CANCEL_NOT_ACKNOWLEDGED");
+      for(let i=0;i<100&&batchButton.disabled;i++)await sleep(20);
+      if(batchButton.disabled||!cancel.disabled)
+        throw Error("CANCEL_NOT_CLEANED");
+      // Two sequential real Edge UI operations must never reuse consent to
+      // replace the encrypted selection. These attempts deliberately lack
+      // authority, so both must fail closed and consume their opt-ins.
+      const confirmToggle=dialog.querySelector('[data-zk1-field="catalog-batch-confirm"]');
+      const manifestControl=dialog.querySelector('[data-zk1-field="catalog-batch-manifest"]');
+      const cekControl=dialog.querySelector('[data-zk1-field="catalog-batch-ceks"]');
+      const manifestPin=dialog.querySelector('[data-zk1-field="catalog-batch-manifest-pin"]');
+      if(!confirmToggle||!manifestControl||!cekControl||!manifestPin)
+        throw Error("MISSING_SELECTION_CONSENT_CONTROLS");
+      const consent=()=>{persistToggle.click();replaceToggle.click();confirmToggle.click();};
+      const deniedConsent=label=>{
+        if(persistToggle.checked||replaceToggle.checked||confirmToggle.checked)
+          throw Error("REPLACEMENT_CONSENT_REUSED_"+label);
+      };
+      consent();
+      batchButton.click();
+      for(let i=0;i<100&&batchButton.disabled;i++)await sleep(20);
+      if(batchButton.disabled)throw Error("FIRST_BATCH_NOT_FINISHED");
+      deniedConsent("AFTER_FIRST_BATCH");
+      consent();
+      const manifestFiles=new DataTransfer();
+      manifestFiles.items.add(new File(["disposable-selected-batch-b"],"batch-b.json"));
+      manifestControl.files=manifestFiles.files;
+      manifestControl.dispatchEvent(new Event("change",{bubbles:true}));
+      deniedConsent("AFTER_MANIFEST_CHANGED");
+      consent();
+      const cekFiles=new DataTransfer();
+      cekFiles.items.add(new File(["disposable-second-cek"],"new-key.bin"));
+      cekControl.files=cekFiles.files;
+      cekControl.dispatchEvent(new Event("change",{bubbles:true}));
+      deniedConsent("AFTER_CEKS_CHANGED");
+      consent();
+      manifestPin.value="offline-pin-for-disposable-second-batch";
+      manifestPin.dispatchEvent(new Event("input",{bubbles:true}));
+      deniedConsent("AFTER_PIN_CHANGED");
+      consent();
+      batchButton.click();
+      for(let i=0;i<100&&batchButton.disabled;i++)await sleep(20);
+      if(batchButton.disabled)throw Error("SECOND_BATCH_NOT_FINISHED");
+      deniedConsent("AFTER_SECOND_BATCH");
+      const id="AAAAAAAAAAAAAAAAAAAAAA";
+      const malicious="<img src=x onerror=alert(1)> secret-local-only";
+      let active=true;
+      const verify=()=>active;
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[{name:malicious,objectId:id,revision:7,epoch:2,
+          logicalTrashCandidate:false}],target,verify,revision);
+      const button=list.querySelector("button");
+      if(!button||button.type!=="button"||button.textContent!=="Selecionar objeto")
+        throw Error("NOT_SELECTABLE");
+      if(list.querySelector("img")||!list.textContent.includes(malicious))
+        throw Error("HTML_UNSAFE");
+      button.click();
+      if(target.value!==id||revision.value!=="7"||document.activeElement!==target)
+        throw Error("OPAQUE_SELECTION_FAILED");
+      target.value="";
+      revision.value="";
+      active=false;
+      button.click();
+      if(target.value!==""||revision.value!=="")throw Error("STALE_RESULT_SELECTED");
+      active=true;
+      list.replaceChildren();
+      button.click();
+      if(target.value!==""||revision.value!=="")throw Error("DETACHED_RESULT_SELECTED");
+      const pageOne={name:"history-0000",objectId:id,revision:7,epoch:2,
+        logicalTrashCandidate:false};
+      const pageTwo={name:"history-0100",objectId:id,revision:8,epoch:2,
+        logicalTrashCandidate:false};
+      let pageReads=0;
+      const readPage=async(offset)=>{
+        if(offset!==100)throw Error("UNEXPECTED_PAGE_OFFSET");
+        pageReads++;
+        return {entries:[pageTwo],offset,totalMatches:101,pageSize:100,
+          hasNext:false,hasPrevious:true,plaintextSentToServer:false,
+          independentlySignedCatalog:true,authorizesMutation:false};
+      };
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[pageOne],target,verify,revision,{offset:0,totalMatches:101,
+          pageSize:100,hasNext:true,hasPrevious:false,readPage});
+      const next=list.querySelector('[data-zk1-page="next"]');
+      if(!next||next.type!=="button")throw Error("MISSING_NEXT_PAGE");
+      next.click();
+      for(let i=0;i<100&&!list.textContent.includes("history-0100");i++)await sleep(10);
+      if(pageReads!==1||!list.textContent.includes("history-0100")
+        ||list.textContent.includes("history-0000"))throw Error("PAGE_NAVIGATION_FAILED");
+      const previous=list.querySelector('[data-zk1-page="previous"]');
+      if(!previous)throw Error("MISSING_PREVIOUS_PAGE");
+      active=false;
+      previous.click();
+      await sleep(40);
+      if(pageReads!==1)throw Error("STALE_PAGE_NAVIGATION");
+      active=true;
+      let rejectObsolete, staleDenials=0, currentSummary="old query";
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[pageOne],target,verify,revision,{offset:0,totalMatches:101,
+          pageSize:100,readPage:()=>new Promise((_,reject)=>{rejectObsolete=reject;}),
+          onDenied:()=>{staleDenials++;currentSummary="old denied";}});
+      const obsoleteNext=list.querySelector('[data-zk1-page="next"]');
+      obsoleteNext.click();
+      if(typeof rejectObsolete!=="function")throw Error("OLD_PAGE_NOT_PENDING");
+      const fresh={...pageOne,name:"fresh authenticated query"};
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[fresh],target,verify,revision);
+      currentSummary="fresh query";
+      rejectObsolete(Error("OLD_CAS_REVOKED"));
+      await sleep(20);
+      if(!list.textContent.includes("fresh authenticated query")
+        ||staleDenials!==0||currentSummary!=="fresh query")
+        throw Error("STALE_REJECTION_ERASED_NEW_QUERY");
+      let rejectCurrent, currentDenials=0;
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,[pageOne],target,verify,revision,{offset:0,totalMatches:101,
+          pageSize:100,readPage:()=>new Promise((_,reject)=>{rejectCurrent=reject;}),
+          onDenied:()=>{currentDenials++;}});
+      list.querySelector('[data-zk1-page="next"]').click();
+      rejectCurrent(Error("CURRENT_GRANT_REVOKED"));
+      await sleep(20);
+      if(list.childNodes.length!==0||currentDenials!==1)
+        throw Error("CURRENT_REVOKED_PAGE_WAS_NOT_CLEARED");
+      list.replaceChildren();
+      getButton.click();
+      for(let i=0;i<100;i++){
+        if(dialog.querySelector('[data-zk1-field="status"]').textContent
+          .includes("Operação recusada"))break;
+        await sleep(25);
+      }
+      if(!dialog.querySelector('[data-zk1-field="status"]').textContent
+        .includes("Operação recusada"))throw Error("MISSING_AUTH_DENIAL");
+      const b64=bytes=>btoa(String.fromCharCode(...bytes))
+        .replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"");
+      const scope={account_id:id,compartment_id:id,keyring_id:id};
+      const metadata={...scope,object_id:id,version_id:id,
+        parent_version_id:null,epoch:2,kind:"file"};
+      const raw=crypto.getRandomValues(new Uint8Array(32));
+      const cek=await window.RootarkZk1FileContent.importFileCek(raw);
+      const content=new TextEncoder().encode("<img src=x onerror=alert(1)> secret-local-only");
+      const sealed=await window.RootarkZk1FileContent.encryptFile({cek,metadata,
+        name:"local.txt",mediaType:"text/plain",data:content});
+      const hash=b64(new Uint8Array(await crypto.subtle.digest("SHA-256",raw)));
+      const ciphertextDigestBase64=b64(new Uint8Array(
+        await crypto.subtle.digest("SHA-256",sealed)));
+      const selected={objectId:id,revision:7,epoch:2,ciphertextDigestBase64};
+      const ownerDigest=b64(crypto.getRandomValues(new Uint8Array(32)));
+      const checked={...selected,ciphertextBase64:b64(sealed),
+        verifiedCiphertext:true,plaintextAvailable:false,authorizesMutation:false};
+      const opened=await window.RootarkZk1SelectedLocalPreview.open({
+        selected,checked,metadata,rawCek:raw,cekSha256Pin:hash,
+        grant:{...scope,device_id:"device",current_epoch:2,
+          manifest_revision:8,manifest_digest:ownerDigest,revoked_at_epoch:null},
+        ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+        baseline:{head:{sequence:11,digest:ownerDigest},entries:[selected]},
+        assertLive:()=>true
+      });
+      const pane=dialog.querySelector('[data-zk1-field="catalog-delta-preview"]');
+      if(!pane||!opened.text.includes("secret-local-only"))throw Error("PREVIEW_DENIED");
+      pane.textContent=opened.text;
+      if(pane.querySelector("img"))throw Error("PREVIEW_XSS");
+      let batchGets=0;
+      const found=await window.RootarkZk1ProtectedTextBatch.search({
+        query:"SECRET-LOCAL-ONLY",
+        items:[{selected,metadata,rawCek:raw,cekSha256Pin:hash}],
+        grant:{...scope,device_id:"device",current_epoch:2,
+          manifest_revision:8,manifest_digest:ownerDigest,revoked_at_epoch:null},
+        ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+        baseline:{head:{sequence:11,digest:ownerDigest},entries:[selected]},
+        assertLive:()=>true,
+        getChecked:async(objectId,rev)=>{
+          batchGets++;
+          if(objectId!==id||rev!==7)throw Error("BATCH_ID_LEAK");
+          return checked;
+        }
+      });
+      if(found.totalSearched!==1||found.totalMatches!==1||batchGets!==1
+        ||found.plaintextSentToServer!==false
+        ||!found.matches[0].excerpt.includes("secret-local-only"))
+        throw Error("BATCH_TEXT_SEARCH_DENIED");
+      const batchPane=dialog.querySelector('[data-zk1-field="catalog-delta-text-results"]');
+      if(!batchPane)throw Error("MISSING_LOCAL_BATCH_RESULTS");
+      batchPane.textContent=found.matches[0].excerpt;
+      if(batchPane.querySelector("img"))throw Error("BATCH_PREVIEW_XSS");
+      const nine=[];
+      const signed=new Map();
+      for(let index=0;index<9;index++){
+        const oid=b64(crypto.getRandomValues(new Uint8Array(16)));
+        const rec={...metadata,object_id:oid};
+        const keyRaw=crypto.getRandomValues(new Uint8Array(32));
+        const key=await window.RootarkZk1FileContent.importFileCek(keyRaw);
+        const cipher=await window.RootarkZk1FileContent.encryptFile({cek:key,
+          metadata:rec,name:"doc-"+index+".txt",mediaType:"text/plain",
+          data:new TextEncoder().encode("local-window secret-local-only "+index)});
+        const exact={objectId:oid,revision:7,epoch:2,
+          ciphertextDigestBase64:b64(new Uint8Array(
+            await crypto.subtle.digest("SHA-256",cipher)))};
+        nine.push({selected:exact,metadata:rec,cekFile:"key-"+index,
+          cekSha256Pin:b64(new Uint8Array(
+            await crypto.subtle.digest("SHA-256",keyRaw)))});
+        signed.set("key-"+index,{keyRaw,checked:{...exact,
+          ciphertextBase64:b64(cipher),verifiedCiphertext:true,
+          plaintextAvailable:false,authorizesMutation:false}});
+      }
+      const multiple={...scope,device_id:"device",current_epoch:2,
+        manifest_revision:8,manifest_digest:ownerDigest,revoked_at_epoch:null};
+      const batchBaseline={head:{sequence:11,digest:ownerDigest},
+        entries:nine.map(row=>row.selected)};
+      const progressCalls=[];
+      const completed=await window.RootarkZk1ProtectedTextBatch.search({
+        query:"secret-local-only",items:nine,grant:multiple,
+        ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+        baseline:batchBaseline,assertLive:()=>true,
+        getChecked:async(oid,rev)=>signed.get(nine.find(item=>
+          item.selected.objectId===oid&&item.selected.revision===rev)?.cekFile)?.checked,
+        readCek:async(name)=>new Uint8Array(signed.get(name).keyRaw),
+        onProgress:({completed,total})=>progressCalls.push(completed+"/"+total),
+        isCancelled:()=>false
+      });
+      if(completed.totalSearched!==9||completed.totalMatches!==9
+        ||progressCalls.join()!=="8/9,9/9")
+        throw Error("EDGE_MULTI_WINDOW_WRONG");
+      const allTerms=await window.RootarkZk1ProtectedTextBatch.search({
+        query:"SECRET-LOCAL-ONLY local-window",matchMode:"all-terms",
+        items:nine,grant:multiple,
+        ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+        baseline:batchBaseline,assertLive:()=>true,
+        getChecked:async(oid,rev)=>signed.get(nine.find(item=>
+          item.selected.objectId===oid&&item.selected.revision===rev)?.cekFile)?.checked,
+        readCek:async(name)=>new Uint8Array(signed.get(name).keyRaw),
+        isCancelled:()=>false
+      });
+      if(allTerms.totalMatches!==9||allTerms.totalSearched!==9
+        ||allTerms.plaintextSentToServer!==false)
+        throw Error("EDGE_ALL_TERMS_FAILED");
+      batchPane.textContent=completed.matches.map(item=>item.excerpt).join(String.fromCharCode(10));
+      if(batchPane.querySelector("img"))throw Error("MULTI_WINDOW_HTML_LEAK");
+      const abortProgress=[];
+      let stopped=false, getCount=0;
+      let rejected=false;
+      try{
+        await window.RootarkZk1ProtectedTextBatch.search({
+          query:"secret-local-only",items:nine,grant:multiple,
+          ownerHead:{revision:8,epoch:2,digest:ownerDigest},
+          baseline:batchBaseline,assertLive:()=>true,
+          getChecked:async(oid,rev)=>{
+            getCount++;
+            return signed.get(nine.find(item=>item.selected.objectId===oid
+              &&item.selected.revision===rev)?.cekFile)?.checked;
+          },
+          readCek:async(name)=>new Uint8Array(signed.get(name).keyRaw),
+          onProgress:({completed})=>{abortProgress.push(completed);stopped=true;},
+          isCancelled:()=>stopped
+        });
+      }catch(error){rejected=error.message==="ZK_BATCH_TEXT_SEARCH_DENIED";}
+      if(!rejected||getCount!==8||abortProgress.join()!=="8")
+        throw Error("EDGE_CANCEL_RELEASED_PARTIAL");
+      target.dispatchEvent(new Event("input",{bubbles:true}));
+      if(pane.textContent!==""||batchPane.textContent!=="")
+        throw Error("PREVIEW_NOT_ZEROED_ON_CHANGE");
+      pane.textContent=opened.text;
+      batchPane.textContent=found.matches[0].excerpt;
+      {
+      // Produce a real authenticated local-search result and let the real
+      // renderer create its selectable row and summary. Only the independent
+      // signed-catalog boundary is a fixture; do not seed DOM nodes manually.
+      const scope={account_id:b64(crypto.getRandomValues(new Uint8Array(16))),
+        compartment_id:b64(new TextEncoder().encode("fixture-compartment")),
+        keyring_id:b64(crypto.getRandomValues(new Uint8Array(16)))};
+      const ownerDigest=b64(crypto.getRandomValues(new Uint8Array(32)));
+      const head={sequence:12,digest:b64(crypto.getRandomValues(new Uint8Array(32)))};
+      const objectId=b64(crypto.getRandomValues(new Uint8Array(16)));
+      const baseline={head,entries:[{objectId,revision:7,epoch:2}]};
+      const grant={...scope,device_id:"fixture-device",current_epoch:2,
+        manifest_revision:8,manifest_digest:ownerDigest,revoked_at_epoch:null};
+      const localMetadataRaw=crypto.getRandomValues(new Uint8Array(32));
+      let openedLocal;
+      try {
+        openedLocal=await window.RootarkZk1ProtectedLocalSearch.search({
+          client:{
+            verifyPrivateListingHead:async()=>({scope,head}),
+            readPrivateListing:async()=>({scope,head,totalMatches:1,
+              entries:[{objectId,revision:7,epoch:2,name:"stale-private-name.txt",
+                logicalTrashCandidate:false}],plaintextSentToServer:false,
+              independentlySignedCatalog:true,authorizesMutation:false}),
+          },
+          baseline,grant,ownerRevision:8,ownerEpoch:2,ownerDigest,
+          metadataRaw:localMetadataRaw,term:"",indexedDBImpl:null,assertLive:()=>{},
+        });
+      } finally { localMetadataRaw.fill(0); }
+      if(openedLocal.entries.length!==1||openedLocal.entries[0].name!=="stale-private-name.txt")
+        throw Error("REAL_LOCAL_SEARCH_FIXTURE_FAILED");
+      const updateSummary=page=>{summary.textContent="Listagem local: "+page.entries.length
+        +" de "+page.totalMatches+" versão(ões) · CAS #"+page.head.sequence;};
+      window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+        list,openedLocal.entries,target,()=>true,revision,{...openedLocal,onPage:updateSummary});
+      updateSummary(openedLocal);
+      // A genuine older local search may still be waiting on its signed-head
+      // response when a newer query finishes. Its response must not replace
+      // the newer result set or summary.
+      const queryField=document.querySelector('[data-zk1-field="catalog-delta-query"]');
+      if(!queryField)throw Error("REAL_LOCAL_QUERY_FIELD_MISSING");
+      let searchGeneration=1;
+      queryField.value="old";
+      let releaseOldListing;
+      let oldReadStarted=false,oldReadReleased=false,oldLiveRejected=false;
+      const oldMetadataRaw=crypto.getRandomValues(new Uint8Array(32));
+      const assertOldLive=()=>{
+        if(searchGeneration!==1||queryField.value!=="old"){
+          oldLiveRejected=true;
+          const error=new Error("SEARCH_SUPERSEDED");error.code="SEARCH_SUPERSEDED";throw error;
+        }
+      };
+      const oldSearch=window.RootarkZk1ProtectedLocalSearch.search({
+        client:{
+          verifyPrivateListingHead:async()=>({scope,head}),
+          // With indexedDB disabled, a fresh search first awaits the REAL
+          // verified listing. verifyPrivateListingHead is only called for a
+          // reused index or a subsequent page, never for this initial read.
+          readPrivateListing:()=>new Promise(resolve=>{
+            oldReadStarted=true;
+            releaseOldListing=()=>{
+              oldReadReleased=true;
+              resolve({scope,head,totalMatches:1,
+                entries:[{objectId,revision:7,epoch:2,name:"old-private-name.txt",
+                  logicalTrashCandidate:false}],plaintextSentToServer:false,
+                independentlySignedCatalog:true,authorizesMutation:false});
+            };
+          }),
+        },
+        baseline,grant,ownerRevision:8,ownerEpoch:2,ownerDigest,
+        metadataRaw:oldMetadataRaw,term:"old",indexedDBImpl:null,assertLive:assertOldLive,
+      });
+      let newMetadataRaw=null;
+      let freshSearch;
+      try {
+        for(let i=0;i<100&&!releaseOldListing;i++)await sleep(0);
+        if(!releaseOldListing||!oldReadStarted)
+          throw Error("OLD_LOCAL_SEARCH_DID_NOT_REACH_SIGNED_LISTING_READ");
+        queryField.value="new";
+        searchGeneration=2;
+        newMetadataRaw=crypto.getRandomValues(new Uint8Array(32));
+        freshSearch=await window.RootarkZk1ProtectedLocalSearch.search({
+          client:{
+            verifyPrivateListingHead:async()=>({scope,head}),
+            readPrivateListing:async()=>({scope,head,totalMatches:1,
+              entries:[{objectId,revision:7,epoch:2,name:"new-private-name.txt",
+                logicalTrashCandidate:false}],plaintextSentToServer:false,
+              independentlySignedCatalog:true,authorizesMutation:false}),
+          },
+          baseline,grant,ownerRevision:8,ownerEpoch:2,ownerDigest,
+          metadataRaw:newMetadataRaw,term:"new",indexedDBImpl:null,
+          assertLive:()=>{
+            if(searchGeneration!==2||queryField.value!=="new"){
+              const error=new Error("SEARCH_SUPERSEDED");error.code="SEARCH_SUPERSEDED";throw error;
+            }
+          },
+        });
+        window.RootarkZk1ProtectedLocalSearch.renderVerifiedResults(
+          list,freshSearch.entries,target,()=>searchGeneration===2&&queryField.value==="new",
+          revision,{...freshSearch,onPage:updateSummary});
+        updateSummary(freshSearch);
+        releaseOldListing();
+        let oldFailure;
+        try { await oldSearch; } catch(error) { oldFailure=error; }
+        // Public search deliberately normalizes a local session exception to
+        // ZK_LOCAL_SEARCH_DENIED; prove the actual assertLive callback ran,
+        // rather than requiring it to expose the private failure code.
+        if(oldFailure?.message!=="ZK_LOCAL_SEARCH_DENIED"
+          ||!oldLiveRejected||!oldReadReleased)
+          throw Error("OLD_LOCAL_SEARCH_WAS_NOT_SUPERSEDED");
+        if(!list.textContent.includes("new-private-name.txt")
+          ||list.textContent.includes("old-private-name.txt"))
+          throw Error("OLD_LOCAL_SEARCH_OVERWROTE_NEW_RESULTS");
+      } finally {
+        searchGeneration=2;
+        queryField.value="new";
+        if(releaseOldListing)releaseOldListing();
+        oldMetadataRaw.fill(0);
+        newMetadataRaw?.fill(0);
+      }
+      if(!summary.textContent.includes("CAS #12")
+        ||!list.textContent.includes("new-private-name.txt"))
+        throw Error("REAL_LOCAL_RESULT_NOT_RENDERED");
+      // Exercise the *workspace's actual input listener*, not a local test
+      // generation counter: editing a query must erase authenticated names
+      // and count before another button click or asynchronous response.
+      queryField.value="newer";
+      queryField.dispatchEvent(new Event("input",{bubbles:true}));
+      if(summary.textContent!==""||list.childNodes.length!==0)
+        throw Error("QUERY_INPUT_FAILED_TO_INVALIDATE_RENDERED_PRIVATE_NAMES");
+      // A new local query must clear the real previous result and its count
+      // synchronously, before any trust/key/network await can reject.
+      listButton.click();
+      if(summary.textContent!==""||list.childNodes.length!==0)
+        throw Error("NEW_QUERY_LEFT_STALE_SUMMARY_OR_RESULTS_VISIBLE");
+      for(let i=0;i<100&&listButton.disabled;i++)await sleep(20);
+      if(listButton.disabled)throw Error("NEW_QUERY_DID_NOT_SETTLE");
+      }
+      window.dispatchEvent(new Event("rootark:logout"));
+      if(pane.textContent!==""||batchPane.textContent!=="")
+        throw Error("PREVIEW_NOT_ZEROED_ON_LOGOUT");
+      raw.fill(0);
+      out.textContent="EDGE_PROTECTED_SELECT_PASS";
+    }catch(error){out.textContent="EDGE_PROTECTED_SELECT_FAIL:"+error.message;}
+  });`;
+  let sensitiveRequests = 0;
+  const server = http.createServer((request, response) => {
+    response.setHeader("Content-Security-Policy",
+      "default-src 'none'; script-src 'self'; connect-src 'self'");
+    if (request.url.includes("secret-local-only")
+      || /\/zk-1\/v1\/(catalog|content)\//.test(request.url)) sensitiveRequests++;
+    const file = /^\/client\/([a-z0-9-]+)\.js$/.exec(request.url)?.[1];
+    const content = request.url === "/" ? html
+      : request.url === "/bootstrap.js" ? bootstrap
+        : request.url === "/probe.js" ? probe
+        : ["rootark-zk1-authenticated-workspace", "rootark-zk1-protected-local-search",
+          "rootark-zk1-file-content", "rootark-zk1-selected-local-preview",
+          "rootark-zk1-protected-text-batch", "rootark-zk1-protected-revision-index"]
+            .includes(file) ? fs.readFileSync(path.join(root, file + ".js"), "utf8") : null;
+    response.writeHead(content === null ? 404 : 200, {
+      "Content-Type": request.url === "/" ? "text/html; charset=utf-8"
+        : "text/javascript; charset=utf-8",
+    });
+    response.end(content ?? "");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-zk63-select-edge-"));
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(folder, { recursive: true, force: true, maxRetries: 5 });
+  });
+  const response = await promisify(execFile)(edge, ["--headless=new", "--disable-gpu",
+    "--no-first-run", "--disable-extensions", "--no-default-browser-check",
+    "--virtual-time-budget=12000", "--user-data-dir=" + path.join(folder, "edge"),
+    "--dump-dom", "http://127.0.0.1:" + server.address().port + "/"], {
+    timeout: 35000, windowsHide: true, maxBuffer: 4 * 1024 * 1024,
+  });
+  const result = response.stdout.match(/<output id="edge-result">([^<]*)<\/output>/)?.[1] || "MISSING";
+  assert.match(result, /EDGE_PROTECTED_SELECT_PASS/);
+  assert.doesNotMatch(result, /EDGE_PROTECTED_SELECT_FAIL/);
+  assert.equal(sensitiveRequests, 0);
+});
