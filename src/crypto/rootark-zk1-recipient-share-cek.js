@@ -341,7 +341,7 @@ async function createProtectedRecipientShareOffer(input) {
     // The independently verified second authority read can outlast the
     // owner-approved HPKE envelope even while the share grant remains valid.
     // Neither lease may expire before releasing the portable CEK offer.
-    const releaseSeconds = nativeReleaseFloor(Math.max(nativeReleaseNow(), Date.now()) / 1000);
+    const releaseSeconds = nativeReleaseFloor(nativeReleaseNow() / 1000);
     if (!Number.isSafeInteger(envelope.core.expires_at)
       || releaseSeconds >= envelope.core.expires_at
       || releaseSeconds >= statement.expires_at) denyOffer();
@@ -480,7 +480,7 @@ async function openProtectedRecipientShareFile(input) {
     const verifiedReleaseExpiresAt = opened.verifiedReleaseExpiresAt;
     if (!Number.isSafeInteger(verifiedReleaseExpiresAt)
       || verifiedReleaseExpiresAt < 1) deny();
-    const releaseSeconds = nativeReleaseFloor(Math.max(nativeReleaseNow(), Date.now()) / 1000);
+    const releaseSeconds = nativeReleaseFloor(nativeReleaseNow() / 1000);
     if (releaseSeconds >= statement.expires_at || nowSeconds >= statement.expires_at
       || releaseSeconds >= verifiedReleaseExpiresAt || nowSeconds >= verifiedReleaseExpiresAt) deny();
     const result = nativeFreeze({
