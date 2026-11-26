@@ -69,7 +69,7 @@ test("canonical TAP retains a complete Windows DWORD process exit only in its fa
     const messages = [];
     const tracker = createTapProgressRecorder((line) => messages.push(line));
     for (const line of [
-      "not ok 1 - private module",
+      "not ok 1 - test/fixture.test.js",
       "  ---",
       "  location: '/private/test/fixture.test.js:1:1'",
       "  failureType: 'testCodeFailure'",
@@ -99,8 +99,9 @@ test("duplicate or unterminated module exit fields cannot supply process status"
     const messages = [];
     const tracker = createTapProgressRecorder((line) => messages.push(line));
     for (const line of [
-      "not ok 1 - private fixture",
+      "not ok 1 - test/fixture.test.js",
       "  ---",
+      "  location: '/private/test/fixture.test.js:1:1'",
       "  failureType: 'testCodeFailure'",
       "  error: 'test failed'",
       "  code: 'ERR_TEST_FAILURE'",
@@ -109,6 +110,32 @@ test("duplicate or unterminated module exit fields cannot supply process status"
     tracker.finish();
     assert.equal(tracker.state.failures, 1);
     assert.doesNotMatch(messages.join("\n"), /moduleExitCode=|private-token|private fixture/);
+  }
+});
+
+test("module exit requires one unambiguous YAML record bound to the failed file label", () => {
+  const location = "  location: '/private/test/fixture.test.js:1:1'";
+  const kind = "  failureType: 'testCodeFailure'";
+  const code = "  code: 'ERR_TEST_FAILURE'";
+  const error = "  error: 'test failed'";
+  const exit = "  exitCode: 4294967295";
+  const record = ["  ---", location, kind, code, error, exit, "  ..."];
+  for (const [title, fields] of [
+    ["ordinary failed test", record],
+    ["test/foreign.test.js", record],
+    ["test/fixture.test.js", ["  ---", location, kind, code, error, "  ---", exit, "  ..."]],
+    ["test/fixture.test.js", [...record, "  ---", "  ..."]],
+    ["test/fixture.test.js", ["  ---", location, kind, code, error, exit, error, "  ..."]],
+    ["test/fixture.test.js", ["  ---", location, kind, code, error, exit, kind, "  ..."]],
+    ["test/fixture.test.js", ["  ---", location, kind, code, error, exit, code, "  ..."]],
+    ["test/fixture.test.js", ["  ---", location, kind, code, error, exit, location, "  ..."]],
+  ]) {
+    const messages = [];
+    const tracker = createTapProgressRecorder((line) => messages.push(line));
+    for (const line of ["not ok 1 - " + title, ...fields]) tracker.accept(line);
+    tracker.finish();
+    assert.equal(tracker.state.failures, 1);
+    assert.doesNotMatch(messages.join("\n"), /moduleExitCode=|private|fixture\.test\.js|foreign\.test\.js/);
   }
 });
 
