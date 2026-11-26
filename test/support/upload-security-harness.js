@@ -17,10 +17,13 @@ const ROOT = path.resolve(__dirname, "..", "..");
 const SERVER = process.env.ROOTARK_TEST_SERVER || path.join(ROOT, "server.js");
 const PUBLIC = path.join(ROOT, "public");
 const TIMEOUT_MS = 10_000;
+// Cold boot loads the whole server dependency graph from the worktree before
+// it can bind HTTP. Keep request/lock deadlines strict, but give bootstrap a
+// distinct budget on slower WSL mounted worktrees and Windows CI hosts.
 const SERVER_BOOT_TIMEOUT_MS = 40_000;
 const FOLDER_ID = "upload-safety";
-const CHUNK_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const createChunkUploadQuota = (options) => createChunkUploadQuotaService({ perAccountEntries: 5000, systemEntries: 10000, ...options });
+const v5AccountKey = (username) => `acct:v5:${Buffer.from(username.trim(), "utf8").toString("base64url")}`;
 
 function chunkBoundaryRequestTimeout(chunkIndex, totalChunks) {
   // Only the final supported 2,000-part boundary assembles 2,000 files on this response.
@@ -67,6 +70,7 @@ function releaseGateVmRequire(gateRequire, spawnSyncMock) {
   };
 }
 
+const CHUNK_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 function getUnusedPort() {
   return new Promise((resolve, reject) => {
     const probe = net.createServer();
@@ -103,6 +107,20 @@ async function waitForServer(port, timeout = TIMEOUT_MS) {
     }
   }
   throw lastError;
+}
+
+async function waitForAssignedFixturePort(child, stdout, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`fixture server exited before readiness: exit=${child.exitCode} signal=${child.signalCode || "none"}`);
+    }
+    const announcement = stdout.join("").match(/^Servidor rodando em http:\/\/(?:\[[^\]\r\n]+\]|[^:\s]+):(\d{1,5})\r?$/m);
+    const port = announcement ? Number(announcement[1]) : 0;
+    if (port > 0 && port <= 65535) return port;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("fixture server did not announce its assigned port before the readiness deadline");
 }
 
 async function login(port, username, password) {
@@ -150,7 +168,10 @@ function testDeadQuotaOwnerEnv(...processIds) {
   return { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: ids.join(",") };
 }
 
-async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, readyTimeout = SERVER_BOOT_TIMEOUT_MS, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false } = {}) {
+async function createHarness(t, { chunkSessions = [], preloadSource = "", waitForReady = true, readyTimeout = SERVER_BOOT_TIMEOUT_MS, uploaderPermissions = {}, secondUploaderHasFolderAccess = false, appDataMode = "json", envOverrides = {}, deterministicQuotaRecovery = false, kernelAssignedPort = false } = {}) {
+  if (kernelAssignedPort && (!waitForReady || Object.hasOwn(envOverrides, "PORT"))) {
+    throw new Error("kernel-assigned fixture port requires owned readiness and no PORT override");
+  }
   const password = crypto.randomBytes(24).toString("base64url");
   const fixtureBase = process.platform === "win32" ? process.env.USERPROFILE : os.tmpdir();
   const dir = fs.mkdtempSync(path.join(fixtureBase, "rootark-upload-safety-"));
@@ -208,7 +229,7 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   const preloadContents = [sqliteSetup, quotaFixtureShim, customPreload].filter(Boolean).join("\n");
   const preloadPath = preloadContents ? path.join(dir, "test-preload.js") : "";
   if (preloadPath) fs.writeFileSync(preloadPath, preloadContents);
-  const port = await getUnusedPort();
+  let port = kernelAssignedPort ? 0 : await getUnusedPort();
   const stdout = [];
   const stderr = [];
   const child = spawn(process.execPath, [...(preloadPath ? ["--require", preloadPath] : []), SERVER], {
@@ -253,7 +274,18 @@ async function createHarness(t, { chunkSessions = [], preloadSource = "", waitFo
   });
   if (waitForReady) {
     try {
-      assert.equal((await waitForServer(port, readyTimeout)).status, 200);
+      const readinessStarted = Date.now();
+      if (kernelAssignedPort) {
+        // Bind the listener atomically in the child and trust only its own
+        // completed startup announcement, not an unrelated HTTP listener.
+        port = await waitForAssignedFixturePort(child, stdout, readyTimeout);
+      }
+      const remaining = kernelAssignedPort ? Math.max(1, readyTimeout - (Date.now() - readinessStarted)) : readyTimeout;
+      assert.equal((await waitForServer(port, remaining)).status, 200);
+      if (kernelAssignedPort) {
+        assert.equal(child.exitCode, null);
+        assert.equal(child.signalCode, null);
+      }
     } catch (error) {
       throw new Error(`${error.message}\nserver exit: ${child.exitCode}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`);
     }
@@ -339,7 +371,7 @@ async function uploadPayload(port, session, payload, method = "POST") {
   });
 }
 
-async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays, forwardedFor, agent, timeoutMs }) {
+async function uploadChunk(port, session, { uploadId, headerUploadId = uploadId, originalName, chunkIndex, totalChunks, bytes, encryptionLevel, password, versionComment, expiresInDays, forwardedFor, agent, timeoutMs }) {
   const parts = [
     { field: "uploadId", bytes: uploadId },
     { field: "originalName", bytes: originalName },
@@ -357,6 +389,7 @@ async function uploadChunk(port, session, { uploadId, originalName, chunkIndex, 
       cookie: session.cookie,
       origin: `http://127.0.0.1:${port}`,
       "x-csrf-token": session.csrf,
+      "x-rootark-upload-id": headerUploadId,
       ...(forwardedFor ? { "x-forwarded-for": forwardedFor } : {}),
       "content-type": payload.contentType,
       "content-length": payload.body.length,
@@ -417,6 +450,73 @@ function legacyChunkMetadata(uploadId, overrides = {}) {
   };
 }
 
+function legacyV4QuotaPreload({ chunkRoot, uploadId, partBytes }) {
+  const accountKey = "uploader";
+  const sessionKey = `${FOLDER_ID}/${uploadId}`;
+  // Legacy v4 persisted native-path separators via path.relative(). On Windows
+  // that is backslash; inventing a Linux-style row on NTFS makes a valid
+  // pre-existing part fail the fail-closed ledger/path identity check.
+  const relativePath = path.join(FOLDER_ID, uploadId, "0.part");
+  const betterSqlitePath = require.resolve("better-sqlite3");
+  const quotaModulePath = path.join(ROOT, "services", "chunkUploadQuota.js");
+  const schema = `
+    CREATE TABLE quota_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE quota_operations (
+      operation_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, session_key TEXT, relative_path TEXT NOT NULL,
+      state TEXT NOT NULL, charge_bytes INTEGER NOT NULL CHECK (charge_bytes >= 0),
+      owner_instance_id TEXT NOT NULL, owner_pid INTEGER NOT NULL, owner_process_identity TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX quota_operations_account ON quota_operations(account_key);
+    CREATE INDEX quota_operations_path ON quota_operations(relative_path);
+    CREATE INDEX quota_operations_session_state ON quota_operations(session_key, state);
+    CREATE TABLE quota_session_locks (
+      session_key TEXT PRIMARY KEY, owner_instance_id TEXT NOT NULL, owner_pid INTEGER NOT NULL,
+      owner_process_identity TEXT, created_at INTEGER NOT NULL
+    );
+    CREATE TABLE quota_usage (account_key TEXT PRIMARY KEY, charge_bytes INTEGER NOT NULL CHECK (charge_bytes >= 0));
+    CREATE TABLE quota_sessions (
+      session_key TEXT PRIMARY KEY, account_key TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX quota_sessions_account ON quota_sessions(account_key);
+  `;
+  return `
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const Database = require(${JSON.stringify(betterSqlitePath)});
+    const { getCurrentProcessIdentity } = require(${JSON.stringify(quotaModulePath)});
+    const currentProcessIdentity = getCurrentProcessIdentity();
+    if (!currentProcessIdentity) throw new Error("Test fixture cannot attest the current process identity");
+    const ownerProcessIdentity = JSON.stringify(currentProcessIdentity);
+    const root = ${JSON.stringify(chunkRoot)};
+    const uploadId = ${JSON.stringify(uploadId)};
+    const sessionDir = path.join(root, ${JSON.stringify(FOLDER_ID)}, uploadId);
+    const database = new Database(path.join(root, ".quota.sqlite"));
+    database.pragma("journal_mode = DELETE");
+    database.exec(${JSON.stringify(schema)});
+    const meta = database.prepare("INSERT INTO quota_meta(key, value) VALUES (?, ?)");
+    meta.run("schema_version", "4");
+    meta.run("ready", "1");
+    meta.run("usage_version", "1");
+    meta.run("system_charge_bytes", String(${partBytes}));
+    database.prepare("INSERT INTO quota_operations (" +
+      "operation_id, account_key, session_key, relative_path, state, charge_bytes, " +
+      "owner_instance_id, owner_pid, owner_process_identity, created_at, updated_at " +
+      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      "legacy-uploader-part", ${JSON.stringify(accountKey)}, ${JSON.stringify(sessionKey)}, ${JSON.stringify(relativePath)},
+      "part_committed", ${partBytes}, "legacy-instance", process.pid, ownerProcessIdentity, 1, 1
+    );
+    database.prepare("INSERT INTO quota_usage(account_key, charge_bytes) VALUES (?, ?)").run(${JSON.stringify(accountKey)}, ${partBytes});
+    database.prepare("INSERT INTO quota_sessions(session_key, account_key, created_at, updated_at) VALUES (?, ?, ?, ?)").run(${JSON.stringify(sessionKey)}, ${JSON.stringify(accountKey)}, 1, 1);
+    database.close();
+    fs.chmodSync(root, 0o700);
+    fs.chmodSync(path.join(root, ${JSON.stringify(FOLDER_ID)}), 0o700);
+    fs.chmodSync(sessionDir, 0o700);
+    fs.chmodSync(path.join(sessionDir, "metadata.json"), 0o600);
+    fs.chmodSync(path.join(sessionDir, "0.part"), 0o600);
+  `;
+}
+
 function auditLogs(dir) {
   const file = path.join(dir, "data", "audit-logs.json");
   return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")).logs : [];
@@ -457,6 +557,7 @@ async function waitForAuditLogs(dir, predicate, timeout = 3000, onTransientSynta
 
   throw new Error("timed out waiting for expected audit logs");
 }
+
 function filesUnder(dir) {
   let descriptor;
   try {
@@ -514,10 +615,10 @@ function quarantine(dir) {
 module.exports = {
   assert, bcrypt, crypto, Database, fs, http, net, os, path, spawn, spawnSync, test,
   createFileLifecycleLock, classifyProcessOwner, createChunkUploadQuotaService, getCurrentProcessIdentity, ensureWindowsChunkUploadRoot,
-  ROOT, SERVER, PUBLIC, TIMEOUT_MS, FOLDER_ID, CHUNK_SESSION_TTL_MS, createChunkUploadQuota,
+  ROOT, SERVER, PUBLIC, TIMEOUT_MS, SERVER_BOOT_TIMEOUT_MS, FOLDER_ID, CHUNK_SESSION_TTL_MS, createChunkUploadQuota, v5AccountKey,
   chunkBoundaryRequestTimeout, isCanonicalNpmTestInvocation, releaseGateFixtureToHost, releaseGateVmRequire,
-  getUnusedPort, request, waitForServer, login, multipartParts, multipart, isContained, testDeadQuotaOwnerEnv,
+  getUnusedPort, request, waitForServer, waitForAssignedFixturePort, login, multipartParts, multipart, isContained, testDeadQuotaOwnerEnv,
   createHarness, startGatedClamAv, upload, uploadPayload, uploadChunk, postJson, waitForExit, waitForFile,
-  legacyChunkMetadata, auditLogs, auditLogFileSignature, waitForAuditLogs,
+  legacyChunkMetadata, legacyV4QuotaPreload, auditLogs, auditLogFileSignature, waitForAuditLogs,
   filesUnder, directoryEntries, assertRejectedClean, pending, quarantine,
 };

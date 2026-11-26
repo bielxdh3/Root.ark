@@ -4,6 +4,7 @@
 // publish a branch; run against the worker2 isolated worktree.
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
+const { randomUUID } = require("node:crypto");
 const fs = require("node:fs/promises");
 const http = require("node:http");
 const os = require("node:os");
@@ -19,6 +20,22 @@ const { acquirePrivateSyncStateLock } =
   require("../sync-client/rootark-sync-private-lock");
 
 const cli = path.resolve(__dirname, "../sync-client/rootark-sync.js");
+
+function disposableAccount() { return `fixture-${randomUUID()}`; }
+
+test("distinct disposable server lifetimes cannot share a recycled port state key", () => {
+  // Real private state intentionally survives restarts of one server/account.
+  // Independent test servers are different authorities even if the OS recycles
+  // their ephemeral port. Never let another suite's uploaded state leak here.
+  const endpoint = { serverUrl: "http://127.0.0.1:40577", targetFolderId: "root" };
+  const first = privateSyncStatePath("fixture-a", {
+    ...endpoint, username: disposableAccount(),
+  });
+  const second = privateSyncStatePath("fixture-b", {
+    ...endpoint, username: disposableAccount(),
+  });
+  assert.notEqual(first, second);
+});
 
 test("SIGINT during a remotely pending upload must retain the state lock", {
   timeout: 120000, skip: process.platform === "win32"
@@ -79,7 +96,7 @@ test("SIGINT during a remotely pending upload must retain the state lock", {
   const config = path.join(privateHome, "config.json");
   const policy = {
     serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "fixture", token: "disposable-token", localFolder: selected,
+    username: disposableAccount(), token: "disposable-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
   };
   await writePrivateSyncConfig(config, JSON.stringify(policy));
@@ -177,7 +194,7 @@ test("failed fetch after upload body cannot unlock a remotely uncertain write", 
   const config = path.join(privateHome, "config.json");
   const policy = {
     serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "fixture", token: "disposable-token", localFolder: selected,
+    username: disposableAccount(), token: "disposable-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
   };
   await writePrivateSyncConfig(config, JSON.stringify(policy));
@@ -287,7 +304,7 @@ test("two private config roots targeting one authority share the lock and upload
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const config = path.join(privateHome, "config.json");
   const policy = { serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "fixture", token: "disposable-token", localFolder: selected,
+    username: disposableAccount(), token: "disposable-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1 };
   await writePrivateSyncConfig(config, JSON.stringify(policy));
   const otherConfig = path.join(otherPrivateHome, "config.json");
@@ -399,7 +416,7 @@ test("two processes can report stale uploaded hash while remote contents differ"
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const config = path.join(privateHome, "config.json");
   const policy = { serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "fixture", token: "disposable-token", localFolder: selected,
+    username: disposableAccount(), token: "disposable-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1 };
   await writePrivateSyncConfig(config, JSON.stringify(policy));
   const a = startClient(config, sharedHome);
@@ -495,7 +512,7 @@ test("a stale exclusive lock fails closed, preserves bytes, and permits explicit
 
   const config = path.join(privateHome, "config.json");
   const policy = { serverUrl: `http://127.0.0.1:${server.address().port}`,
-    username: "fixture", token: "disposable-token", localFolder: selected,
+    username: disposableAccount(), token: "disposable-token", localFolder: selected,
     targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1 };
   await writePrivateSyncConfig(config, JSON.stringify(policy));
   const lockPath = `${privateSyncStatePath(config, policy)}.lock`;

@@ -9,6 +9,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const WebSocket = require("ws");
+const { waitForFixtureListen, request, stop } = require("./support/realtime-server-readiness");
 
 const ROOT = path.resolve(__dirname, "..");
 
@@ -23,31 +24,9 @@ function freePort() {
   });
 }
 
-function request(port, requestPath, options = {}) {
-  return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: requestPath, ...options }, (res) => {
-      let body = "";
-      res.on("data", (chunk) => { body += chunk; });
-      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
-    });
-    req.once("error", reject);
-    req.end(options.body);
-  });
-}
-
-async function ready(port) {
-  for (let index = 0; index < 120; index += 1) {
-    try { await request(port, "/login.html"); return; } catch { await new Promise((resolve) => setTimeout(resolve, 40)); }
-  }
-  throw new Error("server did not start");
-}
-
-function stop(child) {
-  return new Promise((resolve) => {
-    if (child.exitCode !== null) return resolve(child.exitCode);
-    child.once("exit", (code) => resolve(code));
-    child.kill();
-  });
+async function ready(child, port, signal) {
+  await waitForFixtureListen(child, port, signal);
+  assert.equal((await request(port, "/login.html", { signal })).status, 200);
 }
 
 function createWebDavFixture(prefix) {
@@ -67,9 +46,9 @@ function serverEnv(port, extra = {}) {
 test("PROPFIND rejects malformed and unsupported non-empty bodies while empty requests succeed", { timeout: 20_000 }, async (t) => {
   const dir = createWebDavFixture("rootark-propfind-body-");
   const port = await freePort();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: "ignore", windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
-  await ready(port);
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
+  await ready(child, port, t.signal);
   const authorization = `Basic ${Buffer.from("agent:password").toString("base64")}`;
   assert.equal((await request(port, "/dav", { method: "PROPFIND", headers: { authorization, "content-type": "application/xml" }, body: "<broken" })).status, 400);
   assert.equal((await request(port, "/dav", { method: "PROPFIND", headers: { authorization, "content-type": "application/json" }, body: "{}" })).status, 400);
@@ -79,9 +58,9 @@ test("PROPFIND rejects malformed and unsupported non-empty bodies while empty re
 test("chunked PUT over the byte limit removes its staging artifact", { timeout: 30_000 }, async (t) => {
   const dir = createWebDavFixture("rootark-put-limit-");
   const port = await freePort();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: "ignore", windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
-  await ready(port);
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
+  await ready(child, port, t.signal);
   const authorization = `Basic ${Buffer.from("agent:password").toString("base64")}`;
   const result = await request(port, "/dav/too-large.bin", { method: "PUT", headers: { authorization }, body: Buffer.alloc(8 * 1024 * 1024 + 1) });
   assert.equal(result.status, 413);
@@ -93,9 +72,9 @@ test("chunked PUT over the byte limit removes its staging artifact", { timeout: 
 test("aborted PUT removes its incoming staging file", { timeout: 20_000 }, async (t) => {
   const dir = createWebDavFixture("rootark-put-abort-");
   const port = await freePort();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: "ignore", windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
-  await ready(port);
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
+  await ready(child, port, t.signal);
   const authorization = `Basic ${Buffer.from("agent:password").toString("base64")}`;
   await new Promise((resolve) => {
     const req = http.request({ host: "127.0.0.1", port, path: "/dav/aborted.bin", method: "PUT", headers: { authorization, "transfer-encoding": "chunked" } });
@@ -128,9 +107,9 @@ test("restart recovery restores a source staged by MOVE from the durable journal
   const journalPath = path.join(incoming, `rootark-webdav-move-${id}.json`);
   fs.writeFileSync(journalPath, JSON.stringify({ version: 1, transactionId: id, phase: "source_staged", journalPath, sourcePath, destinationPath, stagePath, destinationBackupPath, destinationExisted: false, replacementInstalled: false, completedOperations: ["source.stage"], metadata: { directory: metadataDirectory, files: metadataFiles } }));
   const port = await freePort();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: "ignore", windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
-  await ready(port);
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
+  await ready(child, port, t.signal);
   assert.equal(fs.readFileSync(sourcePath, "utf8"), "source");
   assert.equal(fs.readFileSync(destinationPath, "utf8"), "target");
   assert.equal(fs.existsSync(journalPath), false);
@@ -183,14 +162,9 @@ test("startup incoming cleanup preserves an aged pending WebDAV MOVE journal", {
   quota.reserve({ operationId: chunkOperationId, accountKey: "agent", relativePath: path.join("incoming", chunkOperationId), reservedBytes: 8 * 1024 * 1024 });
   quota.close();
   const port = await freePort();
-  const child = spawn(process.execPath, ["--require", path.join(ROOT, "test", "fixtures", "chunk-quota-dead-owner-preload.js"), path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: "2147483000" }), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-  const serverStdout = [];
-  const serverStderr = [];
-  child.stdout.on("data", (chunk) => serverStdout.push(chunk.toString()));
-  child.stderr.on("data", (chunk) => serverStderr.push(chunk.toString()));
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
-  try { await ready(port); }
-  catch (error) { throw new Error(`${error.message}\nserver stdout:\n${serverStdout.join("")}\nserver stderr:\n${serverStderr.join("")}`); }
+  const child = spawn(process.execPath, ["--require", path.join(ROOT, "test", "fixtures", "chunk-quota-dead-owner-preload.js"), path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: "2147483000" }), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
+  await ready(child, port, t.signal);
   assert.equal(fs.existsSync(journalPath), true, "generic incoming cleanup must preserve durable retry journals");
   assert.equal(fs.existsSync(uploadStagingPath), false, "stale simple-upload staging files should still be cleaned");
   assert.equal(fs.existsSync(webDavPutStagingPath), false, "stale WebDAV PUT staging files should still be cleaned");
@@ -312,9 +286,9 @@ test("oversized WebDAV MOVE metadata snapshot fails closed before checksum verif
 test("configured WebSocket rate boundary is enforced at runtime", { timeout: 20_000 }, async (t) => {
   const dir = createWebDavFixture("rootark-ws-config-");
   const port = await freePort();
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { WEBDAV_ENABLED: "false", REALTIME_MAX_MESSAGES_PER_WINDOW: "2", REALTIME_RATE_WINDOW_MS: "1000" }), stdio: "ignore", windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
-  await ready(port);
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { WEBDAV_ENABLED: "false", REALTIME_MAX_MESSAGES_PER_WINDOW: "2", REALTIME_RATE_WINDOW_MS: "1000" }), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
+  await ready(child, port, t.signal);
   const body = JSON.stringify({ username: "agent", password: "password" });
   const login = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
   const cookie = login.headers["set-cookie"].map((item) => item.split(";", 1)[0]).join("; ");
@@ -335,21 +309,13 @@ test("file rename notifies active workspace sessions over WebSocket", { timeout:
   const oldPath = path.join(dir, "uploads", "before.txt");
   const newPath = path.join(dir, "uploads", "after.txt");
   fs.writeFileSync(oldPath, "disposable realtime fixture");
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { WEBDAV_ENABLED: "false" }), stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
-  let stderr = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { WEBDAV_ENABLED: "false" }), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
   let socket;
   t.after(async () => {
     socket?.terminate();
-    await stop(child);
-    fs.rmSync(dir, { recursive: true, force: true });
+    try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
-  try {
-    await ready(port);
-  } catch (error) {
-    throw new Error(`${error.message}: ${stderr}`);
-  }
+  await ready(child, port, t.signal);
 
   const loginBody = JSON.stringify({ username: "agent", password: "password" });
   const login = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(loginBody) }, body: loginBody });

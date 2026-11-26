@@ -1,11 +1,11 @@
 const {
   assert, bcrypt, crypto, Database, fs, http, net, os, path, spawn, spawnSync, test,
   createFileLifecycleLock, classifyProcessOwner, createChunkUploadQuotaService, getCurrentProcessIdentity, ensureWindowsChunkUploadRoot,
-  ROOT, SERVER, PUBLIC, TIMEOUT_MS, FOLDER_ID, CHUNK_SESSION_TTL_MS, createChunkUploadQuota,
+  ROOT, SERVER, PUBLIC, TIMEOUT_MS, SERVER_BOOT_TIMEOUT_MS, FOLDER_ID, CHUNK_SESSION_TTL_MS, createChunkUploadQuota, v5AccountKey,
   chunkBoundaryRequestTimeout, isCanonicalNpmTestInvocation, releaseGateFixtureToHost, releaseGateVmRequire,
-  getUnusedPort, request, waitForServer, login, multipartParts, multipart, isContained, testDeadQuotaOwnerEnv,
+  getUnusedPort, request, waitForServer, waitForAssignedFixturePort, login, multipartParts, multipart, isContained, testDeadQuotaOwnerEnv,
   createHarness, startGatedClamAv, upload, uploadPayload, uploadChunk, postJson, waitForExit, waitForFile,
-  legacyChunkMetadata, auditLogs, auditLogFileSignature, waitForAuditLogs,
+  legacyChunkMetadata, legacyV4QuotaPreload, auditLogs, auditLogFileSignature, waitForAuditLogs,
   filesUnder, directoryEntries, assertRejectedClean, pending, quarantine,
 } = require("./support/upload-security-harness");
 
@@ -905,6 +905,7 @@ test("a different uploader cannot overwrite or finish another user's chunk sessi
 test("case-folded account aliases cannot resume another exact uploader identity", { timeout: 45_000 }, async (t) => {
   const uploadId = "case-alias-session-owner";
   const harness = await createHarness(t, {
+    readyTimeout: 30_000,
     chunkSessions: [{ uploadId, files: { "metadata.json": legacyChunkMetadata(uploadId, { encryptionLevel: "none" }), "0.part": "original chunk" } }],
   });
   const usersPath = path.join(harness.dir, "data", "users.local.json");
@@ -926,6 +927,113 @@ test("case-folded account aliases cannot resume another exact uploader identity"
   assert.equal(response.status, 409, response.body);
   assert.equal(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part"), "utf8"), "original chunk");
   assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "1.part")), false);
+});
+
+test("v4 quota aliases stay quarantined while an exact-owner legacy session can drain", { timeout: 60_000 }, async (t) => {
+  const uploadId = "v4-quota-legacy-session";
+  const originalPart = Buffer.from("legacy uploader part");
+  const harness = await createHarness(t, {
+    readyTimeout: 30_000,
+    chunkSessions: [{ uploadId, files: {
+      "metadata.json": legacyChunkMetadata(uploadId, { totalChunks: 2, encryptionLevel: "none", originalName: "legacy-file.txt", fileName: "legacy-file.txt" }),
+      "0.part": originalPart,
+    } }],
+    preloadSource: ({ chunkRoot }) => legacyV4QuotaPreload({ chunkRoot, uploadId, partBytes: originalPart.length }),
+  });
+  const usersPath = path.join(harness.dir, "data", "users.local.json");
+  const users = JSON.parse(fs.readFileSync(usersPath, "utf8"));
+  users.push({ username: "UPLOADER", password: bcrypt.hashSync(harness.password, 10), role: "user", permissions: { upload: true, listFiles: true }, sessionVersion: 0 });
+  fs.writeFileSync(usersPath, JSON.stringify(users));
+  const foldersPath = path.join(harness.dir, "data", "folders.json");
+  const folders = JSON.parse(fs.readFileSync(foldersPath, "utf8"));
+  folders.find((folder) => folder.id === FOLDER_ID).allowedUsers.push("UPLOADER");
+  fs.writeFileSync(foldersPath, JSON.stringify(folders));
+
+  const migrated = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  const legacyKey = `acct:v4:${Buffer.from("uploader").toString("base64url")}`;
+  try {
+    assert.equal(migrated.prepare("SELECT value FROM quota_meta WHERE key = 'schema_version'").get().value, "5");
+    assert.deepEqual(migrated.prepare("SELECT account_key, charge_bytes FROM quota_usage").all(), [{ account_key: legacyKey, charge_bytes: originalPart.length }]);
+    assert.deepEqual(migrated.prepare("SELECT account_key, relative_path FROM quota_operations WHERE operation_id = 'legacy-uploader-part'").get(), {
+      account_key: legacyKey,
+      relative_path: path.join(FOLDER_ID, uploadId, "0.part"),
+    });
+  } finally {
+    migrated.close();
+  }
+
+  const owner = await login(harness.port, "uploader", harness.password);
+  const alias = await login(harness.port, "UPLOADER", harness.password);
+  const aliasResume = await uploadChunk(harness.port, alias, {
+    uploadId,
+    originalName: "legacy-file.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    encryptionLevel: "none",
+    bytes: Buffer.from("case alias must be denied"),
+  });
+  assert.equal(aliasResume.status, 409, `${aliasResume.body}\n${harness.stderr.join("")}`);
+  assert.deepEqual(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part")), originalPart);
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+
+  const mismatchedHint = await uploadChunk(harness.port, owner, {
+    uploadId: "different-body-upload-id",
+    headerUploadId: uploadId,
+    originalName: "mismatched-hint.txt",
+    chunkIndex: 0,
+    totalChunks: 1,
+    encryptionLevel: "none",
+    bytes: Buffer.from("header and body must identify the same session"),
+  });
+  assert.equal(mismatchedHint.status, 400, mismatchedHint.body);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, "different-body-upload-id")), false);
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+
+  for (const [session, deniedUploadId] of [[owner, "new-owner-session-blocked"], [alias, "new-alias-session-blocked"]]) {
+    const denied = await uploadChunk(harness.port, session, {
+      uploadId: deniedUploadId,
+      originalName: "blocked.txt",
+      chunkIndex: 0,
+      totalChunks: 1,
+      encryptionLevel: "none",
+      bytes: Buffer.from("must remain quarantined"),
+    });
+    assert.equal(denied.status, 409, `${denied.body}\n${harness.stderr.join("")}`);
+    assert.equal(JSON.parse(denied.body).code, "CHUNK_QUOTA_LEGACY_ACCOUNT_QUARANTINED");
+  }
+  assert.deepEqual(fs.readdirSync(path.join(harness.chunkRoot, "incoming")), []);
+
+  const ownerResume = await uploadChunk(harness.port, owner, {
+    uploadId,
+    originalName: "legacy-file.txt",
+    chunkIndex: 1,
+    totalChunks: 2,
+    encryptionLevel: "none",
+    bytes: Buffer.from("owner's final part"),
+  });
+  assert.equal(ownerResume.status, 200, `${ownerResume.body}\n${harness.stderr.join("")}`);
+  assert.equal(JSON.parse(ownerResume.body).complete, true);
+  assert.equal(fs.existsSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId)), false);
+
+  const afterDrain = await uploadChunk(harness.port, alias, {
+    uploadId: "new-alias-session-after-drain",
+    originalName: "new-alias-file.txt",
+    chunkIndex: 0,
+    totalChunks: 2,
+    encryptionLevel: "none",
+    bytes: Buffer.from("new exact-case account session"),
+  });
+  assert.equal(afterDrain.status, 200, afterDrain.body);
+  assert.equal(JSON.parse(afterDrain.body).complete, false);
+  const afterDrainDatabase = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    const aliasKey = `acct:v5:${Buffer.from("UPLOADER").toString("base64url")}`;
+    assert.deepEqual(afterDrainDatabase.prepare("SELECT account_key FROM quota_operations").all(), [{ account_key: aliasKey }]);
+    assert.deepEqual(afterDrainDatabase.prepare("SELECT account_key FROM quota_sessions").all(), [{ account_key: aliasKey }]);
+    assert.equal(afterDrainDatabase.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE account_key = ?").get(legacyKey).count, 0);
+  } finally {
+    afterDrainDatabase.close();
+  }
 });
 
 test("a recreated uploader account with a newer session generation cannot resume old chunks", { timeout: 45_000 }, async (t) => {
@@ -1574,5 +1682,16 @@ test("chunk metadata failure leaves a previously absent part uncommitted", { tim
   assert.equal(fs.readFileSync(path.join(sessionDir, "0.part"), "utf8"), "already accepted chunk");
   assert.equal(fs.existsSync(path.join(sessionDir, "1.part")), false);
   assert.deepEqual(fs.readdirSync(sessionDir).filter((name) => name.startsWith(".metadata-scrub-")), []);
+});
+
+
+test("kernel-assigned HTTP fixture port is announced by its own server", { timeout: 60_000 }, async (t) => {
+  const harness = await createHarness(t, {
+    kernelAssignedPort: true,
+    preloadSource: 'if (process.env.PORT !== "0") throw new Error("expected a kernel-assigned fixture port");',
+  });
+  assert.ok(Number.isInteger(harness.port) && harness.port > 0 && harness.port <= 65535);
+  assert.equal((await request(harness.port, "/login.html")).status, 200);
+  assert.equal(harness.child.exitCode, null);
 });
 

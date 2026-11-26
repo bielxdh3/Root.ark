@@ -1,11 +1,11 @@
 const {
   assert, bcrypt, crypto, Database, fs, http, net, os, path, spawn, spawnSync, test,
   createFileLifecycleLock, classifyProcessOwner, createChunkUploadQuotaService, getCurrentProcessIdentity, ensureWindowsChunkUploadRoot,
-  ROOT, SERVER, PUBLIC, TIMEOUT_MS, FOLDER_ID, CHUNK_SESSION_TTL_MS, createChunkUploadQuota,
+  ROOT, SERVER, PUBLIC, TIMEOUT_MS, SERVER_BOOT_TIMEOUT_MS, FOLDER_ID, CHUNK_SESSION_TTL_MS, createChunkUploadQuota, v5AccountKey,
   chunkBoundaryRequestTimeout, isCanonicalNpmTestInvocation, releaseGateFixtureToHost, releaseGateVmRequire,
-  getUnusedPort, request, waitForServer, login, multipartParts, multipart, isContained, testDeadQuotaOwnerEnv,
+  getUnusedPort, request, waitForServer, waitForAssignedFixturePort, login, multipartParts, multipart, isContained, testDeadQuotaOwnerEnv,
   createHarness, startGatedClamAv, upload, uploadPayload, uploadChunk, postJson, waitForExit, waitForFile,
-  legacyChunkMetadata, auditLogs, auditLogFileSignature, waitForAuditLogs,
+  legacyChunkMetadata, legacyV4QuotaPreload, auditLogs, auditLogFileSignature, waitForAuditLogs,
   filesUnder, directoryEntries, assertRejectedClean, pending, quarantine,
 } = require("./support/upload-security-harness");
 
@@ -931,7 +931,8 @@ test("a failed handed-off ledger transition preserves registered publication for
     const operation = database.prepare("SELECT state, charge_bytes, relative_path FROM quota_operations WHERE state = 'handoff_published'").get();
     assert.ok(operation);
     assert.equal(operation.charge_bytes, bytes.length);
-    assert.equal(operation.relative_path.replaceAll("\\", "/"), `handoff/${FOLDER_ID}/${encodeURIComponent(fileName)}#${bytes.length}`);
+    assert.equal(operation.relative_path.replaceAll("\\", "/"),
+      `handoff/${FOLDER_ID}/${encodeURIComponent(fileName)}#${bytes.length}@${crypto.createHash("sha256").update("uploader").digest("hex")}`);
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM quota_operations WHERE state = 'handoff_published'").get().count, 1);
   } finally {
     database.close();
@@ -1568,6 +1569,182 @@ test("chunk upload startup disables only chunk uploads when session enumeration 
       assert.equal(JSON.parse(response.body).code, "CHUNK_QUOTA_UNAVAILABLE");
       assert.equal((await request(harness.port, "/login.html")).status, 200);
     });
+  }
+});
+
+test("folder lifecycle lock timeouts reject uploads, remove transient staging, and preserve accepted session data", { timeout: 30_000 }, async (t) => {
+  const uploadId = "lifecycle-timeout-chunk";
+  let timeoutResponseMarker;
+  const harness = await createHarness(t, {
+    chunkSessions: [{
+      uploadId,
+      files: {
+        "metadata.json": legacyChunkMetadata(uploadId, {
+          originalName: "timeout-chunk.txt",
+          fileName: "timeout-chunk.txt",
+          totalChunks: 2,
+          encryptionLevel: "none",
+        }),
+        "0.part": "preserve accepted chunk",
+      },
+    }],
+    preloadSource: ({ dir }) => {
+      const sessionDir = path.join(dir, "temp", ".chunks", FOLDER_ID, uploadId);
+      timeoutResponseMarker = path.join(dir, "chunk-timeout-response-marker.txt");
+      return [
+        "const lockModule = require(" + JSON.stringify(path.join(ROOT, "services", "fileLifecycleLock.js")) + ");",
+        "const create = lockModule.createFileLifecycleLock;",
+        "lockModule.createFileLifecycleLock = (options) => create({ ...options, timeoutMs: 150, pollMs: 5 });",
+        'const fs = require("node:fs");',
+        `const expressResponse = require(${JSON.stringify(require.resolve("express/lib/response", { paths: [ROOT] }))});`,
+        `const sessionDir = ${JSON.stringify(sessionDir)};`,
+        `const markerPath = ${JSON.stringify(timeoutResponseMarker)};`,
+        "const originalJson = expressResponse.json;",
+        'expressResponse.json = function (...args) { if (this.statusCode === 503 && this.req?.url?.startsWith("/upload-chunk")) fs.writeFileSync(markerPath, fs.existsSync(sessionDir) ? "present" : "absent"); return originalJson.apply(this, args); };',
+        'process.env.WEBDAV_ENABLED = "true";',
+      ].join("\n");
+    },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const existingSessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+  const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
+  const lock = createFileLifecycleLock({
+    directory: path.join(harness.dir, "data", ".rootark-cloud-file-locks"),
+    timeoutMs: 10_000,
+    pollMs: 5,
+  });
+  let releaseLock;
+  let markLockHeld;
+  const lockHeld = new Promise((resolve) => { markLockHeld = resolve; });
+  const heldOperation = lock.runFolder(FOLDER_ID, async () => {
+    markLockHeld();
+    await new Promise((resolve) => { releaseLock = resolve; });
+  });
+  await lockHeld;
+
+  try {
+    const simple = await upload(harness.port, session, "timeout-simple.txt", Buffer.from("disposable simple upload"));
+    assertRejectedClean(harness, simple, 503);
+
+    const chunk = await uploadChunk(harness.port, session, {
+      uploadId,
+      originalName: "timeout-chunk.txt",
+      chunkIndex: 1,
+      totalChunks: 2,
+      bytes: Buffer.from("disposable final chunk"),
+    });
+    assertRejectedClean(harness, chunk, 503);
+    assert.equal(chunk.headers["retry-after"], "5");
+    assert.equal(fs.existsSync(existingSessionDir), true);
+    assert.equal(fs.readFileSync(path.join(existingSessionDir, "0.part"), "utf8"), "preserve accepted chunk");
+    assert.equal(fs.readFileSync(path.join(existingSessionDir, "1.part"), "utf8"), "disposable final chunk");
+    assert.equal(fs.readFileSync(timeoutResponseMarker, "utf8"), "present", "the existing session remains present when the 503 response is sent");
+    assert.deepEqual(filesUnder(path.join(harness.chunkRoot, "incoming")), []);
+    const webDavBody = Buffer.from("disposable WebDAV upload");
+    const webDav = await request(harness.port, "/dav/" + FOLDER_ID + "/timeout-webdav.txt", {
+      method: "PUT",
+      headers: {
+        authorization: "Basic " + Buffer.from("uploader:" + harness.password).toString("base64"),
+        "content-length": webDavBody.length,
+      },
+      body: webDavBody,
+    });
+    assertRejectedClean(harness, webDav, 503);
+  } finally {
+    releaseLock();
+    await heldOperation;
+  }
+  await harness.stopServer();
+  const quotaDatabase = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    const sessionOperations = quotaDatabase.prepare("SELECT state, relative_path FROM quota_operations WHERE session_key = ? ORDER BY relative_path").all(`${FOLDER_ID}/${uploadId}`);
+    assert.deepEqual(sessionOperations.map((operation) => [operation.state, operation.relative_path]), [
+      ["part_committed", path.join(FOLDER_ID, uploadId, "0.part")],
+      ["part_committed", path.join(FOLDER_ID, uploadId, "1.part")],
+    ]);
+  } finally {
+    quotaDatabase.close();
+  }
+});
+
+test("a timed-out duplicate chunk request cannot mutate an active upload session", { timeout: 30_000 }, async (t) => {
+  const scanner = await startGatedClamAv();
+  t.after(async () => {
+    for (const gate of scanner.scans) gate.release();
+    await new Promise((resolve) => scanner.server.close(resolve));
+  });
+  const uploadId = "Concurrent-Timeout-Chunk";
+  const harness = await createHarness(t, {
+    chunkSessions: [{
+      uploadId,
+      files: {
+        "metadata.json": legacyChunkMetadata(uploadId, {
+          originalName: "concurrent-timeout.txt",
+          fileName: "concurrent-timeout.txt",
+          totalChunks: 2,
+          encryptionLevel: "none",
+        }),
+        "0.part": Buffer.alloc(2 * 1024 * 1024, 0x61),
+      },
+    }],
+    preloadSource: () => {
+      return [
+        "const lockModule = require(" + JSON.stringify(path.join(ROOT, "services", "fileLifecycleLock.js")) + ");",
+        "const create = lockModule.createFileLifecycleLock;",
+        "lockModule.createFileLifecycleLock = (options) => create({ ...options, timeoutMs: 200, pollMs: 5 });",
+      ].join("\n");
+    },
+    envOverrides: { UPLOAD_SCAN_PROVIDER: "clamav", CLAMAV_HOST: "127.0.0.1", CLAMAV_PORT: String(scanner.port) },
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const { createFileLifecycleLock } = require("../services/fileLifecycleLock");
+  const lock = createFileLifecycleLock({
+    directory: path.join(harness.dir, "data", ".rootark-cloud-file-locks"),
+    timeoutMs: 10_000,
+    pollMs: 5,
+  });
+  let releaseFolder;
+  let markFolderHeld;
+  const folderHeld = new Promise((resolve) => { markFolderHeld = resolve; });
+  const heldOperation = lock.runFolder(FOLDER_ID, async () => {
+    markFolderHeld();
+    await new Promise((resolve) => { releaseFolder = resolve; });
+  });
+  await folderHeld;
+
+  try {
+    const uploadArgs = {
+      uploadId,
+      originalName: "concurrent-timeout.txt",
+      chunkIndex: 1,
+      totalChunks: 2,
+      bytes: Buffer.alloc(2 * 1024 * 1024, 0x62),
+    };
+    const firstPromise = uploadChunk(harness.port, session, uploadArgs);
+    const firstScanDeadline = Date.now() + 5000;
+    while (scanner.scans.length < 1 && Date.now() < firstScanDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(scanner.scans[0], "first upload did not reach scanning");
+    await scanner.scans[0].started;
+
+    const secondArgs = {
+      ...uploadArgs,
+      uploadId: process.platform === "win32" ? uploadId.toLowerCase() : uploadId,
+    };
+    const secondPromise = uploadChunk(harness.port, session, secondArgs);
+    const sessionDir = path.join(harness.chunkRoot, FOLDER_ID, uploadId);
+    const stagedPath = path.join(sessionDir, "assembled.upload");
+    const second = await secondPromise;
+    assert.equal(second.status, 503, second.body);
+    assert.equal(fs.existsSync(stagedPath), true, "a timed-out duplicate request must not remove another request's staged file");
+    const activeMetadata = JSON.parse(fs.readFileSync(path.join(sessionDir, "metadata.json"), "utf8"));
+    assert.notEqual(activeMetadata.__resumeBlocked, true, "an alias request must not block the active session metadata");
+
+    scanner.scans[0].release();
+    const first = await firstPromise;
+    assert.equal(first.status, 503, first.body);
+  } finally {
+    releaseFolder();
+    await heldOperation;
   }
 });
 

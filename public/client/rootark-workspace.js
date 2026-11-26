@@ -867,7 +867,7 @@
       });
       if (index === totalChunks - 1 && totalChunks > 1 && settings.password) form.append("password", settings.password);
       form.append("chunk", file.slice(index * CHUNK_BYTES, Math.min(file.size, (index + 1) * CHUNK_BYTES)), file.name);
-      try { payload = await api.postForm(api.query("/upload-chunk", { folderId }), form); }
+      try { payload = await api.postForm(api.query("/upload-chunk", { folderId }), form, { headers: { "X-Rootark-Upload-Id": uploadId } }); }
       finally { form.delete("password"); }
       progress(Math.min(99, Math.round(((index + 1) / totalChunks) * 100)));
     }

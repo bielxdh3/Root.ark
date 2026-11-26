@@ -21,8 +21,8 @@ const cekTransfer = (() => {
 // Restore Date.now and the module cache immediately, so the real entry-time
 // approval, witness, signature and <=30-second skew checks still run against
 // real time. Only the final post-HPKE release boundary sees elapsed time.
-function releaseClockTransfer() {
-  const moduleId = require.resolve("../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer");
+function releaseClockTransfer(modulePath = "../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer") {
+  const moduleId = require.resolve(modulePath);
   const previousModule = require.cache[moduleId];
   const actualNow = Date.now;
   let nowMs = actualNow();
@@ -1292,7 +1292,7 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
     "owner-pinned issuer revoked after genuine HPKE sealing fails before export");
     assert.equal(issuerReads, 2);
     // The authentic owner-approved HPKE envelope has a shorter lifetime than
-    // this independently owner-signed grant. Advance only the wall clock in
+    // this independently owner-signed grant. Advance the pinned release clock in
     // the SECOND authority read, after the real AEAD + HPKE sealing awaits.
     const longGrantInput = { ...grantInput,
       expiresAt: envelope.core.expires_at + 120 };
@@ -1304,21 +1304,19 @@ test("owner offline ceremony: new device proves V2 HPKE+Ed25519; owner signs onl
       shareSignatureBase64: b64(crypto.sign(null, longGrantBytes, originalActor)) };
     assert.ok(longGrant.expiresAt > envelope.core.expires_at,
       "signed grant remains current after the real CEK offer expires");
-    const expiryOriginalWallClock = Date.now;
+    const expiryClock = releaseClockTransfer("../src/crypto/rootark-zk1-recipient-share-cek");
     let expiryReads = 0;
-    try {
-      await assert.rejects(createProtectedRecipientShareOffer({
-        ...ownerOfferArgs, grant: longGrant,
-        readIndependentAuthority: async () => {
-          const current = await readIndependentAuthority();
-          if (++expiryReads === 2) {
-            Date.now = () => (envelope.core.expires_at + 1) * 1000;
-          }
-          return current;
-        },
-      }), /ZK_SHARE_OFFER_DENIED/,
-      "a valid grant cannot export a newly expired, owner-signed HPKE envelope");
-    } finally { Date.now = expiryOriginalWallClock; }
+    await assert.rejects(expiryClock.transfer.createProtectedRecipientShareOffer({
+      ...ownerOfferArgs, grant: longGrant,
+      readIndependentAuthority: async () => {
+        const current = await readIndependentAuthority();
+        if (++expiryReads === 2) {
+          expiryClock.advanceTo((envelope.core.expires_at + 1) * 1000);
+        }
+        return current;
+      },
+    }), /ZK_SHARE_OFFER_DENIED/,
+    "a valid grant cannot export a newly expired, owner-signed HPKE envelope");
     assert.equal(expiryReads, 2,
       "the test must expire the envelope only at the second independent authority read");
     const maliciousOffer = { ...ownerOfferArgs };

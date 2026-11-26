@@ -392,8 +392,8 @@ function revokeCapability(token, username) {
     if (!row) return { status: "missing" };
     const metadata = safeJsonParse(row.metadata_json, {});
     if (metadata.shareKind !== "capability-v1") return { status: "missing" };
-    // Account identifiers are case-sensitive in users.username and login.
-    // Never authorize a distinct case-colliding principal to revoke the grant.
+    // SQLite account identifiers are case-sensitive. Distinct case-colliding
+    // principals must never revoke one another's capability tokens.
     const owner = row.created_by || metadata.createdBy;
     if (typeof owner !== "string" || !owner || owner !== username) {
       return { status: "forbidden" };

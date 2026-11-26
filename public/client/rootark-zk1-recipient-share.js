@@ -186,8 +186,8 @@
     return url.origin + "/zk-1/v1/share/read";
   }
   function cookieCsrfToken() {
-    // Root.ark's cookie session requires a double-submit CSRF header for POST.
-    // Bearer-based or Node callers can keep using their trusted fetchImpl.
+    // Cookie-authenticated browser POSTs require the same-session double-submit
+    // CSRF header. Headless callers without document can use their own fetch.
     if (typeof document !== "object" || typeof document.cookie !== "string") return "";
     const matches = document.cookie.split(";").map((part) => part.trim())
       .filter((part) => part.startsWith("rootark_csrf="));
@@ -234,9 +234,8 @@
         ...(Object.hasOwn(input, "nowSeconds") ? ["nowSeconds"] : [])];
       exact(input, keys);
       exact(input.grant, ["grantId", "expiresAt", "shareStatementBase64", "shareSignatureBase64"]);
-      // Capture the caller's OWN data callback once, before any crypto/network
-      // await. A mutable input must not replace the final independent trust
-      // reader with an older (but still active) roster during fetchImpl().
+      // Own data callback is pinned once before async signing/fetch. A mutable
+      // input cannot replace the last authority read with a stale roster.
       const authorityDescriptor = Object.getOwnPropertyDescriptor(input, "readIndependentAuthority");
       if (!authorityDescriptor || !Object.hasOwn(authorityDescriptor, "value")
         || typeof authorityDescriptor.value !== "function") deny();
