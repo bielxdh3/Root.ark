@@ -213,3 +213,35 @@ test("assertion location is collected only from the failed result's stack block"
   assert.match(output, /locationLine=7(?:\n|$)/);
   assert.doesNotMatch(output, /assertionLine=999|private|fixture\.test\.js|foreign\.test\.js/);
 });
+
+test("assertion location cannot be borrowed from a different tree with the same test basename", () => {
+  for (const [location, foreign, own] of [
+    ["/private/test/fixture.test.js", "/foreign/test/fixture.test.js", "/private/test/fixture.test.js"],
+    [String.raw`D:\\private\\test\\fixture.test.js`, String.raw`D:\foreign\test\fixture.test.js`, String.raw`D:\private\test\fixture.test.js`],
+  ]) {
+    const messages = [];
+    const tracker = createTapProgressRecorder((line) => messages.push(line));
+    for (const line of [
+      "not ok 1 - private assertion",
+      "  ---",
+      "  location: '" + location + ":3:1'",
+      "  code: 'ERR_ASSERTION'",
+      "  stack: |-",
+      "    TestContext.<anonymous> (" + foreign + ":999:1)",
+      "    TestContext.<anonymous> (" + own + ":4:1)",
+      "  ...",
+      "not ok 2 - no matching frame",
+      "  ---",
+      "  location: '" + location + ":7:1'",
+      "  stack: |-",
+      "    TestContext.<anonymous> (" + foreign + ":999:1)",
+      "  ...",
+    ]) tracker.accept(line);
+    tracker.finish();
+    const report = messages.join("\n");
+    assert.equal(tracker.state.failures, 2);
+    assert.match(report, /locationLine=3 assertionLine=4(?: |\n|$)/);
+    assert.match(report, /locationLine=7(?:\n|$)/);
+    assert.doesNotMatch(report, /assertionLine=999|private|foreign|fixture\.test\.js/);
+  }
+});
