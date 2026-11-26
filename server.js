@@ -5359,6 +5359,9 @@ async function decompressUploadedFileIfNeeded(req) {
 }
 
 async function repairCompressedTempUploads(directory = path.resolve("./temp")) {
+  // The chunk ledger owns this subtree. Raw opens/closes of its SQLite files
+  // can release the live connection's POSIX WAL locks; parts are opaque bytes.
+  if (sameChunkStoragePath(directory, CHUNK_UPLOAD_DIR)) return;
   if (!fs.existsSync(directory)) return;
 
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
