@@ -43,4 +43,11 @@ class StrictRfc8259JsonTest {
             StrictRfc8259Json.validate("[".repeat(40) + "0" + "]".repeat(40))
         }
     }
+
+    @Test fun unicodeEscapesRequireAsciiHexDigits() {
+        StrictRfc8259Json.validate("""{"a":"\u0065\u00Af"}""")
+        assertThrows(IOException::class.java) {
+            StrictRfc8259Json.validate("{\"a\":\"\\u\uFF10\uFF10\uFF16\uFF15\"}")
+        }
+    }
 }
