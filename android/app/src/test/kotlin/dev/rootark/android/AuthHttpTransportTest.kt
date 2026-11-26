@@ -144,6 +144,42 @@ class AuthHttpTransportTest {
     }
 
     @Test
+    fun `inventory rejects malformed UTF-8 inside otherwise valid metadata`() {
+        val origin = ServerOrigin.parse("https://sync.example.test")
+        val page = createValidSyncListing().put("view", "metadata").put("nextCursor", JSONObject.NULL)
+        val record = page.getJSONArray("objects").getJSONObject(0)
+        record.getJSONObject("metadata").put("name", "utf8-fixture-marker")
+        val parts = page.toString().split("utf8-fixture-marker", limit = 2)
+        assertEquals(2, parts.size)
+        val response = parts[0].toByteArray(StandardCharsets.UTF_8) +
+            byteArrayOf(0xC3.toByte(), 0x28) + parts[1].toByteArray(StandardCharsets.UTF_8)
+        var disconnected = false
+        val connection = object : HttpURLConnection(origin.syncInventoryUrl()) {
+            override fun connect() = Unit
+            override fun disconnect() { disconnected = true }
+            override fun usingProxy() = false
+            override fun getResponseCode() = 200
+            override fun getInputStream() = response.inputStream()
+        }
+        assertThrows(SyncListingValidationException::class.java) {
+            AuthHttpTransport(openSyncConnection = { connection }).listInventoryPage(origin, "fixture-bearer")
+        }
+        assertTrue(disconnected)
+    }
+
+    @Test
+    fun `metadata inventory rejects protected payload fields`() {
+        val transport = AuthHttpTransport()
+        for (field in listOf("ciphertext", "nonce", "tag", "aad", "authorization")) {
+            val page = createValidSyncListing().put("view", "metadata").put("nextCursor", JSONObject.NULL)
+            page.getJSONArray("objects").getJSONObject(0).put(field, "opaque-fixture")
+            assertThrows("Unexpected inventory field $field", SyncListingValidationException::class.java) {
+                transport.projectInventoryPage(page)
+            }
+        }
+    }
+
+    @Test
     fun `distinguishes size limit failure from validation failure`() {
         val sizeLimitEx = SyncListingLimitException("Sync listing exceeds limit")
         val validationEx = SyncListingValidationException("Invalid sync listing")

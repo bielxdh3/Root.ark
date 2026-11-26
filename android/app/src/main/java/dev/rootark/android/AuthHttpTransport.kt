@@ -13,6 +13,9 @@ import java.math.BigDecimal
 import java.math.BigInteger
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import org.json.JSONException
 import org.json.JSONObject
@@ -31,6 +34,10 @@ internal class AuthHttpTransport(
         // covers BODY reads only, starting after responseCode and inputStream
         // acquisition. It does not impose a total header/connect deadline.
         private const val MAX_SYNC_LIST_BODY_DURATION_NANOS = 10_000_000_000L
+        private val INVENTORY_RECORD_FIELDS = setOf(
+            "protocolVersion", "operationId", "objectId", "fileId", "versionId", "operation",
+            "revision", "baseRevision", "keyEpoch", "compartmentId", "deviceId", "metadata", "tombstone",
+        )
     }
     fun login(origin: ServerOrigin, username: String, password: String): LoginOutcome {
         val (status, json) = post(origin.loginUrl(), JSONObject().put("username", username).put("password", password))
@@ -138,8 +145,16 @@ internal class AuthHttpTransport(
                     }
                     out.write(buffer, 0, count)
                 }
+                val chars = try {
+                    StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .decode(ByteBuffer.wrap(out.toByteArray())).toString()
+                } catch (e: CharacterCodingException) {
+                    throw SyncListingValidationException("Malformed UTF-8 in inventory page", e)
+                }
                 try {
-                    JSONObject(String(out.toByteArray(), StandardCharsets.UTF_8))
+                    JSONObject(chars)
                 } catch (e: JSONException) {
                     throw SyncListingValidationException("Malformed JSON in sync listing", e)
                 }
@@ -168,6 +183,9 @@ internal class AuthHttpTransport(
             PagedInventoryPolicy.checkEnvelope(version, view, objects.length(), nextCursor)
             val rows = (0 until objects.length()).map { index ->
                 val record = objects.optJSONObject(index) ?: throw SyncListingValidationException("Invalid sync listing")
+                if (record.keys().asSequence().any { it !in INVENTORY_RECORD_FIELDS }) {
+                    throw SyncListingValidationException("Unexpected field in metadata inventory record")
+                }
                 val metadata = record.optJSONObject("metadata") ?: throw SyncListingValidationException("Invalid sync listing")
                 val deleted = record.opt("tombstone") as? Boolean ?: throw SyncListingValidationException("Invalid sync listing")
                 val recordVersion = parseProtocolVersion(record.opt("protocolVersion"))
