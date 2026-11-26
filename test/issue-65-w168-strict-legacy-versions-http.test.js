@@ -41,12 +41,12 @@ async function boot(dir, port, strict, preload) {
   const env = { ...process.env, NODE_ENV: "test", DB_ENABLED: "false",
     PORT: String(port), UPLOAD_SCAN_ENABLED: "false", WEBDAV_ENABLED: "false",
     CLOUD_STORAGE_PROVIDER: "local", ROOTARK_ZK10_SYNC_CUTOVER_STRICT: strict ? "1" : "off",
-    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, preload && `--require=${preload}`].filter(Boolean).join(" ") };
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
   delete env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS;
   delete env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED;
   delete env.TRUSTED_PROXIES;
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], {
+  const child = spawn(process.execPath,
+    [...(preload ? ["--require", preload] : []), path.join(ROOT, "server.js")], {
     cwd: dir, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
   });
   let diagnostic = "";
@@ -89,6 +89,17 @@ test("fixture boot cannot borrow readiness from an unrelated HTTP listener", {
   } finally {
     await attempted.then(stop, () => {});
   }
+});
+test("fixture preload under an owner-private path containing spaces is loaded", {
+  timeout: 30000,
+}, async (t) => {
+  const f = fixture(t);
+  const spacedPreload = path.join(f.dir, "strict preload with spaces.cjs");
+  fs.copyFileSync(f.preload, spacedPreload);
+  const port = await freePort();
+  f.child = await boot(f.dir, port, true, spacedPreload);
+  const headers = await session(port, f.password);
+  assert.match(headers.cookie, /rootark_csrf=/);
 });
 async function session(port, password) {
   const body = JSON.stringify({ username: "alice", password });
