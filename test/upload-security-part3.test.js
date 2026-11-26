@@ -967,6 +967,62 @@ test("startup cleans a tagged handoff " + (hardLinked ? "with hard-link" : "with
 });
 }
 
+test("pending gzip repair never opens the live chunk quota ledger or rewrites an accepted part", { timeout: 60_000 }, async (t) => {
+  const { gzipSync } = require("node:zlib");
+  const uploadId = "gzip-repair-chunk-boundary";
+  const partBytes = gzipSync(Buffer.from("opaque accepted chunk bytes"));
+  const ordinaryBytes = Buffer.from("ordinary pending upload repair");
+  const harness = await createHarness(t, {
+    kernelAssignedPort: true,
+    preloadSource: ({ dir, chunkRoot }) => `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const quotaModule = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
+      const originalFactory = quotaModule.createChunkUploadQuota;
+      const originalOpen = fs.openSync;
+      const root = ${JSON.stringify(chunkRoot)};
+      const marker = ${JSON.stringify(path.join(dir, "raw-quota-opens"))};
+      let live = false;
+      quotaModule.createChunkUploadQuota = (...args) => {
+        const quota = originalFactory(...args);
+        live = true;
+        return quota;
+      };
+      const normalize = (file) => process.platform === "win32" ? path.resolve(file).toLowerCase() : path.resolve(file);
+      fs.openSync = function(file, ...args) {
+        if (live && typeof file === "string" && normalize(path.dirname(file)) === normalize(root)
+            && [".quota.sqlite", ".quota.sqlite-wal", ".quota.sqlite-shm", ".quota.sqlite-journal"].includes(path.basename(file))) {
+          fs.appendFileSync(marker, path.basename(file) + "\\n");
+        }
+        return Reflect.apply(originalOpen, this, [file, ...args]);
+      };
+    `,
+  });
+  const session = await login(harness.port, "uploader", harness.password);
+  const first = await uploadChunk(harness.port, session, {
+    uploadId, originalName: "opaque-part.bin", chunkIndex: 0, totalChunks: 2, encryptionLevel: "none", bytes: partBytes,
+  });
+  assert.equal(first.status, 200, first.body);
+  assert.equal(JSON.parse(first.body).complete, false);
+  const ordinaryPath = path.join(harness.dir, "temp", "ordinary-repair.txt");
+  fs.writeFileSync(ordinaryPath, gzipSync(ordinaryBytes));
+  const repaired = await postJson(harness.port, session, "/pending/repair?folderId=root", {});
+  assert.equal(repaired.status, 200, repaired.body);
+  assert.deepEqual(fs.readFileSync(ordinaryPath), ordinaryBytes, "ordinary pending gzip repair remains enabled");
+  const marker = path.join(harness.dir, "raw-quota-opens");
+  const rawOpens = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").trim().split("\n") : [];
+  assert.deepEqual(rawOpens, [], "non-SQLite opens/closes can discard live POSIX WAL locks");
+  assert.deepEqual(fs.readFileSync(path.join(harness.chunkRoot, FOLDER_ID, uploadId, "0.part")), partBytes);
+  const database = new Database(path.join(harness.chunkRoot, ".quota.sqlite"), { readonly: true });
+  try {
+    assert.deepEqual(database.prepare("SELECT state, charge_bytes FROM quota_operations ORDER BY state").all(), [
+      { state: "part_committed", charge_bytes: partBytes.length },
+    ]);
+  } finally {
+    database.close();
+  }
+});
+
 test("tagged handoff rollback after pending-transition fault releases only its own assembly", { timeout: 75_000 }, async (t) => {
   const uploadId = "tagged-pending-rollback";
   const fileName = "tagged-pending-rollback.txt";
