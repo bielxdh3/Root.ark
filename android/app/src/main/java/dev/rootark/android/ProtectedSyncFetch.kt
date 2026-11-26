@@ -113,8 +113,7 @@ internal class ProtectedSyncFetch(
                 while (true) {
                     checkBodyDeadline()
                     val read = input.read(buffer)
-                    // Check after every read too: EOF itself may arrive after the
-                    // cumulative deadline, and must not bypass the body budget.
+                    // EOF itself may arrive after the cumulative body deadline.
                     checkBodyDeadline()
                     if (read < 0) break
                     if (read > MAX_RESPONSE_BYTES - size) {

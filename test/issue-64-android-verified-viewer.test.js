@@ -17,6 +17,7 @@ test("selected sync metadata retains opaque object id and never carries protecte
 test("native protected text view requires provisioned trust, authenticated fetch and clears on lifecycle", () => {
   const viewer = read("android/app/src/main/java/dev/rootark/android/VerifiedTextPreview.kt");
   const activity = read("android/app/src/main/java/dev/rootark/android/MainActivity.kt");
+  const buffer = read("android/app/src/main/java/dev/rootark/android/SecurePreviewBuffer.kt");
   assert.match(viewer, /withVerifiedContent/);
   assert.match(viewer, /TrustedContentGrantProvider/);
   assert.match(viewer, /decodeVerifiedText/);
@@ -36,7 +37,8 @@ test("native protected text view requires provisioned trust, authenticated fetch
   assert.match(activity, /previewText\.setText\(retained,\s*0,\s*retained\.size\)/,
     "must use retained CharArray setText without an immutable String heap copy");
   assert.match(activity, /securePreviewText\.clear\(\)/, "protected preview must clear on close and lifecycle");
-  const buffer = read("android/app/src/main/java/dev/rootark/android/SecurePreviewBuffer.kt");
+  assert.match(activity, /previewText\.text\s*=\s*""/,
+    "clear must remove the TextView's reference to the old backing buffer");
   assert.match(buffer, /previous\?\.fill\('\\u0000'\)/,
     "clear must wipe the actual retained CharArray before the TextView is replaced");
   assert.doesNotMatch(activity, /text\(view,\s*String\(characters\)\)/, "must not wrap characters in String");

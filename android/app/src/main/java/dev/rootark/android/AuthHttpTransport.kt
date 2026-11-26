@@ -15,6 +15,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLConnection
 import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import javax.net.ssl.HttpsURLConnection
@@ -27,10 +28,12 @@ class SyncListingValidationException(message: String, cause: Throwable? = null) 
 
 /** HTTP adapter for canonical login/TOTP and the bounded, read-only sync listing. */
 internal class AuthHttpTransport(
+    private val clockNanos: () -> Long = System::nanoTime,
     private val monotonicNanos: () -> Long = System::nanoTime,
     private val openInventoryConnection: (URL) -> URLConnection = { it.openConnection() },
 ) {
     companion object {
+        const val INVENTORY_READ_DEADLINE_NANOS = 30_000_000_000L
         // readTimeout applies to each socket read. Bound cumulative inventory
         // BODY reads independently; connection and headers have separate timeouts.
         private const val MAX_INVENTORY_BODY_NANOS = 10_000_000_000L
@@ -82,6 +85,7 @@ internal class AuthHttpTransport(
             connection.setRequestProperty("Accept", "application/json")
             connection.setRequestProperty("Accept-Encoding", "identity")
             connection.setRequestProperty("Cache-Control", "no-store")
+            val requestStartedAt = clockNanos()
             val status = connection.responseCode
             if (status != 200) throw RootArkApiException(status)
             val mime = connection.contentType?.substringBefore(';')?.trim()
@@ -102,8 +106,14 @@ internal class AuthHttpTransport(
                 val buffer = ByteArray(4096)
                 var total = 0
                 while (true) {
+                    if (clockNanos() - requestStartedAt >= INVENTORY_READ_DEADLINE_NANOS) {
+                        throw SyncListingException("Inventory response exceeded read deadline")
+                    }
                     checkBodyDeadline()
                     val count = stream.read(buffer)
+                    if (clockNanos() - requestStartedAt >= INVENTORY_READ_DEADLINE_NANOS) {
+                        throw SyncListingException("Inventory response exceeded read deadline")
+                    }
                     checkBodyDeadline()
                     if (count < 0) break
                     total += count
@@ -117,7 +127,7 @@ internal class AuthHttpTransport(
                         .onMalformedInput(CodingErrorAction.REPORT)
                         .onUnmappableCharacter(CodingErrorAction.REPORT)
                         .decode(ByteBuffer.wrap(out.toByteArray())).toString()
-                } catch (e: Exception) {
+                } catch (e: CharacterCodingException) {
                     throw SyncListingValidationException("Malformed UTF-8 in inventory page", e)
                 }
                 try {

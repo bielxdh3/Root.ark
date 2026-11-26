@@ -103,7 +103,8 @@ function createTapProgressRecorder(write) {
       const moduleExit = pending.fileProcessFailed && pending.failureType === "testCodeFailure"
         && pending.code === "ERR_TEST_FAILURE" && pending.moduleExitCode !== null
         ? ` moduleExitCode=${pending.moduleExitCode}` : "";
-      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${acl}${edge}`);
+      const assertion = pending.assertionLine === null ? "" : ` assertionLine=${pending.assertionLine}`;
+      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${assertion}${acl}${edge}`);
       detailed++;
     } else if (pending.acl && verifiedAclOverflowDetails < 4) {
       // Numerous unrelated failed tests must not suppress the bounded, strictly
@@ -174,7 +175,7 @@ function createTapProgressRecorder(write) {
             const nameHash = hash(result[3]);
             write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
             pending = { index: result[2], nameHash, pathHash: "none",
-              failureType: "unknown", code: "unknown", moduleExitCode: null,
+              failureType: "unknown", code: "unknown", moduleExitCode: null, assertionLine: null,
               fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false };
           }
         } else if (state.results % 25 === 0) {
@@ -220,6 +221,11 @@ function createTapProgressRecorder(write) {
           const moduleExit = /^  exitCode: ([0-9]{1,3})$/.exec(line);
           if (moduleExit && Number(moduleExit[1]) <= 255)
             pending.moduleExitCode = Number(moduleExit[1]);
+          if (pending.assertionLine === null && pending.pathHash !== "none" && /^\s+at \S/.test(line)) {
+            const frame = /(?:^|[\\/])test[\\/]([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}/.exec(line);
+            if (frame && hash(`test/${frame[1]}`) === pending.pathHash)
+              pending.assertionLine = Number(frame[2]);
+          }
         }
         // Legacy bounded TAP code breadcrumbs can occur without YAML; they
         // never establish test-file process identity or a module exit code.

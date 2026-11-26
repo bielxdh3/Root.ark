@@ -43,7 +43,7 @@ function expectedPrivateState(configPath, selected, overrides = {}) {
   });
 }
 
-function runClient(dir, config, extraEnv = {}, { symlinkSentinel = "" } = {}) {
+function runClient(dir, config, extraEnv = {}, { symlinkSentinel = "", timeoutMs } = {}) {
   const args = ["start", "--legacy-development-opt-in", "--once", "--config", config];
   const injected = String.raw`
     const fs = require('node:fs');
@@ -64,14 +64,19 @@ function runClient(dir, config, extraEnv = {}, { symlinkSentinel = "" } = {}) {
     let output = "";
     // Windows native authority checks are deliberately synchronous and can
     // cost several seconds per serialized write on loaded hosted runners.
-    const timeout = setTimeout(() => child.kill(), process.platform === "win32" ? 90000 : 30000);
+    const deadlineMs = timeoutMs ?? (process.platform === "win32" ? 90000 : 30000);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, deadlineMs);
     for (const pipe of [child.stdout, child.stderr]) {
       pipe.on("data", (data) => { output += data.toString("utf8"); });
     }
     child.once("error", (error) => { clearTimeout(timeout); reject(error); });
     child.once("close", (code) => {
       clearTimeout(timeout);
-      resolve({ code, output });
+      resolve({ code, output, timedOut });
     });
   });
 }
@@ -182,12 +187,18 @@ test("forged historical uploaded status cannot suppress an actual upload", async
   assert.equal(state.files["new.txt"].lastStatus, "uploaded");
 });
 
-test("simultaneous legacy uploads serialize private state without lost entries", async (t) => {
+test("simultaneous legacy uploads serialize private state without lost entries", { timeout: 240_000 }, async (t) => {
   const f = await fixture(t, "rootark-state-serial-");
   for (let i = 0; i < 8; i++) {
     await fsp.writeFile(path.join(f.selected, `new-${i}.txt`), `UPLOAD-${i}`);
   }
-  const result = await runClient(f.dir, f.config);
+  // Eight independent uploads must take the real serialized state-write path.
+  // Each write verifies native ACL ownership on Windows; a fixed 90s client
+  // kill under hosted concurrency can terminate correct serialization early.
+  const result = await runClient(f.dir, f.config, {}, {
+    timeoutMs: process.platform === "win32" ? 180_000 : 30_000,
+  });
+  assert.equal(result.timedOut, false, "serialized upload client exceeded its bounded runtime");
   assert.equal(result.code, 0, result.output);
   assert.equal(f.uploads.length, 8);
   const state = JSON.parse(await fsp.readFile(expectedPrivateState(f.config, f.selected, f), "utf8"));
