@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const { spawn, execFileSync } = require("node:child_process");
+const { readEdgeDevToolsPort } = require("./support/issue-65-edge-devtools-port");
 
 test("real Edge: selected 128-revision UI batches consume replacement consent and cancel later-window search atomically", {
   timeout: 90_000,
@@ -379,10 +380,7 @@ test("real Edge: selected 128-revision UI batches consume replacement consent an
       throw Error("EDGE_REPLACE_ONCE_TIMEOUT");
     };
     const port = await waitFor(() => {
-      const file = path.join(profile, "DevToolsActivePort");
-      if (!fs.existsSync(file)) return null;
-      const value = Number(fs.readFileSync(file, "utf8").split(/\r?\n/)[0]);
-      return Number.isSafeInteger(value) && value > 0 ? value : null;
+      return readEdgeDevToolsPort(profile);
     }, 15_000);
     const tabs = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
     const tab = tabs.find((item) => item.type === "page");
