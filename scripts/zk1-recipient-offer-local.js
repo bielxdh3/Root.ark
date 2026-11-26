@@ -7,6 +7,17 @@
 // private trusted context module may supply live signed history, contact pins,
 // owner/recipient secret handles and authenticated HTTP session.
 const fs = require("node:fs");
+const { types: { isUint8Array, isProxy } } = require("node:util");
+// Capture the native brand, byte length and zeroing operations before any
+// independently supplied authority callback can mutate JS prototypes.
+const nativeApply = Reflect.apply.bind(Reflect);
+const nativeIsSafeInteger = Number.isSafeInteger.bind(Number);
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype), "byteLength").get;
+const NativeUint8Array = Uint8Array;
+const nativeTypedSet = Uint8Array.prototype.set;
+const nativeDefineProperty = Object.defineProperty.bind(Object);
+const nativeTypedFill = Uint8Array.prototype.fill;
 const files = require("./zk1-owner-offline-enroll-local");
 const { createProtectedRecipientShareOffer,
   openPortableProtectedRecipientShareFile } =
@@ -55,10 +66,12 @@ function parse(argv) {
     opts[argv[i]] = argv[i + 1];
   }
   if (fields.some((field) => !Object.hasOwn(opts, field))) deny();
-  const names = fields.filter((field) => field !== "--owned-dir")
+  // On Windows, case-insensitive aliases resolve to the same private leaf.
+  // Reject collisions before reading grant/context files or opening output.
+  const filenames = fields.filter((field) => field !== "--owned-dir")
     .map((field) => process.platform === "win32"
       ? opts[field].toLowerCase() : opts[field]);
-  if (new Set(names).size !== names.length) deny();
+  if (new Set(filenames).size !== filenames.length) deny();
   return { mode, opts };
 }
 function batchEntries(root, manifestName, contextName) {
@@ -97,22 +110,35 @@ function batchEntries(root, manifestName, contextName) {
   });
 }
 function privateOutput(root, name, bytes) {
-  if (!(bytes instanceof Uint8Array) || bytes.byteLength > MAX_OUTPUT) deny();
+  if (isProxy(bytes) || !isUint8Array(bytes)) deny();
+  // Typed arrays may expose attacker-controlled own or inherited byteLength
+  // getters. Always use the internal slot, not mutable JS property lookup.
+  const actualLength = nativeApply(typedArrayByteLength, bytes, []);
+  if (!nativeIsSafeInteger(actualLength) || actualLength > MAX_OUTPUT) deny();
+  // Node's fs.writeSync buffer validation may also consult a JS byteLength
+  // property. Give it a private byte-for-byte native copy with a pinned own
+  // length, and scrub that extra copy whether writing succeeds or fails.
+  const stableBytes = new NativeUint8Array(actualLength);
+  nativeApply(nativeTypedSet, stableBytes, [bytes]);
+  nativeDefineProperty(stableBytes, "byteLength",
+    { value: actualLength, configurable: false, writable: false });
   // Refuse an existing name: never clobber recipient plaintext or a trusted
   // input, even when it is a symlink. An exclusive private leaf inherits the
   // already independently verified owner-only directory ACL.
-  files.safeDir(root);
-  const filename = files.fileAt(root, name, false);
-  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
-    | (fs.constants.O_NOFOLLOW || 0);
-  const fd = fs.openSync(filename, flags, 0o600);
+  let fd = null;
+  let filename = null;
   try {
+    files.safeDir(root);
+    filename = files.fileAt(root, name, false);
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+      | (fs.constants.O_NOFOLLOW || 0);
+    fd = fs.openSync(filename, flags, 0o600);
     const initial = fs.fstatSync(fd);
     if (!initial.isFile() || initial.nlink !== 1
       || (process.platform !== "win32" && (initial.mode & 0o077) !== 0)) deny();
     let position = 0;
-    while (position < bytes.byteLength) {
-      const written = fs.writeSync(fd, bytes, position, bytes.byteLength - position);
+    while (position < actualLength) {
+      const written = fs.writeSync(fd, stableBytes, position, actualLength - position);
       if (!Number.isSafeInteger(written) || written <= 0) deny();
       position += written;
     }
@@ -122,13 +148,17 @@ function privateOutput(root, name, bytes) {
     if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1
       || final.ino !== initial.ino || final.dev !== initial.dev
       || named.ino !== final.ino || named.dev !== final.dev
-      || final.size !== bytes.byteLength || named.size !== final.size) deny();
+      || final.size !== actualLength || named.size !== final.size) deny();
   } finally {
     // A failed private output may contain a PARTIAL plaintext file. It is
     // deliberately not unlinked by pathname: a concurrent rename could
     // replace the leaf before unlink. The user must inspect their private
     // directory and remove an incomplete artifact themselves.
-    fs.closeSync(fd);
+    try {
+      if (fd !== null) fs.closeSync(fd);
+    } finally {
+      nativeApply(nativeTypedFill, stableBytes, [0]);
+    }
   }
 }
 async function redeemBatch(root, opts, trustedBuilder) {
@@ -154,7 +184,9 @@ async function redeemBatch(root, opts, trustedBuilder) {
       // might have left an incomplete leaf. No atomicity/rollback is claimed.
       throw new BatchIncomplete(completed, entries.length);
     } finally {
-      if (opened?.data instanceof Uint8Array) opened.data.fill(0);
+      if (opened && !isProxy(opened.data) && isUint8Array(opened.data)) {
+        nativeApply(nativeTypedFill, opened.data, [0]);
+      }
     }
   }
   return `ZK_RECIPIENT_BATCH_REDEEMED_${completed}_OF_${entries.length}`;
@@ -195,7 +227,11 @@ async function run(argv) {
     deny();
   }
   finally {
-    opened?.data?.fill(0);
+    // A last authority callback may also replace `.fill` on a real byte view.
+    // Use the captured native method so cleartext never survives CLI release.
+    if (opened && !isProxy(opened.data) && isUint8Array(opened.data)) {
+      nativeApply(nativeTypedFill, opened.data, [0]);
+    }
   }
 }
 if (require.main === module) {

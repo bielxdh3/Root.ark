@@ -186,8 +186,7 @@
     return url.origin + "/zk-1/v1/share/read";
   }
   function cookieCsrfToken() {
-    // Cookie-authenticated browser POSTs require the same-session double-submit
-    // CSRF header. Headless callers without document can use their own fetch.
+    // Cookie-authenticated POSTs require a same-session double-submit token.
     if (typeof document !== "object" || typeof document.cookie !== "string") return "";
     const matches = document.cookie.split(";").map((part) => part.trim())
       .filter((part) => part.startsWith("rootark_csrf="));
@@ -234,8 +233,6 @@
         ...(Object.hasOwn(input, "nowSeconds") ? ["nowSeconds"] : [])];
       exact(input, keys);
       exact(input.grant, ["grantId", "expiresAt", "shareStatementBase64", "shareSignatureBase64"]);
-      // Own data callback is pinned once before async signing/fetch. A mutable
-      // input cannot replace the last authority read with a stale roster.
       const authorityDescriptor = Object.getOwnPropertyDescriptor(input, "readIndependentAuthority");
       if (!authorityDescriptor || !Object.hasOwn(authorityDescriptor, "value")
         || typeof authorityDescriptor.value !== "function") deny();
@@ -261,8 +258,6 @@
         || input.signerKey.algorithm?.name !== "Ed25519"
         || input.signerKey.extractable !== false
         || !input.signerKey.usages?.includes("sign")) deny();
-      // An untrusted key provider must not replace the signer after its local
-      // recipient-roster binding has been verified.
       const signerKey = input.signerKey;
       const fetchImpl = input.fetchImpl ?? fetch;
       const nowSeconds = input.nowSeconds ?? (() => Math.floor(Date.now() / 1000));
@@ -288,10 +283,8 @@
         "Ed25519", false, ["verify"]);
       if (!await crypto.subtle.verify("Ed25519", issuer, signature,
         Uint8Array.from([...DOMAIN, ...raw]))) deny();
-      // A server can replay authentic owner-signed ciphertext while ignoring
-      // the client's GET signature. Check possession of the independently
-      // enrolled recipient key LOCALLY before any network request. The
-      // nonextractable private CryptoKey is reused for the actual GET.
+      // A server response alone cannot prove possession of the enrolled
+      // recipient's signing key; verify it locally before contacting the server.
       const recipient = await crypto.subtle.importKey("raw", first.recipientKey,
         "Ed25519", false, ["verify"]);
       const challenge = crypto.getRandomValues(new Uint8Array(32));

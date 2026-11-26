@@ -1,9 +1,11 @@
 package dev.rootark.android
 
 import android.app.Activity
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
 import android.view.View
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
@@ -147,15 +149,33 @@ class MainActivity : Activity() {
 
     private fun screen(title: String, description: String): LinearLayout {
         val scroll = ScrollView(this)
+        if (Build.VERSION.SDK_INT >= 35) {
+            val mode = window.attributes.softInputMode
+            val resizeMode = (mode and WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST.inv()) or
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            if (mode != resizeMode) window.setSoftInputMode(resizeMode)
+            scroll.setOnApplyWindowInsetsListener { view, insets ->
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                val ime = insets.getInsets(WindowInsets.Type.ime())
+                val padding = ScreenInsets(bars.left, bars.top, bars.right, bars.bottom)
+                    .union(ScreenInsets(ime.left, ime.top, ime.right, ime.bottom))
+                view.setPadding(padding.left, padding.top, padding.right, padding.bottom)
+                insets
+            }
+        }
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val padding = (24 * resources.displayMetrics.density).toInt()
             setPadding(padding, padding, padding, padding)
         }
         scroll.addView(layout)
-        text(layout, title).textSize = 24f
+        text(layout, title).apply {
+            textSize = 24f
+            isAccessibilityHeading = true
+        }
         text(layout, description)
         setContentView(scroll)
+        if (Build.VERSION.SDK_INT >= 35) scroll.requestApplyInsets()
         return layout
     }
 
@@ -165,9 +185,9 @@ class MainActivity : Activity() {
         layout.addView(it)
     }
 
-    private fun field(layout: LinearLayout, label: String, value: String, secret: Boolean): EditText =
-        EditText(this).also {
-            it.hint = label
+    private fun field(layout: LinearLayout, label: String, value: String, secret: Boolean): EditText {
+        val input = EditText(this).also {
+            it.id = View.generateViewId()
             it.setText(value)
             it.inputType = if (secret) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 else InputType.TYPE_CLASS_TEXT
@@ -176,8 +196,14 @@ class MainActivity : Activity() {
             it.layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
             )
-            layout.addView(it)
         }
+        layout.addView(TextView(this).apply {
+            text = label
+            labelFor = input.id
+        })
+        layout.addView(input)
+        return input
+    }
 
     private fun button(layout: LinearLayout, label: String, action: () -> Unit) {
         val view = Button(this)

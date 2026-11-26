@@ -30,6 +30,7 @@ Then:
 
 ```
 ./gradlew :core:test          # pure JVM path-validator and contract tests
+./gradlew :app:testDebugUnitTest # application JVM tests, including screen-inset calculations
 ./gradlew :app:assembleDebug  # Android launcher build (requires the Android SDK)
 ```
 
@@ -61,9 +62,9 @@ node --test --test-reporter=tap test/issue-64-android-contract.test.js test/issu
 
 ## Verification and remaining gaps
 
-- The `ZK65 Provider and Android Focused Regression` workflow runs `gradle --no-daemon :core:test` with pinned Gradle 8.10.2 and Temurin JDK 17 on hosted Ubuntu. The initial real run exposed a stale signed-DELETE tombstone assertion; after correction, the hosted core build and **51 JVM tests** passed. These actually compile the Kotlin core and deserialize the committed HTTP response fixture, rather than merely scanning source text.
-- The Node route/fixture contracts are additionally exercised on hosted Ubuntu and Windows. Neither these checks nor the Kotlin core tests compile, exercise or certify the Android application module.
+- The first hosted run, before Android app tasks were added, executed `gradle --no-daemon :core:test` with pinned Gradle 8.10.2 and Temurin JDK 17 on hosted Ubuntu. It exposed a stale signed-DELETE tombstone assertion; after correction, the core build and **51 JVM tests** passed. This is historical core-only evidence, not the current workflow scope.
+- The Node route/fixture contracts are additionally exercised on hosted Ubuntu and Windows; these Node checks do not compile or exercise the Android application module.
 - No secure key storage, cryptographic envelope, or metadata protocol is implemented. The protected-metadata protocol gap is documented in the architecture doc and is a blocker for protected Android content.
 - The native screen sends `POST /auth/login` and `POST /auth/login/2fa` to a strictly validated HTTPS origin and handles authenticated, TOTP challenge, mandatory 2FA-enrollment and generic error states. It disables redirects and caching, bounds responses, clears sensitive UI fields, drops sessions on backgrounding, disables view-state saving, and retains session data only in process memory. Enrollment itself still requires the web client.
 - The Android adapter intentionally implements only authentication; `RootArkApi` sync methods, ZK keys, registration, device revocation, recovery and protected data access remain unavailable. No on-device runtime, network integration, or emulator/physical-device validation has been completed for this step yet.
-- The focused CI workflow now requests Android SDK 35 and builds `:app:assembleDebug` as well as running core JVM tests; its result is required before treating the module as compiled.
+- The focused CI workflow requests Android SDK 35 and runs `gradle --no-daemon :core:test :app:testDebugUnitTest :app:assembleDebug`. The application JVM tests include screen-inset calculations; these and the debug build do not establish device or visual validation.
