@@ -20,6 +20,8 @@ on:
       - 'test/issue-64-android-contract.test.js'
       - 'test/issue-64-android-entry.test.js'
       - 'test/issue-64-android-filelist.test.js'
+      - 'test/issue-64-android-pagination.test.js'
+      - 'test/issue-64-android-pagination-real-http.test.js'
       - 'test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js'
       - 'test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js'
       - 'src/services/zk1SyncAtomicCasFloorLedgerDevOff.js'
@@ -64,7 +66,7 @@ jobs:
         # real Windows runner with VS 2022 instead of skipping native builds.
         os: [ubuntu-latest, windows-2022]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
@@ -77,8 +79,18 @@ jobs:
         run: npm ci
       - name: Real signed remote-provider TLS, Android routes and atomic CAS floor negatives
         run: node --test --test-reporter=tap test/issue-65-full-multiprovider-http-restore.test.js test/issue-64-android-contract.test.js test/issue-64-android-entry.test.js test/issue-65-cos-pr235-engine-atomic-batch-queue.test.js test/issue-65-cos-pr235-sync-v2-atomic-witness-options.test.js test/issue-65-sync-atomic-cas-floor-ledger-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-mtls-dev-off.test.js test/issue-65-sync-atomic-retained-anchor-operator-dev-off.test.js test/issue-65-sync-atomic-pg-physical-fence-dev-off.test.js test/issue-65-sync-atomic-signed-owner-bindings-dev-off.test.js test/issue-65-private-fifo-open-nonblock.test.js
-      - name: Verify native read-only file-list authorization and wire shape
-        run: node --test --test-reporter=tap test/issue-64-android-filelist.test.js
+      - name: Verify native read-only file-list authorization and paginated metadata wire shape
+        run: node --test --test-reporter=tap test/issue-64-android-filelist.test.js test/issue-64-android-pagination.test.js
+      - name: Checkout exact issue #66 paginated server dependency outside working tree
+        shell: bash
+        run: |
+          git fetch --no-tags origin 3ccf955874271546b61ecac09d77227612d330fe
+          git worktree add --detach "$RUNNER_TEMP/rootark-issue66-paged-server" FETCH_HEAD
+      - name: Exercise signed >128-object HTTP pagination and authorization on pinned #255
+        env:
+          ROOTARK_PAGED_SERVER_ROOT: ${{ runner.temp }}/rootark-issue66-paged-server
+          NODE_PATH: ${{ github.workspace }}/node_modules
+        run: node --test --test-reporter=tap test/issue-64-android-pagination-real-http.test.js
       - name: Verify tests did not change repository files
         run: git diff --exit-code
       - name: Verify tests did not create untracked files
