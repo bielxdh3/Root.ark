@@ -8,6 +8,7 @@ const path = require("node:path");
 const http = require("node:http");
 const { spawn, execFileSync } = require("node:child_process");
 const { readEdgeDevToolsPort } = require("./support/issue-65-edge-devtools-port");
+const { reportReplacementFailure } = require("../scripts/edge-test-failure-diagnostic");
 
 test("real Edge: selected 128-revision UI batches consume replacement consent and cancel later-window search atomically", {
   timeout: 90_000,
@@ -515,6 +516,7 @@ test("real Edge: selected 128-revision UI batches consume replacement consent an
       return typeof value === "string" && /^EDGE_REPLACE_ONCE_(PASS|FAIL)/.test(value)
         ? value : null;
     });
+    reportReplacementFailure(t, result);
     assert.equal(result, "EDGE_REPLACE_ONCE_PASS");
     const afterCancelCleanup = await send("Runtime.evaluate", {
       expression: "({phase:window.__issue63CancelUiPhase,verifiedGets:window.__issue63CancelUiVerifiedAfterRelease})",
