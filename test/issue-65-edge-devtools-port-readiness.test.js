@@ -7,6 +7,17 @@ const os = require("node:os");
 const path = require("node:path");
 const { readEdgeDevToolsPort } = require("./support/issue-65-edge-devtools-port");
 
+test("offline Edge E2E routes CDP port readiness through the race-safe shared reader", () => {
+  // The real browser fixture must use the same helper that is exercised below
+  // under a physical publication/read race. A second open-coded check reopens
+  // the existence-to-read window and silently loses the shared regression.
+  const source = fs.readFileSync(path.join(__dirname,
+    "issue-65-browser-offline-persisted-restore.test.js"), "utf8");
+  assert.match(source, /const \{ readEdgeDevToolsPort \} = require\("\.\/support\/issue-65-edge-devtools-port"\);/);
+  assert.match(source, /await waitFor\(\(\) => readEdgeDevToolsPort\(profile\)\)/);
+  assert.doesNotMatch(source, /if \(!fs\.existsSync\(file\)\) return null;/);
+});
+
 test("Edge CDP readiness retries a port file removed during its read", (t) => {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-edge-port-race-"));
   t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
