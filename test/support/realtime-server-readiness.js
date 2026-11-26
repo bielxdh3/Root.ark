@@ -2,6 +2,7 @@
 
 const { createInterface } = require("node:readline");
 const http = require("node:http");
+const stdoutCompletion = new WeakMap();
 
 function request(port, requestPath, options = {}) {
   return new Promise((resolve, reject) => {
@@ -17,19 +18,40 @@ function request(port, requestPath, options = {}) {
   });
 }
 
-function stop(child) {
-  return new Promise((resolve) => {
+async function stop(child) {
+  const code = await new Promise((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) {
       return resolve(child.exitCode);
     }
     child.once("exit", (code) => resolve(code));
     child.kill();
   });
+  const completion = stdoutCompletion.get(child);
+  if (completion) {
+    const error = await completion;
+    stdoutCompletion.delete(child);
+    if (error) throw error;
+  }
+  return code;
 }
 
 // The test's existing AbortSignal supplies the deadline. A listener on some
 // other process's port must not be mistaken for this fixture's readiness.
 function waitForFixtureListen(child, port, signal) {
+  // Readline stops observing the pipe as soon as readiness settles. Keep
+  // failures observable until the pipe closes, including during teardown.
+  const stdout = child.stdout;
+  stdoutCompletion.set(child, new Promise((resolve) => {
+    let error;
+    function onError() { error = new Error("fixture stdout read failed"); }
+    function onClose() {
+      stdout.removeListener("error", onError);
+      resolve(error);
+    }
+    if (stdout.closed) return onClose();
+    stdout.on("error", onError);
+    stdout.once("close", onClose);
+  }));
   return new Promise((resolve, reject) => {
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
     let settled = false;

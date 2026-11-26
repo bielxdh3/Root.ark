@@ -71,6 +71,17 @@ test("realtime readiness rejects a stdout pipe error without exposing its messag
   assert.match((await outcome).message, /^fixture stdout read failed$/);
 });
 
+test("realtime teardown reports a stdout error after readiness without leaking output", async (t) => {
+  const { child, ready } = fixture();
+  t.after(() => child.stdout.destroy());
+  child.stdout.write("Servidor rodando em http://127.0.0.1:43210\n");
+  await ready;
+  assert.doesNotThrow(() => child.stdout.emit("error", new Error("private child output")));
+  child.stdout.destroy();
+  await assert.rejects(stop(child), { message: "fixture stdout read failed" });
+  assert.equal(child.stdout.listenerCount("error"), 0);
+});
+
 async function httpFixture(t, handler) {
   const server = http.createServer(handler);
   const sockets = new Set();

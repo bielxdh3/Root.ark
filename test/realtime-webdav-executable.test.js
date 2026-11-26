@@ -47,7 +47,7 @@ test("PROPFIND rejects malformed and unsupported non-empty bodies while empty re
   const dir = createWebDavFixture("rootark-propfind-body-");
   const port = await freePort();
   const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
   await ready(child, port, t.signal);
   const authorization = `Basic ${Buffer.from("agent:password").toString("base64")}`;
   assert.equal((await request(port, "/dav", { method: "PROPFIND", headers: { authorization, "content-type": "application/xml" }, body: "<broken" })).status, 400);
@@ -59,7 +59,7 @@ test("chunked PUT over the byte limit removes its staging artifact", { timeout: 
   const dir = createWebDavFixture("rootark-put-limit-");
   const port = await freePort();
   const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
   await ready(child, port, t.signal);
   const authorization = `Basic ${Buffer.from("agent:password").toString("base64")}`;
   const result = await request(port, "/dav/too-large.bin", { method: "PUT", headers: { authorization }, body: Buffer.alloc(8 * 1024 * 1024 + 1) });
@@ -73,7 +73,7 @@ test("aborted PUT removes its incoming staging file", { timeout: 20_000 }, async
   const dir = createWebDavFixture("rootark-put-abort-");
   const port = await freePort();
   const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
   await ready(child, port, t.signal);
   const authorization = `Basic ${Buffer.from("agent:password").toString("base64")}`;
   await new Promise((resolve) => {
@@ -108,7 +108,7 @@ test("restart recovery restores a source staged by MOVE from the durable journal
   fs.writeFileSync(journalPath, JSON.stringify({ version: 1, transactionId: id, phase: "source_staged", journalPath, sourcePath, destinationPath, stagePath, destinationBackupPath, destinationExisted: false, replacementInstalled: false, completedOperations: ["source.stage"], metadata: { directory: metadataDirectory, files: metadataFiles } }));
   const port = await freePort();
   const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
   await ready(child, port, t.signal);
   assert.equal(fs.readFileSync(sourcePath, "utf8"), "source");
   assert.equal(fs.readFileSync(destinationPath, "utf8"), "target");
@@ -163,7 +163,7 @@ test("startup incoming cleanup preserves an aged pending WebDAV MOVE journal", {
   quota.close();
   const port = await freePort();
   const child = spawn(process.execPath, ["--require", path.join(ROOT, "test", "fixtures", "chunk-quota-dead-owner-preload.js"), path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: "2147483000" }), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
   await ready(child, port, t.signal);
   assert.equal(fs.existsSync(journalPath), true, "generic incoming cleanup must preserve durable retry journals");
   assert.equal(fs.existsSync(uploadStagingPath), false, "stale simple-upload staging files should still be cleaned");
@@ -287,7 +287,7 @@ test("configured WebSocket rate boundary is enforced at runtime", { timeout: 20_
   const dir = createWebDavFixture("rootark-ws-config-");
   const port = await freePort();
   const child = spawn(process.execPath, [path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { WEBDAV_ENABLED: "false", REALTIME_MAX_MESSAGES_PER_WINDOW: "2", REALTIME_RATE_WINDOW_MS: "1000" }), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
-  t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
+  t.after(async () => { try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); } });
   await ready(child, port, t.signal);
   const body = JSON.stringify({ username: "agent", password: "password" });
   const login = await request(port, "/auth/login", { method: "POST", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) }, body });
@@ -313,8 +313,7 @@ test("file rename notifies active workspace sessions over WebSocket", { timeout:
   let socket;
   t.after(async () => {
     socket?.terminate();
-    await stop(child);
-    fs.rmSync(dir, { recursive: true, force: true });
+    try { await stop(child); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
   await ready(child, port, t.signal);
 
