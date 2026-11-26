@@ -181,6 +181,20 @@ class PagedProtectedInventoryTest {
         }
     }
 
+    @Test fun metadataInventoryRejectsFullRecordFieldsBeforeProjection() {
+        val raw = fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body").toString()
+        for (field in listOf("ciphertext", "nonce", "tag", "aad", "authorization")) {
+            val body = JSONObject(raw).apply {
+                getJSONArray("objects").getJSONObject(0).put(field, "opaque-fixture")
+            }.toString().toByteArray(Charsets.UTF_8)
+            val response = SecureResponse(origin.syncInventoryUrl(), payload = body)
+            assertThrows("Unexpected inventory field $field", SyncListingValidationException::class.java) {
+                AuthHttpTransport { response }.listInventoryPage(origin, "fixture-token")
+            }
+            assertTrue(response.disconnected)
+        }
+    }
+
     @Test fun rejectUntrustedMetadataAndRfc8259AmbiguitiesBeforeProjection() {
         val first = fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body")
         val raw = first.toString()

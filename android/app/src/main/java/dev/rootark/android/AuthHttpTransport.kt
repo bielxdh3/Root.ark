@@ -34,6 +34,10 @@ internal class AuthHttpTransport(
         // readTimeout applies to each socket read. Bound cumulative inventory
         // BODY reads independently; connection and headers have separate timeouts.
         private const val MAX_INVENTORY_BODY_NANOS = 10_000_000_000L
+        private val INVENTORY_RECORD_FIELDS = setOf(
+            "protocolVersion", "operationId", "objectId", "fileId", "versionId", "operation",
+            "revision", "baseRevision", "keyEpoch", "compartmentId", "deviceId", "metadata", "tombstone",
+        )
     }
     fun login(origin: ServerOrigin, username: String, password: String): LoginOutcome {
         val (status, json) = post(origin.loginUrl(), JSONObject().put("username", username).put("password", password))
@@ -147,6 +151,9 @@ internal class AuthHttpTransport(
             PagedInventoryPolicy.checkEnvelope(version, view, objects.length(), nextCursor, usedCursors)
             val rows = (0 until objects.length()).map { index ->
                 val record = objects.optJSONObject(index) ?: throw SyncListingValidationException("Invalid sync listing")
+                if (record.keys().asSequence().any { it !in INVENTORY_RECORD_FIELDS }) {
+                    throw SyncListingValidationException("Unexpected inventory record field")
+                }
                 val metadata = record.optJSONObject("metadata") ?: throw SyncListingValidationException("Invalid sync listing")
                 val deleted = record.opt("tombstone") as? Boolean ?: throw SyncListingValidationException("Invalid sync listing")
                 val recordVersion = parseProtocolVersion(record.opt("protocolVersion"))
