@@ -4,6 +4,7 @@
 // of server-side durable commit. A stale lock must fence a replacement client
 // even when the first client has already exited.
 const assert = require("node:assert/strict");
+const { randomUUID } = require("node:crypto");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const http = require("node:http");
@@ -18,6 +19,20 @@ const { privateSyncStatePath } =
   require("../sync-client/rootark-sync-private-state");
 
 const CLI = path.resolve(__dirname, "../sync-client/rootark-sync.js");
+
+function disposableAccount() { return `fixture-${randomUUID()}`; }
+
+test("independent deferred-COMMIT test servers never reuse a cached lock on recycled ports", () => {
+  const server = { serverUrl: "http://127.0.0.1:39001", targetFolderId: "root" };
+  const first = { ...server, username: disposableAccount() };
+  const second = { ...server, username: disposableAccount() };
+  assert.equal(privateSyncStatePath("first-config", first),
+    privateSyncStatePath("second-config", first),
+    "two config roots of the same remote authority must still share the lock");
+  assert.notEqual(privateSyncStatePath("first-config", first),
+    privateSyncStatePath("other-server", second),
+    "different disposable servers must not inherit stale locks after port reuse");
+});
 
 function spawnOnce(config, cwd) {
   const child = spawn(process.execPath,
@@ -100,7 +115,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
       const config = path.join(privateDir, "config.json");
       const policy = {
         serverUrl: `http://127.0.0.1:${server.address().port}`,
-        username: "fixture", token: "disposable-token", localFolder: selected,
+        username: disposableAccount(), token: "disposable-token", localFolder: selected,
         targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
       };
       await writePrivateSyncConfig(config, JSON.stringify(policy));
@@ -216,7 +231,7 @@ test("failed HTTP upload retains lock if the server could COMMIT after client ex
     const config = path.join(privateDir, "config.json");
     const policy = {
       serverUrl: `http://127.0.0.1:${server.address().port}`,
-      username: "fixture", token: "disposable-token", localFolder: selected,
+      username: disposableAccount(), token: "disposable-token", localFolder: selected,
       targetFolderId: "root", debounceMs: 1, stabilityMs: 1, retryLimit: 1,
     };
     await writePrivateSyncConfig(config, JSON.stringify(policy));
