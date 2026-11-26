@@ -15,6 +15,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLConnection
 import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import javax.net.ssl.HttpsURLConnection
@@ -126,7 +127,7 @@ internal class AuthHttpTransport(
                         .onMalformedInput(CodingErrorAction.REPORT)
                         .onUnmappableCharacter(CodingErrorAction.REPORT)
                         .decode(ByteBuffer.wrap(out.toByteArray())).toString()
-                } catch (e: Exception) {
+                } catch (e: CharacterCodingException) {
                     throw SyncListingValidationException("Malformed UTF-8 in inventory page", e)
                 }
                 try {
