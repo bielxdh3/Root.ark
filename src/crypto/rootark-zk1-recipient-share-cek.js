@@ -57,7 +57,8 @@ function nativeBase64Url(value) {
 }
 const { redeemProtectedCiphertextShare } =
   require("../../public/client/rootark-zk1-recipient-share");
-const { openOwnerAuthorizedFileCek, sealOwnerAuthorizedFileCek } =
+const { openOwnerAuthorizedFileCek, sealOwnerAuthorizedFileCek,
+  reserveOwnerHpkeWorker, discardOwnerHpkeWorker } =
   require("./rootark-zk1-owner-authorized-file-cek-transfer");
 const fileContent = require("../../public/client/rootark-zk1-file-content");
 const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
@@ -97,14 +98,13 @@ function copyNativeBytes(value, minLength, maxLength, reject = deny) {
 }
 const copyNativeBytes32 = (value, reject = deny) => copyNativeBytes(value, 32, 32, reject);
 function wipeOwnedBytes(value) {
-  // Independent owner/recipient authority callbacks are executable. They can
-  // replace Buffer.prototype.fill and Uint8Array.prototype.fill after the CEK
-  // or authenticated plaintext has been copied. Never invoke those methods
-  // through the mutable prototype chain during cleanup.
-  if (value && !nativeIsProxy(value) && nativeIsUint8Array(value))
+  if (value && !isProxy(value) && nativeIsUint8Array(value)) {
     nativeApply(nativeTypedFill, value, [0]);
+  }
 }
 function currentSeconds(wallClock, reject = deny) {
+  // A caller callback may run arbitrary code across awaits. Fail closed if
+  // the global clock changes during the operation.
   if (Date.now !== wallClock) reject();
   // Keep the release clock pinned independently of per-call global changes.
   const milliseconds = nativeReleaseNow();
@@ -238,6 +238,8 @@ function snapshotAuthority(value) {
     digest: copyNativeBytes32(h.digest.value, denyOffer) };
   const sourceDevices = fields.devices.value;
   if (isProxy(sourceDevices) || !nativeArrayIsArray(sourceDevices) || sourceDevices.length > 128) denyOffer();
+  // Do not dispatch a caller-supplied array's map/filter methods. A hostile
+  // realm or a custom own method could conceal a revoked/duplicate signer.
   const slots = nativeGetOwnPropertyDescriptors(sourceDevices);
   const count = slots.length?.value;
   if (!nativeNumberIsSafeInteger(count) || count < 0 || count > 128
@@ -281,9 +283,11 @@ async function verifyOfferAuthority(authority, statement, bytes, signature, pin,
       recipient = device;
     }
   }
-  if (!issuer || !same(issuer.authorizationPublicKey,
+  if (!issuer
+    || !same(issuer.authorizationPublicKey,
       from64(issuerPin.authorizationPublicKey, 32))) denyOffer();
-  if (!recipient || !same(recipient.authorizationPublicKey,
+  if (!recipient
+    || !same(recipient.authorizationPublicKey,
       from64(pin.authorizationPublicKey, 32))) denyOffer();
   return current;
 }
@@ -293,7 +297,7 @@ async function verifyOfferAuthority(authority, statement, bytes, signature, pin,
 // The owner also pins recipient keys outside the untrusted grant/ACK.
 async function createProtectedRecipientShareOffer(input) {
   const wallClock = Date.now;
-  let ownerCek, ciphertext;
+  let ownerCek, ciphertext, reservedWorker;
   try {
     strict(input, ["grant", "recipientPin", "issuerPin", "readIndependentAuthority",
       "ownerPrivateKey", "ownerHeldCek", "metadata", "objectRevision",
@@ -344,6 +348,9 @@ async function createProtectedRecipientShareOffer(input) {
     const statementBytes = from64(grant.shareStatementBase64,
       nativeBufferFrom(grant.shareStatementBase64, "base64url").length);
     if (statementBytes.length < 1 || statementBytes.length > 4096) denyOffer();
+    // Prepare the trusted LOAD_SCRIPT bootstrap before the FIRST await.
+    // Even a CBOR promise continuation must not precede Worker construction.
+    reservedWorker = reserveOwnerHpkeWorker();
     const statement = await nativeDecodeDeterministic(statementBytes);
     strict(statement, SHARE);
     if (!same(nativeBufferFrom(await nativeEncodeDeterministic(statement)), statementBytes)
@@ -376,7 +383,8 @@ async function createProtectedRecipientShareOffer(input) {
       ownerPrivateKey: d.ownerPrivateKey.value, ownerHeldCek: ownerCek,
       metadata, objectRevision: d.objectRevision.value, ciphertext,
       ciphertextRoot, authority: d.authority.value,
-    });
+    }, reservedWorker);
+    reservedWorker = null;
     if (envelope.core.device_id !== pin.deviceId
       || envelope.core.hpke_public_key !== pin.hpkePublicKey
       || envelope.core.object_id !== statement.object_id
@@ -405,7 +413,11 @@ async function createProtectedRecipientShareOffer(input) {
       authorizesProductionIo: false, externalCustodyProven: false,
     });
   } catch (_) { denyOffer(); }
-  finally { wipeOwnedBytes(ownerCek); wipeOwnedBytes(ciphertext); }
+  finally {
+    if (reservedWorker) await discardOwnerHpkeWorker(reservedWorker);
+    wipeOwnedBytes(ownerCek);
+    wipeOwnedBytes(ciphertext);
+  }
 }
 function safeEnvelope(value) {
   strict(value, ENVELOPE);
@@ -426,6 +438,9 @@ function safeEnvelope(value) {
   return nativeFreeze({ ...other, core });
 }
 function currentAuthority(snapshotValue, statement, shareSignature, statementBytes) {
+  // The final post-AEAD read must get the same descriptor-only custody check
+  // as the earlier read. Getter and array-method reentry cannot rewrite the
+  // authority we compare to the signed grant.
   const current = snapshotAuthority(snapshotValue);
   if (current.head.revision !== statement.manifest_revision
     || current.head.epoch !== statement.epoch
@@ -523,9 +538,8 @@ async function openProtectedRecipientShareFile(input) {
     if (!nativeNumberIsSafeInteger(verifiedReleaseExpiresAt)
       || verifiedReleaseExpiresAt < 1) deny();
     const releaseSeconds = currentSeconds(wallClock);
-    if (releaseSeconds >= verifiedReleaseExpiresAt || nowSeconds >= verifiedReleaseExpiresAt
-      || releaseSeconds >= statement.expires_at
-      || nowSeconds >= statement.expires_at) deny();
+    if (releaseSeconds >= statement.expires_at || nowSeconds >= statement.expires_at
+      || releaseSeconds >= verifiedReleaseExpiresAt || nowSeconds >= verifiedReleaseExpiresAt) deny();
     const result = nativeFreeze({
       schema: "rootark-zk1-recipient-share-file-dev/v1",
       grantId: receipt.grantId, objectId: receipt.objectId,

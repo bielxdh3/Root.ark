@@ -6,15 +6,17 @@ try {
   if (error?.code !== "ENOENT") throw error;
 }
 
-if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
-  throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
-}
-// Validate the security-critical chunk limiter mode BEFORE loading third-party modules.
-// A malformed mode must fail closed even on slow/cold startup paths.
+// Refuse explicitly invalid rate-limit storage before importing the service
+// dependency graph. Invalid configuration is a startup security boundary,
+// not something that may wait on background initialization or external I/O.
 const UPLOAD_CHUNK_RATE_LIMIT_STORE = process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE === undefined
   ? "memory" : process.env.UPLOAD_CHUNK_RATE_LIMIT_STORE;
 if (UPLOAD_CHUNK_RATE_LIMIT_STORE !== "memory" && UPLOAD_CHUNK_RATE_LIMIT_STORE !== "sqlite") {
   throw new Error("Invalid UPLOAD_CHUNK_RATE_LIMIT_STORE: expected memory or sqlite");
+}
+
+if (String(process.env.ROOTARK_RESTORE_INSTANCE_COUNT || "1").trim() !== "1") {
+  throw new Error("Multiple server instances are unsupported while authentication state is process-local.");
 }
 const express = require("express");
 const { shouldDeferZk1JsonParsing } = require("./src/middlewares/zk1DeferredJsonParsing");

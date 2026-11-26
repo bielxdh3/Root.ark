@@ -4,22 +4,143 @@
 // explicitly rewraps an already-held FILE CEK; a device epoch key alone never
 // grants access to historical file CEKs. No off-host or production claim.
 const crypto = require("node:crypto");
-const { types: nativeTypes } = require("node:util");
+const path = require("node:path");
+const { createRequire } = require("node:module");
+const { Worker, MessagePort } = require("node:worker_threads");
+const nativeEventOn = require("node:events").EventEmitter.prototype.on;
+const nativeEventOnce = require("node:events").EventEmitter.prototype.once;
+const nativeEventEmit = require("node:events").EventEmitter.prototype.emit;
+const nativeSetTimeout = setTimeout;
+const nativeClearTimeout = clearTimeout;
+const NativePromise = Promise;
+const nativePromiseThen = Promise.prototype.then;
+const nativeWeakMapGet = WeakMap.prototype.get;
+const nativeWeakMapSet = WeakMap.prototype.set;
+const nativeWeakMapDelete = WeakMap.prototype.delete;
+const nativeTypes = require("node:util").types;
+const nativeIsProxy = nativeTypes.isProxy;
+const nativeIsUint8Array = nativeTypes.isUint8Array;
+const nativeIsArrayBuffer = nativeTypes.isArrayBuffer;
+const nativeIsCryptoKey = nativeTypes.isCryptoKey;
+const nativeIsKeyObject = nativeTypes.isKeyObject;
+const nativeNumberIsFinite = Number.isFinite;
+const nativeNumberIsSafeInteger = Number.isSafeInteger;
+const nativeMathFloor = Math.floor;
+const nativeMathAbs = Math.abs;
+const nativeMathMin = Math.min;
+const nativeMathCeil = Math.ceil;
 const z = require("./rootark-zk-1");
 const commitment = require("./rootark-zk1-offline-commitment-receipt");
 const committedApproval = require("../../public/client/rootark-zk1-v2-committed-approval");
 const browserPop = require("../../public/client/rootark-zk1-v2-browser-pop");
 const fileContent = require("../../public/client/rootark-zk1-file-content");
 const roots = require("../../public/client/rootark-zk1-ciphertext-chunk-root");
-// Snapshot the release clock and lease intrinsics before caller-controlled
-// cryptographic callbacks can replace globals. A forged callback must neither
-// extend a signed owner-approved CEK lease nor force premature CEK release.
-const nativeReleaseNow = Date.now;
-const nativeReleaseFloor = Math.floor;
-const nativeReleaseMin = Math.min;
-const DOMAIN = Buffer.from("Root.ark/zk-1/owner-authorized-file-cek-transfer/v1\0");
-const INFO = Buffer.from("Root.ark/zk-1/owner-authorized-file-cek-info/v1\0");
-const AAD = Buffer.from("Root.ark/zk-1/owner-authorized-file-cek-aad/v1\0");
+const nativeApply = Reflect.apply;
+const nativeObjectPrototype = Object.prototype;
+const nativeGetPrototypeOf = Object.getPrototypeOf;
+const nativeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const nativeGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+const nativeHasOwn = Object.hasOwn;
+const nativeCreate = Object.create;
+const nativeFreeze = Object.freeze;
+const nativeDefineProperty = Object.defineProperty;
+const nativeOwnKeys = Reflect.ownKeys;
+const nativeArrayIsArray = Array.isArray;
+const nativeArrayBufferIsView = ArrayBuffer.isView;
+const nativeArrayBuffer = ArrayBuffer;
+const nativeArrayBufferConstructorPrototype = nativeGetPrototypeOf(nativeArrayBuffer);
+const nativeFunctionHasInstanceDescriptor = nativeGetOwnPropertyDescriptor(
+  Function.prototype, Symbol.hasInstance);
+const nativeUint8Array = Uint8Array;
+const nativeTypedPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const nativeTypedByteLength = Object.getOwnPropertyDescriptor(nativeTypedPrototype, "byteLength").get;
+const nativeTypedBuffer = Object.getOwnPropertyDescriptor(nativeTypedPrototype, "buffer").get;
+const nativeTypedByteOffset = Object.getOwnPropertyDescriptor(nativeTypedPrototype, "byteOffset").get;
+const nativeTypedSet = Uint8Array.prototype.set;
+const nativeArrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+const nativeTypedFill = Uint8Array.prototype.fill;
+const nativeBufferFrom = Buffer.from.bind(Buffer);
+const nativeBufferPrototype = Buffer.prototype;
+const nativeBufferAlloc = Buffer.alloc.bind(Buffer);
+const nativeBufferConcat = Buffer.concat.bind(Buffer);
+const nativeBufferToString = Buffer.prototype.toString;
+const nativeTimingSafeEqual = crypto.timingSafeEqual.bind(crypto);
+const nativeCreateHash = crypto.createHash.bind(crypto);
+const nativeCreatePublicKey = crypto.createPublicKey.bind(crypto);
+const nativeSign = crypto.sign.bind(crypto);
+const nativeVerify = crypto.verify.bind(crypto);
+const nativeRandomBytes = crypto.randomBytes.bind(crypto);
+const nativeKeyObject = crypto.KeyObject;
+// Node 22 defines export on PublicKeyObject's prototype, not on the generic
+// KeyObject base. Pin the real native method through a fixed public test key;
+// no caller-supplied owner key is inspected while capturing the intrinsic.
+const nativeKeyObjectExport = nativeGetPrototypeOf(nativeCreatePublicKey({
+  key: nativeBufferFrom("302a300506032b6570032100d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "hex"),
+  format: "der", type: "spki",
+})).export;
+const nativeSubtle = crypto.webcrypto.subtle;
+const nativeSubtleExportKey = nativeSubtle.exportKey;
+const nativeSubtleEncrypt = nativeSubtle.encrypt;
+const nativeSubtleImportKey = nativeSubtle.importKey;
+const nativeSubtleSign = nativeSubtle.sign;
+const nativeWorkerPostMessage = Worker.prototype.postMessage;
+const nativeWorkerTerminate = Worker.prototype.terminate;
+const nativeMessagePortPrototype = MessagePort.prototype;
+const nativeMessagePortPostMessage = MessagePort.prototype.postMessage;
+const nativeMessagePortOn = MessagePort.prototype.on;
+const nativeMessagePortStart = MessagePort.prototype.start;
+const nativeMessagePortUnref = MessagePort.prototype.unref;
+const hpkeSealWorkerPath = path.join(__dirname,
+  "rootark-zk1-owner-authorized-hpke-seal-worker.js");
+const nativeJsonStringify = JSON.stringify;
+const nativeDecodeDeterministic = z.decodeDeterministic.bind(z);
+const nativeEncodeDeterministic = z.encodeDeterministic.bind(z);
+const nativeHpkeSuite = z.hpkeSuite.bind(z);
+const nativeHpkeOpen = z.hpkeOpen.bind(z);
+// A captured @hpke/core method is not sufficient: its internal async mutex
+// and AEAD dispatch are still callback-mutable. Only an isolated V8 realm may
+// receive this CEK after the independent authority callback has executed.
+const hpkeRequire = createRequire(require.resolve("@hpke/core"));
+const hpkeAesContextPrototype = hpkeRequire("./src/aeads/aesGcm.js")
+  .AesGcmContext.prototype;
+const nativeHpkeAesSeal = hpkeAesContextPrototype.seal;
+const nativeDecryptFile = fileContent.decryptFile.bind(fileContent);
+const nativeImportFileCek = fileContent.importFileCek.bind(fileContent);
+const nativeComputeCiphertextRoot = roots.computeCiphertextRoot.bind(roots);
+const nativeVerifySignedReceipt = commitment.verifySignedReceipt.bind(commitment);
+const nativeCommitmentSigningBytes = commitment.commitmentSigningBytes.bind(commitment);
+const nativeVerifyCommittedApproval = committedApproval.verifyCommittedApproval.bind(committedApproval);
+const nativeTargetDigest = browserPop.targetDigest.bind(browserPop);
+const nativeHashPrototype = nativeGetPrototypeOf(nativeCreateHash("sha256"));
+const nativeHashUpdate = nativeHashPrototype.update;
+const nativeHashDigest = nativeHashPrototype.digest;
+const HPKE_WORKER_ACK_DOMAIN = nativeBufferFrom("Root.ark/zk-1/owner-hpke-worker-ack/v1\0");
+function nativeSha256(value) {
+  const hash = nativeCreateHash("sha256");
+  nativeApply(nativeHashUpdate, hash, [value]);
+  return nativeApply(nativeHashDigest, hash, []);
+}
+function copyOwnedBytes(view, asBuffer = false) {
+  // Typed-array internal slots cannot run caller-replaced @@hasInstance,
+  // @@iterator, length or byteLength accessors after an authority callback.
+  if (!nativeIsUint8Array(view) || nativeIsProxy(view)) deny();
+  const size = nativeApply(nativeTypedByteLength, view, []);
+  const target = asBuffer ? nativeBufferAlloc(size) : new nativeUint8Array(size);
+  nativeApply(nativeTypedSet, target, [view]);
+  return target;
+}
+function nativeBase64Url(value) {
+  return nativeApply(nativeBufferToString, nativeBufferFrom(value), ["base64url"]);
+}
+function fieldsObject(keys, source) {
+  const output = nativeCreate(null);
+  for (const key of keys) nativeDefineProperty(output, key, {
+    value: source[key], enumerable: true, writable: false, configurable: false });
+  return output;
+}
+const DOMAIN = nativeBufferFrom("Root.ark/zk-1/owner-authorized-file-cek-transfer/v1\0");
+const INFO = nativeBufferFrom("Root.ark/zk-1/owner-authorized-file-cek-info/v1\0");
+const AAD = nativeBufferFrom("Root.ark/zk-1/owner-authorized-file-cek-aad/v1\0");
 const FORMAT = "rootark-zk1-owner-device-file-cek-hpke/v1";
 const GRANT = ["schema", "account_id", "compartment_id", "keyring_id", "device_id",
   "authorization_key_id", "authorization_public_key", "manifest_revision",
@@ -43,97 +164,341 @@ function deny() { throw Error("ZK_OWNER_FILE_CEK_DENIED"); }
 // Native private/public keys are opaque handles, not caller-owned dictionaries.
 function snapshotFields(value, depth = 0, budget = { count: 0, bytes: 0 }) {
   if (depth > 12 || ++budget.count > 512) deny();
+  if (value !== null && (typeof value === "object" || typeof value === "function")
+    && nativeIsProxy(value)) deny();
   if (value === null || typeof value === "boolean" || typeof value === "number"
     || typeof value === "string") {
     if (typeof value === "string" && value.length > 524288) deny();
     return value;
   }
-  if (Buffer.isBuffer(value) || value instanceof Uint8Array
-    || value instanceof ArrayBuffer) {
-    const length = value.byteLength;
+  if (nativeIsUint8Array(value) || nativeIsArrayBuffer(value)) {
+    const length = nativeIsUint8Array(value)
+      ? nativeApply(nativeTypedByteLength, value, [])
+      : nativeApply(nativeArrayBufferByteLength, value, []);
     budget.bytes += length;
-    if (!Number.isSafeInteger(length) || length > 4 * 1024 * 1024
+    if (!nativeNumberIsSafeInteger(length) || length > 4 * 1024 * 1024
       || budget.bytes > 8 * 1024 * 1024) deny();
-    if (Buffer.isBuffer(value)) return Buffer.from(value);
-    if (value instanceof Uint8Array) return Uint8Array.from(value);
-    return value.slice(0);
+    // Buffer.isBuffer invokes mutable Uint8Array Symbol.hasInstance internally.
+    // Use the pinned actual Buffer prototype without dispatching callbacks.
+    if (nativeIsUint8Array(value) && nativeGetPrototypeOf(value) === nativeBufferPrototype) {
+      return copyOwnedBytes(value, true);
+    }
+    if (nativeIsUint8Array(value)) return copyOwnedBytes(value);
+    const target = new nativeArrayBuffer(length);
+    nativeApply(nativeTypedSet, new nativeUint8Array(target), [new nativeUint8Array(value)]);
+    return target;
   }
-  if (value instanceof crypto.KeyObject
-    || nativeTypes.isCryptoKey(value)) return value;
+  if (nativeIsKeyObject(value)
+    || nativeIsCryptoKey(value)) return value;
   // @hpke uses XCryptoKey wrapping mutable 32-byte private raw material.
   // Copy that material synchronously; reconstruct a fresh HPKE handle only
   // after all other authorization checks. Never keep the caller's raw array.
   const prototype = value && typeof value === "object"
-    ? Object.getPrototypeOf(value) : null;
-  const ctor = prototype && Object.getOwnPropertyDescriptor(prototype, "constructor");
-  if (ctor && Object.hasOwn(ctor, "value")
+    ? nativeGetPrototypeOf(value) : null;
+  const ctor = prototype && nativeGetOwnPropertyDescriptor(prototype, "constructor");
+  if (ctor && nativeHasOwn(ctor, "value")
     && ctor.value?.name === "XCryptoKey") {
-    const d = Object.getOwnPropertyDescriptors(value);
+    const d = nativeGetOwnPropertyDescriptors(value);
     const expected = ["key", "type", "extractable", "algorithm", "usages"];
-    if (Reflect.ownKeys(d).length !== expected.length
-      || expected.some((name) => !d[name] || !Object.hasOwn(d[name], "value"))
-      || d.type.value !== "private" || !(d.key.value instanceof Uint8Array)
-      || d.key.value.byteLength !== 32 || !Array.isArray(d.usages.value)
+    const keys = nativeOwnKeys(d);
+    if (keys.length !== expected.length
+      || d.type.value !== "private" || !nativeIsUint8Array(d.key.value)
+      || nativeApply(nativeTypedByteLength, d.key.value, []) !== 32
+      || !nativeArrayIsArray(d.usages.value)
       || d.usages.value.length > 8) deny();
+    for (const name of expected)
+      if (!d[name] || !nativeHasOwn(d[name], "value")) deny();
     const algorithm = snapshotFields(d.algorithm.value, depth + 1, budget);
     if (algorithm.name !== "X25519") deny();
-    const usages = Object.getOwnPropertyDescriptors(d.usages.value);
+    const usages = nativeGetOwnPropertyDescriptors(d.usages.value);
     for (let i = 0; i < d.usages.value.length; i++) {
-      if (!Object.hasOwn(usages[i] ?? {}, "value")
+      if (!nativeHasOwn(usages[i] ?? {}, "value")
         || typeof usages[i].value !== "string") deny();
     }
-    return Object.freeze({ hpkePrivateRaw: Uint8Array.from(d.key.value) });
+    return nativeFreeze({ hpkePrivateRaw: copyOwnedBytes(d.key.value) });
   }
-  if (typeof value !== "object" || Array.isArray(value)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) deny();
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const entries = Reflect.ownKeys(descriptors);
-  const out = Object.create(Object.getPrototypeOf(value));
+  const plainPrototype = nativeGetPrototypeOf(value);
+  if (typeof value !== "object" || nativeArrayIsArray(value)
+    || (plainPrototype !== nativeObjectPrototype && plainPrototype !== null)) deny();
+  const descriptors = nativeGetOwnPropertyDescriptors(value);
+  const entries = nativeOwnKeys(descriptors);
+  const out = nativeCreate(prototype);
   for (const name of entries) {
-    if (typeof name !== "string" || !Object.hasOwn(descriptors[name], "value")) deny();
-    Object.defineProperty(out, name, { value: snapshotFields(
+    if (typeof name !== "string" || !nativeHasOwn(descriptors[name], "value")) deny();
+    nativeDefineProperty(out, name, { value: snapshotFields(
       descriptors[name].value, depth + 1, budget),
     enumerable: true, writable: false, configurable: false });
   }
-  return Object.freeze(out);
+  return nativeFreeze(out);
 }
 function exact(v, keys) {
-  if (!v || typeof v !== "object" || Array.isArray(v)
-    || ![Object.prototype, null].includes(Object.getPrototypeOf(v))
-    || Reflect.ownKeys(v).length !== keys.length
-    || keys.some((k) => !Object.hasOwn(v, k))) deny();
+  if (!v || nativeIsProxy(v) || typeof v !== "object" || nativeArrayIsArray(v)) deny();
+  const prototype = nativeGetPrototypeOf(v);
+  if (prototype !== nativeObjectPrototype && prototype !== null) deny();
+  if (nativeOwnKeys(v).length !== keys.length) deny();
+  for (const key of keys) if (!nativeHasOwn(v, key)) deny();
   return v;
 }
 function raw(v, length) {
-  if (!ArrayBuffer.isView(v) || v.byteLength !== length) deny();
-  return Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+  if (nativeIsProxy(v) || !nativeIsUint8Array(v)
+    || nativeApply(nativeTypedByteLength, v, []) !== length) deny();
+  // A signed authority read can invoke arbitrary JS callbacks. Never read
+  // v.buffer/byteOffset/byteLength through replaceable inherited accessors:
+  // the underlying view may contain the raw owner CEK when this is called.
+  return nativeBufferFrom(nativeApply(nativeTypedBuffer, v, []),
+    nativeApply(nativeTypedByteOffset, v, []), length);
 }
 function from64(v, n) {
   if (typeof v !== "string" || !/^[A-Za-z0-9_-]+$/.test(v)
-    || v.length > Math.ceil(n * 4 / 3) + 3) deny();
-  const b = Buffer.from(v, "base64url");
-  if (b.length !== n || b.toString("base64url") !== v) deny();
+    || v.length > nativeMathCeil(n * 4 / 3) + 3) deny();
+  const b = nativeBufferFrom(v, "base64url");
+  if (b.length !== n || nativeBase64Url(b) !== v) deny();
   return b;
 }
-const b64 = (v) => Buffer.from(v).toString("base64url");
-const sha = (v) => crypto.createHash("sha256").update(v).digest();
-function compare(a, b) { return a.length === b.length && crypto.timingSafeEqual(a, b); }
-function positive(v) { if (!Number.isSafeInteger(v) || v < 1) deny(); return v; }
-function requireUnexpiredAtRelease(expiresAt) {
-  if (!Number.isSafeInteger(expiresAt)
-    || nativeReleaseFloor(nativeReleaseNow() / 1000) >= expiresAt) deny();
+const b64 = nativeBase64Url;
+const sha = nativeSha256;
+function compare(a, b) { return a.length === b.length && nativeTimingSafeEqual(a, b); }
+function positive(v) { if (!nativeNumberIsSafeInteger(v) || v < 1) deny(); return v; }
+function requireUnexpiredAtRelease(expiresAt, wallClock) {
+  if (!nativeNumberIsSafeInteger(expiresAt)
+    || Date.now !== wallClock || !nativeNumberIsFinite(wallClock())
+    || nativeMathFloor(wallClock() / 1000) >= expiresAt) deny();
+}
+function wipeOwnedBytes(value) {
+  // Never dispatch an attacker-replaced Buffer/Uint8Array prototype method:
+  // the final authority callback can run after the actual CEK is in memory.
+  if (value && !nativeIsProxy(value) && nativeIsUint8Array(value)) {
+    nativeApply(nativeTypedFill, value, [0]);
+  }
+}
+// A Worker constructor itself sends LOAD_SCRIPT through its private port
+// before returning. Checking postMessage alone is insufficient: an attacker
+// can poison MessagePort.on to change postMessage during that constructor.
+// Walk captured native descriptors without invoking any caller getter or
+// iterator. Only a pristine constructor dispatch may bootstrap CEK workers.
+function intrinsicMethod(receiverPrototype, name) {
+  let prototype = receiverPrototype;
+  while (prototype !== null) {
+    if (nativeIsProxy(prototype)) deny();
+    const descriptor = nativeGetOwnPropertyDescriptor(prototype, name);
+    if (descriptor) {
+      if (!nativeHasOwn(descriptor, "value")) deny();
+      return descriptor.value;
+    }
+    prototype = nativeGetPrototypeOf(prototype);
+  }
+  deny();
+}
+function requireTrustedWorkerBootstrap() {
+  if (intrinsicMethod(nativeMessagePortPrototype, "postMessage") !== nativeMessagePortPostMessage
+    || intrinsicMethod(nativeMessagePortPrototype, "on") !== nativeMessagePortOn
+    || intrinsicMethod(nativeMessagePortPrototype, "start") !== nativeMessagePortStart
+    || intrinsicMethod(nativeMessagePortPrototype, "unref") !== nativeMessagePortUnref
+    || intrinsicMethod(Worker.prototype, "on") !== nativeEventOn
+    || intrinsicMethod(Worker.prototype, "once") !== nativeEventOnce
+    || intrinsicMethod(Worker.prototype, "emit") !== nativeEventEmit) deny();
+}
+function newPrivateHpkeWorker() {
+  // Never bootstrap through callback-replaced Node internal transport.
+  // Real owner flows reserve this worker BEFORE their first independent
+  // authority callback; a later prototype mutation cannot replace LOAD_SCRIPT.
+  requireTrustedWorkerBootstrap();
+  const options = nativeCreate(null);
+  options.execArgv = [];
+  // Do not inherit unrelated process credentials/environment into a helper
+  // that only needs the already-pinned module and explicit public inputs.
+  options.env = nativeCreate(null);
+  const worker = new Worker(hpkeSealWorkerPath, options);
+  let deadline;
+  try {
+  // Node 22 Worker.postMessage internally delegates to two private native
+  // MessagePorts. A callback can poison MessagePort.prototype.postMessage
+  // and observe the 32-byte CEK despite a captured Worker.postMessage. Pin
+  // the native method ON EACH actual internal port before any secret transfer.
+  // Inspect own value descriptors only; never invoke inherited getters.
+  const ownedPorts = nativeGetOwnPropertyDescriptors(worker);
+  let pinnedPorts = 0;
+  for (const key of nativeOwnKeys(ownedPorts)) {
+    const descriptor = ownedPorts[key];
+    if (!nativeHasOwn(descriptor, "value")) continue;
+    const port = descriptor.value;
+    if (!port || typeof port !== "object" || nativeIsProxy(port)
+      || nativeGetPrototypeOf(port) !== nativeMessagePortPrototype) continue;
+    nativeDefineProperty(port, "postMessage", {
+      value: nativeMessagePortPostMessage, writable: false, configurable: false,
+    });
+    pinnedPorts++;
+  }
+  // Fail closed if a future Node version changes the Worker transport layout.
+  if (pinnedPorts !== 2) deny();
+  // Worker.terminate() calls this.once("exit", ...) dynamically in Node 22.
+  // A post-authority callback must not be able to suppress that listener and
+  // indefinitely stall the owner's final signed release or cleanup.
+  nativeDefineProperty(worker, "on", {
+    value: nativeEventOn, writable: false, configurable: false,
+  });
+  nativeDefineProperty(worker, "once", {
+    value: nativeEventOnce, writable: false, configurable: false,
+  });
+  // Worker inherits EventEmitter.emit from the caller's mutable realm. An
+  // authority callback can replace that method after the worker is started
+  // and substitute a valid HPKE envelope for a different CEK. Pin the native
+  // dispatcher on this instance before registering any response handlers.
+  nativeDefineProperty(worker, "emit", {
+    value: nativeEventEmit, writable: false, configurable: false,
+  });
+  let completed = false;
+  let resolveReply, rejectReply;
+  const reply = new NativePromise((resolve, reject) => {
+    resolveReply = resolve;
+    rejectReply = reject;
+  });
+  // An early worker failure may precede the eventual await; consume that
+  // rejection immediately without changing what await(reply) will observe.
+  nativeApply(nativePromiseThen, reply, [undefined, () => {}]);
+  const settle = (ok, value) => {
+    if (completed) return;
+    completed = true;
+    nativeClearTimeout(deadline);
+    if (ok) resolveReply(value);
+    else rejectReply(Error(value));
+  };
+  nativeApply(nativeEventOn, worker, ["message", (message) => {
+    settle(true, message);
+  }]);
+  nativeApply(nativeEventOn, worker, ["error", () => {
+    settle(false, "ZK_OWNER_HPKE_WORKER_FAILED");
+  }]);
+  nativeApply(nativeEventOn, worker, ["exit", () => {
+    settle(false, "ZK_OWNER_HPKE_WORKER_EXITED");
+  }]);
+  // A prepared worker may wait on a genuine external-authority callback.
+  // Start the absolute 45s timeout only when the secret crosses its port,
+  // otherwise a slow but valid trusted read spuriously expires the worker.
+  const armSecretDeadline = () => {
+    if (deadline !== undefined || completed) deny();
+    deadline = nativeSetTimeout(() => {
+      if (completed) return;
+      settle(false, "ZK_OWNER_HPKE_WORKER_TIMEOUT");
+      try {
+        const dying = nativeApply(nativeWorkerTerminate, worker, []);
+        nativeApply(nativePromiseThen, dying, [() => {}, () => {}]);
+      } catch (_) { /* only the denial may escape */ }
+    }, 45_000);
+  };
+  return { worker, reply, armSecretDeadline };
+  } catch (error) {
+    // A malicious callback can poison Promise[Symbol.species] or another
+    // mutable intrinsic between construction and listener installation. Do
+    // not leak a live worker when any part of its setup throws: no CEK has
+    // crossed the boundary at this point, and no worker handle was returned.
+    nativeClearTimeout(deadline);
+    try { nativeApply(nativeWorkerTerminate, worker, []); }
+    catch (_) { /* preserve the original fail-closed setup error */ }
+    throw error;
+  }
+}
+// A portable sharing operation performs its own independent-authority await
+// BEFORE calling the owner CEK sealer. Reserve a pristine, authenticated
+// bootstrap before that external callback can alter Node's global transports.
+// Tokens are opaque and one-shot; callers cannot inject their own Worker.
+const reservedHpkeWorkers = new WeakMap();
+function reserveOwnerHpkeWorker() {
+  const token = nativeFreeze(nativeCreate(null));
+  nativeApply(nativeWeakMapSet, reservedHpkeWorkers, [token, newPrivateHpkeWorker()]);
+  return token;
+}
+async function discardOwnerHpkeWorker(token) {
+  const issued = nativeApply(nativeWeakMapGet, reservedHpkeWorkers, [token]);
+  if (!issued) return;
+  nativeApply(nativeWeakMapDelete, reservedHpkeWorkers, [token]);
+  try { await nativeApply(nativeWorkerTerminate, issued.worker, []); }
+  catch (_) { /* explicit failed owner operation never releases ciphertext */ }
+}
+async function sealPrivateCekHpke(isolatedWorker, recipientPublicKeyRaw, plaintext, info, aad) {
+  // The only secret-bearing message crosses the native structured-clone
+  // boundary via a transferred ArrayBuffer. No mutable HPKE JS prototype in
+  // the authority callback's realm can observe those 32 bytes.
+  const isolated = new nativeArrayBuffer(32);
+  const view = new nativeUint8Array(isolated);
+  // A malicious authority callback can replace the native transport's
+  // MessagePort.on handler and forge a syntactically valid HPKE response. A
+  // per-operation MAC key is transferred privately along with the CEK; the
+  // receiving realm can inspect a response but cannot forge its authenticator.
+  const ackSecret = nativeRandomBytes(32);
+  const ackKey = new nativeArrayBuffer(32);
+  const ackView = new nativeUint8Array(ackKey);
+  nativeApply(nativeTypedSet, ackView, [ackSecret]);
+  nativeApply(nativeTypedSet, view, [plaintext]);
+  try {
+    // Retain the earlier fail-closed policy for directly poisoned HPKE or
+    // WebCrypto methods. The worker isolation is the decisive protection for
+    // mutations installed after these checks (for example, via mutex.lock).
+    if (nativeGetPrototypeOf(nativeArrayBuffer) !== nativeArrayBufferConstructorPrototype
+      || nativeGetOwnPropertyDescriptor(nativeArrayBuffer, Symbol.hasInstance)
+      || nativeGetOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance)?.value
+        !== nativeFunctionHasInstanceDescriptor.value
+      || nativeGetOwnPropertyDescriptor(hpkeAesContextPrototype, "seal")?.value
+        !== nativeHpkeAesSeal
+      || nativeSubtle.encrypt !== nativeSubtleEncrypt) deny();
+    const request = nativeCreate(null);
+    request.type = "seal";
+    request.cek = isolated;
+    request.ackKey = ackKey;
+    request.recipientPublicKey = copyOwnedBytes(recipientPublicKeyRaw);
+    request.info = copyOwnedBytes(info);
+    request.aad = copyOwnedBytes(aad);
+    // The native Worker method is pinned at module initialization, and the
+    // transfer detaches the CEK bytes from this realm synchronously.
+    isolatedWorker.armSecretDeadline();
+    nativeApply(nativeWorkerPostMessage, isolatedWorker.worker, [request, [isolated, ackKey]]);
+    const response = await isolatedWorker.reply;
+    if (!response || response.ok !== true) deny();
+    const enc = copyOwnedBytes(response.enc, true);
+    const ciphertext = copyOwnedBytes(response.ciphertext, true);
+    const ackMac = copyOwnedBytes(response.ackMac, true);
+    if (nativeApply(nativeTypedByteLength, enc, []) !== 32
+      || nativeApply(nativeTypedByteLength, ciphertext, []) !== 48
+      || nativeApply(nativeTypedByteLength, ackMac, []) !== 32) deny();
+    // crypto.createHmac() is a JS wrapper which dynamically invokes the
+    // native binding's mutable .digest prototype. A post-authority callback
+    // can replace that method and bless a forged HPKE reply. Use captured
+    // WebCrypto native entry points, importing a nonextractable per-operation
+    // HMAC key from an owned ArrayBuffer with no mutable typed-array getters.
+    const verifierRaw = new nativeArrayBuffer(32);
+    const verifierView = new nativeUint8Array(verifierRaw);
+    nativeApply(nativeTypedSet, verifierView, [ackSecret]);
+    let verifier;
+    try {
+      verifier = await nativeApply(nativeSubtleImportKey, nativeSubtle,
+        ["raw", verifierRaw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]]);
+    } finally { nativeApply(nativeTypedFill, verifierView, [0]); }
+    const signedBytes = nativeBufferConcat([HPKE_WORKER_ACK_DOMAIN, enc, ciphertext]);
+    const expectedAck = nativeBufferFrom(await nativeApply(nativeSubtleSign, nativeSubtle,
+      ["HMAC", verifier, signedBytes]));
+    if (expectedAck.length !== 32 || !nativeTimingSafeEqual(expectedAck, ackMac)) deny();
+    return { enc, ciphertext };
+  } finally {
+    nativeApply(nativeTypedFill, ackSecret, [0]);
+    if (nativeApply(nativeArrayBufferByteLength, ackKey, []) !== 0)
+      nativeApply(nativeTypedFill, ackView, [0]);
+    // Detachment is expected. On a failed transfer the original view remains
+    // attached, and must be erased by the original native typed-array method.
+    if (nativeApply(nativeArrayBufferByteLength, isolated, []) !== 0)
+      nativeApply(nativeTypedFill, view, [0]);
+  }
 }
 function metadataCopy(meta) {
   exact(meta, META);
   for (const n of ["account_id", "keyring_id", "object_id", "version_id"])
     from64(meta[n], 16);
-  const compartment = Buffer.from(meta.compartment_id, "base64url");
+  const compartment = nativeBufferFrom(meta.compartment_id, "base64url");
   if (!compartment.length || compartment.length > 128
     || b64(compartment) !== meta.compartment_id) deny();
   if (meta.parent_version_id !== null) from64(meta.parent_version_id, 16);
   positive(meta.epoch);
   if (meta.kind !== "file") deny();
-  return Object.fromEntries(META.map((n) => [n, meta[n]]));
+  return fieldsObject(META, meta);
 }
 function headFrom(a) {
   const h = a.currentHead || a.pinnedCurrentHead;
@@ -142,8 +507,9 @@ function headFrom(a) {
     digest: raw(h.digest, 32) };
 }
 function toNodePub(publicKey) {
-  if (publicKey?.type === "public" && typeof publicKey.export === "function")
-    return publicKey;
+  if (publicKey && !nativeIsProxy(publicKey) && nativeIsKeyObject(publicKey)
+    && nativeApply(nativeGetOwnPropertyDescriptor(nativeKeyObject.prototype, "type").get,
+      publicKey, []) === "public") return publicKey;
   deny();
 }
 async function verifyOwnerApprovedHpkeRecipient(a, trusted, owner, nowSeconds) {
@@ -155,8 +521,8 @@ async function verifyOwnerApprovedHpkeRecipient(a, trusted, owner, nowSeconds) {
   if (request.schema !== "rootark-zk1-device-enrollment-request/v1"
     || request.approval !== "OWNER_MUST_VERIFY_IDENTITY_AND_FINISH_V2_POP_AND_SIGN_CURRENT_GRANT"
     || approval.schema !== "rootark-zk1-offline-v2-device-approval/v1"
-    || !Number.isSafeInteger(approval.issued_at)
-    || !Number.isSafeInteger(approval.expires_at)
+    || !nativeNumberIsSafeInteger(approval.issued_at)
+    || !nativeNumberIsSafeInteger(approval.expires_at)
     || approval.expires_at <= approval.issued_at
     || approval.expires_at - approval.issued_at > 300
     || approval.issued_at > nowSeconds + 30
@@ -165,56 +531,61 @@ async function verifyOwnerApprovedHpkeRecipient(a, trusted, owner, nowSeconds) {
   for (const field of ["request_sha256", "target_device_key_digest",
     "manifest_digest", "grant_sha256"]) from64(approval[field], 32);
   for (const field of ["operation_id", "pop_challenge_id"]) from64(approval[field], 16);
-  if (approval.request_sha256 !== b64(sha(Buffer.from(JSON.stringify(request))))
-    || approval.grant_sha256 !== b64(sha(Buffer.from(JSON.stringify(
-      Object.fromEntries(GRANT.map((field) => [field, trusted.grant[field]]))))))
-    || approval.target_device_key_digest !== await browserPop.targetDigest(request)
+  if (approval.request_sha256 !== b64(sha(nativeBufferFrom(nativeJsonStringify(request))))
+    || approval.grant_sha256 !== b64(sha(nativeBufferFrom(nativeJsonStringify(
+      fieldsObject(GRANT, trusted.grant)))))
+    || approval.target_device_key_digest !== await nativeTargetDigest(request)
     || approval.manifest_revision !== trusted.head.revision
     || approval.manifest_digest !== b64(trusted.head.digest)
     || approval.epoch !== trusted.head.epoch
     || approval.operation_id !== a.committedReceipt.operation_id
     || approval.pop_challenge_id !== a.committedReceipt.pop_challenge_id
     || request.challenge !== a.committedReceipt.request_nonce) deny();
-  const approvedMessage = Buffer.concat([
-    Buffer.from("Root.ark/zk-1/v2-offline-device-approval/v1\0"),
-    Buffer.from(JSON.stringify(Object.fromEntries(
-      APPROVAL.map((field) => [field, approval[field]]))))]);
-  if (!crypto.verify(null, approvedMessage, owner, from64(approval.signature, 64))) deny();
+  const approvedMessage = nativeBufferConcat([
+    nativeBufferFrom("Root.ark/zk-1/v2-offline-device-approval/v1\0"),
+    nativeBufferFrom(nativeJsonStringify(fieldsObject(APPROVAL, approval)))]);
+  if (!nativeVerify(null, approvedMessage, owner, from64(approval.signature, 64))) deny();
 
   // The witness-pinned head identifies the exact signed V2 manifest, not a
   // JSON self-assertion. Ensure its committed target public keys match B.
-  const manifestBytes = Buffer.from(a.signedV2Manifest, "base64url");
+  const manifestBytes = nativeBufferFrom(a.signedV2Manifest, "base64url");
   if (manifestBytes.length < 128 || manifestBytes.length > 262144
     || b64(manifestBytes) !== a.signedV2Manifest
-    || !compare(sha(Buffer.concat([
-      Buffer.from("Root.ark/zk-1/recovery-manifest-digest/v1\0"), manifestBytes])),
+    || !compare(sha(nativeBufferConcat([
+      nativeBufferFrom("Root.ark/zk-1/recovery-manifest-digest/v1\0"), manifestBytes])),
     trusted.head.digest)) deny();
-  const v2 = await z.decodeDeterministic(manifestBytes);
-  const device = v2.devices?.find((d) => d.device_id === request.device_id);
+  const v2 = await nativeDecodeDeterministic(manifestBytes);
+  let device = null;
+  if (nativeArrayIsArray(v2.devices)) {
+    for (const candidate of v2.devices)
+      if (candidate?.device_id === request.device_id) { device = candidate; break; }
+  }
   if (!device
-    || !compare(Buffer.from(device.hpke_public_key), from64(request.hpke_public_key, 32))
-    || !compare(Buffer.from(device.hpke_key_id), from64(request.hpke_key_id, 16))
-    || !compare(Buffer.from(device.authorization_public_key),
+    || !compare(nativeBufferFrom(device.hpke_public_key), from64(request.hpke_public_key, 32))
+    || !compare(nativeBufferFrom(device.hpke_key_id), from64(request.hpke_key_id, 16))
+    || !compare(nativeBufferFrom(device.authorization_public_key),
       from64(request.authorization_public_key, 32))
-    || !compare(Buffer.from(device.authorization_key_id),
+    || !compare(nativeBufferFrom(device.authorization_key_id),
       from64(request.authorization_key_id, 16))
-    || !compare(Buffer.from(v2.operation?.target_device_key_digest),
+    || !compare(nativeBufferFrom(v2.operation?.target_device_key_digest),
       from64(approval.target_device_key_digest, 32))) deny();
-  return Buffer.from(device.hpke_public_key);
+  return nativeBufferFrom(device.hpke_public_key);
 }
-async function normalizedAuthority(a, minimumSequence, nowSeconds, nodeKeys) {
+async function normalizedAuthority(a, minimumSequence, nowSeconds, nodeKeys, wallClock) {
   positive(minimumSequence); positive(nowSeconds);
   // A caller-supplied old time cannot resurrect an expired signed grant.
-  if (Math.abs(Math.floor(Date.now() / 1000) - nowSeconds) > 30) deny();
+  if (Date.now !== wallClock
+    || nativeMathAbs(nativeMathFloor(wallClock() / 1000) - nowSeconds) > 30) deny();
   const grant = exact(snapshotFields(a.signedDeviceGrant), [...GRANT, "signature"]);
   const request = snapshotFields(a.request);
   if (!request || typeof request !== "object") deny();
   const owner = nodeKeys.owner, witness = nodeKeys.witness;
-  const ownerHash = sha(owner.export({ type: "spki", format: "der" }));
+  const ownerHash = sha(nativeApply(nativeKeyObjectExport, owner,
+    [{ type: "spki", format: "der" }]));
   if (!compare(ownerHash, raw(a.independentOwnerSpkiSha256, 32))) deny();
   const head = headFrom(a);
   for (const k of SCOPE) {
-    const value = Buffer.from(grant[k], "base64url");
+    const value = nativeBufferFrom(grant[k], "base64url");
     if (!value.length || value.length > (k === "compartment_id" ? 128 : 16)
       || (k !== "compartment_id" && value.length !== 16)
       || b64(value) !== grant[k]) deny();
@@ -231,32 +602,36 @@ async function normalizedAuthority(a, minimumSequence, nowSeconds, nodeKeys) {
   from64(request.hpke_public_key, 32);
   from64(request.authorization_public_key, 32);
   if (grant.enrolled_epoch > head.epoch) deny();
-  const signatureInput = Buffer.concat([Buffer.from("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
-    Buffer.from(JSON.stringify(Object.fromEntries(GRANT.map((k) => [k, grant[k]]))))]);
-  if (!crypto.verify(null, signatureInput, owner, from64(grant.signature, 64))) deny();
-  const expectedScope = Object.fromEntries(SCOPE.map((k) => [k, Buffer.from(grant[k], "base64url")]));
-  const receipt = commitment.verifySignedReceipt({
+  const signatureInput = nativeBufferConcat([
+    nativeBufferFrom("Root.ark/zk-1/browser-owner-device-grant/v1\0"),
+    nativeBufferFrom(nativeJsonStringify(fieldsObject(GRANT, grant)))]);
+  if (!nativeVerify(null, signatureInput, owner, from64(grant.signature, 64))) deny();
+  const expectedScope = nativeCreate(null);
+  for (const key of SCOPE) nativeDefineProperty(expectedScope, key, {
+    value: nativeBufferFrom(grant[key], "base64url"), enumerable: true,
+    writable: false, configurable: false });
+  const receipt = nativeVerifySignedReceipt({
     receipt: a.committedReceipt, signerPublicKey: witness,
     independentSignerSpkiSha256: b64(raw(a.independentWitnessSpkiSha256, 32)),
     expectedScope, expectedHead: head,
     nowSeconds, previousReceipt: a.previousReceipt,
   });
   if (receipt.sequence < minimumSequence) deny();
-  const signedReceiptBytes = Buffer.concat([
-    commitment.commitmentSigningBytes(Object.fromEntries(commitment.FIELDS.map(
-      (k) => [k, a.committedReceipt[k]]))), from64(a.committedReceipt.signature, 64)]);
+  const signedReceiptBytes = nativeBufferConcat([
+    nativeCommitmentSigningBytes(fieldsObject(commitment.FIELDS, a.committedReceipt)),
+    from64(a.committedReceipt.signature, 64)]);
   return { grant, request, head, scope: expectedScope, sequence: receipt.sequence,
     receiptDigest: sha(signedReceiptBytes), grantDigest: sha(signatureInput),
-    expiresAt: Math.min(a.committedReceipt.expires_at, nowSeconds + 300) };
+    expiresAt: nativeMathMin(a.committedReceipt.expires_at, nowSeconds + 300) };
 }
 async function binding({ metadata, revision, ciphertext, ciphertextRoot, authority }) {
   const meta = metadataCopy(metadata);
   positive(revision);
-  const data = Buffer.from(ciphertext);
+  const data = nativeBufferFrom(ciphertext);
   if (!data.length || data.length > 4 * 1024 * 1024) deny();
   const pin = raw(ciphertextRoot, 32);
-  if (!compare(Buffer.from(await roots.computeCiphertextRoot([data])), pin)) deny();
-  for (const name of SCOPE) if (!compare(Buffer.from(meta[name], "base64url"),
+  if (!compare(nativeBufferFrom(await nativeComputeCiphertextRoot([data])), pin)) deny();
+  for (const name of SCOPE) if (!compare(nativeBufferFrom(meta[name], "base64url"),
     authority.scope[name])) deny();
   if (meta.epoch > authority.head.epoch) deny();
   return { ...meta, object_revision: revision,
@@ -273,51 +648,75 @@ async function binding({ metadata, revision, ciphertext, ciphertextRoot, authori
     ciphertext_root: b64(pin),
     ciphertext_sha256: b64(sha(data)) };
 }
-async function sealOwnerAuthorizedFileCek(input) {
-  let cek, checked, stable;
+async function sealOwnerAuthorizedFileCek(input, reservedToken) {
+  const wallClock = Date.now;
+  let cek, checked, stable, isolatedWorker;
   try {
+    // The standalone owner path creates its Worker before its own authority
+    // callbacks. The portable path consumes one pre-authority reservation.
+    isolatedWorker = reservedToken === undefined
+      ? newPrivateHpkeWorker()
+      : nativeApply(nativeWeakMapGet, reservedHpkeWorkers, [reservedToken]);
+    if (!isolatedWorker) deny();
+    if (reservedToken !== undefined) {
+      nativeApply(nativeWeakMapDelete, reservedHpkeWorkers, [reservedToken]);
+    }
     stable = snapshotFields(input);
     exact(stable, ["ownerPrivateKey", "ownerHeldCek", "metadata",
       "objectRevision", "ciphertext", "ciphertextRoot", "authority"]);
     const a = stable.authority;
-    const owner = crypto.createPublicKey(stable.ownerPrivateKey);
+    const owner = nativeCreatePublicKey(stable.ownerPrivateKey);
     const witness = toNodePub(a.witnessPublicKey);
     const trusted = await normalizedAuthority(a, a.operatorMinimumSequence,
-      a.nowSeconds, { owner, witness });
+      a.nowSeconds, { owner, witness }, wallClock);
     const ownerApprovedHpkePublicKey = await verifyOwnerApprovedHpkeRecipient(
       a, trusted, owner, a.nowSeconds);
-    cek = Buffer.from(raw(stable.ownerHeldCek, 32));
+    cek = nativeBufferFrom(raw(stable.ownerHeldCek, 32));
     // Possession of arbitrary 32 bytes is not proof of owning this particular
     // file's CEK. The authorizing owner must demonstrate an AEAD open of the
     // exact pinned ciphertext before exporting a recipient-specific envelope.
-    checked = await fileContent.decryptFile({
-      cek: await fileContent.importFileCek(cek),
+    checked = await nativeDecryptFile({
+      cek: await nativeImportFileCek(cek),
       metadata: stable.metadata, envelopeBytes: stable.ciphertext });
     const core = { schema: FORMAT, ...await binding({
       metadata: stable.metadata, revision: stable.objectRevision,
       ciphertext: stable.ciphertext, ciphertextRoot: stable.ciphertextRoot, authority: trusted }),
-      nonce: b64(crypto.randomBytes(16)),
-      expires_at: nativeReleaseMin(trusted.expiresAt, a.approval.expires_at) };
+      nonce: b64(nativeRandomBytes(16)),
+      expires_at: nativeMathMin(trusted.expiresAt, a.approval.expires_at) };
     exact(core, CORE);
     if (!compare(from64(core.hpke_public_key, 32), ownerApprovedHpkePublicKey)) deny();
-    const context = Buffer.from(await z.encodeDeterministic(core));
-    const recipient = await z.hpkeSuite().kem.deserializePublicKey(
-      ownerApprovedHpkePublicKey);
-    const sealed = await z.hpkeSeal({ recipientPublicKey: recipient, plaintext: cek,
-      info: Buffer.concat([INFO, context]), aad: Buffer.concat([AAD, context]) });
-    const message = Buffer.concat([DOMAIN, await z.encodeDeterministic({
+    const context = nativeBufferFrom(await nativeEncodeDeterministic(core));
+    // Consume only the pristine Worker reserved before the first authority
+    // callback. Reconstructing it here would reintroduce LOAD_SCRIPT hijack
+    // and orphan the original worker thread on every successful seal.
+    const sealed = await sealPrivateCekHpke(isolatedWorker, ownerApprovedHpkePublicKey, cek,
+      nativeBufferConcat([INFO, context]), nativeBufferConcat([AAD, context]));
+    // The helper wipes its CEK before returning ciphertext. Ensure the
+    // worker exits before the signed release's final wall-clock check.
+    await nativeApply(nativeWorkerTerminate, isolatedWorker.worker, []);
+    isolatedWorker = null;
+    const message = nativeBufferConcat([DOMAIN, await nativeEncodeDeterministic({
       core, enc: sealed.enc, ciphertext: sealed.ciphertext })]);
     // AEAD and HPKE are asynchronous. The signed approval can expire while
     // the owner holds the CEK; gate its final export using the real wall clock.
-    requireUnexpiredAtRelease(core.expires_at);
-    return Object.freeze({ schema: FORMAT, core, enc: b64(sealed.enc),
+    requireUnexpiredAtRelease(core.expires_at, wallClock);
+    return nativeFreeze({ schema: FORMAT, core, enc: b64(sealed.enc),
       ciphertext: b64(sealed.ciphertext),
-      owner_signature: b64(crypto.sign(null, message, stable.ownerPrivateKey)),
+      owner_signature: b64(nativeSign(null, message, stable.ownerPrivateKey)),
       authorizesProductionRestore: false, externalCustodyProven: false });
   } catch (_) { deny(); }
-  finally { checked?.data?.fill(0); cek?.fill(0); stable?.ownerHeldCek?.fill(0); }
+  finally {
+    wipeOwnedBytes(checked?.data);
+    wipeOwnedBytes(cek);
+    wipeOwnedBytes(stable?.ownerHeldCek);
+    if (isolatedWorker) {
+      try { await nativeApply(nativeWorkerTerminate, isolatedWorker.worker, []); }
+      catch (_) { /* keep the original denial and scrub regardless */ }
+    }
+  }
 }
 async function openOwnerAuthorizedFileCek(input) {
+  const wallClock = Date.now;
   let cek, stable;
   try {
     stable = snapshotFields(input);
@@ -329,53 +728,59 @@ async function openOwnerAuthorizedFileCek(input) {
       "authorizesProductionRestore", "externalCustodyProven"]);
     if (wire.schema !== FORMAT || wire.authorizesProductionRestore !== false
       || wire.externalCustodyProven !== false) deny();
-    const approved = await committedApproval.verifyCommittedApproval({
+    const approved = await nativeVerifyCommittedApproval({
       ...a, nowSeconds: stable.nowSeconds });
     if (approved.committedOwnerApprovalVerified !== true
       || approved.authorizesProductionIo !== false) deny();
-    const owner = crypto.createPublicKey({ key: Buffer.from(
-      await crypto.webcrypto.subtle.exportKey("spki", a.ownerPublicKey)),
+    const ownerSpki = await nativeApply(nativeSubtleExportKey, nativeSubtle,
+      ["spki", a.ownerPublicKey]);
+    const witnessSpki = await nativeApply(nativeSubtleExportKey, nativeSubtle,
+      ["spki", a.witnessPublicKey]);
+    const owner = nativeCreatePublicKey({ key: nativeBufferFrom(ownerSpki),
       format: "der", type: "spki" });
-    const witness = crypto.createPublicKey({ key: Buffer.from(
-      await crypto.webcrypto.subtle.exportKey("spki", a.witnessPublicKey)),
+    const witness = nativeCreatePublicKey({ key: nativeBufferFrom(witnessSpki),
       format: "der", type: "spki" });
     const trusted = await normalizedAuthority(a, stable.operatorMinimumSequence,
-      stable.nowSeconds, { owner, witness });
+      stable.nowSeconds, { owner, witness }, wallClock);
     const core = wire.core;
     exact(core, CORE);
-    if (core.schema !== FORMAT || !Number.isSafeInteger(core.expires_at)
+    if (core.schema !== FORMAT || !nativeNumberIsSafeInteger(core.expires_at)
       || core.expires_at < stable.nowSeconds) deny();
     const expected = await binding({
       metadata: stable.metadata, revision: stable.objectRevision,
       ciphertext: stable.ciphertext, ciphertextRoot: stable.ciphertextRoot, authority: trusted });
-    for (const [key, value] of Object.entries(expected))
-      if (core[key] !== value) deny();
+    for (const key of BINDING) if (core[key] !== expected[key]) deny();
     from64(core.nonce, 16);
-    const context = Buffer.from(await z.encodeDeterministic(core));
+    const context = nativeBufferFrom(await nativeEncodeDeterministic(core));
     const enc = from64(wire.enc, 32);
     const ciphertext = from64(wire.ciphertext, 48);
-    const signed = Buffer.concat([DOMAIN, await z.encodeDeterministic({ core, enc, ciphertext })]);
-    if (!crypto.verify(null, signed, owner, from64(wire.owner_signature, 64))) deny();
-    if (!(stable.deviceHpkePrivateKey?.hpkePrivateRaw instanceof Uint8Array)
+    const signed = nativeBufferConcat([DOMAIN,
+      await nativeEncodeDeterministic({ core, enc, ciphertext })]);
+    if (!nativeVerify(null, signed, owner, from64(wire.owner_signature, 64))) deny();
+    if (!nativeIsUint8Array(stable.deviceHpkePrivateKey?.hpkePrivateRaw)
       || stable.deviceHpkePrivateKey.hpkePrivateRaw.length !== 32) deny();
-    const deviceHpkeKey = await z.hpkeSuite().kem.deserializePrivateKey(
+    const deviceHpkeKey = await nativeHpkeSuite().kem.deserializePrivateKey(
       stable.deviceHpkePrivateKey.hpkePrivateRaw);
-    cek = Buffer.from(await z.hpkeOpen({ recipientKey: deviceHpkeKey,
-      enc, ciphertext, info: Buffer.concat([INFO, context]),
-      aad: Buffer.concat([AAD, context]) }));
+    cek = nativeBufferFrom(await nativeHpkeOpen({ recipientKey: deviceHpkeKey,
+      enc, ciphertext, info: nativeBufferConcat([INFO, context]),
+      aad: nativeBufferConcat([AAD, context]) }));
     if (cek.length !== 32) deny();
     // Last use: reject a now-expired owner approval/receipt before returning
     // plaintext-equivalent CEK bytes to B, even if HPKE was valid at entry.
-    const verifiedReleaseExpiresAt = nativeReleaseMin(core.expires_at,
+    // Release the minimum expiration from the exact owner-approved envelope,
+    // committed approval and independently verified witness snapshot, rather
+    // than forcing a later caller to reread mutable untrusted authority.
+    const verifiedReleaseExpiresAt = nativeMathMin(core.expires_at,
       a.approval.expires_at, a.committedReceipt.expires_at);
-    requireUnexpiredAtRelease(verifiedReleaseExpiresAt);
-    // The caller must use this EXACT expiration from the independently
-    // verified, detached authority snapshot, not a pre-await read of the
-    // mutable original approval/receipt supplied by an untrusted caller.
-    return Object.freeze({ cek: Buffer.from(cek), verifiedReleaseExpiresAt,
+    requireUnexpiredAtRelease(verifiedReleaseExpiresAt, wallClock);
+    return nativeFreeze({ cek: nativeBufferFrom(cek), verifiedReleaseExpiresAt,
       authorizesProductionRestore: false,
       externalCustodyProven: false });
   } catch (_) { deny(); }
-  finally { cek?.fill(0); stable?.deviceHpkePrivateKey?.hpkePrivateRaw?.fill(0); }
+  finally {
+    wipeOwnedBytes(cek);
+    wipeOwnedBytes(stable?.deviceHpkePrivateKey?.hpkePrivateRaw);
+  }
 }
-module.exports = { sealOwnerAuthorizedFileCek, openOwnerAuthorizedFileCek };
+module.exports = { sealOwnerAuthorizedFileCek, openOwnerAuthorizedFileCek,
+  reserveOwnerHpkeWorker, discardOwnerHpkeWorker };

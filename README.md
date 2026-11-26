@@ -255,6 +255,7 @@ See [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
 - [Governance](GOVERNANCE.md)
 - [Security policy](SECURITY.md)
 - [Zero-Knowledge migration and trust contract](docs/architecture/zero-knowledge-migration-contract.md)
+- [Capability-based protected sharing (DEV-OFF architecture and local usage)](docs/architecture/capability-sharing-contract.md)
 - [ZK-1 metadata leakage and security boundary register](docs/issue-65-zk1-runtime-leakage-register.md)
 - [Historical integration and exact-SHA CI archive](docs/validation/readme-historical-evidence-through-2026-11-04.md)
 
