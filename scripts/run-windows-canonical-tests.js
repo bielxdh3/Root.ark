@@ -103,7 +103,9 @@ function createTapProgressRecorder(write) {
       const moduleExit = pending.fileProcessFailed && pending.failureType === "testCodeFailure"
         && pending.code === "ERR_TEST_FAILURE" && pending.moduleExitCode !== null
         ? ` moduleExitCode=${pending.moduleExitCode}` : "";
-      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${acl}${edge}`);
+      const location = pending.locationLine === null ? "" : ` locationLine=${pending.locationLine}`;
+      const assertion = pending.assertionLine === null ? "" : ` assertionLine=${pending.assertionLine}`;
+      write(`FAIL detail index=${pending.index} nameSha256=${pending.nameHash} testPathSha256=${pending.pathHash} failureType=${pending.failureType} code=${pending.code} category=${category}${moduleExit}${location}${assertion}${acl}${edge}`);
       detailed++;
     } else if (pending.acl && verifiedAclOverflowDetails < 4) {
       // Numerous unrelated failed tests must not suppress the bounded, strictly
@@ -175,7 +177,8 @@ function createTapProgressRecorder(write) {
             write(`FAIL test result index=${result[2]} nameSha256=${nameHash}`);
             pending = { index: result[2], nameHash, pathHash: "none",
               failureType: "unknown", code: "unknown", moduleExitCode: null,
-              fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false };
+              fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false,
+              locationLine: null, assertionLine: null, stackOpen: false };
           }
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
@@ -209,11 +212,25 @@ function createTapProgressRecorder(write) {
         // apparent failed test-file process. Do not reopen a consumed block.
         if (pending.moduleYamlOpen) {
           const location = /^  location: ['"](.{1,2048})['"]$/.exec(line);
-          if (location) pending.pathHash = fileLocation(location[1]);
+          if (location) {
+            pending.pathHash = fileLocation(location[1]);
+            const match = /:(\d{1,7}):\d+$/.exec(location[1]);
+            if (pending.pathHash !== "none" && match) pending.locationLine = Number(match[1]);
+          }
           const kind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
           if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
           const code = /^  code: '([A-Z0-9_]{1,40})'$/.exec(line);
           if (code && SAFE_CODES.has(code[1])) pending.code = code[1];
+          // Node TAP strips the leading "at " from stack frames. Read only
+          // the failed result's stack block, never multiline error text.
+          if (/^  stack: \|[-+]?$/.test(line)) pending.stackOpen = true;
+          else if (!/^ {4}\S/.test(line)) pending.stackOpen = false;
+          if (pending.stackOpen && pending.pathHash !== "none" && pending.assertionLine === null
+            && /^ {4}\S/.test(line)) {
+            const frame = /(?:^|[\\/])test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}\)?$/.exec(line);
+            if (frame && hash(`test/${frame[1]}`) === pending.pathHash)
+              pending.assertionLine = Number(frame[2]);
+          }
           // Keep only bounded, allowlisted process evidence; never print
           // raw YAML, paths, stack traces, or failure text.
           if (line === "  error: 'test failed'") pending.fileProcessFailed = true;
