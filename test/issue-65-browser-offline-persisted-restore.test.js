@@ -16,6 +16,7 @@ const persisted = require("../public/client/rootark-zk1-persisted-portable-chunk
 const nativeRoots = require("../public/client/rootark-zk1-ciphertext-chunk-root");
 const browser = require("../public/client/rootark-zk1-browser-recovery-http");
 const { waitForBrowserValue: waitFor } = require("./support/issue-65-browser-wait");
+const { readEdgeDevToolsPort } = require("./support/issue-65-edge-devtools-port");
 
 const b64 = (raw) => Buffer.from(raw).toString("base64url");
 const rid = () => b64(crypto.randomBytes(16));
@@ -375,12 +376,7 @@ test("real Edge opt-in UI refuses missing external pins and recovers signed loca
       "--disable-extensions", "--remote-debugging-port=0",
       "--user-data-dir=" + profile, "about:blank"], { stdio: "ignore", windowsHide: true });
     failureStage = "cdp-port";
-    const port = await waitFor(() => {
-      const file = path.join(profile, "DevToolsActivePort");
-      if (!fs.existsSync(file)) return null;
-      const n = Number(fs.readFileSync(file, "utf8").split(/\r?\n/)[0]);
-      return Number.isSafeInteger(n) && n > 0 ? n : null;
-    });
+    const port = await waitFor(() => readEdgeDevToolsPort(profile));
     failureStage = "cdp-target";
     const tabs = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
     const tab = tabs.find((item) => item.type === "page");
