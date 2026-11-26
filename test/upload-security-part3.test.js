@@ -8,6 +8,7 @@ const {
   legacyChunkMetadata, legacyV4QuotaPreload, auditLogs, auditLogFileSignature, waitForAuditLogs,
   filesUnder, directoryEntries, assertRejectedClean, pending, quarantine,
 } = require("./support/upload-security-harness");
+const { fixtureRequest } = require("./support/upload-fixture-lifecycle");
 
 test("folder mutations revalidate session and upload permission after waiting for the lifecycle lock", { timeout: 45_000 }, async (t) => {
   let markerPath;
@@ -974,6 +975,7 @@ test("tagged handoff rollback after pending-transition fault releases only its o
     readyTimeout: 45_000,
     kernelAssignedPort: true,
     preloadSource: () => `
+      require(${JSON.stringify(path.join(ROOT, "test", "support", "upload-fixture-lifecycle.js"))}).installFixtureListenerProbe();
       const quotaModule = require(${JSON.stringify(path.join(ROOT, "services", "chunkUploadQuota.js"))});
       const originalFactory = quotaModule.createChunkUploadQuota;
       quotaModule.createChunkUploadQuota = (...args) => {
@@ -997,15 +999,8 @@ test("tagged handoff rollback after pending-transition fault releases only its o
       };
     `,
   });
-  const fixtureRequest = async (phase, invoke) => {
-    try { return await invoke(); }
-    catch (error) {
-      const code = typeof error.code === "string" && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : "unknown";
-      throw new Error(`fixture ${phase} failed: code=${code} exit=${harness.child.exitCode ?? "running"} signal=${harness.child.signalCode || "none"} stderrChunks=${harness.stderr.length}`, { cause: error });
-    }
-  };
-  const session = await fixtureRequest("login", () => login(harness.port, "uploader", harness.password));
-  const first = await fixtureRequest("first-request", () => uploadChunk(harness.port, session, {
+  const session = await fixtureRequest(harness, "login", () => login(harness.port, "uploader", harness.password));
+  const first = await fixtureRequest(harness, "first-request", () => uploadChunk(harness.port, session, {
     uploadId, originalName: fileName, chunkIndex: 0, totalChunks: 1, encryptionLevel: "none", bytes,
   }));
   assert.equal(first.status, 500, first.body);
@@ -1020,7 +1015,7 @@ test("tagged handoff rollback after pending-transition fault releases only its o
   } finally {
     database.close();
   }
-  const retry = await fixtureRequest("retry-request", () => uploadChunk(harness.port, session, {
+  const retry = await fixtureRequest(harness, "retry-request", () => uploadChunk(harness.port, session, {
     uploadId, originalName: fileName, chunkIndex: 0, totalChunks: 1, encryptionLevel: "none", bytes,
   }));
   assert.equal(retry.status, 200, retry.body);
