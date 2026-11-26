@@ -9,6 +9,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
+const { readBoundedRegularFile } = require("../services/fileReadHandle");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = process.env.SERVER_UNDER_TEST || path.join(ROOT, "server.js");
@@ -56,6 +57,17 @@ async function waitFor(predicate, timeout = 10_000) {
   throw new Error("timed out waiting for state");
 }
 
+function publishFixtureJournalReplacement(fs, journalPath, replacement) {
+  // Windows cannot rename over the open destination with Node's rename API.
+  // In this disposable, synchronous lstat hook, park the old file without
+  // closing its descriptor, then publish the complete replacement before the
+  // reader observes the path. POSIX retains the actual atomic replacement.
+  if (process.platform === "win32") {
+    fs.renameSync(journalPath, journalPath + ".fixture-displaced");
+  }
+  fs.renameSync(replacement, journalPath);
+}
+
 function childSource(localCrash = false) {
   return `
     const fs=require("fs");
@@ -97,7 +109,7 @@ function childSource(localCrash = false) {
           // durable journal while this worker is opening its snapshot.
           const replacement=journalPath+".fixture-refresh";
           fs.writeFileSync(replacement,fs.readFileSync(journalPath),{flag:"wx"});
-          fs.renameSync(replacement,journalPath);
+          (${publishFixtureJournalReplacement.toString()})(fs,journalPath,replacement);
           fs.writeFileSync(process.env.REFRESH_JOURNAL_MARKER,"refreshed");
         }
         return originalLstat(target,...args);
@@ -334,6 +346,49 @@ test("queued MOVE waits when the restart provider differs from the journal provi
     if (recovered?.child.exitCode === null && recovered?.child.signalCode === null) await stop(recovered.child);
     fs.rmSync(f.dir, { recursive: true, force: true });
   }
+});
+
+test("journal refresh fixture replaces the pathname without releasing the pinned descriptor", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-journal-refresh-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const journalPath = path.join(dir, "journal.json");
+  const replacement = journalPath + ".fixture-refresh";
+  const originalBytes = Buffer.from('{"state":"original"}');
+  const replacementBytes = Buffer.from('{"state":"replacement"}');
+  fs.writeFileSync(journalPath, originalBytes, { flag: "wx" });
+  fs.writeFileSync(replacement, replacementBytes, { flag: "wx" });
+  const originalOpen = fs.openSync;
+  const originalLstat = fs.lstatSync;
+  let pinnedFd;
+  let replaced = false;
+  fs.openSync = function (target, ...args) {
+    const fd = originalOpen.call(this, target, ...args);
+    if (target === journalPath && !replaced) pinnedFd = fd;
+    return fd;
+  };
+  fs.lstatSync = function (target, ...args) {
+    if (target === journalPath && !replaced) {
+      assert.ok(Number.isInteger(pinnedFd), "reader must open the descriptor before checking the pathname");
+      const held = fs.fstatSync(pinnedFd, { bigint: true });
+      publishFixtureJournalReplacement(fs, journalPath, replacement);
+      const published = originalLstat.call(this, journalPath, { bigint: true });
+      assert.ok(held.dev !== published.dev || held.ino !== published.ino, "replacement must have a different file identity");
+      const heldBytes = Buffer.alloc(originalBytes.length);
+      assert.equal(fs.readSync(pinnedFd, heldBytes, 0, heldBytes.length, 0), originalBytes.length);
+      assert.deepEqual(heldBytes, originalBytes, "old descriptor must still reference the original bytes");
+      replaced = true;
+    }
+    return originalLstat.call(this, target, ...args);
+  };
+  try {
+    assert.throws(() => readBoundedRegularFile(journalPath, 1024),
+      (error) => error.code === "INVALID_INTERNAL_FILE" && error.reason === "PATH_REPLACED");
+  } finally {
+    fs.openSync = originalOpen;
+    fs.lstatSync = originalLstat;
+  }
+  assert.equal(replaced, true);
+  assert.deepEqual(readBoundedRegularFile(journalPath, 1024).contents, replacementBytes);
 });
 
 test("restart reads a fresh complete journal after a concurrent atomic refresh", { timeout: 30_000 }, async () => {
