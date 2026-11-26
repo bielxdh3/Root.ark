@@ -242,6 +242,7 @@ class ProtectedSyncFetchTest {
             original.replaceFirst("\"objectId\":", "'objectId':"),
             original.replaceFirst("\"objectId\":", "objectId:"),
             original.dropLast(1) + ",}",
+            original.replaceFirst("\"objectId\":", "\"obj\\u\uFF10\uFF10\uFF16\uFF15ctId\":"),
         )
         badBodies.forEachIndexed { index, body ->
             val fake = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = body.toByteArray(Charsets.UTF_8))

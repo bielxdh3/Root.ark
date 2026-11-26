@@ -97,7 +97,13 @@ internal object StrictRfc8259Json {
                                 if (index + 4 > text.length) invalid()
                                 var point = 0
                                 repeat(4) {
-                                    val digit = text[index++].digitToIntOrNull(16) ?: invalid()
+                                    val hex = text[index++]
+                                    val digit = when (hex) {
+                                        in '0'..'9' -> hex - '0'
+                                        in 'a'..'f' -> hex - 'a' + 10
+                                        in 'A'..'F' -> hex - 'A' + 10
+                                        else -> invalid()
+                                    }
                                     point = (point shl 4) or digit
                                 }
                                 result.append(point.toChar())
