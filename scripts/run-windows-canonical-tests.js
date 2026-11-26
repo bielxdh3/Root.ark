@@ -268,8 +268,9 @@ function createTapProgressRecorder(write) {
           // Keep only bounded, allowlisted process evidence; never print
           // raw YAML, paths, stack traces, or failure text.
           if (line === "  error: 'test failed'") pending.fileProcessFailed = true;
-          const moduleExit = /^  exitCode: ([0-9]{1,3})$/.exec(line);
-          if (moduleExit && Number(moduleExit[1]) <= 255)
+          // Windows reports the full unsigned 32-bit process exit status.
+          const moduleExit = /^  exitCode: (0|[1-9][0-9]{0,9})$/.exec(line);
+          if (moduleExit && Number(moduleExit[1]) <= 0xffffffff)
             pending.moduleExitCode = Number(moduleExit[1]);
         }
         // Legacy bounded TAP code breadcrumbs can occur without YAML; they

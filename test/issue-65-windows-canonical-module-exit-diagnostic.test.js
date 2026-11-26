@@ -32,6 +32,62 @@ test("canonical Windows TAP reports a failed test-file process exit without expo
   }
 });
 
+test("real Windows Node TAP preserves the full exit status of a failed test-file process", {
+  skip: process.platform !== "win32",
+}, () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), "rootark-dword-exit-"));
+  try {
+    fs.mkdirSync(path.join(dir, "test"));
+    fs.writeFileSync(path.join(dir, "test", "private-fixture.test.js"), "process.exit(-1);\n");
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawnSync(process.execPath,
+      ["--test", "--test-reporter=tap", "test/private-fixture.test.js"],
+      { cwd: dir, env, encoding: "utf8", windowsHide: true, timeout: 15000 });
+    assert.equal(child.status, 1);
+    assert.equal(child.signal, null);
+    assert.match(child.stdout, /exitCode: 4294967295/);
+    const messages = [];
+    const tracker = createTapProgressRecorder((line) => messages.push(line));
+    for (const line of child.stdout.split(/\r?\n/)) tracker.accept(line);
+    tracker.finish();
+    const report = messages.join("\n");
+    assert.equal(tracker.state.failures, 1);
+    assert.match(report, /moduleExitCode=4294967295(?: |$)/m);
+    assert.doesNotMatch(report, /private-fixture|rootark-dword-exit|[A-Za-z]:\\/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("canonical TAP retains a complete Windows DWORD process exit only in its failed module YAML", () => {
+  for (const [value, valid] of [
+    ["4294967295", true], ["3221225477", true], ["256", true],
+    ["4294967296", false], ["-1", false], ["00000000001", false],
+    ["4294967295 private-token", false],
+  ]) {
+    const messages = [];
+    const tracker = createTapProgressRecorder((line) => messages.push(line));
+    for (const line of [
+      "not ok 1 - private module",
+      "  ---",
+      "  location: '/private/test/fixture.test.js:1:1'",
+      "  failureType: 'testCodeFailure'",
+      "  error: 'test failed'",
+      "  code: 'ERR_TEST_FAILURE'",
+      "  exitCode: " + value,
+      "  ...",
+      "  exitCode: 123",
+    ]) tracker.accept(line);
+    tracker.finish();
+    const report = messages.join("\n");
+    assert.equal(tracker.state.failures, 1);
+    assert.equal(/(?:^| )moduleExitCode=(\d+)(?= |$)/m.exec(report)?.[1],
+      valid ? value : undefined, report);
+    assert.doesNotMatch(report, /private|fixture\.test\.js|moduleExitCode=123/);
+  }
+});
+
 test("malformed TAP process status cannot leak secret text or claim a bounded module exit", () => {
   const diagnostics = [];
   const tracker = createTapProgressRecorder((line) => diagnostics.push(line));
