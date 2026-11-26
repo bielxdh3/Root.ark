@@ -185,7 +185,7 @@ function createTapProgressRecorder(write) {
             pending = { index: result[2], nameHash, pathHash: "none",
               failureType: "unknown", code: "unknown", moduleExitCode: null,
               fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false,
-              locationLine: null, assertionLine: null, messageHash: null, operator: null };
+              locationLine: null, assertionLine: null, stackOpen: false, messageHash: null, operator: null };
           }
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
@@ -239,9 +239,13 @@ function createTapProgressRecorder(write) {
           // assertionLine; otherwise a genuine later frame is shadowed by
           // the earlier location (and the hosted diagnostic points to the
           // wrong statement).
-          if (pending.pathHash !== "none" && pending.assertionLine === null
-            && /^\s{2,}at\s/.test(line)) {
-            const frame = /(?:^|[\\/])test[\\/]([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}/.exec(line);
+          // Node's TAP serializer strips the leading "at " from frames.
+          // Scope these hints to stack YAML, not multiline error text.
+          if (/^  stack: \|[-+]?$/.test(line)) pending.stackOpen = true;
+          else if (!/^ {4}\S/.test(line)) pending.stackOpen = false;
+          if (pending.stackOpen && pending.pathHash !== "none" && pending.assertionLine === null
+            && /^ {4}\S/.test(line)) {
+            const frame = /(?:^|[\\/])test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}\)?$/.exec(line);
             if (frame && hash(`test/${frame[1]}`) === pending.pathHash)
               pending.assertionLine = Number(frame[2]);
           }

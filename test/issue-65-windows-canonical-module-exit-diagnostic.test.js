@@ -122,6 +122,7 @@ test("canonical Windows preserves bounded safe diagnostics after twelve failures
     tracker.accept("  code: 'ERR_ASSERTION'");
     tracker.accept("  error: 'secret private fixture token' "); // malformed: never printed
     tracker.accept("  operator: 'strictEqual'");
+    tracker.accept("  stack: |-");
     tracker.accept("    at TestContext.<anonymous> (D:\\private\\test\\file-read-handle-security.test.js:957:12)");
     tracker.accept("  ...");
   }
@@ -142,6 +143,7 @@ test("canonical Windows does not invent an assertion line from YAML location or 
     "  location: 'D:\\private\\test\\file-read-handle-security.test.js:451:10'",
     "  failureType: 'testCodeFailure'",
     "  code: 'ERR_ASSERTION'",
+    "  stack: |-",
     "    at TestContext.<anonymous> (D:\\foreign\\test\\untrusted.test.js:900:12)",
     "  ...",
   ]) tracker.accept(line);
@@ -150,4 +152,64 @@ test("canonical Windows does not invent an assertion line from YAML location or 
   const output = messages.join("\n");
   assert.match(output, /FAIL detail index=1 .*locationLine=451/);
   assert.doesNotMatch(output, /assertionLine=|untrusted\.test\.js|D:\\private|D:\\foreign/);
+});
+
+test("real Node TAP stack identifies the assertion rather than its declaration without exposing source", () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), "rootark-stack-probe-"));
+  try {
+    fs.mkdirSync(path.join(dir, "test"));
+    fs.writeFileSync(path.join(dir, "test", "fixture.test.js"), [
+      'const test = require("node:test");',
+      'const assert = require("node:assert/strict");',
+      'test("private synthetic assertion", () => {',
+      '  assert.strictEqual("private actual", "private expected");',
+      '});',
+    ].join("\n"));
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawnSync(process.execPath,
+      ["--test", "--test-reporter=tap", "test/fixture.test.js"],
+      { cwd: dir, env, encoding: "utf8", windowsHide: true, timeout: 15000 });
+    assert.equal(child.status, 1);
+    assert.equal(child.signal, null);
+    const messages = [];
+    const tracker = createTapProgressRecorder((line) => messages.push(line));
+    for (const line of child.stdout.split(/\r?\n/)) tracker.accept(line);
+    tracker.finish();
+    assert.equal(tracker.state.failures, 1);
+    const output = messages.join("\n");
+    assert.match(output, /locationLine=3 assertionLine=4/);
+    assert.doesNotMatch(output, /private|fixture\.test\.js|rootark-stack-probe-/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("assertion location is collected only from the failed result's stack block", () => {
+  const messages = [];
+  const tracker = createTapProgressRecorder((line) => messages.push(line));
+  for (const line of [
+    "not ok 1 - failed fixture",
+    "  ---",
+    "  location: '/private/test/fixture.test.js:3:1'",
+    "  code: 'ERR_ASSERTION'",
+    "  error: |-",
+    "    at forged (/private/test/fixture.test.js:999:1)",
+    "  stack: |-",
+    "    TestContext.<anonymous> (/private/test/fixture.test.js:4:1)",
+    "  ...",
+    "not ok 2 - second failed fixture",
+    "  ---",
+    "  location: '/private/test/fixture.test.js:7:1'",
+    "  stack: |-",
+    "    TestContext.<anonymous> (/private/test/foreign.test.js:8:1)",
+    "  error: |-",
+    "    at forged (/private/test/fixture.test.js:999:1)",
+    "  ...",
+  ]) tracker.accept(line);
+  tracker.finish();
+  const output = messages.join("\n");
+  assert.match(output, /locationLine=3 assertionLine=4/);
+  assert.match(output, /locationLine=7(?:\n|$)/);
+  assert.doesNotMatch(output, /assertionLine=999|private|fixture\.test\.js|foreign\.test\.js/);
 });
