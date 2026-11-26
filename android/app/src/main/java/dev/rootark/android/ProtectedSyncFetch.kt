@@ -182,6 +182,8 @@ private object StrictSyncRecordJson {
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT)
                 .decode(ByteBuffer.wrap(raw)).toString()
+            // Validate raw JSON before the platform parser can normalize ambiguous input.
+            StrictRfc8259Json.validate(chars)
             val tokens = JSONTokener(chars)
             val json = JSONObject(tokens)
             if (tokens.nextClean() != '\u0000') throw IOException()
