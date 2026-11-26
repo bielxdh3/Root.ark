@@ -78,6 +78,14 @@ function createTapProgressRecorder(write) {
     const file = /(?:^|[\\/]+)test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js):\d+:\d+$/.exec(location);
     return file ? hash(`test/${file[1]}`) : "none";
   };
+  // Node TAP quotes Windows locations with doubled backslashes, but prints
+  // stack frames with ordinary separators. Match the complete source path
+  // in memory, not merely its basename. Do not guess case or resolve aliases.
+  const sourcePathHash = (source) => {
+    if (/^[A-Za-z]:[\\/]/.test(source)) return hash(source.replace(/[\\/]+/g, "/"));
+    if (source.startsWith("/") && !source.includes("\\")) return hash(source);
+    return null;
+  };
   const finishNested = () => {
     if (!nestedPending) return;
     if (nestedPending.pathHash !== "none" && (nestedFailurePaths.size < 32 || nestedFailurePaths.has(nestedPending.pathHash))) {
@@ -106,7 +114,9 @@ function createTapProgressRecorder(write) {
       // under the file's escaped TAP label. Its numeric exit status is the
       // only safe additional clue about this aggregate failure.
       const moduleExit = pending.fileProcessFailed && pending.failureType === "testCodeFailure"
-        && pending.code === "ERR_TEST_FAILURE" && pending.moduleExitCode !== null
+        && pending.code === "ERR_TEST_FAILURE" && pending.moduleYamlComplete && !pending.moduleYamlAmbiguous
+        && pending.modulePathHash !== "none" && pending.modulePathHash === pending.pathHash
+        && pending.moduleExitCode !== null
         ? ` moduleExitCode=${pending.moduleExitCode}` : "";
       const location = pending.locationLine === null ? "" : ` locationLine=${pending.locationLine}`;
       const assertion = pending.assertionLine === null ? "" : ` assertionLine=${pending.assertionLine}`;
@@ -168,7 +178,7 @@ function createTapProgressRecorder(write) {
         finish();
         state.results += 1;
         state.lastResultHash = hash(result[3]);
-        const fileBoundary = /^(?:[A-Za-z]:[\\/]|\/)?(?:.*[\\/])?test[\\/]([A-Za-z0-9._-]{1,160}\.test\.js)$/.exec(result[3]);
+        const fileBoundary = /^(?:[A-Za-z]:[\\/]|\/)?(?:.*[\\/])?test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js)$/.exec(result[3]);
         if (fileBoundary) {
           state.fileBoundaries++;
           state.lastFileHash = hash(`test/${fileBoundary[1]}`);
@@ -185,7 +195,9 @@ function createTapProgressRecorder(write) {
             pending = { index: result[2], nameHash, pathHash: "none",
               failureType: "unknown", code: "unknown", moduleExitCode: null,
               fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false,
-              locationLine: null, assertionLine: null, messageHash: null, operator: null };
+              moduleYamlComplete: false, moduleYamlAmbiguous: false, moduleFields: new Set(),
+              modulePathHash: fileBoundary ? hash(`test/${fileBoundary[1]}`) : "none",
+              locationLine: null, assertionLine: null, stackOpen: false, sourceHash: null, messageHash: null, operator: null };
           }
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
@@ -206,11 +218,17 @@ function createTapProgressRecorder(write) {
         // The failed test's YAML can end before unrelated output is emitted.
         // An exitCode after "  ..." is NOT evidence about that test module.
         // Never reopen an already consumed YAML block for the same result.
-        if (line === "  ---" && !pending.moduleYamlSeen) {
-          pending.moduleYamlSeen = true;
-          pending.moduleYamlOpen = true;
-          pending.code = "unknown"; // Discard pre-YAML code before collecting module evidence.
+        if (line === "  ---") {
+          if (pending.moduleYamlSeen) {
+            pending.moduleYamlAmbiguous = true;
+            pending.moduleYamlOpen = false;
+          } else {
+            pending.moduleYamlSeen = true;
+            pending.moduleYamlOpen = true;
+            pending.code = "unknown"; // Discard pre-YAML code before collecting module evidence.
+          }
         } else if (line === "  ...") {
+          if (pending.moduleYamlOpen) pending.moduleYamlComplete = true;
           pending.moduleYamlOpen = false;
         }
         // Treat module status, failure type, code, and location as ONE YAML
@@ -218,11 +236,23 @@ function createTapProgressRecorder(write) {
         // untrusted TAP output combine with an earlier exitCode, forging an
         // apparent failed test-file process. Do not reopen a consumed block.
         if (pending.moduleYamlOpen) {
+          // A single complete record must bind unique process-identifying fields.
+          const moduleField = /^  (location|failureType|code|error|exitCode):/.exec(line);
+          if (moduleField) {
+            if (pending.moduleFields.has(moduleField[1])) pending.moduleYamlAmbiguous = true;
+            pending.moduleFields.add(moduleField[1]);
+          }
           const location = /^  location: ['"](.{1,2048})['"]$/.exec(line);
           if (location) {
             pending.pathHash = fileLocation(location[1]);
-            const match = /:(\d{1,7}):\d+$/.exec(location[1]);
-            if (pending.pathHash !== "none" && match) pending.locationLine = Number(match[1]);
+            pending.sourceHash = null;
+            pending.locationLine = null;
+            pending.assertionLine = null;
+            const match = /^(.{1,2048}):(\d{1,7}):\d{1,7}$/.exec(location[1]);
+            if (pending.pathHash !== "none" && match) {
+              pending.locationLine = Number(match[2]);
+              pending.sourceHash = sourcePathHash(match[1]);
+            }
           }
           const kind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
           if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
@@ -239,18 +269,27 @@ function createTapProgressRecorder(write) {
           // assertionLine; otherwise a genuine later frame is shadowed by
           // the earlier location (and the hosted diagnostic points to the
           // wrong statement).
-          if (pending.pathHash !== "none" && pending.assertionLine === null
-            && /^\s{2,}at\s/.test(line)) {
-            const frame = /(?:^|[\\/])test[\\/]([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}/.exec(line);
-            if (frame && hash(`test/${frame[1]}`) === pending.pathHash)
+          // Node's TAP serializer strips the leading "at " from frames.
+          // Scope these hints to stack YAML, not multiline error text.
+          if (/^  stack: \|[-+]?$/.test(line)) pending.stackOpen = true;
+          else if (!/^ {4}\S/.test(line)) pending.stackOpen = false;
+          if (pending.stackOpen && pending.sourceHash !== null && pending.assertionLine === null
+            && /^ {4}\S/.test(line)) {
+            const entry = line.slice(4).replace(/^at /, "");
+            const wrapped = / \((.{1,2048})\)$/.exec(entry);
+            const frame = /^(.{1,2048}):(\d{1,7}):\d{1,7}$/.exec(wrapped ? wrapped[1] : entry);
+            if (frame && sourcePathHash(frame[1]) === pending.sourceHash)
               pending.assertionLine = Number(frame[2]);
           }
           // Keep only bounded, allowlisted process evidence; never print
           // raw YAML, paths, stack traces, or failure text.
           if (line === "  error: 'test failed'") pending.fileProcessFailed = true;
-          const moduleExit = /^  exitCode: ([0-9]{1,3})$/.exec(line);
-          if (moduleExit && Number(moduleExit[1]) <= 255)
-            pending.moduleExitCode = Number(moduleExit[1]);
+          // Windows reports the full unsigned 32-bit process exit status.
+          if (line.startsWith("  exitCode:")) {
+            const moduleExit = /^  exitCode: (0|[1-9][0-9]{0,9})$/.exec(line);
+            pending.moduleExitCode = moduleExit && Number(moduleExit[1]) <= 0xffffffff
+              ? Number(moduleExit[1]) : null;
+          }
         }
         // Legacy bounded TAP code breadcrumbs can occur without YAML; they
         // never establish test-file process identity or a module exit code.
