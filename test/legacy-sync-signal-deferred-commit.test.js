@@ -22,15 +22,23 @@ const CLI = path.resolve(__dirname, "../sync-client/rootark-sync.js");
 
 function disposableAccount() { return `fixture-${randomUUID()}`; }
 
-test("independent deferred-COMMIT test servers never reuse a cached lock on recycled ports", () => {
+test("independent deferred-COMMIT test servers never reuse a cached lock on recycled ports", async (t) => {
+  const scratch = createPrivateAuthorityFixture("rootark-deferred-state-binding-");
+  t.after(() => fs.rm(scratch, { recursive: true, force: true }));
+  const firstConfig = path.join(scratch, "first", "config.json");
+  const secondConfig = path.join(scratch, "second", "config.json");
+  await fs.mkdir(path.dirname(firstConfig), { recursive: true });
+  await fs.mkdir(path.dirname(secondConfig), { recursive: true });
+  await fs.writeFile(firstConfig, "{}", { flag: "wx" });
+  await fs.writeFile(secondConfig, "{}", { flag: "wx" });
   const server = { serverUrl: "http://127.0.0.1:39001", targetFolderId: "root" };
   const first = { ...server, username: disposableAccount() };
   const second = { ...server, username: disposableAccount() };
-  assert.equal(privateSyncStatePath("first-config", first),
-    privateSyncStatePath("second-config", first),
+  assert.equal(privateSyncStatePath(firstConfig, first),
+    privateSyncStatePath(secondConfig, first),
     "two config roots of the same remote authority must still share the lock");
-  assert.notEqual(privateSyncStatePath("first-config", first),
-    privateSyncStatePath("other-server", second),
+  assert.notEqual(privateSyncStatePath(firstConfig, first),
+    privateSyncStatePath(firstConfig, second),
     "different disposable servers must not inherit stale locks after port reuse");
 });
 
