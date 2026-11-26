@@ -73,6 +73,14 @@ function createTapProgressRecorder(write) {
     const file = /(?:^|[\\/]+)test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js):\d+:\d+$/.exec(location);
     return file ? hash(`test/${file[1]}`) : "none";
   };
+  // Node TAP quotes Windows locations with doubled backslashes, but prints
+  // stack frames with ordinary separators. Match the complete source path
+  // in memory, not merely its basename. Do not guess case or resolve aliases.
+  const sourcePathHash = (source) => {
+    if (/^[A-Za-z]:[\\/]/.test(source)) return hash(source.replace(/[\\/]+/g, "/"));
+    if (source.startsWith("/") && !source.includes("\\")) return hash(source);
+    return null;
+  };
   const finishNested = () => {
     if (!nestedPending) return;
     if (nestedPending.pathHash !== "none" && (nestedFailurePaths.size < 32 || nestedFailurePaths.has(nestedPending.pathHash))) {
@@ -178,7 +186,7 @@ function createTapProgressRecorder(write) {
             pending = { index: result[2], nameHash, pathHash: "none",
               failureType: "unknown", code: "unknown", moduleExitCode: null,
               fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false,
-              locationLine: null, assertionLine: null, stackOpen: false };
+              locationLine: null, assertionLine: null, stackOpen: false, sourceHash: null };
           }
         } else if (state.results % 25 === 0) {
           write(`Windows canonical progress: ${state.results} TAP results, ${state.failures} failed`);
@@ -214,8 +222,14 @@ function createTapProgressRecorder(write) {
           const location = /^  location: ['"](.{1,2048})['"]$/.exec(line);
           if (location) {
             pending.pathHash = fileLocation(location[1]);
-            const match = /:(\d{1,7}):\d+$/.exec(location[1]);
-            if (pending.pathHash !== "none" && match) pending.locationLine = Number(match[1]);
+            pending.sourceHash = null;
+            pending.locationLine = null;
+            pending.assertionLine = null;
+            const match = /^(.{1,2048}):(\d{1,7}):\d{1,7}$/.exec(location[1]);
+            if (pending.pathHash !== "none" && match) {
+              pending.locationLine = Number(match[2]);
+              pending.sourceHash = sourcePathHash(match[1]);
+            }
           }
           const kind = /^  failureType: '([A-Za-z]{1,40})'$/.exec(line);
           if (kind && SAFE_FAILURE_TYPES.has(kind[1])) pending.failureType = kind[1];
@@ -225,10 +239,12 @@ function createTapProgressRecorder(write) {
           // the failed result's stack block, never multiline error text.
           if (/^  stack: \|[-+]?$/.test(line)) pending.stackOpen = true;
           else if (!/^ {4}\S/.test(line)) pending.stackOpen = false;
-          if (pending.stackOpen && pending.pathHash !== "none" && pending.assertionLine === null
+          if (pending.stackOpen && pending.sourceHash !== null && pending.assertionLine === null
             && /^ {4}\S/.test(line)) {
-            const frame = /(?:^|[\\/])test[\\/]+([A-Za-z0-9._-]{1,160}\.test\.js):(\d{1,7}):\d{1,7}\)?$/.exec(line);
-            if (frame && hash(`test/${frame[1]}`) === pending.pathHash)
+            const entry = line.slice(4).replace(/^at /, "");
+            const wrapped = / \((.{1,2048})\)$/.exec(entry);
+            const frame = /^(.{1,2048}):(\d{1,7}):\d{1,7}$/.exec(wrapped ? wrapped[1] : entry);
+            if (frame && sourcePathHash(frame[1]) === pending.sourceHash)
               pending.assertionLine = Number(frame[2]);
           }
           // Keep only bounded, allowlisted process evidence; never print
