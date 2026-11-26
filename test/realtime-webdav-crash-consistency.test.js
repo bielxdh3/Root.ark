@@ -9,6 +9,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
+const { readBoundedRegularFile } = require("../services/fileReadHandle");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = process.env.SERVER_UNDER_TEST || path.join(ROOT, "server.js");
@@ -56,6 +57,17 @@ async function waitFor(predicate, timeout = 10_000) {
   throw new Error("timed out waiting for state");
 }
 
+function publishFixtureJournalReplacement(fs, journalPath, replacement) {
+  // Windows cannot rename over the open destination with Node's rename API.
+  // In this disposable, synchronous lstat hook, park the old file without
+  // closing its descriptor, then publish the complete replacement before the
+  // reader observes the path. POSIX retains the actual atomic replacement.
+  if (process.platform === "win32") {
+    fs.renameSync(journalPath, journalPath + ".fixture-displaced");
+  }
+  fs.renameSync(replacement, journalPath);
+}
+
 function childSource(localCrash = false) {
   return `
     const fs=require("fs");
@@ -86,6 +98,23 @@ function childSource(localCrash = false) {
     require.cache[cloudPath]={id:cloudPath,filename:cloudPath,loaded:true,exports:{createCloudStorage:()=>fake}};
     ${localCrash ? `const originalRename=fs.renameSync; fs.renameSync=(from,to)=>{const result=originalRename(from,to); if(process.env.LOCAL_CRASH_TO&&String(from).includes(".rootark-move-")&&String(from).endsWith(".source")&&path.resolve(to)===path.resolve(process.env.LOCAL_CRASH_TO)) process.kill(process.pid,"SIGKILL"); return result;};` : ""}
     if(process.env.CLAIM_SWAP_LOCK_PATH){const lockPath=path.resolve(process.env.CLAIM_SWAP_LOCK_PATH);const evidencePath=path.resolve(process.env.CLAIM_SWAP_EVIDENCE_PATH);const originalRename=fs.renameSync;const originalOpenSync=fs.openSync;const originalReadSync=fs.readSync;let evidenceFd=null;let swapped=false;let completionQueued=false;fs.renameSync=(from,to)=>{if(!swapped&&path.resolve(String(from))===lockPath&&path.resolve(String(to))===evidencePath){swapped=true;fs.writeFileSync(lockPath,process.env.CLAIM_SWAP_CONTENTS);const result=originalRename(from,to);fs.writeFileSync(process.env.CLAIM_SWAP_OBSERVED,"swapped");return result;}return originalRename(from,to);};fs.openSync=(file,...args)=>{const fd=originalOpenSync(file,...args);if(path.resolve(String(file))===evidencePath)evidenceFd=fd;return fd;};fs.readSync=(fd,...args)=>{const result=originalReadSync(fd,...args);if(swapped&&!completionQueued&&fd===evidenceFd&&result>0){completionQueued=true;setImmediate(()=>fs.writeFileSync(process.env.CLAIM_SWAP_COMPLETED,"verified"));}return result;};}
+    if(process.env.REFRESH_JOURNAL_ON_READ){
+      const journalPath=path.resolve(process.env.REFRESH_JOURNAL_ON_READ);
+      const originalLstat=fs.lstatSync;
+      let refreshed=false;
+      fs.lstatSync=(target,...args)=>{
+        if(!refreshed&&path.resolve(String(target))===journalPath){
+          refreshed=true;
+          // Model another legitimate writer atomically committing the same
+          // durable journal while this worker is opening its snapshot.
+          const replacement=journalPath+".fixture-refresh";
+          fs.writeFileSync(replacement,fs.readFileSync(journalPath),{flag:"wx"});
+          (${publishFixtureJournalReplacement.toString()})(fs,journalPath,replacement);
+          fs.writeFileSync(process.env.REFRESH_JOURNAL_MARKER,"refreshed");
+        }
+        return originalLstat(target,...args);
+      };
+    }
     if(process.env.CHILD_EXIT_BEFORE_SERVER_REQUIRE==="true") process.exit(77);
     require(${JSON.stringify(SERVER)});
     if(process.env.CLAIM_PAUSE_POST_START) setImmediate(installPause); else if(installPause) installPause();
@@ -315,6 +344,76 @@ test("queued MOVE waits when the restart provider differs from the journal provi
     if (crashed?.child.exitCode === null && crashed?.child.signalCode === null) await stop(crashed.child);
     if (mismatched?.child.exitCode === null && mismatched?.child.signalCode === null) await stop(mismatched.child);
     if (recovered?.child.exitCode === null && recovered?.child.signalCode === null) await stop(recovered.child);
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("journal refresh fixture replaces the pathname without releasing the pinned descriptor", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-journal-refresh-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const journalPath = path.join(dir, "journal.json");
+  const replacement = journalPath + ".fixture-refresh";
+  const originalBytes = Buffer.from('{"state":"original"}');
+  const replacementBytes = Buffer.from('{"state":"replacement"}');
+  fs.writeFileSync(journalPath, originalBytes, { flag: "wx" });
+  fs.writeFileSync(replacement, replacementBytes, { flag: "wx" });
+  const originalOpen = fs.openSync;
+  const originalLstat = fs.lstatSync;
+  let pinnedFd;
+  let replaced = false;
+  fs.openSync = function (target, ...args) {
+    const fd = originalOpen.call(this, target, ...args);
+    if (target === journalPath && !replaced) pinnedFd = fd;
+    return fd;
+  };
+  fs.lstatSync = function (target, ...args) {
+    if (target === journalPath && !replaced) {
+      assert.ok(Number.isInteger(pinnedFd), "reader must open the descriptor before checking the pathname");
+      const held = fs.fstatSync(pinnedFd, { bigint: true });
+      publishFixtureJournalReplacement(fs, journalPath, replacement);
+      const published = originalLstat.call(this, journalPath, { bigint: true });
+      assert.ok(held.dev !== published.dev || held.ino !== published.ino, "replacement must have a different file identity");
+      const heldBytes = Buffer.alloc(originalBytes.length);
+      assert.equal(fs.readSync(pinnedFd, heldBytes, 0, heldBytes.length, 0), originalBytes.length);
+      assert.deepEqual(heldBytes, originalBytes, "old descriptor must still reference the original bytes");
+      replaced = true;
+    }
+    return originalLstat.call(this, target, ...args);
+  };
+  try {
+    assert.throws(() => readBoundedRegularFile(journalPath, 1024),
+      (error) => error.code === "INVALID_INTERNAL_FILE" && error.reason === "PATH_REPLACED");
+  } finally {
+    fs.openSync = originalOpen;
+    fs.lstatSync = originalLstat;
+  }
+  assert.equal(replaced, true);
+  assert.deepEqual(readBoundedRegularFile(journalPath, 1024).contents, replacementBytes);
+});
+
+test("restart reads a fresh complete journal after a concurrent atomic refresh", { timeout: 30_000 }, async () => {
+  const f = fixture();
+  let crashed;
+  let restarted;
+  let spawned;
+  try {
+    crashed = await startServer(f.dir, { FAKE_PROVIDER_MODE: "crash-after-upload" });
+    try { await move(f.dir, crashed.port); } catch {}
+    await waitFor(() => readJournal(f.dir)?.cloud?.state === "destination_upload_uncertain");
+    await stop(crashed.child);
+    const marker = path.join(f.dir, "journal-refreshed");
+    restarted = await startServer(f.dir, {
+      REFRESH_JOURNAL_ON_READ: journalPaths(f.dir),
+      REFRESH_JOURNAL_MARKER: marker,
+    }, false, { onSpawn: (child) => { spawned = child; } });
+    assert.equal(fs.readFileSync(marker, "utf8"), "refreshed");
+    await waitFor(() => !journalPaths(f.dir));
+    assert.equal(fs.readFileSync(f.target, "utf8"), "source bytes");
+    assert.equal(calls(f.dir).filter((entry) => entry.operation === "upload").length, 2);
+    assert.equal(calls(f.dir).filter((entry) => entry.operation === "remove").length, 1);
+  } finally {
+    if (crashed) await stop(crashed.child);
+    if (restarted || spawned) await stop(restarted?.child || spawned);
     fs.rmSync(f.dir, { recursive: true, force: true });
   }
 });
