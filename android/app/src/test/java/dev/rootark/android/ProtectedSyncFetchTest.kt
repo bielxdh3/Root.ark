@@ -239,10 +239,14 @@ class ProtectedSyncFetchTest {
             original.replaceFirst("\"authorization\":{", "\"authorization\":{\"deviceId\":\"wrong\","),
             original.replaceFirst("\"objectId\":", "\"objectId\"="),
             "/* comment */$original",
+            original.replaceFirst("\"objectId\":", "'objectId':"),
+            original.replaceFirst("\"objectId\":", "objectId:"),
+            original.dropLast(1) + ",}",
+            original.replaceFirst("\"objectId\":", "\"obj\\u\uFF10\uFF10\uFF16\uFF15ctId\":"),
         )
-        badBodies.forEach { body ->
+        badBodies.forEachIndexed { index, body ->
             val fake = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = body.toByteArray(Charsets.UTF_8))
-            assertThrows(IOException::class.java) {
+            assertThrows("Malformed response case $index", IOException::class.java) {
                 ProtectedSyncFetch { fake }.fetchCiphertext(origin, session, "fixture-object-1")
             }
             assertTrue(fake.disconnected)
