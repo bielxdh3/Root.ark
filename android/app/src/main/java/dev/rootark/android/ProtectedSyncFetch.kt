@@ -194,7 +194,9 @@ private object StrictSyncRecordJson {
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT)
                 .decode(ByteBuffer.wrap(raw)).toString()
-            // Validate raw JSON before the platform parser can normalize ambiguous input.
+            // AOSP org.json overwrites repeated keys and accepts non-JSON
+            // separators/comments; strict syntax and key uniqueness must be
+            // enforced on the raw UTF-8 text before it can discard evidence.
             StrictRfc8259Json.validate(chars)
             val tokens = JSONTokener(chars)
             val json = JSONObject(tokens)

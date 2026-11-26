@@ -108,12 +108,12 @@ class AuthHttpTransportTest {
         val sizeLimitEx = SyncListingLimitException("Sync listing exceeds limit")
         val validationEx = SyncListingValidationException("Invalid sync listing")
 
-        assertTrue(sizeLimitEx is IOException)
-        assertTrue(validationEx is IOException)
-        assertTrue(sizeLimitEx is SyncListingLimitException)
-        assertFalse(validationEx is SyncListingLimitException)
-        assertTrue(validationEx is SyncListingValidationException)
-        assertFalse(sizeLimitEx is SyncListingValidationException)
+        assertTrue(IOException::class.java.isInstance(sizeLimitEx))
+        assertTrue(IOException::class.java.isInstance(validationEx))
+        assertTrue(SyncListingLimitException::class.java.isInstance(sizeLimitEx))
+        assertFalse(SyncListingLimitException::class.java.isInstance(validationEx))
+        assertTrue(SyncListingValidationException::class.java.isInstance(validationEx))
+        assertFalse(SyncListingValidationException::class.java.isInstance(sizeLimitEx))
     }
 
     @Test
