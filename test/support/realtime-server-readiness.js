@@ -1,6 +1,31 @@
 "use strict";
 
 const { createInterface } = require("node:readline");
+const http = require("node:http");
+
+function request(port, requestPath, options = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, path: requestPath, ...options }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
+      res.once("aborted", () => reject(new Error("fixture HTTP response aborted")));
+      res.once("error", () => reject(new Error("fixture HTTP response failed")));
+    });
+    req.once("error", reject);
+    req.end(options.body);
+  });
+}
+
+function stop(child) {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) {
+      return resolve(child.exitCode);
+    }
+    child.once("exit", (code) => resolve(code));
+    child.kill();
+  });
+}
 
 // The test's existing AbortSignal supplies the deadline. A listener on some
 // other process's port must not be mistaken for this fixture's readiness.
@@ -13,6 +38,7 @@ function waitForFixtureListen(child, port, signal) {
       settled = true;
       lines.removeListener("line", onLine);
       lines.removeListener("close", onClose);
+      lines.removeListener("error", onPipeError);
       child.removeListener("exit", onExit);
       child.removeListener("error", onError);
       signal.removeEventListener("abort", onAbort);
@@ -30,9 +56,11 @@ function waitForFixtureListen(child, port, signal) {
     function onExit() { finish(new Error("fixture exited before announcing readiness")); }
     function onError() { finish(new Error("fixture spawn failed")); }
     function onClose() { finish(new Error("fixture stdout closed before announcing readiness")); }
+    function onPipeError() { finish(new Error("fixture stdout read failed")); }
     function onAbort() { finish(new Error("fixture readiness aborted")); }
     lines.on("line", onLine);
     lines.once("close", onClose);
+    lines.once("error", onPipeError);
     child.once("exit", onExit);
     child.once("error", onError);
     signal.addEventListener("abort", onAbort, { once: true });
@@ -41,4 +69,4 @@ function waitForFixtureListen(child, port, signal) {
   });
 }
 
-module.exports = { waitForFixtureListen };
+module.exports = { waitForFixtureListen, request, stop };

@@ -9,7 +9,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
 const WebSocket = require("ws");
-const { waitForFixtureListen } = require("./support/realtime-server-readiness");
+const { waitForFixtureListen, request, stop } = require("./support/realtime-server-readiness");
 
 const ROOT = path.resolve(__dirname, "..");
 
@@ -24,29 +24,9 @@ function freePort() {
   });
 }
 
-function request(port, requestPath, options = {}) {
-  return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: requestPath, ...options }, (res) => {
-      let body = "";
-      res.on("data", (chunk) => { body += chunk; });
-      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
-    });
-    req.once("error", reject);
-    req.end(options.body);
-  });
-}
-
 async function ready(child, port, signal) {
   await waitForFixtureListen(child, port, signal);
-  assert.equal((await request(port, "/login.html")).status, 200);
-}
-
-function stop(child) {
-  return new Promise((resolve) => {
-    if (child.exitCode !== null) return resolve(child.exitCode);
-    child.once("exit", (code) => resolve(code));
-    child.kill();
-  });
+  assert.equal((await request(port, "/login.html", { signal })).status, 200);
 }
 
 function createWebDavFixture(prefix) {
@@ -182,14 +162,9 @@ test("startup incoming cleanup preserves an aged pending WebDAV MOVE journal", {
   quota.reserve({ operationId: chunkOperationId, accountKey: "agent", relativePath: path.join("incoming", chunkOperationId), reservedBytes: 8 * 1024 * 1024 });
   quota.close();
   const port = await freePort();
-  const child = spawn(process.execPath, ["--require", path.join(ROOT, "test", "fixtures", "chunk-quota-dead-owner-preload.js"), path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: "2147483000" }), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-  const serverStdout = [];
-  const serverStderr = [];
-  child.stdout.on("data", (chunk) => serverStdout.push(chunk.toString()));
-  child.stderr.on("data", (chunk) => serverStderr.push(chunk.toString()));
+  const child = spawn(process.execPath, ["--require", path.join(ROOT, "test", "fixtures", "chunk-quota-dead-owner-preload.js"), path.join(ROOT, "server.js")], { cwd: dir, env: serverEnv(port, { ROOTARK_TEST_DEAD_QUOTA_OWNER_PIDS: "2147483000" }), stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
   t.after(async () => { await stop(child); fs.rmSync(dir, { recursive: true, force: true }); });
-  try { await ready(child, port, t.signal); }
-  catch (error) { throw new Error(`${error.message}\nserver stdout:\n${serverStdout.join("")}\nserver stderr:\n${serverStderr.join("")}`); }
+  await ready(child, port, t.signal);
   assert.equal(fs.existsSync(journalPath), true, "generic incoming cleanup must preserve durable retry journals");
   assert.equal(fs.existsSync(uploadStagingPath), false, "stale simple-upload staging files should still be cleaned");
   assert.equal(fs.existsSync(webDavPutStagingPath), false, "stale WebDAV PUT staging files should still be cleaned");
