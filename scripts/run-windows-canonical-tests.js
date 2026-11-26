@@ -114,7 +114,7 @@ function createTapProgressRecorder(write) {
       // under the file's escaped TAP label. Its numeric exit status is the
       // only safe additional clue about this aggregate failure.
       const moduleExit = pending.fileProcessFailed && pending.failureType === "testCodeFailure"
-        && pending.code === "ERR_TEST_FAILURE" && pending.moduleExitCode !== null
+        && pending.code === "ERR_TEST_FAILURE" && pending.moduleYamlComplete && pending.moduleExitCode !== null
         ? ` moduleExitCode=${pending.moduleExitCode}` : "";
       const location = pending.locationLine === null ? "" : ` locationLine=${pending.locationLine}`;
       const assertion = pending.assertionLine === null ? "" : ` assertionLine=${pending.assertionLine}`;
@@ -193,6 +193,7 @@ function createTapProgressRecorder(write) {
             pending = { index: result[2], nameHash, pathHash: "none",
               failureType: "unknown", code: "unknown", moduleExitCode: null,
               fileProcessFailed: false, moduleYamlSeen: false, moduleYamlOpen: false,
+              moduleYamlComplete: false, moduleExitSeen: false,
               locationLine: null, assertionLine: null, stackOpen: false, sourceHash: null, messageHash: null, operator: null };
           }
         } else if (state.results % 25 === 0) {
@@ -219,6 +220,7 @@ function createTapProgressRecorder(write) {
           pending.moduleYamlOpen = true;
           pending.code = "unknown"; // Discard pre-YAML code before collecting module evidence.
         } else if (line === "  ...") {
+          if (pending.moduleYamlOpen) pending.moduleYamlComplete = true;
           pending.moduleYamlOpen = false;
         }
         // Treat module status, failure type, code, and location as ONE YAML
@@ -269,9 +271,12 @@ function createTapProgressRecorder(write) {
           // raw YAML, paths, stack traces, or failure text.
           if (line === "  error: 'test failed'") pending.fileProcessFailed = true;
           // Windows reports the full unsigned 32-bit process exit status.
-          const moduleExit = /^  exitCode: (0|[1-9][0-9]{0,9})$/.exec(line);
-          if (moduleExit && Number(moduleExit[1]) <= 0xffffffff)
-            pending.moduleExitCode = Number(moduleExit[1]);
+          if (line.startsWith("  exitCode:")) {
+            const moduleExit = /^  exitCode: (0|[1-9][0-9]{0,9})$/.exec(line);
+            pending.moduleExitCode = !pending.moduleExitSeen && moduleExit && Number(moduleExit[1]) <= 0xffffffff
+              ? Number(moduleExit[1]) : null;
+            pending.moduleExitSeen = true;
+          }
         }
         // Legacy bounded TAP code breadcrumbs can occur without YAML; they
         // never establish test-file process identity or a module exit code.

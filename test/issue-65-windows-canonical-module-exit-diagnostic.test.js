@@ -46,7 +46,7 @@ test("real Windows Node TAP preserves the full exit status of a failed test-file
       { cwd: dir, env, encoding: "utf8", windowsHide: true, timeout: 15000 });
     assert.equal(child.status, 1);
     assert.equal(child.signal, null);
-    assert.match(child.stdout, /exitCode: 4294967295/);
+    assert.ok(/exitCode: 4294967295/.test(child.stdout), "fixture must emit a full DWORD");
     const messages = [];
     const tracker = createTapProgressRecorder((line) => messages.push(line));
     for (const line of child.stdout.split(/\r?\n/)) tracker.accept(line);
@@ -85,6 +85,30 @@ test("canonical TAP retains a complete Windows DWORD process exit only in its fa
     assert.equal(/(?:^| )moduleExitCode=(\d+)(?= |$)/m.exec(report)?.[1],
       valid ? value : undefined, report);
     assert.doesNotMatch(report, /private|fixture\.test\.js|moduleExitCode=123/);
+  }
+});
+
+test("duplicate or unterminated module exit fields cannot supply process status", () => {
+  for (const fields of [
+    ["  exitCode: 1", "  exitCode: 4294967295", "  ..."],
+    ["  exitCode: 4294967295", "  exitCode: 1", "  ..."],
+    ["  exitCode: 1", "  exitCode: private-token", "  ..."],
+    ["  exitCode: private-token", "  exitCode: 4294967295", "  ..."],
+    ["  exitCode: 4294967295"],
+  ]) {
+    const messages = [];
+    const tracker = createTapProgressRecorder((line) => messages.push(line));
+    for (const line of [
+      "not ok 1 - private fixture",
+      "  ---",
+      "  failureType: 'testCodeFailure'",
+      "  error: 'test failed'",
+      "  code: 'ERR_TEST_FAILURE'",
+      ...fields,
+    ]) tracker.accept(line);
+    tracker.finish();
+    assert.equal(tracker.state.failures, 1);
+    assert.doesNotMatch(messages.join("\n"), /moduleExitCode=|private-token|private fixture/);
   }
 });
 
