@@ -13,7 +13,7 @@ const test = require("node:test");
 const { Worker, MessagePort } = require("node:worker_threads");
 const z = require("../src/crypto/rootark-zk-1");
 
-function privateSealHelpers() {
+function privateSealHelpers({ holdAfterClose = false } = {}) {
   const location = path.resolve(__dirname,
     "../src/crypto/rootark-zk1-owner-authorized-file-cek-transfer.js");
   const source = fs.readFileSync(location, "utf8");
@@ -22,9 +22,23 @@ function privateSealHelpers() {
   const injected = new Module(location, module);
   injected.filename = location;
   injected.paths = Module._nodeModulePaths(path.dirname(location));
-  injected._compile(source.replace(marker,
+  let instrumented = source.replace(marker,
     "module.exports = { __newPrivateHpkeWorker: newPrivateHpkeWorker, "
-      + "__sealPrivateCekHpke: sealPrivateCekHpke, sealOwnerAuthorizedFileCek,"), location);
+      + "__sealPrivateCekHpke: sealPrivateCekHpke, sealOwnerAuthorizedFileCek,");
+  if (holdAfterClose) {
+    // Execute the actual HPKE worker module; retain one fixture-only event-loop
+    // handle so its natural parentPort.close cannot race our termination oracle.
+    const spawn = "const worker = new Worker(hpkeSealWorkerPath, options);";
+    assert.ok(instrumented.includes(spawn));
+    injected.closeState = new Int32Array(new SharedArrayBuffer(4));
+    instrumented = instrumented.replace(spawn, `const worker = new Worker(
+      'const { parentPort, workerData } = require("node:worker_threads");'
+      + 'parentPort.once("close", () => { Atomics.store(workerData, 0, 1); Atomics.notify(workerData, 0); });'
+      + 'setInterval(() => {}, 1000); require(' + JSON.stringify(hpkeSealWorkerPath) + ');',
+      { ...options, eval: true, workerData: module.closeState });`);
+  }
+  injected._compile(instrumented, location);
+  if (holdAfterClose) injected.exports.closeState = injected.closeState;
   return injected.exports;
 }
 
@@ -84,7 +98,7 @@ test("P1: callback-patched EventEmitter.emit cannot forge owner CEK ciphertext o
 });
 
 test("P2: callback-poisoned EventEmitter.once cannot strand the owner HPKE worker termination", async () => {
-  const helper = privateSealHelpers();
+  const helper = privateSealHelpers({ holdAfterClose: true });
   const pair = await z.hpkeSuite().kem.generateKeyPair();
   const pub = Buffer.from(await z.hpkeSuite().kem.serializePublicKey(pair.publicKey));
   const info = Buffer.from("Root.ark/sharing/worker-once-exit-p2/info\0");
@@ -105,6 +119,9 @@ test("P2: callback-poisoned EventEmitter.once cannot strand the owner HPKE worke
       return Reflect.apply(savedOnce, this, [kind, listener]);
     };
     const sealed = await helper.__sealPrivateCekHpke(issued, pub, ownerCek, info, aad);
+    // Wait for genuine worker-side port closure, not a guessed scheduling delay.
+    await Atomics.waitAsync(helper.closeState, 0, 0, 3000).value;
+    assert.equal(Atomics.load(helper.closeState, 0), 1, "real HPKE worker must close its port");
     assert.ok(issued.worker.threadId >= 0,
       "test must terminate a real active Worker, not accept an already stopped fixture");
     let timer;
