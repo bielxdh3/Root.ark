@@ -11,7 +11,6 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.math.BigDecimal
 import java.math.BigInteger
-import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLConnection
 import java.nio.ByteBuffer
@@ -19,21 +18,24 @@ import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import javax.net.ssl.HttpsURLConnection
-import org.json.JSONException
 import org.json.JSONObject
 
-open class SyncListingException(message: String, cause: Throwable? = null) : IOException(message, cause)
-class SyncListingLimitException(message: String) : SyncListingException(message)
-class SyncListingValidationException(message: String, cause: Throwable? = null) : SyncListingException(message, cause)
+/** Listing-only failures do not alter the HTTP or core API contract. */
+internal open class SyncListingException(message: String, cause: Throwable? = null) : IOException(message, cause)
+internal class SyncListingLimitException(message: String, cause: Throwable? = null) : SyncListingException(message, cause)
+internal class SyncListingValidationException(message: String, cause: Throwable? = null) : SyncListingException(message, cause)
 
 /** HTTP adapter for canonical login/TOTP and the bounded, read-only sync listing. */
 internal class AuthHttpTransport(
     private val clockNanos: () -> Long = System::nanoTime,
+    private val openAuthConnection: (URL) -> URLConnection = { it.openConnection() },
     private val monotonicNanos: () -> Long = System::nanoTime,
     private val openInventoryConnection: (URL) -> URLConnection = { it.openConnection() },
 ) {
     companion object {
         const val INVENTORY_READ_DEADLINE_NANOS = 30_000_000_000L
+        const val AUTH_READ_DEADLINE_NANOS = 30_000_000_000L
+        private const val AUTH_MAX_RESPONSE_BYTES = 16 * 1024
         // readTimeout applies to each socket read. Bound cumulative inventory
         // BODY reads independently; connection and headers have separate timeouts.
         private const val MAX_INVENTORY_BODY_NANOS = 10_000_000_000L
@@ -89,11 +91,13 @@ internal class AuthHttpTransport(
             val status = connection.responseCode
             if (status != 200) throw RootArkApiException(status)
             val mime = connection.contentType?.substringBefore(';')?.trim()
+            if (connection.contentLengthLong > PagedInventoryPolicy.MAX_RESPONSE_BYTES) {
+                throw SyncListingLimitException("Inventory page exceeds declared size limit")
+            }
             if (!"application/json".equals(mime, ignoreCase = true) ||
                 (connection.contentEncoding != null &&
-                    !"identity".equals(connection.contentEncoding, ignoreCase = true)) ||
-                connection.contentLengthLong > PagedInventoryPolicy.MAX_RESPONSE_BYTES) {
-                throw SyncListingValidationException("Invalid inventory response encoding or size")
+                    !"identity".equals(connection.contentEncoding, ignoreCase = true))) {
+                throw SyncListingValidationException("Invalid inventory response encoding")
             }
             val json = connection.inputStream.use { stream ->
                 val startedNanos = monotonicNanos()
@@ -116,10 +120,10 @@ internal class AuthHttpTransport(
                     }
                     checkBodyDeadline()
                     if (count < 0) break
-                    total += count
-                    if (total > PagedInventoryPolicy.MAX_RESPONSE_BYTES) {
+                    if (count > PagedInventoryPolicy.MAX_RESPONSE_BYTES - total) {
                         throw SyncListingLimitException("Inventory page exceeds limit")
                     }
+                    total += count
                     out.write(buffer, 0, count)
                 }
                 val chars = try {
@@ -133,6 +137,8 @@ internal class AuthHttpTransport(
                 try {
                     StrictRfc8259Json.validate(chars)
                     JSONObject(chars)
+                } catch (e: StrictRfc8259Json.LimitExceededException) {
+                    throw SyncListingLimitException("Sync listing exceeds structural limit", e)
                 } catch (e: Exception) {
                     throw SyncListingValidationException("Malformed JSON in inventory page", e)
                 }
@@ -235,11 +241,7 @@ internal class AuthHttpTransport(
         is Short -> value.toInt()
         is Byte -> value.toInt()
         is Long -> if (value in Int.MIN_VALUE..Int.MAX_VALUE) value.toInt() else null
-        is BigInteger -> try {
-            value.intValueExact()
-        } catch (_: ArithmeticException) {
-            null
-        }
+        is BigInteger -> exactBigIntegerInt(value)
         is BigDecimal -> exactBigDecimalInt(value)
         is Double, is Float -> null
         else -> null
@@ -250,12 +252,7 @@ internal class AuthHttpTransport(
         is Long -> if (value >= 0L) value else null
         is Short -> if (value >= 0) value.toLong() else null
         is Byte -> if (value >= 0) value.toLong() else null
-        is BigInteger -> try {
-            val l = value.longValueExact()
-            if (l >= 0L) l else null
-        } catch (_: ArithmeticException) {
-            null
-        }
+        is BigInteger -> exactBigIntegerLong(value)?.takeIf { it >= 0L }
         is BigDecimal -> exactBigDecimalLong(value)?.takeIf { it >= 0L }
         is Double, is Float -> null
         else -> null
@@ -266,12 +263,7 @@ internal class AuthHttpTransport(
         is Short -> if (value > 0) value.toInt() else null
         is Byte -> if (value > 0) value.toInt() else null
         is Long -> if (value in 1..Int.MAX_VALUE) value.toInt() else null
-        is BigInteger -> try {
-            val i = value.intValueExact()
-            if (i > 0) i else null
-        } catch (_: ArithmeticException) {
-            null
-        }
+        is BigInteger -> exactBigIntegerInt(value)?.takeIf { it > 0 }
         is BigDecimal -> exactBigDecimalInt(value)?.takeIf { it > 0 }
         is Double, is Float -> null
         else -> null
@@ -291,11 +283,8 @@ internal class AuthHttpTransport(
             is Long -> value
             is Short -> value.toLong()
             is Byte -> value.toLong()
-            is BigInteger -> try {
-                value.longValueExact()
-            } catch (_: ArithmeticException) {
-                throw SyncListingValidationException("Invalid sync listing")
-            }
+            is BigInteger -> exactBigIntegerLong(value)
+                ?: throw SyncListingValidationException("Invalid sync listing")
             is BigDecimal -> exactBigDecimalLong(value)
                 ?: throw SyncListingValidationException("Invalid sync listing")
             is Double, is Float -> throw SyncListingValidationException("Invalid sync listing")
@@ -314,6 +303,14 @@ internal class AuthHttpTransport(
             null
         }
     }
+
+    // BigInteger.*ValueExact was added to Android's platform API at level 31.
+    // bitLength preserves the exact range check on the app's API 29 minimum.
+    private fun exactBigIntegerInt(value: BigInteger): Int? =
+        if (value.bitLength() <= 31) value.toInt() else null
+
+    private fun exactBigIntegerLong(value: BigInteger): Long? =
+        if (value.bitLength() <= 63) value.toLong() else null
 
     private fun exactBigDecimalInt(value: BigDecimal): Int? =
         exactBigDecimalLong(value)?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
@@ -341,7 +338,8 @@ internal class AuthHttpTransport(
         parsePositiveInt(json.opt(name)) ?: throw IOException("Unexpected authentication response")
 
     private fun post(url: java.net.URL, body: JSONObject): Pair<Int, JSONObject> {
-        val connection = url.openConnection() as HttpURLConnection
+        val connection = openAuthConnection(url) as? HttpsURLConnection
+            ?: throw IOException("TLS authentication transport unavailable")
         try {
             connection.requestMethod = "POST"
             connection.instanceFollowRedirects = false
@@ -353,8 +351,18 @@ internal class AuthHttpTransport(
             connection.setRequestProperty("Cache-Control", "no-store")
             connection.doOutput = true
             connection.outputStream.use { it.write(body.toString().toByteArray(StandardCharsets.UTF_8)) }
+            val requestStartedAt = clockNanos()
             val status = connection.responseCode
             if (status != 200 && status != 403) throw RootArkApiException(status)
+            val mime = connection.contentType?.substringBefore(';')?.trim()
+            if (!"application/json".equals(mime, ignoreCase = true) ||
+                (connection.contentEncoding != null &&
+                    !"identity".equals(connection.contentEncoding, ignoreCase = true))) {
+                throw IOException("Invalid authentication response encoding")
+            }
+            if (connection.contentLengthLong > AUTH_MAX_RESPONSE_BYTES) {
+                throw IOException("Authentication response exceeds declared size limit")
+            }
             val stream = (if (status == 200) connection.inputStream else connection.errorStream)
                 ?: throw IOException("Missing authentication response")
             val json = stream.use { input ->
@@ -362,15 +370,28 @@ internal class AuthHttpTransport(
                 val chunk = ByteArray(4096)
                 var total = 0
                 while (true) {
+                    if (clockNanos() - requestStartedAt >= AUTH_READ_DEADLINE_NANOS) {
+                        throw IOException("Authentication response exceeded read deadline")
+                    }
                     val count = input.read(chunk)
+                    if (clockNanos() - requestStartedAt >= AUTH_READ_DEADLINE_NANOS) {
+                        throw IOException("Authentication response exceeded read deadline")
+                    }
                     if (count < 0) break
+                    if (count > AUTH_MAX_RESPONSE_BYTES - total) {
+                        throw IOException("Authentication response exceeds limit")
+                    }
                     total += count
-                    if (total > 16 * 1024) throw IOException("Authentication response exceeds limit")
                     output.write(chunk, 0, count)
                 }
                 try {
-                    JSONObject(String(output.toByteArray(), StandardCharsets.UTF_8))
-                } catch (e: JSONException) {
+                    val text = StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .decode(ByteBuffer.wrap(output.toByteArray())).toString()
+                    StrictRfc8259Json.validate(text)
+                    JSONObject(text)
+                } catch (e: Exception) {
                     throw IOException("Malformed JSON in authentication response", e)
                 }
             }

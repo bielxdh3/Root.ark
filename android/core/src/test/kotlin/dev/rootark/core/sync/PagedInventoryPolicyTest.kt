@@ -1,11 +1,20 @@
 package dev.rootark.core.sync
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class PagedInventoryPolicyTest {
+    @Test
+    fun finalAllowedPageIsDisplayedWithoutOfferingAnOutOfRangeNextPage() {
+        assertTrue(PagedInventoryPolicy.hasNextPage(PagedInventoryPolicy.MAX_PAGES - 1, "next"))
+        assertFalse(PagedInventoryPolicy.hasNextPage(PagedInventoryPolicy.MAX_PAGES, "next"))
+        assertFalse(PagedInventoryPolicy.hasNextPage(PagedInventoryPolicy.MAX_PAGES, null))
+        assertFalse(PagedInventoryPolicy.hasNextPage(0, "next"))
+    }
+
     @Test
     fun `a library larger than 128 entries can be browsed in bounded pages`() {
         val seen = mutableSetOf<String>()

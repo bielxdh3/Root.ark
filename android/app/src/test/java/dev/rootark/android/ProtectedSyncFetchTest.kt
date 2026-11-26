@@ -1,6 +1,7 @@
 package dev.rootark.android
 
 import dev.rootark.core.auth.ServerOrigin
+import dev.rootark.core.sync.OfflineSession
 import dev.rootark.core.sync.LoginOutcome
 import dev.rootark.core.sync.PinnedSyncReadContext
 import dev.rootark.core.sync.ProtectedSyncException
@@ -21,9 +22,11 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import java.security.Signature
 import java.security.cert.Certificate
+import java.nio.file.Files
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import javax.net.ssl.HttpsURLConnection
@@ -114,9 +117,10 @@ class ProtectedSyncFetchTest {
     ) : HttpsURLConnection(url) {
         var opened = 0
         var disconnected = false
-        var bodyStream: InputStream? = null
+        var forcedStream: java.io.InputStream? = null
         override fun getResponseCode(): Int = status
-        override fun getInputStream() = (bodyStream ?: ByteArrayInputStream(payload)).also { opened++ }
+        override fun getInputStream(): java.io.InputStream =
+            (forcedStream ?: ByteArrayInputStream(payload)).also { opened++ }
         override fun getContentType(): String? = mime
         override fun getContentEncoding(): String? = encoding
         override fun getContentLengthLong(): Long = declaredSize
@@ -128,6 +132,37 @@ class ProtectedSyncFetchTest {
         override fun getServerCertificates(): Array<Certificate> = emptyArray()
         override fun getPeerPrincipal(): Principal = Principal { "CN=test" }
         override fun getLocalPrincipal(): Principal? = null
+    }
+
+    @Test fun signedCiphertextGetNeverAcceptsAnEofDeliveredAfterTheAbsoluteDeadline() {
+        var nowNanos = 0L
+        var reads = 0
+        val sealed = response
+        val stream = object : java.io.InputStream() {
+            override fun read(): Int = throw AssertionError("Expected bulk read")
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                reads++
+                // Each 9s read is below the transport's 10s idle timeout.
+                // A successful body at t=9s followed by EOF at t=18s must not
+                // be accepted as an authenticated GET within the 10s total cap.
+                nowNanos += 9_000_000_000L
+                if (reads == 1) {
+                    require(sealed.size <= length)
+                    sealed.copyInto(buffer, offset)
+                    return sealed.size
+                }
+                return -1
+            }
+        }
+        val connection = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = sealed)
+        connection.forcedStream = stream
+        val fetch = ProtectedSyncFetch(clockNanos = { nowNanos }, openConnection = { connection })
+        val failure = assertThrows(IOException::class.java) {
+            fetch.fetchPacket(origin, session, "fixture-object-1", SessionCiphertextCache.MAX_PACKET_BYTES)
+        }
+        assertTrue(failure.message.orEmpty().contains("deadline"))
+        assertEquals(2, reads)
+        assertTrue(connection.disconnected)
     }
 
     private class Transport {
@@ -161,6 +196,81 @@ class ProtectedSyncFetchTest {
         assertFalse(conn.instanceFollowRedirects)
         assertFalse(conn.useCaches)
         assertTrue(conn.disconnected)
+    }
+
+    @Test fun signedServerHttpPacketCanBeSealedButCannotSupplyOfflineGrant() {
+        val transport = Transport()
+        val gateway = ProtectedSyncFetch { url ->
+            transport.open(url).also { (it as SecureResponse).payload = response }
+        }
+        val packet = gateway.fetchPacket(origin, session, "fixture-object-1",
+            SessionCiphertextCache.MAX_PACKET_BYTES)
+        assertArrayEquals(response, packet.bytes)
+        assertEquals("fixture-object-1", packet.record.objectId)
+        val root = Files.createTempDirectory("rootark-cipher-http").toFile()
+        val binding = OfflineSession("https://files.example.org:9443", "alice", "https-capture-session")
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        try {
+            val cache = SessionCiphertextCache(root, binding, key)
+            assertEquals("fixture-object-1", cache.save(binding, "fixture-object-1", packet.bytes).objectId)
+            assertEquals("fixture-object-1", cache.inspect(binding, "fixture-object-1").objectId)
+            assertFalse(VerifiedTextPreview(null).available)
+            assertThrows(ProtectedSyncException::class.java) {
+                VerifiedTextPreview(null).open(origin, session, "fixture-object-1")
+            }
+            cache.clear()
+            assertTrue(root.listFiles().isNullOrEmpty())
+        } finally {
+            packet.bytes.fill(0)
+            root.deleteRecursively()
+        }
+        assertTrue(transport.result!!.disconnected)
+
+        val tooLarge = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = response)
+        val rejected = ProtectedSyncFetch { tooLarge }
+        assertThrows(IOException::class.java) {
+            rejected.fetchPacket(origin, session, "fixture-object-1", response.size - 1)
+        }
+        assertTrue(tooLarge.disconnected)
+    }
+
+    @Test fun repeatedSignedHttpsGetPreservesUiCacheWithoutErasingKeystore() {
+        val responses = mutableListOf<SecureResponse>()
+        val gateway = ProtectedSyncFetch { url ->
+            SecureResponse(url, payload = response).also { responses.add(it) }
+        }
+        val binding = OfflineSession("https://files.example.org:9443", "alice", "same-login")
+        val root = Files.createTempDirectory("rootark-cipher-duplicate-get").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        try {
+            val cache = SessionCiphertextCache(root, binding, key)
+            val firstGet = gateway.fetchPacket(origin, session, "fixture-object-1", SessionCiphertextCache.MAX_PACKET_BYTES)
+            val captured = try {
+                cache.save(binding, "fixture-object-1", firstGet.bytes)
+            } finally { firstGet.bytes.fill(0) }
+            val firstSealed = File(root, "packet.bin").readBytes()
+
+            val repeatedGet = gateway.fetchPacket(origin, session, "fixture-object-1", SessionCiphertextCache.MAX_PACKET_BYTES)
+            val duplicate = try {
+                assertThrows(DuplicateCiphertextCaptureException::class.java) {
+                    cache.save(binding, "fixture-object-1", repeatedGet.bytes)
+                }
+            } finally { repeatedGet.bytes.fill(0) }
+            var discarded = false
+            assertEquals(CiphertextCaptureUiResult.ALREADY_CAPTURED,
+                CiphertextCaptureFailurePolicy.handle(duplicate) {
+                    discarded = true
+                    cache.clear()
+                })
+            assertFalse(discarded)
+            assertEquals(captured, cache.inspect(binding, "fixture-object-1"))
+            assertArrayEquals(firstSealed, File(root, "packet.bin").readBytes())
+            assertEquals(2, responses.size)
+            assertTrue(responses.all { it.disconnected && it.requestMethod == "GET" })
+            assertFalse(VerifiedTextPreview(null).available)
+        } finally {
+            root.deleteRecursively()
+        }
     }
 
     @Test fun failsClosedBeforeNetworkForUnprovisionedTrustOrMissingListPermission() {
@@ -236,7 +346,7 @@ class ProtectedSyncFetchTest {
     @Test fun rejectsBodyThatFinishesAfterTotalReadDeadlineEvenWhenFinalReadIsEof() {
         val clock = AtomicLong(0L)
         val fake = SecureResponse(origin.syncObjectUrl("fixture-object-1"), payload = response)
-        fake.bodyStream = object : InputStream() {
+        fake.forcedStream = object : InputStream() {
             private var offset = 0
 
             override fun read(): Int {
@@ -259,7 +369,7 @@ class ProtectedSyncFetchTest {
         }
 
         val failure = assertThrows(IOException::class.java) {
-            ProtectedSyncFetch(openConnection = { fake }, monotonicNanos = clock::get)
+            ProtectedSyncFetch(openConnection = { fake }, clockNanos = clock::get)
                 .fetchCiphertext(origin, session, "fixture-object-1")
         }
         assertTrue("EOF after the total body budget must be rejected", failure.message?.contains("deadline") == true)

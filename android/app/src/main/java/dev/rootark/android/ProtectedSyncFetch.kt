@@ -34,29 +34,44 @@ internal data class ProtectedContentGrant(
     val fileKey: ByteArray,
 )
 
-/** Deliberately has no implementation: the current Android login is not a ZK grant. */
+/** Production implementations must prove a fresh owner grant for this exact reader and object. */
 internal fun interface TrustedContentGrantProvider {
     fun obtain(username: String, objectId: String): ProtectedContentGrant?
+
+    /** A UI availability check must be read-only and must never unwrap the CEK. */
+    fun isAvailable(username: String, objectId: String): Boolean = false
+
+    /** Real providers override this to keep the owner-floor lock held through content use. */
+    fun <T> withGrant(
+        username: String,
+        objectId: String,
+        consume: (PinnedSyncReadContext, ByteArray) -> T,
+    ): T {
+        val grant = obtain(username, objectId) ?: throw ProtectedSyncException()
+        try { return consume(grant.context, grant.fileKey) }
+        finally { grant.fileKey.fill(0) }
+    }
 }
+
+/** Authenticated HTTP bytes, structurally parsed but NOT independently signature-verified. */
+internal data class FetchedCiphertextPacket(val bytes: ByteArray, val record: SyncRecord)
 
 /**
  * App-internal, HTTPS-only bounded ciphertext transport.
  *
  * fetchCiphertext() returns an UNTRUSTED remote record: it is never plaintext
  * and callers must not treat metadata or server-supplied device pins as truth.
- * withVerifiedContent() accepts externally provisioned trust + CEK, verifies
+ * withVerifiedContent() accepts owner-pinned trust + a wrapped CEK, verifies
  * the signed v2 envelope/AES-GCM, and wipes key/plaintext after the callback.
- * This component is not wired to any UI or automatic download.
+ * The Activity invokes it only after a local credential prompt and fresh grant check.
  */
 internal class ProtectedSyncFetch(
+    private val clockNanos: () -> Long = System::nanoTime,
     private val openConnection: (URL) -> URLConnection = { it.openConnection() },
 ) {
-    private var monotonicNanos: () -> Long = System::nanoTime
-
-    internal constructor(openConnection: (URL) -> URLConnection, monotonicNanos: () -> Long) : this(openConnection) {
-        this.monotonicNanos = monotonicNanos
-    }
-
+    // Keep existing one-argument/handler call sites while allowing deterministic
+    // monotonic deadline tests without real sleeps or network access.
+    constructor(openConnection: (URL) -> URLConnection) : this(System::nanoTime, openConnection)
     companion object {
         // An 8 MiB ciphertext becomes ~11.2 MiB base64url, plus signed metadata/AAD.
         const val MAX_RESPONSE_BYTES = 12 * 1024 * 1024
@@ -69,6 +84,18 @@ internal class ProtectedSyncFetch(
         session: LoginOutcome.Authenticated,
         objectId: String,
     ): SyncRecord {
+        val packet = fetchPacket(origin, session, objectId)
+        packet.bytes.fill(0)
+        return packet.record
+    }
+
+    fun fetchPacket(
+        origin: ServerOrigin,
+        session: LoginOutcome.Authenticated,
+        objectId: String,
+        maxResponseBytes: Int = MAX_RESPONSE_BYTES,
+    ): FetchedCiphertextPacket {
+        require(maxResponseBytes in 1..MAX_RESPONSE_BYTES)
         // Validate before opening the connection; the server checks these anew.
         val url = origin.syncObjectUrl(objectId)
         if (!ReadOnlyFileListPolicy.canList(session.permissions) ||
@@ -96,27 +123,26 @@ internal class ProtectedSyncFetch(
                     !connection.contentEncoding.equals("identity", ignoreCase = true))) {
                 throw IOException("Invalid protected sync response")
             }
-            if (connection.contentLengthLong > MAX_RESPONSE_BYTES) {
+            if (connection.contentLengthLong > maxResponseBytes) {
                 throw IOException("Protected sync response exceeds limit")
             }
-            val startedNanos = monotonicNanos()
-            fun checkBodyDeadline() {
-                if (monotonicNanos() - startedNanos >= BODY_READ_DEADLINE_NANOS) {
-                    connection.disconnect()
-                    throw IOException("Protected sync response read deadline exceeded")
-                }
-            }
+            val readStartedAt = clockNanos()
             val body = connection.inputStream.use { input ->
                 val output = ByteArrayOutputStream()
                 val buffer = ByteArray(8192)
                 var size = 0
                 while (true) {
-                    checkBodyDeadline()
+                    if (clockNanos() - readStartedAt >= BODY_READ_DEADLINE_NANOS) {
+                        throw IOException("Protected sync response read deadline exceeded")
+                    }
                     val read = input.read(buffer)
-                    // EOF itself may arrive after the cumulative body deadline.
-                    checkBodyDeadline()
+                    // A final EOF is still a read. Checking only before it can
+                    // incorrectly accept a signed packet after the wall budget.
+                    if (clockNanos() - readStartedAt >= BODY_READ_DEADLINE_NANOS) {
+                        throw IOException("Protected sync response read deadline exceeded")
+                    }
                     if (read < 0) break
-                    if (read > MAX_RESPONSE_BYTES - size) {
+                    if (read > maxResponseBytes - size) {
                         throw IOException("Protected sync response exceeds limit")
                     }
                     output.write(buffer, 0, read)
@@ -126,7 +152,7 @@ internal class ProtectedSyncFetch(
             }
             val record = StrictSyncRecordJson.parse(body)
             if (record.objectId != objectId) throw IOException("Protected sync object mismatch")
-            return record
+            return FetchedCiphertextPacket(body, record)
         } finally {
             connection.disconnect()
         }
@@ -146,36 +172,33 @@ internal class ProtectedSyncFetch(
     ) {
         origin.syncObjectUrl(objectId)
         if (!ReadOnlyFileListPolicy.canList(session.permissions)) throw ProtectedSyncException()
-        var grant: ProtectedContentGrant? = null
-        try {
-            grant = grantProvider.obtain(session.username, objectId)
-            val currentGrant = grant ?: throw ProtectedSyncException()
-            val context = currentGrant.context
-            if (currentGrant.fileKey.size != 32 ||
-                context.username != session.username || context.objectId != objectId ||
-                context.trustedDevicePublicKeys.isEmpty()) {
-                throw ProtectedSyncException()
-            }
+        grantProvider.withGrant(session.username, objectId) { context, fileKey ->
+            try {
+                if (fileKey.size != 32 || context.username != session.username ||
+                    context.objectId != objectId || context.trustedDevicePublicKeys.isEmpty()) {
+                    throw ProtectedSyncException()
+                }
             if (!stillActive()) throw ProtectedSyncException()
             val record = fetchCiphertext(origin, session, objectId)
             // The window may have stopped while the HTTPS response arrived.
             // Never decrypt a response after foreground authorization ended.
             if (!stillActive()) throw ProtectedSyncException()
-            val plaintext = ProtectedSyncContent.verifyAndDecrypt(record, currentGrant.fileKey, context)
+            val plaintext = ProtectedSyncContent.verifyAndDecrypt(record, fileKey, context)
             try {
                 if (!stillActive()) throw ProtectedSyncException()
                 consume(plaintext)
             } finally {
                 plaintext.fill(0)
             }
-        } finally {
-            grant?.fileKey?.fill(0)
+            } finally {
+                fileKey.fill(0)
+            }
         }
     }
 }
 
 /** Exact field/type validation before turning attacker-controlled JSON into a wire model. */
-private object StrictSyncRecordJson {
+internal object StrictSyncRecordJson {
     private val FIELDS = setOf(
         "protocolVersion", "operationId", "objectId", "fileId", "versionId",
         "operation", "revision", "baseRevision", "keyEpoch", "compartmentId",

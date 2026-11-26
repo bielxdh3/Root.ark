@@ -11,17 +11,24 @@ test("#275 viewer is reachable from each #273 metadata-only page without an unbo
   const origin = src("android/core/src/main/kotlin/dev/rootark/core/auth/ServerOrigin.kt");
   assert.match(screen, /loadInventoryPage/);
   assert.match(screen, /showInventoryPage/);
-  assert.match(screen, /showProtectedObject\(row\.objectId\)/);
-  assert.match(screen, /independentlyProvisionedGrantProvider\(\).*null/);
-  assert.match(screen, /409\s*->\s*\{\s*offlineInventory\?\.clear\(\)\s*showSession/);
+  assert.match(screen, /showProtectedObject\(row\.objectId,\s*backToPage\s*=/);
+  assert.match(screen, /return OwnerPinnedGrantProvider\(this, origin\)/);
+  assert.match(screen, /409\s*->\s*\{\s*offlineInventory\?\.clear\(\)/);
+  assert.match(screen, /409\s*->\s*\{[\s\S]{0,300}ciphertextCache\?\.clear\(\)/);
   assert.match(screen, /401\s*->\s*showLogin/);
   assert.match(screen, /403\s*->\s*showLogin/);
-  assert.match(screen, /private fun clearSensitiveState\(\)\s*\{\s*offlineInventory\?\.clear\(\)/);
+  assert.match(screen, /private fun clearSensitiveState\(\)/);
+  assert.match(screen, /offlineInventory\?\.clear\(\)/);
+  assert.match(screen, /LocalCipherCacheKey\.erase\(\)/);
   assert.match(screen, /onStop\(\)/);
   assert.match(transport, /listInventoryPage/);
   assert.doesNotMatch(transport, /fun listSyncObjects\(/);
   assert.match(origin, /syncInventoryUrl/);
   assert.match(origin, /syncObjectUrl/);
+  const provider = src("android/app/src/main/java/dev/rootark/android/OwnerPinnedGrantProvider.kt");
+  assert.match(provider, /override fun obtain\(username: String, objectId: String\): ProtectedContentGrant\? = null/);
+  assert.match(provider, /OwnerEnrollmentCapabilityPolicy\.isEnabled/);
+  assert.match(provider, /OwnerEnrollmentAdmission\.withAuthorizedGrant/);
 });
 
 test("strict signed-content parser stays in the combined flow and page limits remain bounded", () => {

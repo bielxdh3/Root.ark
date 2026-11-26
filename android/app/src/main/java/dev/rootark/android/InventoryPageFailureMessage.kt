@@ -8,7 +8,11 @@ import java.net.UnknownHostException
 import javax.net.ssl.SSLException
 
 /** Presentation only: never include raw exception text in a user-facing message. */
-internal fun inventoryPageRequestFailureMessage(failure: Exception?): String = when (failure) {
+internal fun inventoryPageFailureMessage(failure: Exception?): String = when (failure) {
+    is SyncListingLimitException ->
+        "Não foi possível carregar a página de inventário. A resposta excede os limites de tamanho ou estrutura (128 KiB / 64 registros)."
+    is SyncListingValidationException ->
+        "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
     is SocketTimeoutException ->
         "A solicitação do inventário excedeu o tempo limite. Tente novamente."
     is UnknownHostException ->

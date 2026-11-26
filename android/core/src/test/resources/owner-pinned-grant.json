@@ -1,0 +1,78 @@
+{
+  "anchor": {
+    "origin": "https://rootark.test",
+    "username": "offline-owner",
+    "readerDeviceId": "reader-android-001",
+    "ownerRevision": 15,
+    "ownerDigest": "wivhjjb69_LQVFyAxCpoP4vz_0iMlIkZs-el28wcOLM",
+    "ownerPublicSpki": "MCowBQYDK2VwAyEAsIq45WLvDyyFd_OaQt_5mbuLwwATVYG4kLl317qvcuM",
+    "ownerPublicSpkiSha256": "F3rFvsmfD6YQA9N1s-_VC2CeR2hmzf-aAVx3_jEsuuc"
+  },
+  "head": {
+    "schema": "rootark-android-owner-head/v1",
+    "origin": "https://rootark.test",
+    "username": "offline-owner",
+    "readerDeviceId": "reader-android-001",
+    "ownerRevision": 15,
+    "ownerDigest": "wivhjjb69_LQVFyAxCpoP4vz_0iMlIkZs-el28wcOLM",
+    "revokedDeviceIds": [],
+    "issuedAtMillis": 1700000000000,
+    "expiresAtMillis": 1700000120000,
+    "signature": "WMCukc4bqf3s4zkGH_bBFhFq9YLA_yZXb5tdB--S996En3six28TNePAGv4oPJcU0u5Lpp9gGVxV9oqCrPPoCw"
+  },
+  "grant": {
+    "schema": "rootark-android-cek-read/v1",
+    "origin": "https://rootark.test",
+    "username": "offline-owner",
+    "readerDeviceId": "reader-android-001",
+    "ownerRevision": 15,
+    "ownerDigest": "wivhjjb69_LQVFyAxCpoP4vz_0iMlIkZs-el28wcOLM",
+    "objectId": "item-id-001",
+    "fileId": "file-id-001",
+    "versionId": "version-id-001",
+    "compartmentId": "compartment-1",
+    "keyEpoch": "epoch-2",
+    "signerDeviceId": "issuer-001",
+    "signerPublicKeySpki": "MCowBQYDK2VwAyEAfBdo79N9sPgqBxIWrAzgTvG5HY7l_Bsu321Itc_HOB0",
+    "cekSha256": "riFsLvUkejeCwTXvonmj5M3GEJQnD10r5YxiBLemEsk",
+    "nonce": "CQkJCQkJCQkJCQkJCQkJCQ",
+    "issuedAtMillis": 1700000000000,
+    "expiresAtMillis": 1700000090000,
+    "signature": "Hb5uQKV8HI0rbbba13qxDJhjCElxBUPo7Pu8cV8ITe_VNKIquOc0TQUmnkzz_Wwx-G6Yw15cq4hSpX9SNil3CQ"
+  },
+  "revoked": {
+    "schema": "rootark-android-owner-head/v1",
+    "origin": "https://rootark.test",
+    "username": "offline-owner",
+    "readerDeviceId": "reader-android-001",
+    "ownerRevision": 16,
+    "ownerDigest": "qh4zm_YzO9dd3sGYV6INaA-59sckGd2WzjtzBm509U0",
+    "revokedDeviceIds": [
+      "issuer-001",
+      "reader-android-001"
+    ],
+    "issuedAtMillis": 1700000000000,
+    "expiresAtMillis": 1700000120000,
+    "signature": "TiryaLtNXuw1lwDV5uCN3WxYGV_KQQnAZVjTtQ4f9wavztbqmEV5iDnN2fupPIIJ18iMfcQgKfx9jUCzFxmvCQ"
+  },
+  "revokedGrant": {
+    "schema": "rootark-android-cek-read/v1",
+    "origin": "https://rootark.test",
+    "username": "offline-owner",
+    "readerDeviceId": "reader-android-001",
+    "ownerRevision": 16,
+    "ownerDigest": "qh4zm_YzO9dd3sGYV6INaA-59sckGd2WzjtzBm509U0",
+    "objectId": "item-id-001",
+    "fileId": "file-id-001",
+    "versionId": "version-id-001",
+    "compartmentId": "compartment-1",
+    "keyEpoch": "epoch-2",
+    "signerDeviceId": "issuer-001",
+    "signerPublicKeySpki": "MCowBQYDK2VwAyEAfBdo79N9sPgqBxIWrAzgTvG5HY7l_Bsu321Itc_HOB0",
+    "cekSha256": "riFsLvUkejeCwTXvonmj5M3GEJQnD10r5YxiBLemEsk",
+    "nonce": "CQkJCQkJCQkJCQkJCQkJCQ",
+    "issuedAtMillis": 1700000000000,
+    "expiresAtMillis": 1700000090000,
+    "signature": "T205ziGrRf3M_S3xjWYhr9PKrllC25zC_5qa539cUyOEhGJ2_TId3CgW_l03QvxIjuGifl1YUdDjzw8A38zDDg"
+  }
+}

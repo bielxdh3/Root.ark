@@ -7,17 +7,29 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import javax.net.ssl.SSLException
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 class InventoryPageFailureMessageTest {
-    @Test fun knownLimitKeepsPageBounds() {
-        assertEquals("Não foi possível carregar a página de inventário. A resposta excede o limite (128 KiB / 64 registros).",
-            inventoryPageFailureMessage(SyncListingLimitException("fixture")))
+    @Test fun listingLimitHasItsOwnSafeMessage() {
+        val message = inventoryPageFailureMessage(SyncListingLimitException("private fixture detail"))
+        assertEquals(
+            "Não foi possível carregar a página de inventário. A resposta excede os limites de tamanho ou estrutura (128 KiB / 64 registros).",
+            message,
+        )
+        assertFalse(message.contains("private fixture detail"))
     }
 
-    @Test fun invalidResponseKeepsItsMessage() {
-        assertEquals("Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos.",
-            inventoryPageFailureMessage(SyncListingValidationException("fixture")))
+    @Test fun listingValidationHasItsOwnSafeMessage() {
+        val message = inventoryPageFailureMessage(
+            SyncListingValidationException("private fixture detail", IllegalArgumentException("secret"))
+        )
+        assertEquals(
+            "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos.",
+            message,
+        )
+        assertFalse(message.contains("private fixture detail"))
+        assertFalse(message.contains("secret"))
     }
 
     @Test fun timeoutHasItsOwnMessage() {

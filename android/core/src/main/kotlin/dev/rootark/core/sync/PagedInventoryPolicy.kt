@@ -8,6 +8,10 @@ object PagedInventoryPolicy {
     const val MAX_RESPONSE_BYTES = 128 * 1024
     const val MAX_ENTRIES = 64
     const val MAX_CURSOR_CHARS = 1024
+    const val MAX_PAGES = 1_000
+
+    fun hasNextPage(pageNumber: Int, nextCursor: String?): Boolean =
+        nextCursor != null && pageNumber in 1 until MAX_PAGES
 
     fun checkCursor(value: String, previouslyUsed: Set<String>): Boolean {
         require(value.isNotEmpty() && value.length <= MAX_CURSOR_CHARS &&

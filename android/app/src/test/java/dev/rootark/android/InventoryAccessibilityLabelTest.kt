@@ -27,20 +27,20 @@ class InventoryAccessibilityLabelTest {
         val unsafePath = row("id-path", "report.pdf", "finance/\u202Ereport.pdf")
         val unsafeName = row("id-name", "report\u2066.pdf", null)
         val invisiblePath = row("id-invisible", "report.pdf", "finance/\u034Freport.pdf")
-        val joinerPath = row("id-joiner-path", "report.pdf", "finance/\u200Dreport.pdf")
-        val joinerName = row("id-joiner-name", "report\u200C.pdf", null)
 
         assertEquals("Conteúdo protegido: report.pdf", protectedContentAccessibilityLabel(unsafePath))
         assertEquals("Conteúdo protegido: arquivo", protectedContentAccessibilityLabel(unsafeName))
         assertEquals("Conteúdo protegido: report.pdf", protectedContentAccessibilityLabel(invisiblePath))
-        assertEquals("Conteúdo protegido: report.pdf", protectedContentAccessibilityLabel(joinerPath))
-        assertEquals("Conteúdo protegido: arquivo", protectedContentAccessibilityLabel(joinerName))
     }
 
     @Test
     fun ordinaryUnicodeEmojiAndCombiningMarksArePreserved() {
-        val path = "cafe\u0301/relatório 📄 🇧🇷.pdf"
+        val path = "cafe\u0301/relatório 👨‍👩‍👧‍👦.pdf"
         assertEquals("Conteúdo protegido: $path", protectedContentAccessibilityLabel(row("id-unicode", "relatório 📄.pdf", path)))
+        val flagPath = "cafe\u0301/relatório 📄 🇧🇷.pdf"
+        assertEquals("Conteúdo protegido: $flagPath", protectedContentAccessibilityLabel(row("id-flag", "relatório 📄.pdf", flagPath)))
+        val persianPath = "پیش\u200Cنویس.pdf"
+        assertEquals("Conteúdo protegido: $persianPath", protectedContentAccessibilityLabel(row("id-persian", "نویس.pdf", persianPath)))
     }
 
     private fun row(objectId: String, name: String, path: String?) = ReadOnlyFileRow(
