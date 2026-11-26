@@ -30,6 +30,7 @@ class ReadOnlyFileListPolicyTest {
             metadata.getLong("size"), metadata.getString("contentType"),
         )
         assertEquals("readme.txt", row.name)
+        assertEquals("fixture-object-1", row.objectId)
         assertEquals("docs/readme.txt", row.path)
         assertEquals(5L, row.size)
         assertEquals("text/plain", row.contentType)
@@ -61,6 +62,7 @@ class ReadOnlyFileListPolicyTest {
             )
         }
         assertTrue(rows.any { it.name == "readme.txt" })
+        assertTrue(rows.all { it.objectId.isNotBlank() })
         assertTrue(rows.any { it.name.length == 300 && it.contentType?.length == 512 })
     }
 

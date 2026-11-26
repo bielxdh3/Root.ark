@@ -142,6 +142,7 @@ internal class ProtectedSyncFetch(
         session: LoginOutcome.Authenticated,
         objectId: String,
         grantProvider: TrustedContentGrantProvider,
+        stillActive: () -> Boolean = { true },
         consume: (ByteArray) -> Unit,
     ) {
         origin.syncObjectUrl(objectId)
@@ -156,9 +157,14 @@ internal class ProtectedSyncFetch(
                 context.trustedDevicePublicKeys.isEmpty()) {
                 throw ProtectedSyncException()
             }
+            if (!stillActive()) throw ProtectedSyncException()
             val record = fetchCiphertext(origin, session, objectId)
+            // The window may have stopped while the HTTPS response arrived.
+            // Never decrypt a response after foreground authorization ended.
+            if (!stillActive()) throw ProtectedSyncException()
             val plaintext = ProtectedSyncContent.verifyAndDecrypt(record, currentGrant.fileKey, context)
             try {
+                if (!stillActive()) throw ProtectedSyncException()
                 consume(plaintext)
             } finally {
                 plaintext.fill(0)

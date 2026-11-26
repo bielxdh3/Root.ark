@@ -14,12 +14,22 @@ import android.widget.ScrollView
 import android.widget.TextView
 import dev.rootark.core.auth.ServerOrigin
 import dev.rootark.core.sync.LoginOutcome
+import dev.rootark.core.sync.InventoryPage
+import dev.rootark.core.sync.PagedInventoryPolicy
 import dev.rootark.core.sync.ReadOnlyFileListPolicy
-import dev.rootark.core.sync.ReadOnlyFileRow
 import dev.rootark.core.sync.RootArkApiException
 
-/** Online auth and read-only metadata listing; protected files and device keys remain gated. */
+/** Authenticated metadata browsing with an explicit, provisioned-only protected text viewer. */
 /** Listing-specific presentation; keep the two explicit response categories separate. */
+internal fun inventoryPageFailureMessage(failure: Exception?): String = when (failure) {
+    is SyncListingLimitException ->
+        "Não foi possível carregar a página de inventário. A resposta excede o limite (128 KiB / 64 registros)."
+    is SyncListingValidationException ->
+        "Não foi possível carregar a página de inventário. Os dados retornados pelo servidor são inválidos."
+    else -> inventoryPageRequestFailureMessage(failure)
+}
+
+/** Presentation for the legacy, non-paginated inventory list. */
 internal fun inventoryListFailureMessage(failure: Exception?): String = when (failure) {
     is SyncListingLimitException ->
         "Não foi possível carregar a lista. A resposta excede o limite do protótipo (1 MiB / 128 registros)."
@@ -38,25 +48,46 @@ class MainActivity : Activity() {
     private var challengeId: String? = null
     private var sessionToken: String? = null
     private var sessionUsername: String? = null
+    private var authenticatedSession: LoginOutcome.Authenticated? = null
+    private val securePreviewText = SecurePreviewBuffer()
     private var sessionCanListFiles = false
-    private var generation = 0
+    @Volatile private var generation = 0
+    @Volatile private var isForeground = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(null)
-        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         showLogin()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        isForeground = true
     }
 
     override fun onStop() {
         super.onStop()
+        isForeground = false
         generation++
         clearSensitiveState()
         showLogin()
     }
 
+    override fun onDestroy() {
+        // Also invalidate callbacks and wipe retained preview arrays when the
+        // activity is destroyed without a normal foreground/background cycle.
+        // clearSensitiveState is idempotent after onStop.
+        isForeground = false
+        generation++
+        clearSensitiveState()
+        super.onDestroy()
+    }
+
     private fun clearSensitiveState() {
+        securePreviewText.clear()
         sessionToken = null
         sessionUsername = null
+        authenticatedSession = null
         sessionCanListFiles = false
         challengeId = null
         activeOrigin = null
@@ -68,7 +99,7 @@ class MainActivity : Activity() {
 
     private fun showLogin(message: String? = null, savedServer: String = "", savedUser: String = "") {
         clearSensitiveState()
-        val layout = screen("Root.ark", "Acesso online. Arquivos protegidos ainda não estão disponíveis no Android.")
+        val layout = screen("Root.ark", "Acesso online. A visualização protegida exige confiança independente do dispositivo.")
         serverField = field(layout, "Servidor HTTPS", savedServer, false)
         usernameField = field(layout, "Usuário", savedUser, false)
         passwordField = field(layout, "Senha", "", true)
@@ -133,6 +164,7 @@ class MainActivity : Activity() {
     private fun showAuthenticated(result: LoginOutcome.Authenticated, origin: ServerOrigin) {
         clearSensitiveState()
         sessionToken = result.token
+        authenticatedSession = result
         activeOrigin = origin
         sessionUsername = result.username
         sessionCanListFiles = ReadOnlyFileListPolicy.canList(result.permissions)
@@ -142,35 +174,90 @@ class MainActivity : Activity() {
     private fun showSession(message: String? = null) {
         val username = sessionUsername ?: return showLogin()
         val layout = screen("Acesso confirmado", "Sessão de $username autenticada em memória.")
-        text(layout, "Somente metadados de sincronização. O conteúdo criptografado permanece inacessível.")
+        text(layout, "Listagem de metadados. Conteúdo protegido só é aberto após verificação local e autorização independente.")
         if (message != null) text(layout, message)
         if (sessionCanListFiles) {
-            button(layout, "Listar arquivos (somente leitura)") { loadFileList() }
+            button(layout, "Listar arquivos (somente leitura)") { loadInventoryPage() }
         } else {
             text(layout, "Esta conta não possui permissão listFiles.")
         }
         button(layout, "Encerrar acesso local") { showLogin() }
     }
 
-    private fun loadFileList() {
+    data class InventoryPagingTracker(
+        val cursor: String? = null,
+        val pageNumber: Int = 1,
+        val usedCursors: Set<String> = emptySet(),
+        val previousCursors: List<String?> = emptyList(),
+    ) {
+        fun advance(nextCursor: String?): InventoryPagingTracker {
+            val history = previousCursors + cursor
+            return InventoryPagingTracker(
+                cursor = nextCursor,
+                pageNumber = pageNumber + 1,
+                usedCursors = history.filterNotNull().toSet(),
+                previousCursors = history,
+            )
+        }
+
+        fun previous(): InventoryPagingTracker? {
+            if (pageNumber <= 1 || !isValid()) return null
+            val history = previousCursors.dropLast(1)
+            return InventoryPagingTracker(
+                cursor = previousCursors.last(),
+                pageNumber = pageNumber - 1,
+                usedCursors = history.filterNotNull().toSet(),
+                previousCursors = history,
+            ).takeIf { it.isValid() }
+        }
+
+        fun isValid(): Boolean {
+            if (pageNumber !in 1..100_000 || previousCursors.size != pageNumber - 1) return false
+            if (pageNumber == 1) return cursor == null && usedCursors.isEmpty()
+            if (previousCursors.firstOrNull() != null) return false
+            val priorCursors = previousCursors.filterNotNull()
+            if (priorCursors.size != previousCursors.size - 1 ||
+                priorCursors.toSet().size != priorCursors.size || usedCursors != priorCursors.toSet()
+            ) return false
+            val currentCursor = cursor ?: return false
+            return runCatching { PagedInventoryPolicy.checkCursor(currentCursor, usedCursors) }.isSuccess
+        }
+    }
+
+    private fun loadInventoryPage(tracker: InventoryPagingTracker = InventoryPagingTracker()) {
         if (!sessionCanListFiles) return
         val origin = activeOrigin ?: return
         val token = sessionToken ?: return
-        runRequest({ transport.listSyncObjects(origin, token) }) { rows, failure ->
-            if (rows != null) {
-                showFileList(rows)
+        if (!tracker.isValid()) {
+            showSession("Cursor de inventário inválido. Reinicie a listagem.")
+            return
+        }
+        val currentCursor = tracker.cursor
+        val used = tracker.usedCursors
+        runRequest({ transport.listInventoryPage(origin, token, currentCursor, used) }) { page, failure ->
+            if (page != null) {
+                val nextTracker = tracker.advance(page.nextCursor)
+                val next = page.nextCursor
+                if (next != null && runCatching {
+                    PagedInventoryPolicy.checkCursor(next, nextTracker.usedCursors)
+                }.isFailure) {
+                    showSession("Inventário retornou cursor repetido. Reinicie a listagem.")
+                } else {
+                    showInventoryPage(page, tracker, nextTracker)
+                }
             } else when ((failure as? RootArkApiException)?.statusCode) {
                 401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
                 403 -> showSession("Servidor negou acesso à lista (403).")
-                else -> showSession(inventoryListFailureMessage(failure))
+                409 -> showSession("Inventário mudou no servidor. Reinicie a listagem para obter um novo snapshot.")
+                else -> showSession(inventoryPageFailureMessage(failure))
             }
         }
     }
 
-    private fun showFileList(rows: List<ReadOnlyFileRow>) {
-        val layout = screen("Arquivos · somente leitura", "${rows.size} registro(s) de sincronização. Nenhum conteúdo descriptografado.")
-        if (rows.isEmpty()) text(layout, "Nenhum registro disponível.")
-        for (row in rows) {
+    private fun showInventoryPage(page: InventoryPage, tracker: InventoryPagingTracker, nextTracker: InventoryPagingTracker) {
+        val layout = screen("Inventário · página ${tracker.pageNumber}", "${page.rows.size} metadados de sincronização. Nenhum conteúdo descriptografado.")
+        if (page.rows.isEmpty()) text(layout, "Nenhum registro disponível.")
+        for (row in page.rows) {
             text(layout, row.name + if (row.deleted) " (excluído)" else "")
             val details = listOfNotNull(
                 row.path?.let { "Caminho: $it" },
@@ -178,28 +265,96 @@ class MainActivity : Activity() {
                 row.contentType?.let { "Tipo: $it" },
             ).joinToString(" · ")
             if (details.isNotEmpty()) text(layout, details)
+            if (!row.deleted) button(layout, "Conteúdo protegido", accessibilityLabel = protectedContentAccessibilityLabel(row)) {
+                showProtectedObject(row.objectId) { showInventoryPage(page, tracker, nextTracker) }
+            }
         }
-        button(layout, "Atualizar lista") { loadFileList() }
+        val previous = tracker.previous()
+        if (previous != null) button(layout, "Página anterior") { loadInventoryPage(previous) }
+        val next = nextTracker.cursor
+        if (next != null) button(layout, "Próxima página") { loadInventoryPage(nextTracker) }
+        button(layout, "Atualizar desde o início") { loadInventoryPage() }
         button(layout, "Voltar") { showSession() }
         button(layout, "Encerrar acesso local") { showLogin() }
     }
 
-    private fun <T> runRequest(operation: () -> T, done: (T?, Exception?) -> Unit) {
-        val started = ++generation
+    /**
+     * Explicit integration gate for a future independently approved Android
+     * enrollment/recovery authority. The server login and wire JSON cannot
+     * manufacture CEKs, device pins, revocation state or epoch authority.
+     * The current product deliberately has no such provider.
+     */
+    private fun independentlyProvisionedGrantProvider(): TrustedContentGrantProvider? = null
+
+    private fun showProtectedObject(objectId: String, backToPage: () -> Unit) {
+        val origin = activeOrigin ?: return showLogin()
+        val session = authenticatedSession ?: return showLogin()
+        if (!sessionCanListFiles) return showSession("Sem permissão para ler arquivos.")
+        val preview = VerifiedTextPreview(independentlyProvisionedGrantProvider())
+        val layout = screen("Conteúdo protegido", "Apenas texto UTF-8 verificado localmente pode ser exibido.")
+        if (!preview.available) {
+            text(layout, "Bloqueado: este dispositivo ainda não recebeu uma autorização de chave e época verificável. Use um dispositivo autorizado.")
+        } else {
+            button(layout, "Abrir texto verificado") {
+                runCheckedRequest({ stillActive ->
+                    preview.open(origin, session, objectId, stillActive)
+                }) { characters, failure ->
+                    if (characters != null) {
+                        try {
+                            val view = screen("Texto verificado", "Conteúdo autenticado localmente. Feche para descartá-lo da tela.")
+                            val previewText = TextView(this).apply {
+                                isSaveEnabled = false
+                                importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+                                setTextIsSelectable(false)
+                                setPadding(0, 0, 0, (16 * resources.displayMetrics.density).toInt())
+                            }
+                            securePreviewText.show(characters, { retained ->
+                                previewText.setText(retained, 0, retained.size)
+                                view.addView(previewText)
+                            }, { previewText.text = "" })
+                            button(view, "Fechar conteúdo") {
+                                securePreviewText.clear()
+                                backToPage()
+                            }
+                        } catch (failure: Throwable) {
+                            characters.fill('\u0000')
+                            securePreviewText.clear()
+                            throw failure
+                        }
+                    } else when ((failure as? RootArkApiException)?.statusCode) {
+                        401 -> showLogin("Sessão expirada ou revogada. Faça login novamente.")
+                        403 -> showSession("Servidor negou acesso ao arquivo (403).")
+                        else -> showSession("Conteúdo indisponível. Autorização ou verificação criptográfica não confirmada.")
+                    }
+                }
+            }
+        }
+        button(layout, "Voltar") { backToPage() }
+    }
+
+    private fun <T> runCheckedRequest(operation: (stillActive: () -> Boolean) -> T, done: (T?, Exception?) -> Unit) {
+        val startedGeneration = ++generation
+        val stillActive = { isForeground && generation == startedGeneration && !isFinishing && !isDestroyed }
         screen("Conectando", "Aguardando resposta do servidor...")
         Thread {
             var response: T? = null
             var failure: Exception? = null
             try {
-                response = operation()
+                response = operation(stillActive)
             } catch (caught: Throwable) {
                 failure = if (caught is Exception) caught else RuntimeException(caught)
             }
+            val completedResponse = response
+            val completedFailure = failure
             runOnUiThread {
-                if (generation == started && !isFinishing && !isDestroyed) done(response, failure)
+                if (stillActive()) done(completedResponse, completedFailure)
+                else if (completedResponse is CharArray) completedResponse.fill('\u0000')
             }
         }.start()
     }
+
+    private fun <T> runRequest(operation: () -> T, done: (T?, Exception?) -> Unit) =
+        runCheckedRequest({ _ -> operation() }, done)
 
     private fun errorText(error: Exception?): String = when ((error as? RootArkApiException)?.statusCode) {
         401, 400 -> "Credenciais ou código inválidos."
@@ -209,6 +364,7 @@ class MainActivity : Activity() {
     }
 
     private fun screen(title: String, description: String): LinearLayout {
+        securePreviewText.clear()
         val scroll = ScrollView(this)
         if (Build.VERSION.SDK_INT >= 35) {
             // Keep the platform default keyboard behavior on older Android versions.
@@ -231,7 +387,10 @@ class MainActivity : Activity() {
             setPadding(padding, padding, padding, padding)
         }
         scroll.addView(layout)
-        text(layout, title).apply { textSize = 24f; setAccessibilityHeading(true) }
+        text(layout, title).apply {
+            textSize = 24f
+            isAccessibilityHeading = true
+        }
         text(layout, description)
         setContentView(scroll)
         if (Build.VERSION.SDK_INT >= 35) scroll.requestApplyInsets()
@@ -263,9 +422,10 @@ class MainActivity : Activity() {
             layout.addView(it)
         }
 
-    private fun button(layout: LinearLayout, label: String, action: () -> Unit) {
+    private fun button(layout: LinearLayout, label: String, accessibilityLabel: String? = null, action: () -> Unit) {
         val view = Button(this)
         view.text = label
+        if (accessibilityLabel != null) view.contentDescription = accessibilityLabel
         view.filterTouchesWhenObscured = true
         view.setOnClickListener { action() }
         layout.addView(view)
