@@ -16,6 +16,7 @@ import java.security.cert.Certificate
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.net.ssl.HttpsURLConnection
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -274,6 +275,41 @@ class PagedProtectedInventoryTest {
         assertNull(page.nextCursor)
         assertNull(page.rows.first().contentType)
         assertNull(page.rows.first().size)
+    }
+
+    @Test fun metadataInventoryRejectsMalformedBaseRevisionValues() {
+        val raw = fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body").toString()
+        val malformedBaseRevisions = listOf(
+            "string" to "not-a-revision",
+            "number" to 1,
+            "array" to JSONArray(),
+            "missing counter" to JSONObject().put("deviceId", "fixture-device"),
+            "string counter" to JSONObject().put("counter", "0").put("deviceId", "fixture-device"),
+            "negative counter" to JSONObject().put("counter", -1).put("deviceId", "fixture-device"),
+            "missing device id" to JSONObject().put("counter", 0),
+            "non-string device id" to JSONObject().put("counter", 0).put("deviceId", 1),
+            "oversized device id" to JSONObject().put("counter", 0).put("deviceId", "x".repeat(257)),
+        )
+
+        for ((description, baseRevision) in malformedBaseRevisions) {
+            val body = JSONObject(raw)
+            body.getJSONArray("objects").getJSONObject(0).put("baseRevision", baseRevision)
+            assertThrows("Malformed baseRevision: $description", SyncListingValidationException::class.java) {
+                AuthHttpTransport().projectInventoryPage(body)
+            }
+        }
+    }
+
+    @Test fun metadataInventoryAcceptsCanonicalBaseRevisionObject() {
+        val body = JSONObject(fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body").toString())
+        body.getJSONArray("objects").getJSONObject(0).put(
+            "baseRevision",
+            JSONObject().put("counter", 1).put("deviceId", "fixture-device"),
+        )
+
+        val page = AuthHttpTransport().projectInventoryPage(body)
+
+        assertFalse(page.rows.isEmpty())
     }
 
     @Test fun metadataInventoryRejectsFullRecordFieldsBeforeProjection() {

@@ -187,9 +187,13 @@ internal class AuthHttpTransport(
                 val recordVersion = parseProtocolVersion(record.opt("protocolVersion"))
                     ?: throw SyncListingValidationException("Invalid sync listing")
                 val revision = record.optJSONObject("revision") ?: throw SyncListingValidationException("Invalid sync listing")
+                val baseRevision = record.opt("baseRevision")
                 if (!hasOnlyFields(revision, INVENTORY_REVISION_FIELDS) ||
-                    record.optJSONObject("baseRevision")?.let { !hasOnlyFields(it, INVENTORY_REVISION_FIELDS) } == true) {
+                    (baseRevision as? JSONObject)?.let { !hasOnlyFields(it, INVENTORY_REVISION_FIELDS) } == true) {
                     throw SyncListingValidationException("Unexpected inventory revision field")
+                }
+                if (!hasValidOptionalInventoryRevisionValues(baseRevision)) {
+                    throw SyncListingValidationException("Invalid sync listing")
                 }
                 val counter = parseNonNegativeLong(revision.opt("counter"))
                     ?: throw SyncListingValidationException("Invalid sync listing")
@@ -254,6 +258,13 @@ internal class AuthHttpTransport(
 
     private fun hasOnlyFields(json: JSONObject, allowedFields: Set<String>): Boolean =
         json.keys().asSequence().all { it in allowedFields }
+
+    private fun hasValidOptionalInventoryRevisionValues(value: Any?): Boolean = when (value) {
+        null, JSONObject.NULL -> true
+        is JSONObject -> parseNonNegativeLong(value.opt("counter")) != null &&
+            (value.opt("deviceId") as? String)?.let { it.isNotBlank() && it.length <= 256 } == true
+        else -> false
+    }
 
     internal fun parseProtocolVersion(value: Any?): Int? = when (value) {
         is Int -> value
