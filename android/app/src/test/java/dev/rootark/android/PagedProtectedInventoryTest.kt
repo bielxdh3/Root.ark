@@ -234,6 +234,48 @@ class PagedProtectedInventoryTest {
         assertTrue(cache.pages(binding).isEmpty())
     }
 
+    @Test fun metadataInventoryRejectsUnknownEnvelopeMetadataAndRevisionProperties() {
+        val raw = fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body").toString()
+        val cases = listOf(
+            "envelope" to { body: JSONObject -> body.put("fixtureExtension", "inert") },
+            "metadata" to { body: JSONObject ->
+                body.getJSONArray("objects").getJSONObject(0).getJSONObject("metadata")
+                    .put("fixtureExtension", "inert")
+            },
+            "revision" to { body: JSONObject ->
+                body.getJSONArray("objects").getJSONObject(0).getJSONObject("revision")
+                    .put("fixtureExtension", "inert")
+            },
+            "base revision" to { body: JSONObject ->
+                body.getJSONArray("objects").getJSONObject(0)
+                    .put("baseRevision", JSONObject().put("counter", 0).put("deviceId", "fixture-device")
+                        .put("fixtureExtension", "inert"))
+            },
+        )
+
+        for ((level, addUnknownProperty) in cases) {
+            val body = JSONObject(raw)
+            addUnknownProperty(body)
+            assertThrows("Unexpected $level extension", SyncListingValidationException::class.java) {
+                AuthHttpTransport().projectInventoryPage(body)
+            }
+        }
+    }
+
+    @Test fun metadataInventoryAcceptsCanonicalNullableFields() {
+        val body = JSONObject(fixture.getJSONArray("pages").getJSONObject(2).getJSONObject("body").toString())
+        val record = body.getJSONArray("objects").getJSONObject(0)
+        record.put("baseRevision", JSONObject.NULL)
+        record.getJSONObject("metadata").put("contentType", JSONObject.NULL)
+        record.getJSONObject("metadata").put("size", JSONObject.NULL)
+
+        val page = AuthHttpTransport().projectInventoryPage(body)
+
+        assertNull(page.nextCursor)
+        assertNull(page.rows.first().contentType)
+        assertNull(page.rows.first().size)
+    }
+
     @Test fun metadataInventoryRejectsFullRecordFieldsBeforeProjection() {
         val raw = fixture.getJSONArray("pages").getJSONObject(0).getJSONObject("body").toString()
         for (field in listOf("ciphertext", "nonce", "tag", "aad", "authorization")) {

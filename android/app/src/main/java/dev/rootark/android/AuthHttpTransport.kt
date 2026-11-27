@@ -39,10 +39,16 @@ internal class AuthHttpTransport(
         // readTimeout applies to each socket read. Bound cumulative inventory
         // BODY reads independently; connection and headers have separate timeouts.
         private const val MAX_INVENTORY_BODY_NANOS = 10_000_000_000L
+        private val INVENTORY_ENVELOPE_FIELDS = setOf("protocolVersion", "view", "objects", "nextCursor")
         private val INVENTORY_RECORD_FIELDS = setOf(
             "protocolVersion", "operationId", "objectId", "fileId", "versionId", "operation",
             "revision", "baseRevision", "keyEpoch", "compartmentId", "deviceId", "metadata", "tombstone",
         )
+        private val INVENTORY_METADATA_FIELDS = setOf(
+            "fileId", "versionId", "path", "parentId", "name", "contentType", "size",
+            "keyEpoch", "compartmentId", "deviceId", "sourcePath",
+        )
+        private val INVENTORY_REVISION_FIELDS = setOf("counter", "deviceId")
     }
     fun login(origin: ServerOrigin, username: String, password: String): LoginOutcome {
         val (status, json) = post(origin.loginUrl(), JSONObject().put("username", username).put("password", password))
@@ -150,6 +156,9 @@ internal class AuthHttpTransport(
     }
 
     internal fun projectInventoryPage(response: JSONObject, usedCursors: Set<String> = emptySet()): InventoryPage {
+        if (!hasOnlyFields(response, INVENTORY_ENVELOPE_FIELDS)) {
+            throw SyncListingValidationException("Unexpected inventory envelope field")
+        }
         val objects = response.optJSONArray("objects") ?: throw SyncListingValidationException("Invalid inventory page")
         if (objects.length() > PagedInventoryPolicy.MAX_ENTRIES) {
             throw SyncListingLimitException("Inventory page exceeds maximum entry limit")
@@ -167,14 +176,21 @@ internal class AuthHttpTransport(
             PagedInventoryPolicy.checkEnvelope(version, view, objects.length(), nextCursor, usedCursors)
             val rows = (0 until objects.length()).map { index ->
                 val record = objects.optJSONObject(index) ?: throw SyncListingValidationException("Invalid sync listing")
-                if (record.keys().asSequence().any { it !in INVENTORY_RECORD_FIELDS }) {
+                if (!hasOnlyFields(record, INVENTORY_RECORD_FIELDS)) {
                     throw SyncListingValidationException("Unexpected inventory record field")
                 }
                 val metadata = record.optJSONObject("metadata") ?: throw SyncListingValidationException("Invalid sync listing")
+                if (!hasOnlyFields(metadata, INVENTORY_METADATA_FIELDS)) {
+                    throw SyncListingValidationException("Unexpected inventory metadata field")
+                }
                 val deleted = record.opt("tombstone") as? Boolean ?: throw SyncListingValidationException("Invalid sync listing")
                 val recordVersion = parseProtocolVersion(record.opt("protocolVersion"))
                     ?: throw SyncListingValidationException("Invalid sync listing")
                 val revision = record.optJSONObject("revision") ?: throw SyncListingValidationException("Invalid sync listing")
+                if (!hasOnlyFields(revision, INVENTORY_REVISION_FIELDS) ||
+                    record.optJSONObject("baseRevision")?.let { !hasOnlyFields(it, INVENTORY_REVISION_FIELDS) } == true) {
+                    throw SyncListingValidationException("Unexpected inventory revision field")
+                }
                 val counter = parseNonNegativeLong(revision.opt("counter"))
                     ?: throw SyncListingValidationException("Invalid sync listing")
                 if (requiredListingString(revision, "deviceId").length > 256) {
@@ -235,6 +251,9 @@ internal class AuthHttpTransport(
             throw SyncListingValidationException("Invalid sync listing")
         }
     }
+
+    private fun hasOnlyFields(json: JSONObject, allowedFields: Set<String>): Boolean =
+        json.keys().asSequence().all { it in allowedFields }
 
     internal fun parseProtocolVersion(value: Any?): Int? = when (value) {
         is Int -> value
