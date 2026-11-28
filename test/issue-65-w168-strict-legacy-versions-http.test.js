@@ -9,6 +9,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const test = require("node:test");
+const { createPrivateAuthorityFixture } =
+  require("./support/issue-65-private-authority-fixture");
 
 const ROOT = path.resolve(__dirname, "..");
 const NAME = "w168-disposable.txt";
@@ -39,19 +41,29 @@ async function boot(dir, port, strict, preload) {
   const env = { ...process.env, NODE_ENV: "test", DB_ENABLED: "false",
     PORT: String(port), UPLOAD_SCAN_ENABLED: "false", WEBDAV_ENABLED: "false",
     CLOUD_STORAGE_PROVIDER: "local", ROOTARK_ZK10_SYNC_CUTOVER_STRICT: strict ? "1" : "off",
-    JWT_SECRET: crypto.randomBytes(48).toString("base64url"),
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, preload && `--require=${preload}`].filter(Boolean).join(" ") };
+    JWT_SECRET: crypto.randomBytes(48).toString("base64url") };
   delete env.ROOTARK_DEV_BOOTSTRAP_DEFAULTS;
   delete env.ROOTARK_BOOTSTRAP_USERS_FROM_SEED;
   delete env.TRUSTED_PROXIES;
-  const child = spawn(process.execPath, [path.join(ROOT, "server.js")], {
+  const child = spawn(process.execPath,
+    [...(preload ? ["--require", preload] : []), path.join(ROOT, "server.js")], {
     cwd: dir, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
   });
   let diagnostic = "";
   for (const stream of [child.stdout, child.stderr])
     stream.on("data", (chunk) => { diagnostic = (diagnostic + chunk.toString()).slice(-1400); });
-  for (let i = 0; i < 240 && child.exitCode === null; i++) {
-    try { if ((await request(port, "/login.html")).status === 200) return child; } catch {}
+  let startupLine = "";
+  let ownedListenerReady = false;
+  child.stdout.on("data", (chunk) => {
+    const lines = (startupLine + chunk.toString()).split(/\r?\n/);
+    startupLine = lines.pop().slice(-256);
+    if (lines.some((line) => line.startsWith("Servidor rodando em http://")
+      && line.endsWith(`:${port}`))) ownedListenerReady = true;
+  });
+  for (let i = 0; i < 240 && child.exitCode === null && child.signalCode === null; i++) {
+    if (ownedListenerReady) {
+      try { if ((await request(port, "/login.html")).status === 200) return child; } catch {}
+    }
     await new Promise((resolve) => setTimeout(resolve, 60));
   }
   child.kill();
@@ -61,6 +73,34 @@ async function stop(child) {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   await new Promise((resolve) => { child.once("exit", resolve); child.kill(); });
 }
+test("fixture boot cannot borrow readiness from an unrelated HTTP listener", {
+  timeout: 30000,
+}, async (t) => {
+  const foreign = http.createServer((_req, res) => res.writeHead(200).end("foreign fixture"));
+  await new Promise((resolve) => foreign.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => foreign.close(resolve)));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-w168-foreign-listener-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // The app process cannot bind this port. A 200 from an unrelated PID is
+  // never evidence that this fixture's server finished starting.
+  const attempted = boot(dir, foreign.address().port, false, null);
+  try {
+    await assert.rejects(attempted, /disposable server failed to start/);
+  } finally {
+    await attempted.then(stop, () => {});
+  }
+});
+test("fixture preload under an owner-private path containing spaces is loaded", {
+  timeout: 30000,
+}, async (t) => {
+  const f = fixture(t);
+  const spacedPreload = path.join(f.dir, "strict preload with spaces.cjs");
+  fs.copyFileSync(f.preload, spacedPreload);
+  const port = await freePort();
+  f.child = await boot(f.dir, port, true, spacedPreload);
+  const headers = await session(port, f.password);
+  assert.match(headers.cookie, /rootark_csrf=/);
+});
 async function session(port, password) {
   const body = JSON.stringify({ username: "alice", password });
   const login = await request(port, "/auth/login", "POST", {
@@ -77,7 +117,7 @@ const ROUTES = [
   { id: "delete", method: "DELETE", endpoint: `/versions/${NAME}/v/1?folderId=root` },
 ];
 function fixture(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zk65-w168-versions-"));
+  const dir = createPrivateAuthorityFixture("zk65-w168-versions-");
   const data = path.join(dir, "data");
   const uploads = path.join(dir, "uploads");
   fs.mkdirSync(data);

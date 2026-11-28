@@ -12,11 +12,11 @@ import java.io.IOException
 import java.io.InputStream
 import java.math.BigDecimal
 import java.math.BigInteger
-import java.net.HttpURLConnection
-import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.security.cert.Certificate
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import javax.net.ssl.HttpsURLConnection
 import dev.rootark.core.auth.ServerOrigin
 
 class AuthHttpTransportTest {
@@ -24,7 +24,7 @@ class AuthHttpTransportTest {
     @Test
     fun `adversarial slow-drip sync listing exhausts total response budget before EOF`() {
         val origin = ServerOrigin.parse("https://sync.example.test")
-        val expected = """{"protocolVersion":2,"objects":[]}""".toByteArray(StandardCharsets.UTF_8)
+        val expected = """{"protocolVersion":2,"view":"metadata","objects":[],"nextCursor":null}""".toByteArray(StandardCharsets.UTF_8)
         val elapsed = AtomicLong(0L)
         val reads = AtomicInteger(0)
         var offset = 0
@@ -47,22 +47,26 @@ class AuthHttpTransportTest {
                 return 1
             }
         }
-        val connection = object : HttpURLConnection(URL("https://sync.example.test/sync/v1/objects")) {
+        val connection = object : HttpsURLConnection(origin.syncInventoryUrl()) {
             override fun connect() = Unit
             override fun disconnect() { disconnected = true }
             override fun usingProxy() = false
             override fun getResponseCode() = 200
             override fun getInputStream() = dripper
+            override fun getContentType() = "application/json"
+            override fun getCipherSuite() = "TLS_AES_128_GCM_SHA256"
+            override fun getLocalCertificates(): Array<Certificate>? = null
+            override fun getServerCertificates(): Array<Certificate> = emptyArray()
         }
         val transport = AuthHttpTransport(
-            openSyncConnection = { requested ->
-                assertEquals("https://sync.example.test/sync/v1/objects", requested.toString())
+            openInventoryConnection = { requested ->
+                assertEquals(origin.syncInventoryUrl().toString(), requested.toString())
                 connection
             },
             monotonicNanos = elapsed::get,
         )
         val failure = assertThrows(SyncListingLimitException::class.java) {
-            transport.listSyncObjects(origin, "independent-bearer")
+            transport.listInventoryPage(origin, "independent-bearer")
         }
         assertTrue(failure.message?.contains("deadline") == true)
         assertEquals("the third short read crosses the body budget", 3, reads.get())

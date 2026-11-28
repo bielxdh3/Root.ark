@@ -7,6 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const { spawn, execFileSync } = require("node:child_process");
+const { readEdgeDevToolsPort } = require("./support/issue-65-edge-devtools-port");
+const { reportReplacementFailure } = require("../scripts/edge-test-failure-diagnostic");
 
 test("real Edge: selected 128-revision UI batches consume replacement consent and cancel later-window search atomically", {
   timeout: 90_000,
@@ -294,11 +296,18 @@ test("real Edge: selected 128-revision UI batches consume replacement consent an
       window.__issue63CancelUiStartGetCalls=cancelStartGetCalls;
       window.__issue63CancelUiStartVerifiedGets=cancelStartVerifiedGets;
       pauseGetAt=cancelStartGetCalls+9;
+      // Force the legal scheduling boundary where CDP observes the paused
+      // GET before the page's polling continuation validates the UI.
+      const validateNinthGet=new Promise(resolve=>{
+        window.__issue63AllowNinthGetValidation=resolve;
+      });
       batchButton.click();
       const cancelButton=action("catalog-delta-text-cancel");
       const cancelProgress=field("catalog-batch-progress");
       for(let i=0;i<800&&window.__issue63CancelUiPhase!=="ninth-get-paused";i++)
         await sleep(20);
+      if(window.__issue63CancelUiPhase==="ninth-get-paused")
+        await validateNinthGet;
       if(!cancelButton||!cancelProgress
         ||window.__issue63CancelUiPhase!=="ninth-get-paused"
         ||cancelProgress.textContent!=="8 / 17 revisões conferidas"
@@ -307,6 +316,9 @@ test("real Edge: selected 128-revision UI batches consume replacement consent an
       const verifiedGetsBeforeRelease=verifiedGets;
       if(window.__issue63CancelUiVerifiedBeforeRelease!==verifiedGetsBeforeRelease)
         throw Error("CANCEL_UI_VERIFIED_GET_PRE_RELEASE_MISMATCH");
+      // Publishing the pause marker alone does not mean this continuation
+      // has observed the uncancelled UI. Acknowledge only after validation.
+      window.__issue63CancelUiValidated=true;
       for(let i=0;i<800&&window.__issue63CancelUiPhase!=="ninth-get-released";i++)
         await sleep(20);
       if(window.__issue63CancelUiPhase!=="ninth-get-released")
@@ -379,10 +391,7 @@ test("real Edge: selected 128-revision UI batches consume replacement consent an
       throw Error("EDGE_REPLACE_ONCE_TIMEOUT");
     };
     const port = await waitFor(() => {
-      const file = path.join(profile, "DevToolsActivePort");
-      if (!fs.existsSync(file)) return null;
-      const value = Number(fs.readFileSync(file, "utf8").split(/\r?\n/)[0]);
-      return Number.isSafeInteger(value) && value > 0 ? value : null;
+      return readEdgeDevToolsPort(profile);
     }, 15_000);
     const tabs = await (await fetch("http://127.0.0.1:" + port + "/json/list")).json();
     const tab = tabs.find((item) => item.type === "page");
@@ -471,14 +480,28 @@ test("real Edge: selected 128-revision UI batches consume replacement consent an
     });
     const cancelUiPaused = await waitFor(async () => {
       const evalResult = await send("Runtime.evaluate", {
-        expression: "window.__issue63CancelUiPhase || document.getElementById('edge-result')?.textContent || null",
+        expression: "(()=>{const result=document.getElementById('edge-result')?.textContent;return /^EDGE_REPLACE_ONCE_(PASS|FAIL)/.test(result)?result:window.__issue63CancelUiPhase||null;})()",
         returnByValue: true,
       });
       const value = evalResult.result?.value;
       return value === "ninth-get-paused" || typeof value === "string"
         && /^EDGE_REPLACE_ONCE_(PASS|FAIL)/.test(value) ? value : null;
     });
-    assert.equal(cancelUiPaused, "ninth-get-paused");
+    reportReplacementFailure(t, cancelUiPaused);
+    assert.ok(cancelUiPaused === "ninth-get-paused", "GET #9 must pause");
+    await send("Runtime.evaluate", {
+      expression: "window.__issue63AllowNinthGetValidation(); true",
+      returnByValue: true,
+    });
+    const cancelUiValidated = await waitFor(async () => {
+      const evalResult = await send("Runtime.evaluate", {
+        expression: "(()=>{const result=document.getElementById('edge-result')?.textContent;return /^EDGE_REPLACE_ONCE_(PASS|FAIL)/.test(result)?result:window.__issue63CancelUiValidated===true;})()",
+        returnByValue: true,
+      });
+      return evalResult.result?.value || null;
+    });
+    reportReplacementFailure(t, cancelUiValidated);
+    assert.equal(cancelUiValidated === true, true, "page must validate the paused GET before cancellation");
     const beforeExplicitCancel = await send("Runtime.evaluate", {
       expression: "(()=>{const d=document.querySelector('dialog.zk1-workspace-dialog');const p=d?.querySelector('[data-zk1-field=\\\"catalog-batch-progress\\\"]');const b=d?.querySelector('[data-zk1-action=\\\"catalog-delta-text-cancel\\\"]');const r=d?.querySelector('[data-zk1-field=\\\"catalog-delta-text-results\\\"]');return {opened:d?.open,batchDisabled:d?.querySelector('[data-zk1-action=\\\"catalog-delta-text-search\\\"]')?.disabled,progress:p?.textContent,results:r?.textContent,cancelDisabled:b?.disabled,cancelVisible:!!b?.getClientRects().length,getDelta:window.__issue63CancelUiGetCount-window.__issue63CancelUiStartGetCalls,startVerifiedGets:window.__issue63CancelUiStartVerifiedGets,verifiedGetsBeforeRelease:window.__issue63CancelUiVerifiedBeforeRelease};})()",
       returnByValue: true,
@@ -497,7 +520,7 @@ test("real Edge: selected 128-revision UI batches consume replacement consent an
     assert.equal(beforeCancel.verifiedGetsBeforeRelease-beforeCancel.startVerifiedGets, 8,
       "the first eight GET rows must be verified before GET #9 is released");
     const clickedCancel = await send("Runtime.evaluate", {
-      expression: "(()=>{const b=document.querySelector('[data-zk1-action=\\\"catalog-delta-text-cancel\\\"]');if(!b||b.disabled||!b.getClientRects().length)throw Error('CANCEL_BUTTON_NOT_VISIBLE');b.click();return {progress:document.querySelector('[data-zk1-field=\\\"catalog-batch-progress\\\"]').textContent,status:document.querySelector('[data-zk1-field=\\\"status\\\"]').textContent};})()",
+      expression: "(()=>{if(window.__issue63CancelUiValidated!==true)throw Error('CANCEL_BEFORE_PROBE_VALIDATION');const b=document.querySelector('[data-zk1-action=\\\"catalog-delta-text-cancel\\\"]');if(!b||b.disabled||!b.getClientRects().length)throw Error('CANCEL_BUTTON_NOT_VISIBLE');b.click();return {progress:document.querySelector('[data-zk1-field=\\\"catalog-batch-progress\\\"]').textContent,status:document.querySelector('[data-zk1-field=\\\"status\\\"]').textContent};})()",
       returnByValue: true,
     });
     assert.deepEqual(clickedCancel.result?.value, {
@@ -517,6 +540,7 @@ test("real Edge: selected 128-revision UI batches consume replacement consent an
       return typeof value === "string" && /^EDGE_REPLACE_ONCE_(PASS|FAIL)/.test(value)
         ? value : null;
     });
+    reportReplacementFailure(t, result);
     assert.equal(result, "EDGE_REPLACE_ONCE_PASS");
     const afterCancelCleanup = await send("Runtime.evaluate", {
       expression: "({phase:window.__issue63CancelUiPhase,verifiedGets:window.__issue63CancelUiVerifiedAfterRelease})",

@@ -8,6 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const test = require("node:test");
+const { privateAuthorityDirectory } = require("./support/issue-65-private-authority-directory");
 
 const ROOT = path.resolve(__dirname, "..");
 const SERVER = path.join(ROOT, "server.js");
@@ -38,11 +39,18 @@ function request(port, requestPath, { method = "GET", headers = {}, body = "" } 
 
 async function waitForServer(port, child) {
   const deadline = Date.now() + 10_000;
+  let lastUnavailable;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error("disposable server exited before becoming ready");
-    try { return await request(port, "/login.html"); } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
+    try {
+      const response = await request(port, "/login.html");
+      if (response.status !== 503) return response;
+      lastUnavailable = response;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error("disposable server did not start");
+  throw new Error("disposable server did not become ready" +
+    (lastUnavailable ? ": HTTP 503 " + lastUnavailable.body.slice(0, 200) : ""));
 }
 
 function stop(child) {
@@ -52,7 +60,7 @@ function stop(child) {
 }
 
 test("resetting a file ACL preserves its owner and owner-based edit access", { timeout: 30_000 }, async (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "rootark-file-owner-acl-"));
+  const directory = privateAuthorityDirectory("rootark-file-owner-acl-");
   const dataDir = path.join(directory, "data");
   const uploadsDir = path.join(directory, "uploads");
   fs.mkdirSync(dataDir, { recursive: true });

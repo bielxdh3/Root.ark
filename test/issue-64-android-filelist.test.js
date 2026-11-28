@@ -42,7 +42,7 @@ test("native list limits responses, checks listFiles, handles denied sessions an
   assert.match(transport, /Bearer /);
   assert.match(transport, /instanceFollowRedirects\s*=\s*false/);
   assert.match(transport, /MAX_RESPONSE_BYTES/);
-  assert.match(transport, /ReadOnlyFileListPolicy\.checkEnvelope/);
+  assert.match(transport, /PagedInventoryPolicy\.checkEnvelope/);
   assert.match(transport, /ReadOnlyFileListPolicy\.project/);
   assert.match(policy, /listFiles/);
   assert.match(policy, /validText\(name, 512\)/, "name must obey server metadata limit");

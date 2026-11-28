@@ -239,7 +239,15 @@ test("executable Node owner CLI interchanges real browser PoP + signed receipt u
   child.stdout.on("data", (c) => { stdout += c; });
   async function until(filename) {
     for (let i = 0; i < 150; i++) {
-      if (fs.existsSync(file(filename))) return JSON.parse(fs.readFileSync(file(filename), "utf8"));
+      if (fs.existsSync(file(filename))) {
+        // The child writes its disposable JSON fixture directly. A reader can
+        // observe the newly created file before the write has completed.
+        const bytes = fs.readFileSync(file(filename), "utf8");
+        try { return JSON.parse(bytes); }
+        catch (error) {
+          if (!(error instanceof SyntaxError) || child.exitCode !== null) throw error;
+        }
+      }
       if (child.exitCode !== null) throw Error("CLI early exit: " + stderr);
       await new Promise((resolve) => setTimeout(resolve, 70));
     }
